@@ -1,0 +1,47 @@
+[package]
+name = "colay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+autobins = false
+
+[[bin]]
+name = "colay"
+path = "src/main.rs"
+
+[features]
+default = []
+test-fixtures = ["dep:orchestrator-test-support"]
+
+[[bin]]
+name = "colay-e2e-fake-provider"
+path = "src/bin/fake-provider-cli.rs"
+required-features = ["test-fixtures"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+codex-compat = { path = "../codex-compat" }
+orchestrator-domain = { path = "../orchestrator-domain" }
+orchestrator-engine = { path = "../orchestrator-engine" }
+orchestrator-policy = { path = "../orchestrator-policy" }
+orchestrator-process = { path = "../orchestrator-process" }
+orchestrator-providers = { path = "../orchestrator-providers" }
+orchestrator-state = { path = "../orchestrator-state" }
+orchestrator-tui = { path = "../orchestrator-tui" }
+orchestrator-test-support = { path = "../orchestrator-test-support", optional = true }
+rusqlite.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "orchestrator-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+orchestrator-domain = { path = "../orchestrator-domain" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

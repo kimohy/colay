@@ -1,0 +1,27 @@
+[package]
+name = "orchestrator-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+codex-compat = { path = "../codex-compat" }
+orchestrator-domain = { path = "../orchestrator-domain" }
+orchestrator-policy = { path = "../orchestrator-policy" }
+orchestrator-process = { path = "../orchestrator-process" }
+orchestrator-providers = { path = "../orchestrator-providers" }
+orchestrator-state = { path = "../orchestrator-state" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "orchestrator-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+fs2.workspace = true
+hex.workspace = true
+orchestrator-domain = { path = "../orchestrator-domain" }
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml_edit.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

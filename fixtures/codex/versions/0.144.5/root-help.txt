@@ -1,0 +1,6 @@
+Codex CLI
+
+Commands:
+  exec        Run Codex non-interactively
+  app-server  Launch the Codex App Server
+

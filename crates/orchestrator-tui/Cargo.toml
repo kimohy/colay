@@ -1,0 +1,16 @@
+[package]
+name = "orchestrator-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

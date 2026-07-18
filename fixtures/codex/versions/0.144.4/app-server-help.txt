@@ -1,0 +1,5 @@
+Usage: codex app-server [OPTIONS]
+      --listen <stdio://|ws://IP:PORT|unix://|off>
+Commands:
+  generate-json-schema
+

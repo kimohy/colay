@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "objective": "Implement the requested repository change and verify it",
+  "original_request": "Replace this example with the user's task",
+  "constraints": [
+    "Do not modify unrelated files",
+    "Do not push or merge automatically"
+  ],
+  "acceptance_criteria": [
+    "Configured verification commands exit successfully",
+    "No out-of-scope files are changed"
+  ],
+  "allowed_write_paths": ["crates/example", "docs/example.md"],
+  "repository_wide_write_scope": false
+}

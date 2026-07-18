@@ -1,0 +1,2 @@
+Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]
+

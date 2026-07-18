@@ -1,0 +1,10 @@
+Usage: codex exec [OPTIONS] [PROMPT]
+
+Options:
+      --json
+      --output-schema <FILE>
+      --sandbox <read-only|workspace-write|danger-full-access>
+  -m, --model <MODEL>
+  -C <DIR>
+  -c <key=value>
+

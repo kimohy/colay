@@ -1,0 +1,23 @@
+[package]
+name = "orchestrator-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+orchestrator-domain = { path = "../orchestrator-domain" }
+orchestrator-providers = { path = "../orchestrator-providers" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+orchestrator-engine = { path = "../orchestrator-engine" }
+orchestrator-state = { path = "../orchestrator-state" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

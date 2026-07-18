@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"019aa000-0000-7000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"cargo test","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"cargo test","status":"completed","exit_code":0}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Tests pass."}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10}}
+

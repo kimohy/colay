@@ -1,0 +1,31 @@
+{
+  "schema_version": "1",
+  "generated_from": [
+    "compatibility/codex-version.toml",
+    "fixtures/codex/versions/*/manifest.toml"
+  ],
+  "versions": [
+    {
+      "version": "0.144.5",
+      "exec": "pass",
+      "jsonl": "pass",
+      "resume": "pass",
+      "app_server": "pass",
+      "output_schema": "pass",
+      "reasoning_effort": "pass",
+      "usage": "pass",
+      "status": "supported"
+    },
+    {
+      "version": "0.144.4",
+      "exec": "pass",
+      "jsonl": "pass",
+      "resume": "pass",
+      "app_server": "pass",
+      "output_schema": "pass",
+      "reasoning_effort": "pass",
+      "usage": "pass",
+      "status": "supported"
+    }
+  ]
+}

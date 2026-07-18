@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StableCodexAppServerFixture",
+  "definitions": {
+    "InitializeRequest": { "properties": { "method": { "const": "initialize" } } },
+    "InitializedNotification": { "properties": { "method": { "const": "initialized" } } },
+    "ThreadStartRequest": { "properties": { "method": { "const": "thread/start" } } },
+    "ThreadResumeRequest": { "properties": { "method": { "const": "thread/resume" } } },
+    "TurnStartRequest": { "properties": { "method": { "const": "turn/start" } } },
+    "ItemStartedNotification": { "properties": { "method": { "const": "item/started" } } },
+    "ItemCompletedNotification": { "properties": { "method": { "const": "item/completed" } } },
+    "TurnCompletedNotification": {
+      "properties": {
+        "method": { "const": "turn/completed" },
+        "params": { "properties": { "tokenUsage": { "type": ["object", "null"] } } }
+      }
+    },
+    "ThreadStartParams": {
+      "properties": {
+        "sandbox": { "enum": ["read-only", "workspace-write"] },
+        "cwd": { "type": "string" },
+        "model": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

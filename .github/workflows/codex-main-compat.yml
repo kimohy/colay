@@ -1,0 +1,96 @@
+name: Codex upstream main compatibility
+
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Optional exact 40-character upstream commit
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-main:
+    runs-on: ubuntu-latest
+    env:
+      COLAY_TEST_FAKE_PROVIDERS_ONLY: "1"
+      CODEX_API_KEY: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Resolve and checkout exact revision
+        env:
+          REQUESTED_REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/openai/codex.git "$RUNNER_TEMP/codex"
+          if [[ -n "${REQUESTED_REVISION:-}" ]]; then
+            [[ "$REQUESTED_REVISION" =~ ^[0-9a-f]{40}$ ]]
+            revision="$REQUESTED_REVISION"
+          else
+            revision="$(git -C "$RUNNER_TEMP/codex" rev-parse origin/main)"
+          fi
+          git -C "$RUNNER_TEMP/codex" checkout --detach "$revision"
+          echo "$revision" > "$RUNNER_TEMP/upstream-sha.txt"
+      - name: Build exact upstream source without secrets
+        env:
+          CODEX_API_KEY: ""
+          OPENAI_API_KEY: ""
+        run: cargo build --locked -p codex-cli --manifest-path "$RUNNER_TEMP/codex/codex-rs/Cargo.toml"
+      - name: Capture help and stable App Server schema only
+        run: |
+          set -euo pipefail
+          revision="$(cat "$RUNNER_TEMP/upstream-sha.txt")"
+          out="$RUNNER_TEMP/report/$revision"
+          mkdir -p "$out/schema"
+          codex_bin="$RUNNER_TEMP/codex/codex-rs/target/debug/codex"
+          capture() {
+            name="$1"
+            shift
+            set +e
+            "$@" > "$out/$name" 2> "$out/$name.stderr"
+            code="$?"
+            set -e
+            printf '%s\n' "$code" > "$out/$name.exit-code"
+          }
+          capture version-output.txt "$codex_bin" --version
+          capture root-help.txt "$codex_bin" --help
+          capture exec-help.txt "$codex_bin" exec --help
+          capture exec-resume-help.txt "$codex_bin" exec resume --help
+          capture app-server-help.txt "$codex_bin" app-server --help
+          set +e
+          "$codex_bin" app-server generate-json-schema --out "$out/schema" \
+            > "$out/app-server-schema.stdout" 2> "$out/app-server-schema.stderr"
+          schema_code="$?"
+          set -e
+          printf '%s\n' "$schema_code" > "$out/app-server-schema.exit-code"
+          printf '{"revision":"%s","risk":"unassessed","inference_executed":false}\n' "$revision" > "$out/report.json"
+          find "$out" -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > "$out/SHA256SUMS"
+      - name: Build actionable compatibility report
+        run: |
+          revision="$(cat "$RUNNER_TEMP/upstream-sha.txt")"
+          python scripts/build_compat_report.py \
+            --capture "$RUNNER_TEMP/report/$revision" \
+            --matrix compatibility/codex-matrix.json \
+            --fixtures fixtures/codex/versions \
+            --subject "$revision" \
+            --revision "$revision" \
+            --kind upstream-main
+          find "$RUNNER_TEMP/report/$revision" -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/report/$revision/SHA256SUMS"
+      - name: Run compatibility parser and migrations
+        run: cargo test -p codex-compat -p orchestrator-state -p orchestrator-test-support
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-main-compat-${{ github.run_id }}
+          path: ${{ runner.temp }}/report
+          if-no-files-found: error

@@ -1,0 +1,8 @@
+/target/
+/.colay/
+/.codex/orchestrator/
+/.codex-orchestrator-worktrees/
+*.db-shm
+*.db-wal
+*.backup.*
+*.recovered.*

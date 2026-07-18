@@ -1,0 +1,146 @@
+name: Codex stable compatibility
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional exact rust-v* release tag
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    env:
+      COLAY_TEST_FAKE_PROVIDERS_ONLY: "1"
+      CODEX_API_KEY: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      report_name: ${{ steps.report.outputs.name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - id: resolve
+        name: Resolve exact stable tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_TAG:-}" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            tag="$(gh api repos/openai/codex/releases/latest --jq .tag_name)"
+          fi
+          [[ "$tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Checkout exact upstream release
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$TAG" --filter=blob:none https://github.com/openai/codex.git "$RUNNER_TEMP/codex"
+          git -C "$RUNNER_TEMP/codex" rev-parse HEAD | tee "$RUNNER_TEMP/upstream-sha.txt"
+      - name: Build upstream CLI without credentials
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: cargo build --locked -p codex-cli --manifest-path "$RUNNER_TEMP/codex/codex-rs/Cargo.toml"
+      - name: Capture non-inference capability contract
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/report/$TAG"
+          mkdir -p "$out/schema"
+          codex_bin="$RUNNER_TEMP/codex/codex-rs/target/debug/codex"
+          capture() {
+            name="$1"
+            shift
+            set +e
+            "$@" > "$out/$name" 2> "$out/$name.stderr"
+            code="$?"
+            set -e
+            printf '%s\n' "$code" > "$out/$name.exit-code"
+          }
+          capture version-output.txt "$codex_bin" --version
+          capture root-help.txt "$codex_bin" --help
+          capture exec-help.txt "$codex_bin" exec --help
+          capture exec-resume-help.txt "$codex_bin" exec resume --help
+          capture app-server-help.txt "$codex_bin" app-server --help
+          set +e
+          "$codex_bin" app-server generate-json-schema --out "$out/schema" \
+            > "$out/app-server-schema.stdout" 2> "$out/app-server-schema.stderr"
+          schema_code="$?"
+          set -e
+          printf '%s\n' "$schema_code" > "$out/app-server-schema.exit-code"
+          printf '{"tag":"%s","commit":"%s","inference_executed":false}\n' \
+            "$TAG" "$(cat "$RUNNER_TEMP/upstream-sha.txt")" > "$out/report.json"
+          find "$out" -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > "$out/SHA256SUMS"
+      - name: Build actionable compatibility report
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          python scripts/build_compat_report.py \
+            --capture "$RUNNER_TEMP/report/$TAG" \
+            --matrix compatibility/codex-matrix.json \
+            --fixtures fixtures/codex/versions \
+            --subject "$TAG" \
+            --revision "$(cat "$RUNNER_TEMP/upstream-sha.txt")" \
+            --kind release
+          find "$RUNNER_TEMP/report/$TAG" -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/report/$TAG/SHA256SUMS"
+      - name: Run orchestrator contract tests
+        run: cargo test -p codex-compat -p orchestrator-state -p orchestrator-test-support
+      - id: report
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: echo "name=codex-compat-${TAG}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.report.outputs.name }}
+          path: ${{ runner.temp }}/report
+          if-no-files-found: error
+
+  publish-draft-report:
+    if: ${{ vars.PUBLISH_COMPAT_REPORT == 'true' }}
+    needs: inspect
+    runs-on: ubuntu-latest
+    env:
+      CODEX_API_KEY: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.inspect.outputs.report_name }}
+          path: compatibility/reports/${{ needs.inspect.outputs.tag }}
+      - name: Publish whitelisted report as draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.inspect.outputs.tag }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch="compat/codex-${TAG}-${RUN_ID}"
+          git switch -c "$branch"
+          git add "compatibility/reports/$TAG"
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git commit -m "Report Codex $TAG compatibility"
+          git push origin "$branch"
+          gh pr create --draft --title "Codex $TAG compatibility report" --body "Automated non-inference compatibility report. No provider credentials were available to the inspection job."
