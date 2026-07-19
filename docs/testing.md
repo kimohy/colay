@@ -6,15 +6,18 @@ Tests and CI must never invoke real Codex, Claude, or Gemini inference. Provider
 
 CI clears common provider API-key variables and sets `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` at job scope. Compatibility workflows may build an exact official Codex source revision and run only the explicit version/help/schema probe allowlist; they never pass a prompt.
 
+Configuration, resolver, and rollback tests also use local fixtures and fake binaries only. They do not invoke provider inference: Windows and Unix executable-resolution cases exercise fixture files, and rollback cases validate persisted execution evidence without resolving a live provider binary from the current `PATH`.
+
 ## Required local verification
 
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+python scripts/generate_codex_matrix.py --check
 ```
 
-No provider credentials are needed. If an integration test asks for a provider login or consumes Enterprise quota, stop: that test violates the repository contract.
+No provider credentials are needed. If an integration test asks for a provider login or consumes Enterprise quota, stop: that test violates the repository contract. For lower disk pressure, the repository verification suite may be run with `CARGO_INCREMENTAL=0`.
 
 ## Contract coverage
 

@@ -18,6 +18,8 @@ The project does not rotate accounts or identities, evade quotas, scrape provide
 
 Persisted repository paths reject absolute paths, `..`, NUL, and Windows prefixes. State/artifact operations reject symlink components, and worktree evidence validates paths beneath the managed root.
 
+Configuration may be layered from personal defaults or environment-selected files, but effective state paths are constrained beneath the repository. Automatic discovery of both current and legacy repository configuration fails closed unless an explicit `--config` selects one; an explicit missing configuration file also fails instead of falling back.
+
 On Unix, state directories/files are set to `0700`/`0600`. On Windows, state creation removes inheritance and broad grants, then verifies a protected DACL restricted to the current SID, `SYSTEM`, and built-in Administrators. The multi-command ACL mutation is serialized within the process so concurrent state opens cannot observe an intentional intermediate descriptor. The implementation invokes only canonical System32 `whoami.exe`/`icacls.exe` with separated arguments, an empty environment except the Windows root, bounded output, and a timeout; any unverifiable ACL fails closed.
 
 `--task-file` is read only when it is a non-symlink regular file inside the current repository, no larger than 1 MiB, and already has the same private Unix mode or verified Windows DACL. The orchestrator checks this policy without changing the input file.
@@ -33,6 +35,8 @@ Before checkpoint persistence, restart recovery, handover, or reviewer sharing, 
 ## Approval boundaries
 
 Completion is blocked by failed verification, out-of-scope files, secret findings, inconclusive large-file scans, or a missing required independent review. Worktree deletion is not automated. Release and database-migration rollback both require an explicit `--approved-by` identity and an exact plan-bound integrity hash. Quality-floor downgrade approval records exist in the state schema; this release does not silently lower critical-task quality.
+
+A release rollback that replaces the Codex executable also requires validated, persisted evidence from the latest completed writable Codex attempt. The stored attempt/task/provider identity, actual resolved executable, and trusted worktree must agree; missing, malformed, or mismatched execution evidence fails closed. Current configuration or `PATH` resolution is not substituted for that persisted identity.
 
 ## Residual trust
 

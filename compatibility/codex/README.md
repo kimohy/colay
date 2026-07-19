@@ -18,8 +18,8 @@ registry, or a per-version manifest diverges. Regenerate it with
 
 | Codex version | exec | JSONL | resume | app-server | usage | status |
 |---|---|---|---|---|---|---|
+| 0.144.6 | pass | pass | pass | pass | pass | supported |
 | 0.144.5 | pass | pass | pass | pass | pass | supported |
-| 0.144.4 | pass | pass | pass | pass | pass | supported |
 
 No N-2 maintenance row is claimed until an actual third release has reviewed
 fixtures. Unknown releases remain read-only/disabled according to the startup

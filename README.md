@@ -33,4 +33,20 @@ colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity
 colay tui [task-id]
 ```
 
-Configuration is local to the repository at `.colay/config.toml`. Start from [`config.example.toml`](config.example.toml). A legacy `.codex/orchestrator/config.toml` is discovered without moving its state; if both locations exist, Colay fails closed until an administrator selects one with `--config`. See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.
+## Configuration
+
+Colay resolves versioned TOML configuration in this order, with later layers overriding earlier ones:
+
+```text
+compiled defaults
+< $COLAY_HOME/config.toml
+< <repository>/.colay/config.toml
+< $COLAY_CONFIG
+< --config
+```
+
+`COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Configuration files are partial overrides: tables merge by key, while arrays replace the lower-precedence array rather than concatenate. Every loaded file must declare the supported `config_version`. Absent automatic layers are ignored, but an explicitly selected `$COLAY_CONFIG` or `--config` file must exist or startup fails.
+
+Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely; read-only commands do not create repository state, while the first writable `run` initializes it when needed. Start from [`config.example.toml`](config.example.toml).
+
+See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.
