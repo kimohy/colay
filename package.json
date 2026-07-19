@@ -1,0 +1,11 @@
+{
+  "name": "colay-release-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "workspaces": ["npm/*"],
+  "scripts": {
+    "test": "node --test scripts/release/test/*.test.mjs npm/colay/test/*.test.cjs"
+  },
+  "engines": { "node": ">=22" }
+}

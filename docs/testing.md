@@ -11,13 +11,35 @@ Configuration, resolver, and rollback tests also use local fixtures and fake bin
 ## Required local verification
 
 ```text
+npm test
+node --test scripts/release/test/workflow-contract.test.mjs
+python scripts/generate_codex_matrix.py --check
+git diff --check
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-python scripts/generate_codex_matrix.py --check
 ```
 
-No provider credentials are needed. If an integration test asks for a provider login or consumes Enterprise quota, stop: that test violates the repository contract. For lower disk pressure, the repository verification suite may be run with `CARGO_INCREMENTAL=0`.
+`npm test` uses only the dependency-free Node.js built-in test runner. It
+checks the npm package templates, launcher behavior, release version/channel
+classification, staging allowlists and checksums, retry-safe publication logic,
+and workflow contracts without contacting npm or GitHub.
+
+## Release package smoke tests
+
+The release workflow packs all four staged tarballs locally and, on each native
+runner, installs the root tarball and its selected platform tarball into an
+isolated npm prefix with `--offline --ignore-scripts`. It then runs only
+`colay --version` from that isolated installation. On Windows, the smoke
+invokes npm's generated `colay.ps1` global command shim through the known
+Windows PowerShell executable with separated arguments and `shell: false`.
+This proves package versions, exact optional dependencies, and the embedded
+Rust version agree without a registry publish or provider process. Linux x64
+uses a musl-linked binary and
+has no npm `libc` selector, so the package remains installable on both musl and
+glibc hosts.
+
+No provider credentials are needed. If an integration test asks for a provider login or consumes Enterprise quota, stop: that test violates the repository contract. For lower disk pressure, the Rust verification suite may be run with `CARGO_INCREMENTAL=0`.
 
 ## Contract coverage
 

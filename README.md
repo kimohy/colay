@@ -1,5 +1,30 @@
 # Colay
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+## Install
+
+Requires Node.js 22 or newer. Install the stable channel (the default) with:
+
+```text
+npm install --global @kimohy/colay
+colay --version
+```
+
+Beta and nightly channels are available when you explicitly opt in:
+
+```text
+npm install --global @kimohy/colay@beta
+npm install --global @kimohy/colay@nightly
+```
+
+Colay currently supports Windows x64, macOS Apple Silicon (ARM64), and Linux
+x64. The Linux x64 package contains a musl-linked binary and deliberately has
+no npm `libc` selector, so it can install on both musl and glibc Linux hosts.
+For beta and stable builds without Node.js, download the matching archive from
+[GitHub Releases](https://github.com/kimohy/colay/releases). Nightly workflow
+artifacts expire after 14 days; npm is the normal way to install a nightly.
+
 Colay is a local-first enterprise orchestrator for approved Codex CLI, Claude Code, and Gemini CLI installations. It selects a provider and logical model profile, records why it made that decision, preserves work in isolated Git worktrees, and can resume from a vendor-neutral checkpoint after a provider becomes unavailable.
 
 The orchestrator never rotates identities, bypasses quotas, scrapes usage pages, extracts credentials, purchases credits, or calls unofficial provider endpoints. Provider inference is performed only by the official CLIs with their existing authenticated state. Tests use fake binaries and consume no provider credit.

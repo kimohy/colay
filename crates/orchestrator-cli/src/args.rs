@@ -3,10 +3,19 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use orchestrator_domain::ProviderId;
 
+const fn selected_build_version(override_version: Option<&'static str>) -> &'static str {
+    match override_version {
+        Some(version) => version,
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
+
+const COLAY_VERSION: &str = selected_build_version(option_env!("COLAY_BUILD_VERSION"));
+
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "colay",
-    version,
+    version = COLAY_VERSION,
     about = "Local Enterprise multi-provider coding-agent relay",
     long_about = None
 )]
@@ -227,6 +236,16 @@ impl From<ProviderName> for ProviderId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_uses_the_selected_build_version() {
+        assert_eq!(
+            selected_build_version(Some("0.1.1-nightly.20260719.a1b2c3d")),
+            "0.1.1-nightly.20260719.a1b2c3d"
+        );
+        assert_eq!(Cli::command().get_version(), Some(COLAY_VERSION));
+    }
 
     #[test]
     fn parses_migration_rollback_plan_with_explicit_backup() -> Result<(), clap::Error> {
