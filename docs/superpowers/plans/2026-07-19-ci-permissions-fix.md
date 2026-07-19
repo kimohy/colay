@@ -349,3 +349,18 @@ Keep each integration test's `TempDir` handle alive, canonicalize `path()` immed
 Run focused state tests, then required workspace format/Clippy/tests; commit, push, and monitor the complete CI matrix.
 
 Expected: macOS advances through all state and integration tests, and every CI job succeeds.
+
+### Task 11: Canonical multi-provider E2E roots
+
+**Files:**
+- Modify and test: `crates/orchestrator-test-support/tests/multi_provider_handover_e2e.rs`
+
+- [x] **Step 1: Preserve canonical state and workspace roots**
+
+Canonicalize both temporary directories immediately and pass only those roots to artifact storage, worker requests, persistence preflight, and verification.
+
+- [ ] **Step 2: Verify and publish**
+
+Run the focused E2E test and required workspace checks, commit, push, and monitor the complete CI matrix.
+
+Expected: the multi-provider handover E2E test no longer rejects macOS `/var` aliases.
