@@ -5,7 +5,9 @@ use orchestrator_domain::{
     AttemptId, ModelProfile, ProviderId, QuotaPeriod, QuotaScope, ReasoningEffort, SandboxMode,
     SchemaVersion, TaskId, UsageUnit, WorkerEvent, WorkerRequest,
 };
-use orchestrator_process::{CommandSpec, EnvironmentPolicy, ExecutableKind, ProcessRunner};
+#[cfg(windows)]
+use orchestrator_process::EnvironmentPolicy;
+use orchestrator_process::{CommandSpec, ExecutableKind, ProcessRunner};
 use orchestrator_providers::{
     AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
     GeminiAdapter, GeminiAdapterConfig, PreparedInvocation, ProcessAdapterRuntime, ProviderError,
