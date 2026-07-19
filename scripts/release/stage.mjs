@@ -28,7 +28,7 @@ const PACKAGES = Object.freeze([
   Object.freeze({ name: "@kimohy/colay", directory: "colay", binary: null, target: null }),
   Object.freeze({ name: "@kimohy/colay-win32-x64", directory: "colay-win32-x64", binary: "bin/colay.exe", target: "x86_64-pc-windows-msvc", os: ["win32"], cpu: ["x64"], libc: null }),
   Object.freeze({ name: "@kimohy/colay-darwin-arm64", directory: "colay-darwin-arm64", binary: "bin/colay", target: "aarch64-apple-darwin", os: ["darwin"], cpu: ["arm64"], libc: null }),
-  Object.freeze({ name: "@kimohy/colay-linux-x64", directory: "colay-linux-x64", binary: "bin/colay", target: "x86_64-unknown-linux-musl", os: ["linux"], cpu: ["x64"], libc: ["musl"] }),
+  Object.freeze({ name: "@kimohy/colay-linux-x64", directory: "colay-linux-x64", binary: "bin/colay", target: "x86_64-unknown-linux-musl", os: ["linux"], cpu: ["x64"], libc: null }),
 ]);
 const NATIVE_PACKAGES = PACKAGES.filter(({ target }) => target !== null);
 const PACKAGE_BY_NAME = new Map(PACKAGES.map((item) => [item.name, item]));

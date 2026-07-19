@@ -112,6 +112,10 @@ jobs:
           $archive = "colay-v${{ needs.classify.outputs.version }}-${{ matrix.target }}.zip"
           Compress-Archive -Path "native/${{ matrix.executable }}", 'native/LICENSE' -DestinationPath "native/$archive" -CompressionLevel Optimal
           $digest = (Get-FileHash -Algorithm SHA256 "native/$archive").Hash.ToLowerInvariant()
+          New-Item -ItemType Directory -Force archive-check | Out-Null
+          Expand-Archive -Path "native/$archive" -DestinationPath archive-check
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+          if ((Get-FileHash -Algorithm SHA256 "native/$archive").Hash.ToLowerInvariant() -ne $digest) { throw 'archive checksum changed after verification' }
           node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
       - name: Package macOS archive and descriptor
         shell: bash
@@ -123,6 +127,11 @@ jobs:
           archive="colay-v${{ needs.classify.outputs.version }}-${{ matrix.target }}.tar.gz"
           tar -czf "native/$archive" -C native "${{ matrix.executable }}" LICENSE
           digest="$(shasum -a 256 "native/$archive" | awk '{print $1}')"
+          mkdir archive-check
+          tar -xzf "native/$archive" -C archive-check
+          chmod 755 "archive-check/${{ matrix.executable }}"
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+          test "$digest" = "$(shasum -a 256 "native/$archive" | awk '{print $1}')"
           node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
       - name: Package Linux archive and descriptor
         shell: bash
@@ -134,11 +143,17 @@ jobs:
           archive="colay-v${{ needs.classify.outputs.version }}-${{ matrix.target }}.tar.gz"
           tar -czf "native/$archive" -C native "${{ matrix.executable }}" LICENSE
           digest="$(sha256sum "native/$archive" | awk '{print $1}')"
+          mkdir archive-check
+          tar -xzf "native/$archive" -C archive-check
+          chmod 755 "archive-check/${{ matrix.executable }}"
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+          test "$digest" = "$(sha256sum "native/$archive" | awk '{print $1}')"
           node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-${{ matrix.target }}
           path: native
+          retention-days: ${{ needs.classify.outputs.retention_days }}
           if-no-files-found: error
 
   validate:
@@ -207,6 +222,7 @@ jobs:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: release-${{ needs.classify.outputs.version }}
+          path: dist
       - name: Smoke test the selected native npm package
         run: node scripts/release/smoke.mjs --tarballs-dir dist/tarballs --prefix "${{ runner.temp }}/colay-smoke" --package-name "${{ matrix.package_name }}" --version "${{ needs.classify.outputs.version }}"
 
@@ -221,6 +237,7 @@ jobs:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: release-${{ needs.classify.outputs.version }}
+          path: dist
       - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
         with:
           subject-path: |
@@ -250,6 +267,7 @@ jobs:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: release-${{ needs.classify.outputs.version }}
+          path: dist
       - name: Install npm Trusted Publishing client
         run: npm install --global npm@11.18.0
       - name: Publish immutable packages in native-first order
@@ -272,26 +290,10 @@ jobs:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: release-${{ needs.classify.outputs.version }}
+          path: dist
       - name: Generate release notes from the validated manifest
         run: |
-          node --input-type=module <<'NODE'
-          import { readFile, writeFile } from 'node:fs/promises';
-          const manifest = JSON.parse(await readFile('dist/release/release-manifest.json', 'utf8'));
-          const codex = manifest.codex;
-          const notes = [
-            `# Colay v${manifest.version}`,
-            '',
-            `Supported Codex versions: ${codex.tested_versions.join(', ')} (minimum ${codex.supported_min}).`,
-            `Recommended Codex version: ${codex.recommended}.`,
-            '',
-            `State schema ${manifest.state_schema_version} and config schema ${manifest.config_schema_version} may require the documented migration procedure before use.`,
-            'Known limitations: provider compatibility and current single-worker routing are described in docs/release.md.',
-            'Rollback: use the release manifest and the explicit-approval rollback procedure in docs/rollback.md.',
-            '',
-            'Verify the attached SHA256SUMS, release-manifest.json, artifact attestation, and npm provenance before deployment.',
-          ].join('\n');
-          await writeFile('dist/release/RELEASE_NOTES.md', `${notes}\n`, 'utf8');
-          NODE
+          node scripts/release/notes.mjs --manifest dist/release/release-manifest.json --release-guide docs/release.md --output dist/release/RELEASE_NOTES.md
       - name: Create or immutably reconcile GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -306,11 +308,21 @@ jobs:
             gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --notes-file dist/release/RELEASE_NOTES.md "${prerelease[@]}"
             exit 0
           fi
+          release_json="$(gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease,body)"
+          node -e "const fs = require('node:fs'); const [json, tag, mode, notesPath] = process.argv.slice(1); const release = JSON.parse(json); const notes = fs.readFileSync(notesPath, 'utf8'); if (release.tagName !== tag || release.isDraft !== false || release.isPrerelease !== (mode === 'prerelease') || release.body !== notes) throw new Error('existing GitHub release metadata does not match the immutable release contract');" "$release_json" "$GITHUB_REF_NAME" "${{ needs.classify.outputs.github_mode }}" dist/release/RELEASE_NOTES.md
           remote_dir="$(mktemp -d)"
-          gh release download "$GITHUB_REF_NAME" --dir "$remote_dir"
-          for remote_asset in "$remote_dir"/*; do
+          asset_count="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')"
+          if [ "$asset_count" -gt 0 ]; then
+            gh release download "$GITHUB_REF_NAME" --dir "$remote_dir"
+          fi
+          shopt -s nullglob
+          remote_assets=("$remote_dir"/*)
+          for remote_asset in "${remote_assets[@]}"; do
             asset_name="$(basename "$remote_asset")"
-            test -f "dist/release/$asset_name"
+            if [ ! -f "dist/release/$asset_name" ]; then
+              echo "unexpected immutable remote release asset: $asset_name" >&2
+              exit 1
+            fi
           done
           for local_asset in "${assets[@]}"; do
             asset_name="$(basename "$local_asset")"

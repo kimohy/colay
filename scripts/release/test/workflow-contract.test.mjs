@@ -22,6 +22,19 @@ test("release workflow uses the reviewed multi-platform channel contract", async
   assert.match(workflow, /id-token: write/);
   assert.match(workflow, /attestations: write/);
   assert.match(workflow, /retention-days:\s*\$\{\{ needs\.classify\.outputs\.retention_days \}\}/);
+  assert.match(workflow, /name:\s*native-\$\{\{ matrix\.target \}\}[\s\S]*?retention-days:\s*\$\{\{ needs\.classify\.outputs\.retention_days \}\}/);
+
+  const releaseDownloads = [...workflow.matchAll(/name:\s*release-\$\{\{ needs\.classify\.outputs\.version \}\}\s*\n\s*path:\s*dist/g)];
+  assert.equal(releaseDownloads.length, 4, "each release-bundle consumer must restore the dist root");
+  assert.match(workflow, /Expand-Archive[\s\S]*archive-check[\s\S]*Get-FileHash -Algorithm SHA256/);
+  assert.match(workflow, /tar -xzf[\s\S]*archive-check[\s\S]*chmod 755[\s\S]*sha256sum/);
+  assert.equal((workflow.match(/unexpected archived version/g) ?? []).length, 3);
+  assert.match(workflow, /scripts\/release\/notes\.mjs[\s\S]*docs\/release\.md/);
+  assert.match(workflow, /--json tagName,isDraft,isPrerelease,body/);
+  assert.match(workflow, /release\.body !== notes/);
+  assert.match(workflow, /shopt -s nullglob/);
+  assert.match(workflow, /asset_count=.*--json assets/);
+  assert.match(workflow, /if \[ "\$asset_count" -gt 0 \]; then/);
 
   const actionPins = [
     "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10",

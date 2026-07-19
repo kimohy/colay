@@ -163,7 +163,7 @@ Create each native manifest with the same description/repository/homepage/bugs/l
 ```json
 { "name": "@kimohy/colay-win32-x64", "os": ["win32"], "cpu": ["x64"], "binary": "bin/colay.exe" }
 { "name": "@kimohy/colay-darwin-arm64", "os": ["darwin"], "cpu": ["arm64"], "binary": "bin/colay" }
-{ "name": "@kimohy/colay-linux-x64", "os": ["linux"], "cpu": ["x64"], "libc": ["musl"], "binary": "bin/colay" }
+{ "name": "@kimohy/colay-linux-x64", "os": ["linux"], "cpu": ["x64"], "binary": "bin/colay" }
 ```
 
 The shown `binary` field is package metadata used by the staging script; every native manifest must also contain `"version": "0.1.0"`, `"files": ["bin", "LICENSE"]`, and `"publishConfig": { "access": "public" }`. Do not add registry dependencies or a lockfile: all developer tests use Node built-ins and release packages are packed independently. Add `/dist/` to `.gitignore`.

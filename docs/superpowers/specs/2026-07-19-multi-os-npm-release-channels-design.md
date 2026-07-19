@@ -81,9 +81,11 @@ uses npm `os` and `cpu` metadata so npm installs only the matching artifact:
 | `@kimohy/colay-linux-x64` | `linux` / `x64` | `x86_64-unknown-linux-musl` | `ubuntu-22.04` |
 
 The Linux binary uses musl so the initial Linux x64 artifact is independent of
-a distribution's glibc version. The implementation must prove that the current
-bundled SQLite and process dependencies build and run on this target before the
-target is considered supported.
+a distribution's glibc version. Its npm package deliberately declares no
+`libc` selector: the musl-linked binary must remain installable on both musl and
+glibc Linux hosts. The implementation must prove that the current bundled
+SQLite and process dependencies build and run on this target before the target
+is considered supported.
 
 The CommonJS launcher maps `process.platform` and `process.arch` to one native
 package, resolves only that package's known binary path, and starts it with the

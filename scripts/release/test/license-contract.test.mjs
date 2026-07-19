@@ -59,4 +59,11 @@ test("package metadata and licenses match the release contract", async () => {
     "@kimohy/colay-linux-x64": "0.1.0",
     "@kimohy/colay-win32-x64": "0.1.0",
   });
+
+  const linuxPackage = JSON.parse(
+    await readFile(join(repoRoot, "npm/colay-linux-x64/package.json"), "utf8"),
+  );
+  assert.deepEqual(linuxPackage.os, ["linux"]);
+  assert.deepEqual(linuxPackage.cpu, ["x64"]);
+  assert.equal(Object.hasOwn(linuxPackage, "libc"), false);
 });

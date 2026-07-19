@@ -8,7 +8,6 @@
   "bugs": { "url": "https://github.com/kimohy/colay/issues" },
   "os": ["linux"],
   "cpu": ["x64"],
-  "libc": ["musl"],
   "binary": "bin/colay",
   "files": ["bin", "LICENSE"],
   "publishConfig": { "access": "public" }
