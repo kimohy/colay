@@ -30,18 +30,23 @@ impl CliFixture {
     }
 
     fn colay<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
-        Command::new(env!("CARGO_BIN_EXE_colay"))
+        #[cfg(windows)]
+        let system_root = system_root()?;
+        #[cfg(not(windows))]
+        let system_root = system_root();
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_colay"));
+        command
             .args(args)
             .current_dir(&self.repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
             .env("PATH", fake_provider_path()?)
             .env("PATHEXT", ".EXE;.CMD")
-            .env("SystemRoot", system_root()?)
+            .env("SystemRoot", system_root)
             .env("TEMP", self.temp.path())
-            .env("TMP", self.temp.path())
-            .output()
-            .context("failed to invoke colay")
+            .env("TMP", self.temp.path());
+        command.output().context("failed to invoke colay")
     }
 
     fn configure_fake_codex(&self) -> Result<()> {
@@ -68,18 +73,16 @@ fn fake_provider_path() -> Result<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+#[cfg(windows)]
 fn system_root() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .context("SystemRoot must be set for Windows subprocess tests")
-    }
+    env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .context("SystemRoot must be set for Windows subprocess tests")
+}
 
-    #[cfg(not(windows))]
-    {
-        Ok(PathBuf::from("/"))
-    }
+#[cfg(not(windows))]
+fn system_root() -> PathBuf {
+    PathBuf::from("/")
 }
 
 fn toml_path(path: &Path) -> String {
