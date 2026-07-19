@@ -11,7 +11,8 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 struct CliFixture {
-    temp: tempfile::TempDir,
+    _temp: tempfile::TempDir,
+    temp_root: PathBuf,
     repository: PathBuf,
     colay_home: PathBuf,
 }
@@ -19,11 +20,13 @@ struct CliFixture {
 impl CliFixture {
     fn new() -> Result<Self> {
         let temp = tempfile::tempdir()?;
-        let repository = temp.path().join("repository");
-        let colay_home = temp.path().join("home/.colay");
+        let temp_root = fs::canonicalize(temp.path())?;
+        let repository = temp_root.join("repository");
+        let colay_home = temp_root.join("home/.colay");
         fs::create_dir_all(&repository)?;
         Ok(Self {
-            temp,
+            _temp: temp,
+            temp_root,
             repository,
             colay_home,
         })
@@ -44,8 +47,8 @@ impl CliFixture {
             .env("PATH", fake_provider_path()?)
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
-            .env("TEMP", self.temp.path())
-            .env("TMP", self.temp.path());
+            .env("TEMP", &self.temp_root)
+            .env("TMP", &self.temp_root);
         command.output().context("failed to invoke colay")
     }
 
