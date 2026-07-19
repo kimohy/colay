@@ -31,7 +31,10 @@ use orchestrator_policy::{
     AnalysisHints, BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig,
     RoutingContext, RoutingEngine, TaskAnalysisInput, TaskAnalyzer, TaskRole, period_window,
 };
-use orchestrator_process::{CommandSpec, ProcessError, ProcessRunner, RedactionConfig, Redactor};
+use orchestrator_process::{
+    CommandSpec, EnvironmentPolicy, ProcessError, ProcessRunner, RedactionConfig, Redactor,
+    resolve_executable,
+};
 use orchestrator_providers::{
     AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
     CodexTransportFeatures, GeminiAdapter, GeminiAdapterConfig, ProcessAdapterRuntime,
@@ -437,12 +440,18 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
         }
 
         for (provider, config) in provider_configs(&config.orchestrator) {
-            let result = diagnostic_command(&config.executable, ["--version"], &redaction).await;
+            let result =
+                diagnostic_command(&config.executable, ["--version"], repository, &redaction).await;
             match result {
                 Ok(output) if output.success() => checks.push(Check::with_data(
                     format!("provider_{}", provider.as_str()),
                     true,
-                    json!({"version": output.stdout.redacted_text.trim()}),
+                    json!({
+                        "version": output.stdout.redacted_text.trim(),
+                        "configured_executable": output.resolved_executable.configured,
+                        "resolved_executable": output.resolved_executable.path,
+                        "executable_kind": output.resolved_executable.kind,
+                    }),
                 )),
                 Ok(output) => checks.push(Check::fail(
                     format!("provider_{}", provider.as_str()),
@@ -4640,7 +4649,9 @@ fn trusted_rollback_destination(
                 .codex
                 .as_ref()
                 .ok_or_else(|| anyhow!("Codex is not configured for binary rollback"))?;
-            locate_configured_executable(repository, &executable.executable)?
+            let environment = EnvironmentPolicy::default();
+            let search = environment.executable_search(repository);
+            resolve_executable(Path::new(&executable.executable), &search)?.path
         }
         "database" | "state_database" => bail!(
             "release rollback cannot replace the live task database; use validated schema migration recovery"
@@ -4657,28 +4668,6 @@ fn trusted_rollback_destination(
         bail!("trusted rollback destination must be a non-symlink regular file");
     }
     Ok(fs::canonicalize(path)?)
-}
-
-fn locate_configured_executable(repository: &Path, executable: &str) -> Result<PathBuf> {
-    let configured = PathBuf::from(executable);
-    if configured.is_absolute() || configured.components().count() > 1 {
-        return Ok(resolve_from(repository, &configured));
-    }
-    let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is unavailable"))?;
-    for directory in std::env::split_paths(&path) {
-        let direct = directory.join(&configured);
-        if direct.is_file() {
-            return Ok(direct);
-        }
-        #[cfg(windows)]
-        {
-            let executable_path = directory.join(format!("{executable}.exe"));
-            if executable_path.is_file() {
-                return Ok(executable_path);
-            }
-        }
-    }
-    bail!("configured executable `{executable}` was not found")
 }
 
 fn rollback_manager(
@@ -5159,9 +5148,15 @@ async fn collect_usage(
             if format != "json" {
                 bail!("only JSON usage probes are supported");
             }
-            let result =
-                run_bounded_command(executable, args.iter().map(String::as_str), 30, redaction)
-                    .await?;
+            let working_directory = current_repository()?;
+            let result = run_bounded_command(
+                executable,
+                args.iter().map(String::as_str),
+                &working_directory,
+                30,
+                redaction,
+            )
+            .await?;
             if !result.success() {
                 bail!(
                     "configured {} usage probe failed: {}",
@@ -5372,11 +5367,13 @@ async fn probe_provider(
         ));
     }
 
-    let version = diagnostic_command(&config.executable, ["--version"], redaction).await?;
+    let repository = current_repository()?;
+    let version =
+        diagnostic_command(&config.executable, ["--version"], &repository, redaction).await?;
     if !version.success() {
         bail!("{} --version failed", provider.as_str());
     }
-    let help = diagnostic_command(&config.executable, ["--help"], redaction).await?;
+    let help = diagnostic_command(&config.executable, ["--help"], &repository, redaction).await?;
     let help_text = format!(
         "{}\n{}",
         help.stdout.redacted_text, help.stderr.redacted_text
@@ -5470,14 +5467,16 @@ impl CapabilitySource for ProcessCapabilitySource {
 async fn diagnostic_command<const N: usize>(
     executable: &str,
     args: [&str; N],
+    working_directory: &Path,
     redaction: &RedactionConfig,
 ) -> Result<orchestrator_process::ProcessResult> {
-    run_bounded_command(executable, args, 20, redaction).await
+    run_bounded_command(executable, args, working_directory, 20, redaction).await
 }
 
 async fn run_bounded_command<I, S>(
     executable: &str,
     args: I,
+    working_directory: &Path,
     timeout_seconds: u64,
     redaction: &RedactionConfig,
 ) -> Result<orchestrator_process::ProcessResult>
@@ -5485,7 +5484,9 @@ where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
 {
-    let mut spec = CommandSpec::new(executable).args(args);
+    let mut spec = CommandSpec::new(executable)
+        .args(args)
+        .current_dir(working_directory);
     spec.timeout = Duration::from_secs(timeout_seconds);
     spec.stdout_limit = 4 * 1024 * 1024;
     spec.stderr_limit = 2 * 1024 * 1024;

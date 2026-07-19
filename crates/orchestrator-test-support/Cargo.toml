@@ -16,8 +16,10 @@ tokio.workspace = true
 
 [dev-dependencies]
 orchestrator-engine = { path = "../orchestrator-engine" }
+orchestrator-process = { path = "../orchestrator-process" }
 orchestrator-state = { path = "../orchestrator-state" }
 tempfile.workspace = true
+tokio-util.workspace = true
 
 [lints]
 workspace = true

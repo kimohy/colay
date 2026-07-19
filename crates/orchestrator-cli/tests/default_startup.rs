@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 struct CliFixture {
     temp: tempfile::TempDir,
@@ -105,6 +105,33 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
     assert!(!fixture.repository.join(".colay").exists());
     let json: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(json["data"]["checks"][0]["status"], "pass");
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_fake_provider_executable_resolution() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    fixture.configure_fake_codex()?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.repository.join(".colay").exists());
+    let json: Value = serde_json::from_slice(&output.stdout)?;
+    let codex = json["data"]["checks"]
+        .as_array()
+        .context("doctor checks must be an array")?
+        .iter()
+        .find(|check| check["name"] == "provider_codex")
+        .context("doctor must report the configured fake Codex provider")?;
+    let expected = fake_provider_binary();
+    assert_eq!(codex["data"]["configured_executable"], json!(expected));
+    assert_eq!(codex["data"]["resolved_executable"], json!(expected));
+    assert_eq!(codex["data"]["executable_kind"], "native");
     Ok(())
 }
 

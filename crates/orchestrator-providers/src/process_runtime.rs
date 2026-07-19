@@ -711,6 +711,11 @@ mod tests {
     ) -> Result<orchestrator_process::ProcessResult, orchestrator_process::RedactionError> {
         let redactor = Redactor::new(&RedactionConfig::default())?;
         Ok(orchestrator_process::ProcessResult {
+            resolved_executable: orchestrator_process::ResolvedExecutable {
+                configured: "fake-provider-cli".into(),
+                path: "fake-provider-cli".into(),
+                kind: orchestrator_process::ExecutableKind::Native,
+            },
             exit_code: None,
             termination,
             tree_termination_error: Some("process-tree termination was not confirmed".to_owned()),

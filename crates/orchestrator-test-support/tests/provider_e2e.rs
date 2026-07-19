@@ -5,12 +5,14 @@ use orchestrator_domain::{
     AttemptId, ModelProfile, ProviderId, QuotaPeriod, QuotaScope, ReasoningEffort, SandboxMode,
     SchemaVersion, TaskId, UsageUnit, WorkerEvent, WorkerRequest,
 };
+use orchestrator_process::{CommandSpec, EnvironmentPolicy, ExecutableKind, ProcessRunner};
 use orchestrator_providers::{
     ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig, GeminiAdapter,
     GeminiAdapterConfig, ProcessAdapterRuntime, ProviderError, RuntimeTermination,
     UsageProbeConfig, UsageProbeFormat, WorkerAdapter,
 };
 use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
+use tokio_util::sync::CancellationToken;
 
 fn fake_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake-provider-cli"))
@@ -51,6 +53,57 @@ fn scope(provider: ProviderId) -> QuotaScope {
 
 fn runtime() -> Arc<ProcessAdapterRuntime> {
     Arc::new(ProcessAdapterRuntime::default())
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn fake_provider_process_reports_native_resolution() -> Result<(), Box<dyn std::error::Error>>
+{
+    let configured = fake_binary();
+    let result = ProcessRunner
+        .run(
+            CommandSpec::new(&configured).arg("--version"),
+            CancellationToken::new(),
+        )
+        .await?;
+
+    assert!(result.success());
+    assert_eq!(result.resolved_executable.configured, configured);
+    assert_eq!(result.resolved_executable.kind, ExecutableKind::Native);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn fake_provider_cmd_wrapper_is_selected_from_injected_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = tempfile::tempdir()?;
+    let wrapper = fixture.path().join("fake-provider-wrapper.cmd");
+    fs::write(
+        &wrapper,
+        format!("@echo off\r\n\"{}\" --version\r\n", fake_binary().display()),
+    )?;
+    let mut environment = EnvironmentPolicy::empty();
+    environment.set("PATH", std::env::join_paths([fixture.path()])?)?;
+    environment.set("PATHEXT", ".CMD")?;
+    for name in ["SystemRoot", "ComSpec"] {
+        environment.allow_inherit(name)?;
+    }
+    let mut spec = CommandSpec::new("fake-provider-wrapper");
+    spec.environment = environment;
+
+    let result = ProcessRunner.run(spec, CancellationToken::new()).await?;
+
+    assert!(result.success());
+    assert_eq!(result.resolved_executable.path, wrapper);
+    assert_eq!(
+        result.resolved_executable.kind,
+        ExecutableKind::CommandScript
+    );
+    assert!(result.stdout.redacted_text.contains("codex-cli"));
+    Ok(())
 }
 
 #[test]
