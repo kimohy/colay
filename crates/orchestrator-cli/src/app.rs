@@ -384,8 +384,8 @@ fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> 
     let document = CONFIG_TEMPLATE.parse::<DocumentMut>()?;
     save_override_atomic(&document, config_path)?;
     let state = StatePaths::from_config(repository, runtime.effective.config())?;
-    let database = Database::open(&state.database)?;
-    let migration = database.migrate_with_backup(&state.backups)?;
+    let database = initialize_repository_state(&state)?;
+    let migration = database.migration_status()?;
     let events = EventLog::open(&state.events)?;
     let reconciliation = events.reconcile(&database)?;
     emit(
@@ -609,7 +609,11 @@ async fn run_task(
         bail!("orchestrator execution is disabled by configuration");
     }
     let state = StatePaths::from_config(repository, document.config())?;
-    let database = open_ready_database(&state)?;
+    let database = if state.database.exists() {
+        open_ready_database(&state)?
+    } else {
+        initialize_repository_state(&state)?
+    };
     let input = load_task_input(&arguments)?;
     let redactor = Redactor::new(&process_redaction(&document.config().orchestrator))?;
     let runtime_prompt = input.original_request.clone();
@@ -3753,7 +3757,15 @@ fn status(
     selector: &TaskSelector,
     json_output: bool,
 ) -> Result<()> {
-    let (state, database) = load_existing_state(repository, effective)?;
+    let state = StatePaths::from_config(repository, effective.config())?;
+    if !state.database.exists() {
+        return emit(
+            json_output,
+            "status",
+            &json!({"tasks": [], "database": Value::Null, "state_dir": state.root}),
+        );
+    }
+    let database = open_ready_database(&state)?;
     let tasks = database.with_connection(|connection| {
         let mut sql =
             "SELECT task_id, state, objective, created_at, updated_at FROM tasks".to_owned();
@@ -6147,6 +6159,13 @@ fn open_ready_database(state: &StatePaths) -> Result<Database> {
             status.pending_versions
         );
     }
+    Ok(database)
+}
+
+fn initialize_repository_state(state: &StatePaths) -> Result<Database> {
+    let database = Database::open(&state.database)?;
+    database.migrate_with_backup(&state.backups)?;
+    EventLog::open(&state.events)?.reconcile(&database)?;
     Ok(database)
 }
 
