@@ -1,0 +1,211 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import { appendBoundedOutput, smokeInstall } from "../smoke.mjs";
+
+const version = "0.1.1-nightly.20260719.a1b2c3d";
+
+test("caps captured child output without discarding its first bytes", () => {
+  const captured = appendBoundedOutput(Buffer.from("colay "), Buffer.from("0.1.1\nextra"), 11);
+  assert.equal(captured.toString("utf8"), "colay 0.1.1");
+  assert.equal(captured.length, 11);
+});
+
+async function fixture({ records, writeTarballs = true } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "colay-smoke-"));
+  const tarballsDir = join(root, "tarballs");
+  const prefix = join(root, "prefix");
+  await mkdir(tarballsDir);
+  const packageRecords = records ?? [
+    { name: "@kimohy/colay", version, filename: "kimohy-colay.tgz", integrity: "sha512-root" },
+    { name: "@kimohy/colay-linux-x64", version, filename: "kimohy-colay-linux-x64.tgz", integrity: "sha512-native" },
+  ];
+  await writeFile(join(tarballsDir, "npm-pack.json"), `${JSON.stringify(packageRecords, null, 2)}\n`);
+  if (writeTarballs) {
+    for (const { filename } of packageRecords) {
+      await writeFile(join(tarballsDir, filename), filename);
+    }
+  }
+  return { tarballsDir, prefix };
+}
+
+test("installs root and selected native tarballs offline, then runs the isolated shim", async () => {
+  const values = await fixture();
+  const calls = [];
+  const run = async (command, args, options) => {
+    calls.push([command, args, options]);
+    if (command === "npm") return { code: 0, stdout: "", stderr: "" };
+    return { code: 0, stdout: `colay ${version}\n`, stderr: "" };
+  };
+  await smokeInstall({
+    ...values,
+    packageName: "@kimohy/colay-linux-x64",
+    version,
+    platform: "linux",
+    run,
+  });
+  assert.deepEqual(calls[0], [
+    "npm",
+    [
+      "install", "--global", "--offline", "--ignore-scripts", "--prefix", values.prefix,
+      join(values.tarballsDir, "kimohy-colay.tgz"),
+      join(values.tarballsDir, "kimohy-colay-linux-x64.tgz"),
+    ],
+    { shell: false },
+  ]);
+  assert.deepEqual(calls[1], [join(values.prefix, "bin", "colay"), ["--version"], { shell: false }]);
+});
+
+test("runs the generated Windows PowerShell command shim with separated arguments", async () => {
+  const values = await fixture({ records: [
+    { name: "@kimohy/colay", version, filename: "root.tgz", integrity: "sha512-root" },
+    { name: "@kimohy/colay-win32-x64", version, filename: "win.tgz", integrity: "sha512-win" },
+  ] });
+  const calls = [];
+  await smokeInstall({
+    ...values,
+    packageName: "@kimohy/colay-win32-x64",
+    version,
+    platform: "win32",
+    run: async (command, args, options) => {
+      calls.push([command, args, options]);
+      return command === "npm"
+        ? { code: 0, stdout: "", stderr: "" }
+        : { code: 0, stdout: `colay ${version}\r\n`, stderr: "" };
+    },
+  });
+  assert.deepEqual(calls[1], [
+    join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", join(values.prefix, "colay.ps1"), "--version"],
+    { shell: false, stdio: ["ignore", "pipe", "pipe"] },
+  ]);
+});
+
+test("fails specifically for invalid packages, metadata, commands, and versions", async (t) => {
+  await t.test("unknown native package", async () => {
+    const values = await fixture();
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-freebsd-x64", version, run: async () => ({ code: 0 }) }),
+      /unsupported native package @kimohy\/colay-freebsd-x64/,
+    );
+  });
+  await t.test("missing tarball record", async () => {
+    const values = await fixture({ records: [{ name: "@kimohy/colay", version, filename: "root.tgz" }] });
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /missing tarball metadata for @kimohy\/colay-linux-x64@/,
+    );
+  });
+  await t.test("duplicate tarball record", async () => {
+    const duplicate = { name: "@kimohy/colay", version, filename: "root.tgz" };
+    const values = await fixture({ records: [duplicate, duplicate, { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" }] });
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /duplicate tarball metadata for @kimohy\/colay@/,
+    );
+  });
+  await t.test("unsafe dot tarball filename", async () => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "." },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /unsafe tarball filename for @kimohy\/colay@/,
+    );
+  });
+  await t.test("tarball path traversal", async () => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "../outside.tgz" },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /unsafe tarball filename for @kimohy\/colay@/,
+    );
+  });
+  await t.test("tarball metadata cannot name a directory", async () => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "directory.tgz" },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    await mkdir(join(values.tarballsDir, "directory.tgz"));
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /tarball must be a regular file for @kimohy\/colay@/,
+    );
+  });
+  await t.test("tarball metadata cannot follow an escaping symlink", async (t) => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "root.tgz" },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    const outside = join(values.tarballsDir, "..", "outside.tgz");
+    await writeFile(outside, "outside");
+    try {
+      await symlink(outside, join(values.tarballsDir, "root.tgz"));
+    } catch (error) {
+      if (error?.code === "EPERM") {
+        t.skip("symlink creation is unavailable on this Windows host");
+        return;
+      }
+      throw error;
+    }
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /tarball must be a regular file for @kimohy\/colay@/,
+    );
+  });
+  await t.test("npm install failure", async () => {
+    const values = await fixture();
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 17, stderr: "offline miss" }) }),
+      /npm install failed with exit code 17: offline miss/,
+    );
+  });
+  await t.test("Colay failure", async () => {
+    const values = await fixture();
+    let call = 0;
+    await assert.rejects(
+      smokeInstall({
+        ...values,
+        packageName: "@kimohy/colay-linux-x64",
+        version,
+        run: async () => (++call === 1 ? { code: 0 } : { code: 9, stderr: "broken" }),
+      }),
+      /colay --version failed with exit code 9: broken/,
+    );
+  });
+  await t.test("version mismatch", async () => {
+    const values = await fixture();
+    let call = 0;
+    await assert.rejects(
+      smokeInstall({
+        ...values,
+        packageName: "@kimohy/colay-linux-x64",
+        version,
+        run: async () => (++call === 1 ? { code: 0 } : { code: 0, stdout: "colay wrong\n" }),
+      }),
+      /colay version mismatch: expected "colay .*", received "colay wrong"/,
+    );
+  });
+});
