@@ -27,8 +27,9 @@ test("release workflow uses the reviewed multi-platform channel contract", async
   const releaseDownloads = [...workflow.matchAll(/name:\s*release-\$\{\{ needs\.classify\.outputs\.version \}\}\s*\n\s*path:\s*dist/g)];
   assert.equal(releaseDownloads.length, 4, "each release-bundle consumer must restore the dist root");
   assert.match(workflow, /Expand-Archive[\s\S]*archive-check[\s\S]*Get-FileHash -Algorithm SHA256/);
-  assert.match(workflow, /tar -xzf[\s\S]*archive-check[\s\S]*chmod 755[\s\S]*sha256sum/);
+  assert.match(workflow, /tar -xzf[\s\S]*archive-check[\s\S]*unexpected archived version[\s\S]*sha256sum/);
   assert.equal((workflow.match(/unexpected archived version/g) ?? []).length, 3);
+  assert.doesNotMatch(workflow, /chmod\s+\d+\s+"?archive-check/);
   assert.match(workflow, /scripts\/release\/notes\.mjs[\s\S]*docs\/release\.md/);
   assert.match(workflow, /--json tagName,isDraft,isPrerelease,body/);
   assert.match(workflow, /release\.body !== notes/);

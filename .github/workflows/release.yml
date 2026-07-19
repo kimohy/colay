@@ -129,7 +129,6 @@ jobs:
           digest="$(shasum -a 256 "native/$archive" | awk '{print $1}')"
           mkdir archive-check
           tar -xzf "native/$archive" -C archive-check
-          chmod 755 "archive-check/${{ matrix.executable }}"
           node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
           test "$digest" = "$(shasum -a 256 "native/$archive" | awk '{print $1}')"
           node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
@@ -145,7 +144,6 @@ jobs:
           digest="$(sha256sum "native/$archive" | awk '{print $1}')"
           mkdir archive-check
           tar -xzf "native/$archive" -C archive-check
-          chmod 755 "archive-check/${{ matrix.executable }}"
           node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
           test "$digest" = "$(sha256sum "native/$archive" | awk '{print $1}')"
           node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
