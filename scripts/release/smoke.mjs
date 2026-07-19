@@ -75,7 +75,10 @@ export async function smokeInstall({ tarballsDir, prefix, packageName, version, 
   const install = await run("npm", ["install", "--global", "--offline", "--ignore-scripts", "--prefix", prefix, rootTarball, nativeTarball], { shell: false });
   if (install?.code !== 0) fail(`npm install failed with exit code ${install?.code}: ${resultText(install)}`);
   const shim = platform === "win32" ? join(prefix, "colay.cmd") : join(prefix, "bin", "colay");
-  const launched = await run(shim, ["--version"], { shell: false });
+  const installedLauncher = join(prefix, "node_modules", "@kimohy", "colay", "bin", "colay.js");
+  const launched = platform === "win32"
+    ? await run(process.execPath, [installedLauncher, "--version"], { shell: false })
+    : await run(shim, ["--version"], { shell: false });
   if (launched?.code !== 0) fail(`colay --version failed with exit code ${launched?.code}: ${resultText(launched)}`);
   const expected = `colay ${version}`;
   const received = typeof launched.stdout === "string" ? launched.stdout.replace(/\r?\n$/, "") : "";

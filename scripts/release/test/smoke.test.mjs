@@ -53,7 +53,7 @@ test("installs root and selected native tarballs offline, then runs the isolated
   assert.deepEqual(calls[1], [join(values.prefix, "bin", "colay"), ["--version"], { shell: false }]);
 });
 
-test("uses the Windows npm command shim without searching PATH", async () => {
+test("runs the installed Windows launcher with Node instead of spawning a cmd shim", async () => {
   const values = await fixture({ records: [
     { name: "@kimohy/colay", version, filename: "root.tgz", integrity: "sha512-root" },
     { name: "@kimohy/colay-win32-x64", version, filename: "win.tgz", integrity: "sha512-win" },
@@ -71,7 +71,11 @@ test("uses the Windows npm command shim without searching PATH", async () => {
         : { code: 0, stdout: `colay ${version}\r\n`, stderr: "" };
     },
   });
-  assert.equal(calls[1][0], join(values.prefix, "colay.cmd"));
+  assert.deepEqual(calls[1], [
+    process.execPath,
+    [join(values.prefix, "node_modules", "@kimohy", "colay", "bin", "colay.js"), "--version"],
+    { shell: false },
+  ]);
 });
 
 test("fails specifically for invalid packages, metadata, commands, and versions", async (t) => {
