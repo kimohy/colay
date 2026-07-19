@@ -5,8 +5,8 @@ This repository versions Colay and its persisted/public contracts independently.
 | Component | Current value | Authority |
 |---|---:|---|
 | Colay | `0.1.0` | workspace `Cargo.toml` |
-| Tested Codex | `0.144.4`, `0.144.5` | `compatibility/codex-version.toml` |
-| Recommended Codex | `0.144.5` | `compatibility/codex-version.toml` |
+| Tested Codex | `0.144.5`, `0.144.6` | `compatibility/codex-version.toml` |
+| Recommended Codex | `0.144.6` | `compatibility/codex-version.toml` |
 | SQLite state schema | `3` | `STATE_SCHEMA_VERSION` and migrations |
 | Config schema | `4` | `CONFIG_SCHEMA_VERSION` |
 | Checkpoint/handover schema | `1` | domain writers |

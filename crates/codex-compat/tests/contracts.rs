@@ -98,7 +98,7 @@ fn probe_input(root: &Path) -> Result<CapabilityProbeInput, std::io::Error> {
 
 #[test]
 fn n_and_n_minus_one_contracts() -> Result<(), Box<dyn std::error::Error>> {
-    for version in ["0.144.5", "0.144.4"] {
+    for version in ["0.144.6", "0.144.5"] {
         let root = fixture_root(version);
         let manifest: Manifest = toml::from_str(&read(&root.join("manifest.toml"))?)?;
         assert_eq!(manifest.version, version);
@@ -194,6 +194,23 @@ fn n_and_n_minus_one_contracts() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn current_and_previous_codex_versions_are_exact() {
+    let registry = CompatibilityRegistry::default();
+    assert!(matches!(
+        registry.select(Some(&semver::Version::new(0, 144, 6))),
+        AdapterSelection::Exact { .. }
+    ));
+    assert!(matches!(
+        registry.select(Some(&semver::Version::new(0, 144, 5))),
+        AdapterSelection::Exact { .. }
+    ));
+    assert!(matches!(
+        registry.select(Some(&semver::Version::new(0, 144, 4))),
+        AdapterSelection::GenericUntested
+    ));
+}
+
+#[test]
 fn committed_machine_readable_matrix_matches_catalog_and_version_manifests()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = repository_root();
@@ -204,9 +221,13 @@ fn committed_machine_readable_matrix_matches_catalog_and_version_manifests()
 
     assert_eq!(matrix.schema_version, "1");
     assert_eq!(matrix.generated_from.len(), 2);
-    assert_eq!(catalog.supported_min, "0.144.4");
-    assert_eq!(catalog.recommended, "0.144.5");
-    assert_eq!(catalog.pinned_revision.len(), 40);
+    assert_eq!(catalog.supported_min, "0.144.5");
+    assert_eq!(catalog.tested_versions, ["0.144.5", "0.144.6"]);
+    assert_eq!(catalog.recommended, "0.144.6");
+    assert_eq!(
+        catalog.pinned_revision,
+        "5d1fbf26c43abc65a203928b2e31561cb039e06d"
+    );
     assert_eq!(matrix.versions.len(), catalog.tested_versions.len());
     let recommended = catalog
         .versions

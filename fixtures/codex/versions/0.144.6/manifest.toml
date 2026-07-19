@@ -1,0 +1,14 @@
+version = "0.144.6"
+revision = "5d1fbf26c43abc65a203928b2e31561cb039e06d"
+adapter = "v0_144_generic"
+status = "supported"
+exec = true
+jsonl = true
+resume = true
+app_server = true
+output_schema = true
+reasoning_effort = true
+usage_events = true
+fixture_schema = 1
+metadata_contract_files = ["version-output.txt", "root-help.txt", "exec-help.txt", "exec-resume-help.txt", "app-server-help.txt", "app-server-schema.json"]
+event_contract_files = ["jsonl-success.jsonl", "jsonl-tool-call.jsonl", "jsonl-error.jsonl", "quota-error.jsonl", "resume-events.jsonl", "malformed-events.jsonl", "unknown-lifecycle.jsonl"]
