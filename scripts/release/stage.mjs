@@ -22,7 +22,7 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const SOURCE_COMMIT = /^[0-9a-f]{40}$/;
 const STABLE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const BETA = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-beta\.(0|[1-9]\d*)$/;
-const NIGHTLY = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.\d{8}\.[0-9a-f]{7}$/;
+const NIGHTLY = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.\d{8}\.(?:(?=[0-9a-f]{7}$)(?=[0-9a-f]*[a-f])[0-9a-f]{7}|g\d{7})$/;
 
 const PACKAGES = Object.freeze([
   Object.freeze({ name: "@kimohy/colay", directory: "colay", binary: null, target: null }),

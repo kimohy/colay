@@ -55,7 +55,9 @@ function nightlyVersion(version, now, sha) {
     now.getUTCDate().toString().padStart(2, "0"),
   ].join("");
   const patch = version.prerelease ? version.patch : incrementDecimal(version.patch);
-  return `${version.major}.${version.minor}.${patch}-nightly.${date}.${sha.slice(0, 7)}`;
+  const shortSha = sha.slice(0, 7);
+  const semverIdentifier = /^\d{7}$/.test(shortSha) ? `g${shortSha}` : shortSha;
+  return `${version.major}.${version.minor}.${patch}-nightly.${date}.${semverIdentifier}`;
 }
 
 export function classifyRelease({ ref, sha, now, workspaceVersion, templateVersion }) {

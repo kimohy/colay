@@ -46,6 +46,11 @@ same version in `Cargo.toml` and every checked-in npm template: the Cargo,
 npm, and tag versions must be exactly equal. A nightly is materialized only in
 workflow staging and never changes checked-in version files.
 
+The short SHA normally uses its first seven lowercase hexadecimal characters.
+When those seven characters are all decimal digits, the workflow prefixes the
+identifier with `g` (for example, `g0123456`) so every commit-derived component
+is non-numeric and never creates a leading-zero numeric SemVer identifier.
+
 ## One-time npm bootstrap and Trusted Publishing
 
 The `@kimohy` scope owner must first make all four packages public. npm
@@ -83,6 +88,31 @@ Those publisher records restrict `npm publish` to
 `npm-beta`, and `npm-stable`; require human approval for `npm-stable`. The
 workflow uses OIDC and does not store an npm token, provider credential,
 signing key, or personal access token in the repository.
+
+## Verify a published bundle
+
+Download the beta or stable release assets into `dist/release`, then verify the
+published bytes and their GitHub attestation before installing anything:
+
+```text
+(cd dist/release && sha256sum --check SHA256SUMS)
+gh attestation verify <archive> --repo kimohy/colay
+```
+
+Use a disposable npm project to verify the package provenance associated with
+the exact published version:
+
+```text
+verify_dir="$(mktemp -d)"
+cd "$verify_dir"
+npm init --yes
+npm install @kimohy/colay@<version>
+npm audit signatures --json --include-attestations
+```
+
+npm Trusted Publishing automatically creates provenance for workflow-published
+packages. The audit command validates those npm attestations; it does not
+replace checking the release archive and GitHub attestation above.
 
 ## Operator release procedure
 

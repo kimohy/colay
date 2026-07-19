@@ -13,7 +13,7 @@ test("release workflow uses the reviewed multi-platform channel contract", async
   assert.match(workflow, /tags:\s*\["v\*\.\*\.\*"\]/);
   assert.match(workflow, /permissions:\s*\n\s*contents: read/);
   assert.match(workflow, /windows-2022/);
-  assert.match(workflow, /macos-14/);
+  assert.match(workflow, /macos-15/);
   assert.match(workflow, /ubuntu-22\.04/);
   assert.match(workflow, /x86_64-pc-windows-msvc/);
   assert.match(workflow, /aarch64-apple-darwin/);
@@ -42,7 +42,7 @@ test("release workflow uses the reviewed multi-platform channel contract", async
     "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
     "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
     "actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53",
-    "actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661",
+    "actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32",
   ];
   const uses = [...workflow.matchAll(/^\s*-\s*uses:\s*([^\s#]+)\s*$/gm)].map((match) => match[1]);
   assert.ok(uses.length > 0, "workflow must use reviewed GitHub actions");

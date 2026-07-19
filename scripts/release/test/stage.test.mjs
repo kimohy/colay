@@ -27,7 +27,7 @@ const packageDirectories = new Map([
   ["@kimohy/colay-win32-x64", "colay-win32-x64"],
 ]);
 
-async function fixture() {
+async function fixture(releaseVersion = version) {
   const root = await mkdtemp(join(tmpdir(), "colay-stage-"));
   const repoRoot = join(root, "repo");
   const outputRoot = join(root, "dist");
@@ -60,7 +60,7 @@ async function fixture() {
     await chmod(binaryPath, 0o755);
     binaries.set(packageName, binaryPath);
 
-    const name = `colay-v${version}-${target}${extension}`;
+    const name = `colay-v${releaseVersion}-${target}${extension}`;
     const archivePath = join(targetRoot, name);
     await writeFile(archivePath, `fixture archive for ${target}\n`);
     archives.push({ target, name, path: archivePath, sha256: await sha256File(archivePath) });
@@ -69,12 +69,13 @@ async function fixture() {
 }
 
 async function stage(overrides = {}) {
-  const values = await fixture();
+  const releaseVersion = overrides.version ?? version;
+  const values = await fixture(releaseVersion);
   const result = await stageRelease({
     repoRoot: values.repoRoot,
     outputRoot: values.outputRoot,
     channel: "nightly",
-    version,
+    version: releaseVersion,
     sourceCommit,
     binaries: values.binaries,
     archives: values.archives,
@@ -82,6 +83,19 @@ async function stage(overrides = {}) {
   });
   return { ...values, result };
 }
+
+test("staging accepts a nightly version whose all-decimal SHA identifier is prefixed", async () => {
+  const generatedVersion = "0.1.1-nightly.20260719.g0123456";
+  const { result } = await stage({ version: generatedVersion });
+  assert.equal(result.manifest.version, generatedVersion);
+});
+
+test("staging rejects an unprefixed all-decimal nightly SHA identifier", async () => {
+  await assert.rejects(
+    stage({ version: "0.1.1-nightly.20260719.0123456" }),
+    /version "0\.1\.1-nightly\.20260719\.0123456" is invalid for nightly/,
+  );
+});
 
 test("stages exact packages, archives, checksums, and authoritative release metadata", async () => {
   const { repoRoot, outputRoot, result } = await stage();

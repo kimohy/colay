@@ -79,6 +79,19 @@ test("classifyRelease replaces a prerelease with a nightly prerelease on main", 
   );
 });
 
+test("classifyRelease prefixes an all-decimal short SHA so its SemVer identifier has no leading zero", () => {
+  assert.equal(
+    classifyRelease({
+      ref: "refs/heads/main",
+      sha: "0123456789abcdef0123456789abcdef01234567",
+      now,
+      workspaceVersion: "0.2.0",
+      templateVersion: "0.2.0",
+    }).version,
+    "0.2.1-nightly.20260719.g0123456",
+  );
+});
+
 test("classifyRelease increments an arbitrarily large stable patch without precision loss", () => {
   assert.equal(
     classifyRelease({

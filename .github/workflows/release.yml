@@ -65,7 +65,7 @@ jobs:
             package_name: "@kimohy/colay-win32-x64"
             executable: colay.exe
             archive_kind: zip
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             package_name: "@kimohy/colay-darwin-arm64"
             executable: colay
@@ -205,7 +205,7 @@ jobs:
         include:
           - os: windows-2022
             package_name: "@kimohy/colay-win32-x64"
-          - os: macos-14
+          - os: macos-15
             package_name: "@kimohy/colay-darwin-arm64"
           - os: ubuntu-22.04
             package_name: "@kimohy/colay-linux-x64"
@@ -236,7 +236,7 @@ jobs:
         with:
           name: release-${{ needs.classify.outputs.version }}
           path: dist
-      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:
           subject-path: |
             dist/release/colay-v${{ needs.classify.outputs.version }}-x86_64-pc-windows-msvc.zip

@@ -33,6 +33,9 @@ test("Apache license and Cargo metadata use Apache-2.0", async () => {
 
 test("package metadata and licenses match the release contract", async () => {
   const rootLicense = await readFile(join(repoRoot, "LICENSE"));
+  const cargoToml = await readFile(join(repoRoot, "Cargo.toml"), "utf8");
+  const workspaceVersion = /^\[workspace\.package\]\r?\n[\s\S]*?^version\s*=\s*"([^"]+)"\s*$/m.exec(cargoToml)?.[1];
+  assert.ok(workspaceVersion, "workspace package version must be declared in Cargo.toml");
   const expected = new Map([
     ["npm/colay/package.json", "@kimohy/colay"],
     ["npm/colay-win32-x64/package.json", "@kimohy/colay-win32-x64"],
@@ -43,7 +46,7 @@ test("package metadata and licenses match the release contract", async () => {
   for (const [relative, name] of expected) {
     const manifest = JSON.parse(await readFile(join(repoRoot, relative), "utf8"));
     assert.equal(manifest.name, name);
-    assert.equal(manifest.version, "0.1.0");
+    assert.equal(manifest.version, workspaceVersion);
     assert.equal(manifest.license, "Apache-2.0");
     assert.equal(manifest.publishConfig.access, "public");
 
@@ -55,9 +58,9 @@ test("package metadata and licenses match the release contract", async () => {
     await readFile(join(repoRoot, "npm/colay/package.json"), "utf8"),
   );
   assert.deepEqual(rootPackage.optionalDependencies, {
-    "@kimohy/colay-darwin-arm64": "0.1.0",
-    "@kimohy/colay-linux-x64": "0.1.0",
-    "@kimohy/colay-win32-x64": "0.1.0",
+    "@kimohy/colay-darwin-arm64": workspaceVersion,
+    "@kimohy/colay-linux-x64": workspaceVersion,
+    "@kimohy/colay-win32-x64": workspaceVersion,
   });
 
   const linuxPackage = JSON.parse(
@@ -66,6 +69,11 @@ test("package metadata and licenses match the release contract", async () => {
   assert.deepEqual(linuxPackage.os, ["linux"]);
   assert.deepEqual(linuxPackage.cpu, ["x64"]);
   assert.equal(Object.hasOwn(linuxPackage, "libc"), false);
+});
+
+test("license metadata contract derives its expected version instead of embedding a release number", async () => {
+  const source = await readFile(fileURLToPath(import.meta.url), "utf8");
+  assert.doesNotMatch(source, /"0\.1\.0"/);
 });
 
 test("installation and release documentation describe the supported distribution contract", async () => {
@@ -94,5 +102,11 @@ test("installation and release documentation describe the supported distribution
   assert.match(releaseGuide, /npm trust github/);
   assert.match(releaseGuide, /vX\.Y\.Z-beta\.N/);
   assert.match(releaseGuide, /vX\.Y\.Z/);
+  assert.match(releaseGuide, /\(cd dist\/release && sha256sum --check SHA256SUMS\)/);
+  assert.match(releaseGuide, /gh attestation verify <archive> --repo kimohy\/colay/);
+  assert.match(releaseGuide, /npm audit signatures --json --include-attestations/);
+  assert.match(releaseGuide, /Trusted Publishing[\s\S]*automatically.*provenance/i);
   assert.match(testingGuide, /npm test/);
+  assert.match(testingGuide, /scripts\/release\/test\/workflow-contract\.test\.mjs/);
+  assert.match(testingGuide, /git diff --check/);
 });
