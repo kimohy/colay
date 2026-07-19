@@ -58,6 +58,7 @@ use crate::args::{
 
 const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
 const DEFAULT_CONFIG_PATH: &str = ".colay/config.toml";
+const LEGACY_CONFIG_PATH: &str = ".codex/orchestrator/config.toml";
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -86,19 +87,17 @@ pub async fn run(cli: Cli) -> Result<()> {
         Ok(runtime) => runtime,
         Err(load_error) => {
             if let Command::Migrate(arguments) = &cli.command {
-                let explicit_edit_path =
-                    config_edit_path(&repository, cli.config.as_deref(), &environment);
-                return migrate_without_runtime(
-                    &repository,
-                    &explicit_edit_path,
-                    arguments.action.clone(),
-                    cli.json,
-                )
-                .with_context(|| {
-                    format!(
-                        "effective configuration could not be loaded before migration: {load_error}"
-                    )
-                });
+                match migration_fallback_path(&repository, cli.config.as_deref(), &environment)? {
+                    Some(explicit_edit_path) => {
+                        return migrate_without_runtime(
+                            &repository,
+                            &explicit_edit_path,
+                            arguments.action.clone(),
+                            cli.json,
+                        );
+                    }
+                    None => return Err(load_error),
+                }
             }
             return Err(load_error);
         }
@@ -194,6 +193,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn load_config_runtime(
     repository: &Path,
     cli_config: Option<&Path>,
@@ -206,12 +206,13 @@ fn load_config_runtime(
         )
     })?;
     let cli_config = cli_config.map(|path| resolve_from(&repository, path));
-    let explicit_edit_path = config_edit_path(&repository, cli_config.as_deref(), &environment);
     let effective = load_effective_config(&ConfigRequest {
         repository: &repository,
         cli_config: cli_config.as_deref(),
-        environment,
+        environment: environment.clone(),
     })?;
+    let explicit_edit_path =
+        config_edit_path(&repository, cli_config.as_deref(), &environment, &effective);
     Ok(ConfigRuntime {
         effective,
         explicit_edit_path,
@@ -222,11 +223,93 @@ fn config_edit_path(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: &ConfigEnvironment,
+    effective: &EffectiveConfig,
+) -> PathBuf {
+    cli_config
+        .map(|path| resolve_from(repository, path))
+        .or_else(|| environment.colay_config.clone())
+        .or_else(|| {
+            effective.sources().iter().find_map(|source| {
+                matches!(
+                    source.kind,
+                    ConfigLayerKind::Repository | ConfigLayerKind::LegacyRepository
+                )
+                .then(|| source.path.clone())
+            })
+        })
+        .unwrap_or_else(|| repository.join(DEFAULT_CONFIG_PATH))
+}
+
+fn configured_edit_path(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: &ConfigEnvironment,
 ) -> PathBuf {
     cli_config
         .map(|path| resolve_from(repository, path))
         .or_else(|| environment.colay_config.clone())
         .unwrap_or_else(|| repository.join(DEFAULT_CONFIG_PATH))
+}
+
+fn migration_fallback_path(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: &ConfigEnvironment,
+) -> Result<Option<PathBuf>> {
+    let current = repository.join(DEFAULT_CONFIG_PATH);
+    let legacy = repository.join(LEGACY_CONFIG_PATH);
+    if config_source_exists(&current)? && config_source_exists(&legacy)? {
+        return Ok(None);
+    }
+
+    let cli_config = cli_config.map(|path| resolve_from(repository, path));
+    let (target, environment_target) = if let Some(path) = cli_config {
+        (path, false)
+    } else if let Some(path) = environment.colay_config.clone() {
+        (path, true)
+    } else if config_source_exists(&current)? {
+        (current.clone(), false)
+    } else if config_source_exists(&legacy)? {
+        (legacy.clone(), false)
+    } else {
+        return Ok(None);
+    };
+    if !config_source_exists(&target)? {
+        return Ok(None);
+    }
+    let Ok(migratable) = MigratableConfigDocument::load(&target) else {
+        return Ok(None);
+    };
+    if migratable.current_version() >= orchestrator_state::CONFIG_SCHEMA_VERSION {
+        return Ok(None);
+    }
+
+    let mut preflight_environment = environment.clone();
+    if environment_target {
+        preflight_environment.colay_config = None;
+    }
+    let temporary_repository;
+    let preflight_repository = if target == current || target == legacy {
+        temporary_repository = tempfile::tempdir()?;
+        temporary_repository.path()
+    } else {
+        repository
+    };
+    load_effective_config(&ConfigRequest::new(
+        preflight_repository,
+        preflight_environment,
+    ))?;
+    Ok(Some(target))
+}
+
+fn config_source_exists(path: &Path) -> Result<bool> {
+    orchestrator_state::reject_symlink_components(path)?;
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect configuration source: {}", path.display())),
+    }
 }
 
 fn load_initialization_config_runtime(
@@ -235,7 +318,7 @@ fn load_initialization_config_runtime(
     environment: ConfigEnvironment,
 ) -> Result<ConfigRuntime> {
     let cli_config = cli_config.map(|path| resolve_from(repository, path));
-    let explicit_edit_path = config_edit_path(repository, cli_config.as_deref(), &environment);
+    let explicit_edit_path = configured_edit_path(repository, cli_config.as_deref(), &environment);
     let load_cli = cli_config.as_deref().filter(|path| path.exists());
     let mut load_environment = environment;
     if load_environment
@@ -6539,6 +6622,95 @@ mod tests {
         );
 
         super::migrate_without_runtime(root.path(), &path, MigrationAction::Status, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let legacy = root.path().join(".codex/orchestrator/config.toml");
+        write_layer(&legacy, 3)?;
+        let environment = ConfigEnvironment::isolated();
+        let runtime = load_config_runtime(root.path(), None, environment.clone())?;
+
+        set_provider_enabled(
+            root.path(),
+            None,
+            environment,
+            &runtime,
+            ProviderId::Codex,
+            false,
+            true,
+        )?;
+
+        assert!(fs::read_to_string(&legacy)?.contains("enabled = false"));
+        assert!(!root.path().join(".colay/config.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_legacy_migration_targets_legacy_source() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let legacy = root.path().join(".codex/orchestrator/config.toml");
+        write_full_version(&legacy, 3)?;
+
+        assert_eq!(
+            super::migration_fallback_path(root.path(), None, &ConfigEnvironment::isolated())?,
+            Some(legacy)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_does_not_bypass_current_legacy_conflict() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        write_full_version(&root.path().join(".colay/config.toml"), 3)?;
+        write_full_version(&root.path().join(".codex/orchestrator/config.toml"), 3)?;
+
+        assert!(
+            super::migration_fallback_path(root.path(), None, &ConfigEnvironment::isolated())?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_does_not_bypass_invalid_global_layer() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let global = root.path().join("home/config.toml");
+        fs::create_dir_all(
+            global
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("no global parent"))?,
+        )?;
+        fs::write(&global, "not valid toml = [")?;
+        write_full_version(&root.path().join(".colay/config.toml"), 3)?;
+        let environment = ConfigEnvironment {
+            colay_home: Some(root.path().join("home")),
+            user_home: None,
+            colay_config: None,
+        };
+
+        let Err(error) = super::migration_fallback_path(root.path(), None, &environment) else {
+            anyhow::bail!("invalid global layer did not fail closed");
+        };
+        assert!(error.to_string().contains("global config layer"));
+        Ok(())
+    }
+
+    fn write_full_version(path: &Path, version: u32) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let current = toml_edit::ser::to_string(&RootConfig::default())?;
+        fs::write(
+            path,
+            current.replacen(
+                "config_version = 4",
+                &format!("config_version = {version}"),
+                1,
+            ),
+        )?;
         Ok(())
     }
 
