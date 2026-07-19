@@ -2,7 +2,7 @@
 
 ## Initialize and diagnose
 
-Run `colay init` once in the repository. It writes a minimal versioned override (rather than a materialized copy of every default), creates `.colay`, migrates a new SQLite database to the current schema, and creates/reconciles `events.jsonl`. Initialization does not invoke a provider. Read-only commands do not create repository state; the first writable `colay run` creates the repository state safely if it is absent.
+Run `colay init` once in the repository. It writes a minimal versioned override (rather than a materialized copy of every default), creates `.colay`, migrates a new SQLite database to the current schema, and creates/reconciles `events.jsonl`. Initialization does not invoke a provider. Other read-only commands do not create repository state; the first `colay run`, including `run --plan-only`, creates and persists repository state safely if it is absent.
 
 ## Configuration resolution
 
@@ -16,11 +16,11 @@ compiled defaults
 < --config
 ```
 
-`COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Layers merge table values by key; arrays replace the lower-precedence value and never concatenate. Each loaded layer must carry the current supported `config_version`. Missing automatic layers are allowed, but a path selected through `$COLAY_CONFIG` or `--config` is required to exist. A malformed or unsupported layer fails startup rather than being skipped.
+`COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Layers merge table values by key; arrays replace the lower-precedence value and never concatenate. Each loaded layer must carry the current supported `config_version`. Missing automatic layers are allowed, but normal runtime commands require a path selected through `$COLAY_CONFIG` or `--config` to exist. `init` instead treats a missing explicit selector as the destination for its new minimal override. A malformed or unsupported loaded layer fails startup rather than being skipped.
 
 The personal `$COLAY_HOME` layer and `$COLAY_CONFIG` provide configuration inputs only. The effective `state_dir` is constrained beneath the repository, so task state remains repository-local. When neither explicit selector is used, Colay discovers either `.colay/config.toml` or the legacy `.codex/orchestrator/config.toml` without moving live state. If both are present, automatic resolution fails closed; use `--config` to select one explicitly.
 
-`colay doctor` performs only non-inference checks: config validation, SQLite integrity/schema health when the database exists, event-log reconciliation when the log exists, and `<provider> --version` for configured CLIs. For every provider version check, its structured result records the configured executable, the resolved executable actually selected, and its executable kind. It does not prove sandbox behavior or start a model turn.
+`colay doctor` performs only non-inference checks: config validation, SQLite integrity/schema health when the database exists, event-log reconciliation when the log exists, and `<provider> --version` for configured CLIs. Only a successful provider version check includes structured configured-executable, resolved-executable, and executable-kind evidence. Failed resolution, spawn, or nonzero version checks report their detail without that structured evidence. Doctor does not prove sandbox behavior or start a model turn.
 
 Executable resolution is platform-specific but shared by diagnostics and execution. On Windows, a bare executable name is searched through the effective `PATH` using only `.exe`, `.com`, `.cmd`, and `.bat` entries from `PATHEXT`, in `PATHEXT` order; matching is case-insensitive and `.cmd`/`.bat` are reported as command scripts. A bare Unix name must be a regular file with an executable permission bit. An explicit path is resolved from the working directory when relative, and a missing explicit path does not fall back to `PATH`.
 

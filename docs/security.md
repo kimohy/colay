@@ -18,7 +18,7 @@ The project does not rotate accounts or identities, evade quotas, scrape provide
 
 Persisted repository paths reject absolute paths, `..`, NUL, and Windows prefixes. State/artifact operations reject symlink components, and worktree evidence validates paths beneath the managed root.
 
-Configuration may be layered from personal defaults or environment-selected files, but effective state paths are constrained beneath the repository. Automatic discovery of both current and legacy repository configuration fails closed unless an explicit `--config` selects one; an explicit missing configuration file also fails instead of falling back.
+Configuration may be layered from personal defaults or environment-selected files, but effective state paths are constrained beneath the repository. Automatic discovery of both current and legacy repository configuration fails closed unless an explicit `--config` selects one. Normal runtime commands fail rather than fall back when an explicitly selected `$COLAY_CONFIG` or `--config` file is missing; `init` treats a missing explicit selector as the destination for a new minimal override.
 
 On Unix, state directories/files are set to `0700`/`0600`. On Windows, state creation removes inheritance and broad grants, then verifies a protected DACL restricted to the current SID, `SYSTEM`, and built-in Administrators. The multi-command ACL mutation is serialized within the process so concurrent state opens cannot observe an intentional intermediate descriptor. The implementation invokes only canonical System32 `whoami.exe`/`icacls.exe` with separated arguments, an empty environment except the Windows root, bounded output, and a timeout; any unverifiable ACL fails closed.
 
