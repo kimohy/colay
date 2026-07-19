@@ -774,6 +774,14 @@ mod tests {
             panic!("non-executable Unix fixture unexpectedly resolved");
         };
 
-        assert!(matches!(error, ExecutableResolutionError::NotFound { .. }));
+        assert!(matches!(
+            error,
+            ExecutableResolutionError::InvalidCandidate {
+                configured,
+                candidate,
+                ..
+            } if configured == Path::new("provider")
+                && candidate == fixture.path("bin/provider")
+        ));
     }
 }
