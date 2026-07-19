@@ -258,11 +258,16 @@ fn migration_fallback_path(
 ) -> Result<Option<PathBuf>> {
     let current = repository.join(DEFAULT_CONFIG_PATH);
     let legacy = repository.join(LEGACY_CONFIG_PATH);
-    if config_source_exists(&current)? && config_source_exists(&legacy)? {
+    let cli_config = cli_config.map(|path| resolve_from(repository, path));
+    if config_source_exists(&current)?
+        && config_source_exists(&legacy)?
+        && !cli_config
+            .as_ref()
+            .is_some_and(|path| path == &current || path == &legacy)
+    {
         return Ok(None);
     }
 
-    let cli_config = cli_config.map(|path| resolve_from(repository, path));
     let (target, environment_target) = if let Some(path) = cli_config {
         (path, false)
     } else if let Some(path) = environment.colay_config.clone() {
@@ -6670,6 +6675,25 @@ mod tests {
         assert!(
             super::migration_fallback_path(root.path(), None, &ConfigEnvironment::isolated())?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_repository_config_resolves_migration_conflict() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let current = root.path().join(".colay/config.toml");
+        let legacy = root.path().join(".codex/orchestrator/config.toml");
+        write_full_version(&current, 3)?;
+        write_full_version(&legacy, 3)?;
+
+        assert_eq!(
+            super::migration_fallback_path(
+                root.path(),
+                Some(&current),
+                &ConfigEnvironment::isolated()
+            )?,
+            Some(current)
         );
         Ok(())
     }
