@@ -67,3 +67,26 @@ test("package metadata and licenses match the release contract", async () => {
   assert.deepEqual(linuxPackage.cpu, ["x64"]);
   assert.equal(Object.hasOwn(linuxPackage, "libc"), false);
 });
+
+test("installation and release documentation describe the supported distribution contract", async () => {
+  const [readme, releaseGuide, testingGuide] = await Promise.all([
+    readFile(join(repoRoot, "README.md"), "utf8"),
+    readFile(join(repoRoot, "docs/release.md"), "utf8"),
+    readFile(join(repoRoot, "docs/testing.md"), "utf8"),
+  ]);
+
+  assert.match(readme, /Apache-2\.0.*LICENSE/s);
+  assert.match(readme, /npm install (?:--global|-g) @kimohy\/colay/);
+  assert.match(readme, /@kimohy\/colay@beta/);
+  assert.match(readme, /@kimohy\/colay@nightly/);
+  assert.match(releaseGuide, /npm-nightly/);
+  assert.match(releaseGuide, /npm-beta/);
+  assert.match(releaseGuide, /npm-stable/);
+  assert.match(releaseGuide, /Trusted Publishing/);
+  assert.match(releaseGuide, /one-time interactive bootstrap/);
+  assert.match(releaseGuide, /colay-candidate/);
+  assert.match(releaseGuide, /npm trust github/);
+  assert.match(releaseGuide, /vX\.Y\.Z-beta\.N/);
+  assert.match(releaseGuide, /vX\.Y\.Z/);
+  assert.match(testingGuide, /npm test/);
+});

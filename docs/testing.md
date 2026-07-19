@@ -9,10 +9,29 @@ CI clears common provider API-key variables and sets `COLAY_TEST_FAKE_PROVIDERS_
 ## Required local verification
 
 ```text
+npm test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
+
+`npm test` uses only the dependency-free Node.js built-in test runner. It
+checks the npm package templates, launcher behavior, release version/channel
+classification, staging allowlists and checksums, retry-safe publication logic,
+and workflow contracts without contacting npm or GitHub.
+
+## Release package smoke tests
+
+The release workflow packs all four staged tarballs locally and, on each native
+runner, installs the root tarball and its selected platform tarball into an
+isolated npm prefix with `--offline --ignore-scripts`. It then runs only
+`colay --version` from that isolated installation. On Windows, the smoke
+invokes the installed CommonJS launcher with Node because a `.cmd` shim cannot
+be spawned with `shell: false`. This proves package versions, exact optional
+dependencies, and the embedded Rust version agree without a registry publish
+or provider process. Linux x64 uses a musl-linked binary and
+has no npm `libc` selector, so the package remains installable on both musl and
+glibc hosts.
 
 No provider credentials are needed. If an integration test asks for a provider login or consumes Enterprise quota, stop: that test violates the repository contract.
 
