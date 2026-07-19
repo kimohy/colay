@@ -284,3 +284,39 @@ Expected: the branch is clean and synchronized with `origin`.
 Wait for Ubuntu, macOS, and Windows jobs to finish.
 
 Expected: all jobs succeed; do not report completion while any job is pending or failed.
+
+### Task 9: Canonical engine fixtures and complete hosted MSVC environment
+
+**Files:**
+- Modify and test: `crates/orchestrator-engine/src/lib.rs`
+- Modify and test: `crates/orchestrator-engine/src/checkpoint.rs`
+- Modify and test: `crates/orchestrator-engine/src/rollback.rs`
+- Modify and test: `crates/orchestrator-engine/src/verification.rs`
+- Modify and test: `crates/orchestrator-engine/src/worktree.rs`
+- Modify and test: `crates/orchestrator-process/src/runner.rs`
+
+**Interfaces:**
+- Produces: test-only `crate::test_support::CanonicalTempDir` with `new() -> io::Result<Self>` and `path() -> &Path`.
+- Produces: a static, credential-free Visual Studio build environment allowlist for hosted Windows verification commands.
+
+- [x] **Step 1: Add and adopt a canonical engine tempdir fixture**
+
+Wrap `tempfile::TempDir` in a test-only helper that canonicalizes its path at construction while retaining the original handle for automatic cleanup. Replace every `tempfile::tempdir()?` in the four engine test modules with `CanonicalTempDir::new()?`.
+
+Use macOS CI run `29667820725` as RED evidence: seven engine tests fail with `SymlinkEscape("/var")` or `UnsafePath("/var")`.
+
+- [x] **Step 2: Complete the explicit Visual Studio build environment allowlist**
+
+Add the hosted developer-shell variables needed for MSVC tool and library discovery, including `VCToolsInstallDir`, `VCToolsRedistDir`, `INCLUDE`, `LIB`, `LIBPATH`, `UniversalCRTSdkDir`, `UCRTVersion`, `WindowsLibPath`, `WindowsSdkBinPath`, `WindowsSdkVerBinPath`, `WindowsSDKLibVersion`, `VSCMD_ARG_HOST_ARCH`, `VSCMD_VER`, and `VisualStudioVersion`. Keep the allowlist static; do not inherit arbitrary variables.
+
+- [x] **Step 3: Extend and run focused regression tests**
+
+Extend `default_environment_preserves_msvc_tool_discovery` to cover the complete list. Run the engine test suite and process test suite.
+
+Expected: all local tests pass; Windows CI run `29667820725` remains RED evidence that the prior partial allowlist selected GNU `link.exe`.
+
+- [ ] **Step 4: Run required verification, commit, push, and monitor**
+
+Run the required format, Clippy, and workspace test commands; commit only the planned files; push the branch; and monitor all three CI jobs to completion.
+
+Expected: Ubuntu, macOS, and Windows jobs all succeed.

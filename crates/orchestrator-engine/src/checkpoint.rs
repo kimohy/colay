@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn git_evidence_overrides_worker_claimed_files() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let store = orchestrator_state::ArtifactStore::open(directory.path())?;
         let manager = CheckpointManager::new(store);
         let input = CheckpointInput {

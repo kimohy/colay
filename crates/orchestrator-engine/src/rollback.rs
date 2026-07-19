@@ -791,7 +791,7 @@ mod tests {
 
     #[test]
     fn approval_must_match_plan_hash() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let old = directory.path().join("old.bin");
         let current = directory.path().join("current.bin");
         std::fs::write(&old, b"old")?;
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn preserved_state_cannot_be_replaced_or_contain_a_destination()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let state = directory.path().join("state");
         std::fs::create_dir(&state)?;
         let old = directory.path().join("old.bin");
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn successful_apply_keeps_recovery_backup_and_journal() -> Result<(), Box<dyn std::error::Error>>
     {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let old = directory.path().join("old.bin");
         let current = directory.path().join("current.bin");
         std::fs::write(&old, b"old")?;
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn approved_backup_content_is_integrity_bound() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let old = directory.path().join("old.bin");
         let current = directory.path().join("current.bin");
         std::fs::write(&old, b"approved-old")?;
@@ -896,7 +896,7 @@ mod tests {
     #[test]
     fn later_step_failure_restores_all_previously_changed_destinations()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let old_a = directory.path().join("old-a.bin");
         let old_b = directory.path().join("old-b.bin");
         let current_a = directory.path().join("current-a.bin");

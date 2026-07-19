@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn deleted_diff_lines_are_not_scanned_as_current_secrets()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
+        let root = crate::test_support::CanonicalTempDir::new()?;
         let engine = VerificationEngine::new()?;
         let deleted = RepoPath::try_from("deleted.env")?;
         let diff = b"diff --git a/deleted.env b/deleted.env\n--- a/deleted.env\n+++ /dev/null\n@@ -1 +0,0 @@\n-sk-abcdefghijklmnopqrstuvwxyz1234\n";
@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn persistence_preflight_blocks_secret_even_when_line_is_removed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
+        let root = crate::test_support::CanonicalTempDir::new()?;
         let engine = VerificationEngine::new()?;
         let snapshot = GitSnapshot {
             base_revision: "0123456789abcdef".to_owned(),
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn added_diff_lines_are_still_scanned_for_secrets() -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
+        let root = crate::test_support::CanonicalTempDir::new()?;
         let engine = VerificationEngine::new()?;
         let diff = b"diff --git a/new.env b/new.env\n--- /dev/null\n+++ b/new.env\n@@ -0,0 +1 @@\n+sk-abcdefghijklmnopqrstuvwxyz1234\n";
 
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn truncated_large_file_makes_secret_scan_inconclusive_and_requires_approval()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
+        let root = crate::test_support::CanonicalTempDir::new()?;
         let path = root.path().join("large.bin");
         let file = std::fs::File::create(&path)?;
         file.set_len(MAX_SECRET_SCAN_BYTES_PER_FILE + 1)?;
