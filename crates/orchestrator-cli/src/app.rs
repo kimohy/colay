@@ -6672,22 +6672,28 @@ mod tests {
         Ok(())
     }
 
+    fn canonical_tempdir() -> Result<(tempfile::TempDir, PathBuf)> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        Ok((temporary, root))
+    }
+
     #[test]
     fn cli_config_is_the_highest_layer() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let global = root.path().join("home/config.toml");
-        let environment = root.path().join("environment.toml");
-        let cli = root.path().join("cli.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let global = root.join("home/config.toml");
+        let environment = root.join("environment.toml");
+        let cli = root.join("cli.toml");
         write_layer(&global, 2)?;
-        write_layer(&root.path().join(".colay/config.toml"), 3)?;
+        write_layer(&root.join(".colay/config.toml"), 3)?;
         write_layer(&environment, 4)?;
         write_layer(&cli, 5)?;
 
         let runtime = load_config_runtime(
-            root.path(),
+            &root,
             Some(&cli),
             ConfigEnvironment {
-                colay_home: Some(root.path().join("home")),
+                colay_home: Some(root.join("home")),
                 user_home: None,
                 colay_config: Some(environment),
             },
@@ -6712,12 +6718,12 @@ mod tests {
 
     #[test]
     fn init_writes_only_a_minimal_override() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let runtime = load_config_runtime(root.path(), None, ConfigEnvironment::isolated())?;
+        let (_temporary, root) = canonical_tempdir()?;
+        let runtime = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
 
-        initialize(root.path(), &runtime, true)?;
+        initialize(&root, &runtime, true)?;
 
-        let persisted = fs::read_to_string(root.path().join(".colay/config.toml"))?;
+        let persisted = fs::read_to_string(root.join(".colay/config.toml"))?;
         assert!(!persisted.contains("quota_limit"));
         assert!(!persisted.contains("warning_threshold_percent"));
         assert!(!persisted.to_ascii_lowercase().contains("credential"));
@@ -6728,12 +6734,12 @@ mod tests {
 
     #[test]
     fn provider_enable_adds_only_the_requested_boolean() -> Result<()> {
-        let root = tempfile::tempdir()?;
+        let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
-        let runtime = load_config_runtime(root.path(), None, environment.clone())?;
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
 
         set_provider_enabled(
-            root.path(),
+            &root,
             None,
             environment,
             &runtime,
@@ -6753,8 +6759,8 @@ mod tests {
 
     #[test]
     fn repository_provider_edit_preserves_global_comments() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let global = root.path().join("home/config.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let global = root.join("home/config.toml");
         fs::create_dir_all(
             global
                 .parent()
@@ -6763,14 +6769,14 @@ mod tests {
         let original = "# retain this administrator comment\nconfig_version = 4\n[orchestrator]\nmax_parallel_workers = 7\n";
         fs::write(&global, original)?;
         let environment = ConfigEnvironment {
-            colay_home: Some(root.path().join("home")),
+            colay_home: Some(root.join("home")),
             user_home: None,
             colay_config: None,
         };
-        let runtime = load_config_runtime(root.path(), None, environment.clone())?;
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
 
         set_provider_enabled(
-            root.path(),
+            &root,
             None,
             environment,
             &runtime,
@@ -6786,8 +6792,8 @@ mod tests {
 
     #[test]
     fn provider_edit_targets_the_environment_override() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let environment_path = root.path().join("environment.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let environment_path = root.join("environment.toml");
         fs::write(
             &environment_path,
             "# environment comment\nconfig_version = 4\n",
@@ -6797,10 +6803,10 @@ mod tests {
             user_home: None,
             colay_config: Some(environment_path.clone()),
         };
-        let runtime = load_config_runtime(root.path(), None, environment.clone())?;
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
 
         set_provider_enabled(
-            root.path(),
+            &root,
             None,
             environment,
             &runtime,
@@ -6812,37 +6818,35 @@ mod tests {
         let persisted = fs::read_to_string(environment_path)?;
         assert!(persisted.starts_with("# environment comment\n"));
         assert!(persisted.contains("enabled = false"));
-        assert!(!root.path().join(".colay/config.toml").exists());
+        assert!(!root.join(".colay/config.toml").exists());
         Ok(())
     }
 
     #[test]
     fn legacy_full_config_can_enter_cli_migration() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let path = root.path().join("legacy-v3.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let path = root.join("legacy-v3.toml");
         let current = toml_edit::ser::to_string(&RootConfig::default())?;
         fs::write(
             &path,
             current.replacen("config_version = 4", "config_version = 3", 1),
         )?;
-        assert!(
-            load_config_runtime(root.path(), Some(&path), ConfigEnvironment::isolated()).is_err()
-        );
+        assert!(load_config_runtime(&root, Some(&path), ConfigEnvironment::isolated()).is_err());
 
-        super::migrate_without_runtime(root.path(), &path, MigrationAction::Status, true)?;
+        super::migrate_without_runtime(&root, &path, MigrationAction::Status, true)?;
         Ok(())
     }
 
     #[test]
     fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let legacy = root.path().join(".codex/orchestrator/config.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let legacy = root.join(".codex/orchestrator/config.toml");
         write_layer(&legacy, 3)?;
         let environment = ConfigEnvironment::isolated();
-        let runtime = load_config_runtime(root.path(), None, environment.clone())?;
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
 
         set_provider_enabled(
-            root.path(),
+            &root,
             None,
             environment,
             &runtime,
@@ -6852,18 +6856,18 @@ mod tests {
         )?;
 
         assert!(fs::read_to_string(&legacy)?.contains("enabled = false"));
-        assert!(!root.path().join(".colay/config.toml").exists());
+        assert!(!root.join(".colay/config.toml").exists());
         Ok(())
     }
 
     #[test]
     fn automatic_legacy_migration_targets_legacy_source() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let legacy = root.path().join(".codex/orchestrator/config.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let legacy = root.join(".codex/orchestrator/config.toml");
         write_full_version(&legacy, 3)?;
 
         assert_eq!(
-            super::migration_fallback_path(root.path(), None, &ConfigEnvironment::isolated())?,
+            super::migration_fallback_path(&root, None, &ConfigEnvironment::isolated())?,
             Some(legacy)
         );
         Ok(())
@@ -6871,31 +6875,26 @@ mod tests {
 
     #[test]
     fn migration_does_not_bypass_current_legacy_conflict() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        write_full_version(&root.path().join(".colay/config.toml"), 3)?;
-        write_full_version(&root.path().join(".codex/orchestrator/config.toml"), 3)?;
+        let (_temporary, root) = canonical_tempdir()?;
+        write_full_version(&root.join(".colay/config.toml"), 3)?;
+        write_full_version(&root.join(".codex/orchestrator/config.toml"), 3)?;
 
         assert!(
-            super::migration_fallback_path(root.path(), None, &ConfigEnvironment::isolated())?
-                .is_none()
+            super::migration_fallback_path(&root, None, &ConfigEnvironment::isolated())?.is_none()
         );
         Ok(())
     }
 
     #[test]
     fn explicit_repository_config_resolves_migration_conflict() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let current = root.path().join(".colay/config.toml");
-        let legacy = root.path().join(".codex/orchestrator/config.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let current = root.join(".colay/config.toml");
+        let legacy = root.join(".codex/orchestrator/config.toml");
         write_full_version(&current, 3)?;
         write_full_version(&legacy, 3)?;
 
         assert_eq!(
-            super::migration_fallback_path(
-                root.path(),
-                Some(&current),
-                &ConfigEnvironment::isolated()
-            )?,
+            super::migration_fallback_path(&root, Some(&current), &ConfigEnvironment::isolated())?,
             Some(current)
         );
         Ok(())
@@ -6903,22 +6902,22 @@ mod tests {
 
     #[test]
     fn migration_does_not_bypass_invalid_global_layer() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let global = root.path().join("home/config.toml");
+        let (_temporary, root) = canonical_tempdir()?;
+        let global = root.join("home/config.toml");
         fs::create_dir_all(
             global
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("no global parent"))?,
         )?;
         fs::write(&global, "not valid toml = [")?;
-        write_full_version(&root.path().join(".colay/config.toml"), 3)?;
+        write_full_version(&root.join(".colay/config.toml"), 3)?;
         let environment = ConfigEnvironment {
-            colay_home: Some(root.path().join("home")),
+            colay_home: Some(root.join("home")),
             user_home: None,
             colay_config: None,
         };
 
-        let Err(error) = super::migration_fallback_path(root.path(), None, &environment) else {
+        let Err(error) = super::migration_fallback_path(&root, None, &environment) else {
             anyhow::bail!("invalid global layer did not fail closed");
         };
         assert!(error.to_string().contains("global config layer"));

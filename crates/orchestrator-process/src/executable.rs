@@ -742,6 +742,13 @@ mod tests {
         let fixture = SearchFixture::new();
         fixture.write_bytes("bin/provider.exe", b"MZ");
         let executable = fixture.path("bin/provider.exe");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+                .unwrap_or_else(|error| panic!("set fixture permissions: {error}"));
+        }
         let evidence = ResolvedExecutable {
             configured: executable.clone(),
             path: executable,
