@@ -57,18 +57,19 @@ Use Node.js 22.14.0 or newer and the exact npm client used by the workflow:
 npm install --global npm@11.18.0
 npm login
 # Complete the interactive 2FA challenge.
-npm publish <tarballs/@kimohy-colay-win32-x64-<version>.tgz> --access public --tag colay-candidate
-npm publish <tarballs/@kimohy-colay-darwin-arm64-<version>.tgz> --access public --tag colay-candidate
-npm publish <tarballs/@kimohy-colay-linux-x64-<version>.tgz> --access public --tag colay-candidate
-npm publish <tarballs/@kimohy-colay-<version>.tgz> --access public --tag <nightly|beta|latest>
+npm publish dist/tarballs/kimohy-colay-darwin-arm64-<version>.tgz --access public --tag colay-candidate
+npm publish dist/tarballs/kimohy-colay-linux-x64-<version>.tgz --access public --tag colay-candidate
+npm publish dist/tarballs/kimohy-colay-win32-x64-<version>.tgz --access public --tag colay-candidate
+npm publish dist/tarballs/kimohy-colay-<version>.tgz --access public --tag <nightly|beta|latest>
 ```
 
-Verify the four tarballs and their release files before this bootstrap; never
-publish a reconstructed bundle. After that first publication, configure npm
-Trusted Publishing for the sole release workflow. Each package supports one
-trusted publisher, so these commands intentionally omit `--environment`: the
-workflow name is the stable identity while GitHub environments provide the
-per-channel gate.
+Use the exact `filename` entries in `dist/tarballs/npm-pack.json` rather than
+constructing scoped package paths. Verify the four tarballs and their release
+files before this bootstrap; never publish a reconstructed bundle. After that
+first publication, configure npm Trusted Publishing for the sole release
+workflow. Each package supports one trusted publisher, so these commands
+intentionally omit `--environment`: the workflow name is the stable identity
+while GitHub environments provide the per-channel gate.
 
 ```text
 npm trust github @kimohy/colay --file release.yml --repo kimohy/colay --allow-publish

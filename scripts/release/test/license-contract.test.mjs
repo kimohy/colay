@@ -85,6 +85,12 @@ test("installation and release documentation describe the supported distribution
   assert.match(releaseGuide, /Trusted Publishing/);
   assert.match(releaseGuide, /one-time interactive bootstrap/);
   assert.match(releaseGuide, /colay-candidate/);
+  assert.match(releaseGuide, /dist\/tarballs\/npm-pack\.json/);
+  assert.match(releaseGuide, /dist\/tarballs\/kimohy-colay-darwin-arm64-<version>\.tgz/);
+  assert.match(releaseGuide, /dist\/tarballs\/kimohy-colay-linux-x64-<version>\.tgz/);
+  assert.match(releaseGuide, /dist\/tarballs\/kimohy-colay-win32-x64-<version>\.tgz/);
+  assert.match(releaseGuide, /dist\/tarballs\/kimohy-colay-<version>\.tgz/);
+  assert.doesNotMatch(releaseGuide, /tarballs\/@kimohy-colay/);
   assert.match(releaseGuide, /npm trust github/);
   assert.match(releaseGuide, /vX\.Y\.Z-beta\.N/);
   assert.match(releaseGuide, /vX\.Y\.Z/);

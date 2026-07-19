@@ -1,11 +1,10 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
-const execFilePromise = promisify(execFile);
 const ROOT_PACKAGE = "@kimohy/colay";
+const MAX_CAPTURED_OUTPUT_BYTES = 1024 * 1024;
 const NATIVE_PACKAGES = new Map([
   ["@kimohy/colay-win32-x64", "win32"],
   ["@kimohy/colay-darwin-arm64", "darwin"],
@@ -17,16 +16,32 @@ function fail(message) {
   throw new Error(`Invalid release smoke test: ${message}`);
 }
 
-async function defaultRun(command, args, options) {
+export function appendBoundedOutput(output, chunk, limit = MAX_CAPTURED_OUTPUT_BYTES) {
+  const existing = Buffer.isBuffer(output) ? output : Buffer.from(output);
+  const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+  if (existing.length >= limit) return existing;
+  return Buffer.concat([existing, next.subarray(0, limit - existing.length)]);
+}
+
+function defaultRun(command, args, options) {
   const invocation = command === "npm" && process.platform === "win32"
     ? { command: process.execPath, args: [NPM_CLI, ...args] }
     : { command, args };
-  try {
-    const { stdout, stderr } = await execFilePromise(invocation.command, invocation.args, options);
-    return { code: 0, stdout, stderr };
-  } catch (error) {
-    return { code: typeof error.code === "number" ? error.code : 1, stdout: error.stdout ?? "", stderr: error.stderr ?? error.message };
-  }
+  return new Promise((resolve) => {
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let failed = false;
+    const child = spawn(invocation.command, invocation.args, options);
+    child.stdout?.on("data", (chunk) => { stdout = appendBoundedOutput(stdout, chunk); });
+    child.stderr?.on("data", (chunk) => { stderr = appendBoundedOutput(stderr, chunk); });
+    child.on("error", (error) => {
+      failed = true;
+      resolve({ code: 1, stdout: stdout.toString("utf8"), stderr: stderr.length > 0 ? stderr.toString("utf8") : error.message });
+    });
+    child.on("close", (code) => {
+      if (!failed) resolve({ code: typeof code === "number" ? code : 1, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8") });
+    });
+  });
 }
 
 function resultText(result) {
@@ -74,10 +89,16 @@ export async function smokeInstall({ tarballsDir, prefix, packageName, version, 
   ]);
   const install = await run("npm", ["install", "--global", "--offline", "--ignore-scripts", "--prefix", prefix, rootTarball, nativeTarball], { shell: false });
   if (install?.code !== 0) fail(`npm install failed with exit code ${install?.code}: ${resultText(install)}`);
-  const shim = platform === "win32" ? join(prefix, "colay.cmd") : join(prefix, "bin", "colay");
-  const installedLauncher = join(prefix, "node_modules", "@kimohy", "colay", "bin", "colay.js");
+  const shim = platform === "win32" ? join(prefix, "colay.ps1") : join(prefix, "bin", "colay");
+  const powershell = join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
   const launched = platform === "win32"
-    ? await run(process.execPath, [installedLauncher, "--version"], { shell: false })
+    ? await run(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", shim, "--version"], { shell: false, stdio: ["ignore", "pipe", "pipe"] })
     : await run(shim, ["--version"], { shell: false });
   if (launched?.code !== 0) fail(`colay --version failed with exit code ${launched?.code}: ${resultText(launched)}`);
   const expected = `colay ${version}`;

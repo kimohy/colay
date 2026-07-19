@@ -4,9 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { smokeInstall } from "../smoke.mjs";
+import { appendBoundedOutput, smokeInstall } from "../smoke.mjs";
 
 const version = "0.1.1-nightly.20260719.a1b2c3d";
+
+test("caps captured child output without discarding its first bytes", () => {
+  const captured = appendBoundedOutput(Buffer.from("colay "), Buffer.from("0.1.1\nextra"), 11);
+  assert.equal(captured.toString("utf8"), "colay 0.1.1");
+  assert.equal(captured.length, 11);
+});
 
 async function fixture({ records, writeTarballs = true } = {}) {
   const root = await mkdtemp(join(tmpdir(), "colay-smoke-"));
@@ -53,7 +59,7 @@ test("installs root and selected native tarballs offline, then runs the isolated
   assert.deepEqual(calls[1], [join(values.prefix, "bin", "colay"), ["--version"], { shell: false }]);
 });
 
-test("runs the installed Windows launcher with Node instead of spawning a cmd shim", async () => {
+test("runs the generated Windows PowerShell command shim with separated arguments", async () => {
   const values = await fixture({ records: [
     { name: "@kimohy/colay", version, filename: "root.tgz", integrity: "sha512-root" },
     { name: "@kimohy/colay-win32-x64", version, filename: "win.tgz", integrity: "sha512-win" },
@@ -72,9 +78,9 @@ test("runs the installed Windows launcher with Node instead of spawning a cmd sh
     },
   });
   assert.deepEqual(calls[1], [
-    process.execPath,
-    [join(values.prefix, "node_modules", "@kimohy", "colay", "bin", "colay.js"), "--version"],
-    { shell: false },
+    join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", join(values.prefix, "colay.ps1"), "--version"],
+    { shell: false, stdio: ["ignore", "pipe", "pipe"] },
   ]);
 });
 
