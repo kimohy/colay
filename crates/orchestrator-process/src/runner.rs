@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io,
     path::PathBuf,
     process::Stdio,
@@ -22,7 +22,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{RedactionConfig, RedactionError, Redactor};
+use crate::{
+    ExecutablePlatform, ExecutableResolutionError, ExecutableSearch, RedactionConfig,
+    RedactionError, Redactor, ResolvedExecutable, resolve_executable,
+};
 
 const DEFAULT_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_STDERR_LIMIT: usize = 8 * 1024 * 1024;
@@ -129,6 +132,65 @@ impl EnvironmentPolicy {
         validate_environment_name(&display)?;
         self.overrides.insert(name, value.into());
         Ok(())
+    }
+
+    #[must_use]
+    pub fn executable_search(&self, working_directory: impl Into<PathBuf>) -> ExecutableSearch {
+        let platform = ExecutablePlatform::current();
+        let working_directory = working_directory.into();
+        let path = self
+            .effective_value("PATH", platform)
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .map(|directory| {
+                        if directory.as_os_str().is_empty() {
+                            working_directory.clone()
+                        } else if directory.is_absolute() {
+                            directory
+                        } else {
+                            working_directory.join(directory)
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pathext = self
+            .effective_value("PATHEXT", platform)
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .map(OsString::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ExecutableSearch {
+            platform,
+            path,
+            pathext,
+            working_directory,
+        }
+    }
+
+    fn effective_value(&self, name: &str, platform: ExecutablePlatform) -> Option<OsString> {
+        let matches = |candidate: &OsStr| match platform {
+            ExecutablePlatform::Windows => candidate.to_string_lossy().eq_ignore_ascii_case(name),
+            ExecutablePlatform::Unix => candidate == OsStr::new(name),
+        };
+        if let Some((_, value)) = self
+            .overrides
+            .iter()
+            .rev()
+            .find(|(candidate, _)| matches(candidate))
+        {
+            return Some(value.clone());
+        }
+        self.inherited
+            .iter()
+            .rev()
+            .find(|candidate| matches(OsStr::new(candidate)))
+            .and_then(std::env::var_os)
     }
 
     fn apply(&self, command: &mut Command) {
@@ -258,6 +320,7 @@ impl CapturedOutput {
 
 #[derive(Clone, Debug)]
 pub struct ProcessResult {
+    pub resolved_executable: ResolvedExecutable,
     pub exit_code: Option<i32>,
     pub termination: TerminationReason,
     /// Set when the direct child was killed and reaped, but the operating
@@ -284,6 +347,8 @@ pub enum ProcessError {
     InvalidEnvironment(String),
     #[error(transparent)]
     Redaction(#[from] RedactionError),
+    #[error(transparent)]
+    Resolve(#[from] ExecutableResolutionError),
     #[error("failed to spawn `{executable}`: {source}")]
     Spawn {
         executable: String,
@@ -448,20 +513,25 @@ impl ProcessSupervisor {
     pub async fn start(&self, spec: CommandSpec) -> Result<ProcessSession, ProcessError> {
         validate_spec(&spec)?;
         let redactor = Redactor::new(&spec.redaction)?;
-        let mut command = Command::new(&spec.executable);
+        let working_directory = absolute_working_directory(spec.working_dir.as_deref())?;
+        let search = spec
+            .environment
+            .executable_search(working_directory.clone());
+        let resolved_executable = resolve_executable(&spec.executable, &search)?;
+        let mut command = Command::new(&resolved_executable.path);
         command
             .args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(directory) = &spec.working_dir {
-            command.current_dir(directory);
+        if spec.working_dir.is_some() {
+            command.current_dir(&working_directory);
         }
         spec.environment.apply(&mut command);
         configure_process_group(&mut command);
 
-        let display = spec.executable.to_string_lossy().into_owned();
+        let display = resolved_executable.path.to_string_lossy().into_owned();
         let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
             executable: display,
             source,
@@ -532,6 +602,7 @@ impl ProcessSupervisor {
             stdout_task,
             stderr_task,
             event_sender,
+            resolved_executable,
         ));
         Ok(ProcessSession {
             process_id: pid,
@@ -541,6 +612,16 @@ impl ProcessSupervisor {
             completion: Some(completion),
         })
     }
+}
+
+fn absolute_working_directory(configured: Option<&std::path::Path>) -> io::Result<PathBuf> {
+    let current = std::env::current_dir()?;
+    let configured = configured.unwrap_or(&current);
+    Ok(if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        current.join(configured)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -553,6 +634,7 @@ async fn monitor(
     stdout_task: JoinHandle<io::Result<CapturedOutput>>,
     stderr_task: JoinHandle<io::Result<CapturedOutput>>,
     event_sender: broadcast::Sender<ProcessEvent>,
+    resolved_executable: ResolvedExecutable,
 ) -> Result<ProcessResult, ProcessError> {
     let started = Instant::now();
     let mut deadline = Box::pin(time::sleep(timeout));
@@ -576,6 +658,7 @@ async fn monitor(
         return Err(error.into());
     }
     let result = ProcessResult {
+        resolved_executable,
         exit_code: exit_status.code(),
         termination,
         tree_termination_error,
@@ -928,7 +1011,10 @@ fn validate_environment_name(name: &str) -> Result<(), ProcessError> {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsString,
+        fs,
         io::{BufRead as _, Write as _},
+        path::Path,
         time::Duration,
     };
 
@@ -940,6 +1026,7 @@ mod tests {
     };
     #[cfg(windows)]
     use super::{terminate_platform_tree, trusted_taskkill_path};
+    use crate::ExecutableKind;
 
     fn fixture(mode: &str) -> CommandSpec {
         let executable = std::env::current_exe()
@@ -981,13 +1068,97 @@ mod tests {
     #[tokio::test]
     async fn captures_streams_and_redacts_persistable_text() {
         let spec = fixture("output");
+        let configured = spec.executable.clone();
         let result = ProcessRunner
             .run(spec, CancellationToken::new())
             .await
             .unwrap_or_else(|error| panic!("process: {error}"));
         assert!(result.success());
+        assert_eq!(result.resolved_executable.kind, ExecutableKind::Native);
+        assert_eq!(result.resolved_executable.configured, configured);
         assert!(!result.stdout.redacted_text.contains("supersecret"));
         assert!(result.stderr.redacted_text.contains("err"));
+    }
+
+    #[test]
+    fn environment_policy_builds_search_from_effective_overrides() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let encoded_path = std::env::join_paths([&first, &second])
+            .unwrap_or_else(|error| panic!("encode PATH: {error}"));
+        let mut environment = EnvironmentPolicy::empty();
+        environment
+            .set("PATH", encoded_path)
+            .unwrap_or_else(|error| panic!("set PATH: {error}"));
+        environment
+            .set("PATHEXT", ".EXE;.CMD")
+            .unwrap_or_else(|error| panic!("set PATHEXT: {error}"));
+
+        let search = environment.executable_search(root.path());
+
+        assert_eq!(search.path, [first, second]);
+        assert_eq!(
+            search.pathext,
+            [OsString::from(".EXE"), OsString::from(".CMD")]
+        );
+        assert_eq!(search.working_directory, root.path());
+    }
+
+    #[test]
+    fn environment_policy_anchors_relative_and_empty_path_entries_to_working_directory() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let encoded_path = std::env::join_paths([Path::new("bin"), Path::new("")])
+            .unwrap_or_else(|error| panic!("encode PATH: {error}"));
+        let mut environment = EnvironmentPolicy::empty();
+        environment
+            .set("PATH", encoded_path)
+            .unwrap_or_else(|error| panic!("set PATH: {error}"));
+
+        let search = environment.executable_search(root.path());
+
+        assert_eq!(
+            search.path,
+            [root.path().join("bin"), root.path().to_path_buf()]
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_path_entry_resolves_from_command_working_directory() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("create fixture bin: {error}"));
+        let executable_name = if cfg!(windows) { "tool.exe" } else { "tool" };
+        let executable = bin.join(executable_name);
+        fs::copy(
+            std::env::current_exe()
+                .unwrap_or_else(|error| panic!("current test executable: {error}")),
+            &executable,
+        )
+        .unwrap_or_else(|error| panic!("copy fixture executable: {error}"));
+
+        let mut spec = CommandSpec::new("tool")
+            .args(["--exact", "runner::tests::fixture_child", "--nocapture"])
+            .current_dir(root.path());
+        spec.environment = EnvironmentPolicy::empty();
+        spec.environment
+            .set("PATH", "bin")
+            .unwrap_or_else(|error| panic!("set PATH: {error}"));
+        spec.environment
+            .set("PATHEXT", ".EXE")
+            .unwrap_or_else(|error| panic!("set PATHEXT: {error}"));
+        spec.environment
+            .set("ORCHESTRATOR_PROCESS_FIXTURE", "output")
+            .unwrap_or_else(|error| panic!("fixture environment: {error}"));
+
+        let result = ProcessRunner
+            .run(spec, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("process: {error}"));
+
+        assert!(result.success());
+        assert_eq!(result.resolved_executable.path, executable);
+        assert!(result.stdout.redacted_text.contains("[REDACTED]"));
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 
 mod artifacts;
 mod config;
+mod config_layers;
 mod database;
 mod error;
 mod event_log;
@@ -21,6 +22,10 @@ pub use config::{
     ConfigMigrationPreview, ConfigMigrationResult, ConfigMigrationStep, ConfigValidationError,
     FeatureConfig, MigratableConfigDocument, ModelProfileConfig, OrchestratorConfig,
     ProviderConfig, ProviderConfigs, RedactionSettings, RootConfig, UsageProbeConfig,
+};
+pub use config_layers::{
+    ConfigEnvironment, ConfigLayerKind, ConfigRequest, ConfigSource, EffectiveConfig,
+    load_effective_config,
 };
 pub use database::{Database, DatabaseHealth, OutboxRecord};
 pub use error::{StateError, StateResult};

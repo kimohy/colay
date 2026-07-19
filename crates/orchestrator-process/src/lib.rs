@@ -2,11 +2,17 @@
 #![allow(clippy::missing_errors_doc)]
 #![cfg_attr(test, allow(clippy::panic))]
 
+mod executable;
 mod git;
 mod jsonl;
 mod redaction;
 mod runner;
 
+pub use executable::{
+    ExecutableKind, ExecutablePlatform, ExecutableResolutionError, ExecutableSearch,
+    ExecutableValidationContext, ResolvedExecutable, resolve_executable,
+    validate_resolution_evidence,
+};
 pub use git::{GitCommandBuilder, GitSafetyError, resolve_repo_path};
 pub use jsonl::{JsonLines, MalformedJsonLine, parse_json_lines};
 pub use redaction::{RedactionConfig, RedactionError, Redactor};

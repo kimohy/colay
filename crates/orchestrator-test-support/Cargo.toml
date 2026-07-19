@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
@@ -16,8 +17,10 @@ tokio.workspace = true
 
 [dev-dependencies]
 orchestrator-engine = { path = "../orchestrator-engine" }
+orchestrator-process = { path = "../orchestrator-process" }
 orchestrator-state = { path = "../orchestrator-state" }
 tempfile.workspace = true
+tokio-util.workspace = true
 
 [lints]
 workspace = true

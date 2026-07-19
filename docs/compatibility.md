@@ -14,7 +14,11 @@ The probe allowlist contains only `--version`, public `--help` surfaces, and `ap
 
 Unknown optional item/event payloads are retained as opaque values. Unknown `thread.*` or `turn.*` lifecycle events, missing/changed required fields, and malformed JSON fail closed. Quota errors are normalized without treating a transient rate limit as confirmed quota exhaustion.
 
-The committed machine-readable matrix is [`compatibility/codex-matrix.json`](../compatibility/codex-matrix.json). Contract tests require it to match [`compatibility/codex-version.toml`](../compatibility/codex-version.toml) and every per-version manifest. N and N-1 fixtures cover capability output, successful/tool/error/quota/resume streams, malformed JSON, unknown optional items, and an unknown lifecycle event. N-2 is added only after a real release has fixture evidence and an explicit maintenance decision.
+## Supported Codex releases
+
+Exact fixture-backed compatibility is limited to Codex `0.144.6` and `0.144.5`; `0.144.6` is the recommended release. The committed registry pins the recommended release to revision `5d1fbf26c43abc65a203928b2e31561cb039e06d`. The version registry and generated matrix are the authoritative records: [`compatibility/codex-version.toml`](../compatibility/codex-version.toml) and [`compatibility/codex-matrix.json`](../compatibility/codex-matrix.json). A numerically nearby or otherwise unknown version is not treated as exact compatibility.
+
+Contract tests require the committed machine-readable matrix to match the version registry and every per-version manifest. The two exact-version fixtures cover capability output, successful/tool/error/quota/resume streams, malformed JSON, unknown optional items, and an unknown lifecycle event. A third version is added only after a real release has fixture evidence and an explicit maintenance decision.
 
 ## Fixture provenance
 

@@ -103,6 +103,9 @@ pub enum RuntimeTermination {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeOutput {
+    /// Exact generic process-boundary identity for the process that produced
+    /// this output. Worker completions persist it outside the domain contract.
+    pub resolved_executable: Option<orchestrator_process::ResolvedExecutable>,
     pub exit_code: Option<i32>,
     pub termination: RuntimeTermination,
     /// Present when the direct child was reaped but the process layer could

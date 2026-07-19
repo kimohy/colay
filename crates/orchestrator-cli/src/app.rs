@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    io::Write as _,
     path::{Component, Path, PathBuf},
     str::FromStr as _,
     sync::Arc,
@@ -30,22 +31,27 @@ use orchestrator_policy::{
     AnalysisHints, BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig,
     RoutingContext, RoutingEngine, TaskAnalysisInput, TaskAnalyzer, TaskRole, period_window,
 };
-use orchestrator_process::{CommandSpec, ProcessError, ProcessRunner, RedactionConfig, Redactor};
+use orchestrator_process::{
+    CommandSpec, ProcessError, ProcessRunner, RedactionConfig, Redactor, ResolvedExecutable,
+    validate_resolution_evidence,
+};
 use orchestrator_providers::{
     AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
     CodexTransportFeatures, GeminiAdapter, GeminiAdapterConfig, ProcessAdapterRuntime,
     RuntimeTermination, WorkerAdapter,
 };
 use orchestrator_state::{
-    ArtifactStore, ConfigDocument, ControlAction, CoordinatorLease, CoordinatorLeaseRequest,
-    Database, EventLog, MigratableConfigDocument, OrchestratorConfig, ProviderConfig, RootConfig,
-    WorkerLease, WorkerLeaseMode, WorkerLeaseRequest,
+    ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
+    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, Database, EffectiveConfig, EventLog,
+    MigratableConfigDocument, OrchestratorConfig, ProviderConfig, RootConfig, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest, load_effective_config,
 };
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
+use toml_edit::{DocumentMut, Item, Table, TableLike};
 use uuid::Uuid;
 
 use crate::args::{
@@ -57,82 +63,302 @@ const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
 const DEFAULT_CONFIG_PATH: &str = ".colay/config.toml";
 const LEGACY_CONFIG_PATH: &str = ".codex/orchestrator/config.toml";
 
+struct ConfigRuntime {
+    effective: EffectiveConfig,
+    explicit_edit_path: PathBuf,
+}
+
+#[allow(clippy::too_many_lines)]
 pub async fn run(cli: Cli) -> Result<()> {
     configure_tracing();
-    let (repository, initializing) = match &cli.command {
-        Command::Init(arguments) => (arguments.repository.clone(), true),
-        _ => (current_repository()?, false),
+    let repository = match &cli.command {
+        Command::Init(arguments) => fs::canonicalize(&arguments.repository).with_context(|| {
+            format!(
+                "cannot canonicalize repository directory: {}",
+                arguments.repository.display()
+            )
+        })?,
+        _ => current_repository()?,
     };
-    let config_path = select_config_path(cli.config.as_deref(), &repository, initializing)?;
+    let environment = config_environment();
+    let runtime_result = if matches!(cli.command, Command::Init(_)) {
+        load_initialization_config_runtime(&repository, cli.config.as_deref(), environment.clone())
+    } else {
+        load_config_runtime(&repository, cli.config.as_deref(), environment.clone())
+    };
+    let runtime = match runtime_result {
+        Ok(runtime) => runtime,
+        Err(load_error) => {
+            if let Command::Migrate(arguments) = &cli.command {
+                match migration_fallback_path(&repository, cli.config.as_deref(), &environment)? {
+                    Some(explicit_edit_path) => {
+                        return migrate_without_runtime(
+                            &repository,
+                            &explicit_edit_path,
+                            arguments.action.clone(),
+                            cli.json,
+                        );
+                    }
+                    None => return Err(load_error),
+                }
+            }
+            return Err(load_error);
+        }
+    };
     match cli.command {
-        Command::Init(arguments) => initialize(&config_path, &arguments.repository, cli.json),
-        Command::Run(arguments) => run_task(&config_path, arguments, cli.json).await,
-        Command::Status(selector) => status(&config_path, &selector, cli.json),
+        Command::Init(_) => initialize(&repository, &runtime, cli.json),
+        Command::Run(arguments) => {
+            run_task(&repository, &runtime.effective, arguments, cli.json).await
+        }
+        Command::Status(selector) => status(&repository, &runtime.effective, &selector, cli.json),
         Command::Providers(arguments) => match arguments.action {
-            Some(ProviderAction::Enable { provider }) => {
-                set_provider_enabled(&config_path, provider.into(), true, cli.json)
-            }
-            Some(ProviderAction::Disable { provider }) => {
-                set_provider_enabled(&config_path, provider.into(), false, cli.json)
-            }
-            None => providers(&config_path, cli.json).await,
+            Some(ProviderAction::Enable { provider }) => set_provider_enabled(
+                &repository,
+                cli.config.as_deref(),
+                environment,
+                &runtime,
+                provider.into(),
+                true,
+                cli.json,
+            ),
+            Some(ProviderAction::Disable { provider }) => set_provider_enabled(
+                &repository,
+                cli.config.as_deref(),
+                environment,
+                &runtime,
+                provider.into(),
+                false,
+                cli.json,
+            ),
+            None => providers(&runtime.effective, cli.json).await,
         },
         Command::Usage(arguments) => match arguments.action {
             Some(UsageAction::Override(arguments)) => {
-                usage_override(&config_path, arguments, cli.json)
+                usage_override(&repository, &runtime.effective, arguments, cli.json)
             }
-            None => usage(&config_path, cli.json),
+            None => usage(&repository, &runtime.effective, cli.json),
         },
-        Command::Handover(arguments) => control_handover(&config_path, arguments, cli.json),
-        Command::Pause(task) => control(&config_path, task, "pause", json!({}), cli.json),
-        Command::Resume(task) => resume_task(&config_path, &task, cli.json).await,
-        Command::Cancel(task) => control(&config_path, task, "cancel", json!({}), cli.json),
-        Command::ExplainRouting(task) => explain_routing(&config_path, &task.task_id, cli.json),
-        Command::Checkpoint(task) => checkpoint(&config_path, &task.task_id, cli.json),
-        Command::Doctor => doctor(&config_path, cli.json).await,
-        Command::Compatibility => compatibility(&config_path, cli.json),
-        Command::Migrate(arguments) => migrate(&config_path, arguments.action, cli.json),
-        Command::Rollback(arguments) => rollback(&config_path, arguments.action, cli.json),
-        Command::Tui(selector) => Box::pin(tui(&config_path, &selector, cli.json)).await,
+        Command::Handover(arguments) => {
+            control_handover(&repository, &runtime.effective, arguments, cli.json)
+        }
+        Command::Pause(task) => control(
+            &repository,
+            &runtime.effective,
+            task,
+            "pause",
+            json!({}),
+            cli.json,
+        ),
+        Command::Resume(task) => {
+            resume_task(&repository, &runtime.effective, &task, cli.json).await
+        }
+        Command::Cancel(task) => control(
+            &repository,
+            &runtime.effective,
+            task,
+            "cancel",
+            json!({}),
+            cli.json,
+        ),
+        Command::ExplainRouting(task) => {
+            explain_routing(&repository, &runtime.effective, &task.task_id, cli.json)
+        }
+        Command::Checkpoint(task) => {
+            checkpoint(&repository, &runtime.effective, &task.task_id, cli.json)
+        }
+        Command::Doctor => doctor(&repository, &runtime.effective, cli.json).await,
+        Command::Compatibility => compatibility(&runtime.effective, cli.json),
+        Command::Migrate(arguments) => migrate(
+            &repository,
+            &runtime.effective,
+            &runtime.explicit_edit_path,
+            arguments.action,
+            cli.json,
+        ),
+        Command::Rollback(arguments) => rollback(
+            &repository,
+            &runtime.effective,
+            &runtime.explicit_edit_path,
+            arguments.action,
+            cli.json,
+        ),
+        Command::Tui(selector) => {
+            Box::pin(tui(
+                &repository,
+                cli.config.as_deref(),
+                environment,
+                &runtime,
+                &selector,
+                cli.json,
+            ))
+            .await
+        }
     }
 }
 
-fn select_config_path(
-    explicit: Option<&Path>,
+#[allow(clippy::needless_pass_by_value)]
+fn load_config_runtime(
     repository: &Path,
-    initializing: bool,
-) -> Result<PathBuf> {
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+) -> Result<ConfigRuntime> {
     let repository = fs::canonicalize(repository).with_context(|| {
         format!(
             "cannot canonicalize repository directory: {}",
             repository.display()
         )
     })?;
-    if let Some(explicit) = explicit {
-        return Ok(resolve_from(&repository, explicit));
-    }
+    let cli_config = cli_config.map(|path| resolve_from(&repository, path));
+    let effective = load_effective_config(&ConfigRequest {
+        repository: &repository,
+        cli_config: cli_config.as_deref(),
+        environment: environment.clone(),
+    })?;
+    let explicit_edit_path =
+        config_edit_path(&repository, cli_config.as_deref(), &environment, &effective);
+    Ok(ConfigRuntime {
+        effective,
+        explicit_edit_path,
+    })
+}
 
+fn config_edit_path(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: &ConfigEnvironment,
+    effective: &EffectiveConfig,
+) -> PathBuf {
+    cli_config
+        .map(|path| resolve_from(repository, path))
+        .or_else(|| environment.colay_config.clone())
+        .or_else(|| {
+            effective.sources().iter().find_map(|source| {
+                matches!(
+                    source.kind,
+                    ConfigLayerKind::Repository | ConfigLayerKind::LegacyRepository
+                )
+                .then(|| source.path.clone())
+            })
+        })
+        .unwrap_or_else(|| repository.join(DEFAULT_CONFIG_PATH))
+}
+
+fn configured_edit_path(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: &ConfigEnvironment,
+) -> PathBuf {
+    cli_config
+        .map(|path| resolve_from(repository, path))
+        .or_else(|| environment.colay_config.clone())
+        .unwrap_or_else(|| repository.join(DEFAULT_CONFIG_PATH))
+}
+
+fn migration_fallback_path(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: &ConfigEnvironment,
+) -> Result<Option<PathBuf>> {
     let current = repository.join(DEFAULT_CONFIG_PATH);
     let legacy = repository.join(LEGACY_CONFIG_PATH);
-    match (current.exists(), legacy.exists()) {
-        (true, true) => bail!(
-            "both Colay config locations exist ({} and {}); select one explicitly with `--config`",
-            current.display(),
-            legacy.display()
-        ),
-        (false, true) if initializing => bail!(
-            "legacy Colay configuration already exists at {}; initialization refused to avoid splitting local state (use `--config` explicitly)",
-            legacy.display()
-        ),
-        (false, true) => {
-            eprintln!(
-                "warning: using legacy Colay configuration at {}; state is not moved automatically",
-                legacy.display()
-            );
-            Ok(legacy)
-        }
-        (_, false) => Ok(current),
+    let cli_config = cli_config.map(|path| resolve_from(repository, path));
+    if config_source_exists(&current)?
+        && config_source_exists(&legacy)?
+        && !cli_config
+            .as_ref()
+            .is_some_and(|path| path == &current || path == &legacy)
+    {
+        return Ok(None);
     }
+
+    let (target, environment_target) = if let Some(path) = cli_config {
+        (path, false)
+    } else if let Some(path) = environment.colay_config.clone() {
+        (path, true)
+    } else if config_source_exists(&current)? {
+        (current.clone(), false)
+    } else if config_source_exists(&legacy)? {
+        (legacy.clone(), false)
+    } else {
+        return Ok(None);
+    };
+    if !config_source_exists(&target)? {
+        return Ok(None);
+    }
+    let Ok(migratable) = MigratableConfigDocument::load(&target) else {
+        return Ok(None);
+    };
+    if migratable.current_version() >= orchestrator_state::CONFIG_SCHEMA_VERSION {
+        return Ok(None);
+    }
+
+    let mut preflight_environment = environment.clone();
+    if environment_target {
+        preflight_environment.colay_config = None;
+    }
+    let temporary_repository;
+    let canonical_temporary_repository;
+    let preflight_repository = if target == current || target == legacy {
+        temporary_repository = tempfile::tempdir()?;
+        canonical_temporary_repository = fs::canonicalize(temporary_repository.path())?;
+        &canonical_temporary_repository
+    } else {
+        repository
+    };
+    load_effective_config(&ConfigRequest::new(
+        preflight_repository,
+        preflight_environment,
+    ))?;
+    Ok(Some(target))
+}
+
+fn config_source_exists(path: &Path) -> Result<bool> {
+    orchestrator_state::reject_symlink_components(path)?;
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect configuration source: {}", path.display())),
+    }
+}
+
+fn load_initialization_config_runtime(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+) -> Result<ConfigRuntime> {
+    let cli_config = cli_config.map(|path| resolve_from(repository, path));
+    let explicit_edit_path = configured_edit_path(repository, cli_config.as_deref(), &environment);
+    let load_cli = cli_config.as_deref().filter(|path| path.exists());
+    let mut load_environment = environment;
+    if load_environment
+        .colay_config
+        .as_deref()
+        .is_some_and(|path| !path.exists())
+    {
+        load_environment.colay_config = None;
+    }
+    let mut runtime = load_config_runtime(repository, load_cli, load_environment)?;
+    runtime.explicit_edit_path = explicit_edit_path;
+    Ok(runtime)
+}
+
+fn config_environment() -> ConfigEnvironment {
+    ConfigEnvironment {
+        colay_home: std::env::var_os("COLAY_HOME").map(PathBuf::from),
+        user_home: platform_user_home(),
+        colay_config: std::env::var_os("COLAY_CONFIG").map(PathBuf::from),
+    }
+}
+
+#[cfg(windows)]
+fn platform_user_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn platform_user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn configure_tracing() {
@@ -145,18 +371,26 @@ fn configure_tracing() {
         .try_init();
 }
 
-fn initialize(config_path: &Path, repository: &Path, json_output: bool) -> Result<()> {
-    let repository = fs::canonicalize(repository)
-        .with_context(|| format!("repository does not exist: {}", repository.display()))?;
-    let config_path = resolve_from(&repository, config_path);
+fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> Result<()> {
+    let config_path = &runtime.explicit_edit_path;
     if config_path.exists() {
         bail!("configuration already exists: {}", config_path.display());
     }
-    let document = ConfigDocument::parse(CONFIG_TEMPLATE)?;
-    document.save_atomic(&config_path)?;
-    let state = StatePaths::from_config(&repository, document.config())?;
-    let database = Database::open(&state.database)?;
-    let migration = database.migrate_with_backup(&state.backups)?;
+    if runtime
+        .effective
+        .sources()
+        .iter()
+        .any(|source| source.kind == ConfigLayerKind::LegacyRepository)
+    {
+        bail!(
+            "legacy Colay configuration already exists; initialization refused to avoid splitting local state (use `--config` explicitly)"
+        );
+    }
+    let document = CONFIG_TEMPLATE.parse::<DocumentMut>()?;
+    save_override_atomic(&document, config_path)?;
+    let state = StatePaths::from_config(repository, runtime.effective.config())?;
+    let database = initialize_repository_state(&state)?;
+    let migration = database.migration_status()?;
     let events = EventLog::open(&state.events)?;
     let reconciliation = events.reconcile(&database)?;
     emit(
@@ -172,23 +406,12 @@ fn initialize(config_path: &Path, repository: &Path, json_output: bool) -> Resul
     )
 }
 
-async fn doctor(config_path: &Path, json_output: bool) -> Result<()> {
-    let repository = current_repository()?;
-    let mut checks = Vec::new();
-    let document = match ConfigDocument::load(config_path) {
-        Ok(document) => {
-            checks.push(Check::pass("config", "schema and values are valid"));
-            Some(document)
-        }
-        Err(error) => {
-            checks.push(Check::fail("config", error.to_string()));
-            None
-        }
-    };
-
-    if let Some(document) = &document {
-        let redaction = process_redaction(&document.config().orchestrator);
-        let state = StatePaths::from_config(&repository, document.config())?;
+async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    let mut checks = vec![Check::pass("config", "schema and values are valid")];
+    let config = effective.config();
+    {
+        let redaction = process_redaction(&config.orchestrator);
+        let state = StatePaths::from_config(repository, config)?;
         if state.database.exists() {
             match Database::open(&state.database)
                 .and_then(|database| database.health().map(|health| (database, health)))
@@ -214,17 +437,23 @@ async fn doctor(config_path: &Path, json_output: bool) -> Result<()> {
         } else {
             checks.push(Check::warn(
                 "database",
-                "state database does not exist; run init or migrate apply",
+                "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas",
             ));
         }
 
-        for (provider, config) in provider_configs(&document.config().orchestrator) {
-            let result = diagnostic_command(&config.executable, ["--version"], &redaction).await;
+        for (provider, config) in provider_configs(&config.orchestrator) {
+            let result =
+                diagnostic_command(&config.executable, ["--version"], repository, &redaction).await;
             match result {
                 Ok(output) if output.success() => checks.push(Check::with_data(
                     format!("provider_{}", provider.as_str()),
                     true,
-                    json!({"version": output.stdout.redacted_text.trim()}),
+                    json!({
+                        "version": output.stdout.redacted_text.trim(),
+                        "configured_executable": output.resolved_executable.configured,
+                        "resolved_executable": output.resolved_executable.path,
+                        "executable_kind": output.resolved_executable.kind,
+                    }),
                 )),
                 Ok(output) => checks.push(Check::fail(
                     format!("provider_{}", provider.as_str()),
@@ -251,9 +480,8 @@ async fn doctor(config_path: &Path, json_output: bool) -> Result<()> {
     )
 }
 
-fn compatibility(config_path: &Path, json_output: bool) -> Result<()> {
-    let document = ConfigDocument::load(config_path)?;
-    let executable = document
+fn compatibility(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    let executable = effective
         .config()
         .orchestrator
         .providers
@@ -262,16 +490,15 @@ fn compatibility(config_path: &Path, json_output: bool) -> Result<()> {
         .map_or("codex", |config| config.executable.as_str());
     let report = probe_codex(
         executable,
-        &process_redaction(&document.config().orchestrator),
+        &process_redaction(&effective.config().orchestrator),
     )?;
     emit(json_output, "compatibility", &report)
 }
 
-async fn providers(config_path: &Path, json_output: bool) -> Result<()> {
-    let document = ConfigDocument::load(config_path)?;
-    let redaction = process_redaction(&document.config().orchestrator);
+async fn providers(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    let redaction = process_redaction(&effective.config().orchestrator);
     let mut reports = Vec::new();
-    for (provider, config) in provider_configs(&document.config().orchestrator) {
+    for (provider, config) in provider_configs(&effective.config().orchestrator) {
         let diagnostic = probe_provider(provider, config, &redaction).await;
         reports.push(match diagnostic {
             Ok((health, capabilities)) => ProviderReport {
@@ -299,14 +526,26 @@ async fn providers(config_path: &Path, json_output: bool) -> Result<()> {
 }
 
 fn set_provider_enabled(
-    config_path: &Path,
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+    runtime: &ConfigRuntime,
     provider: ProviderId,
     enabled: bool,
     json_output: bool,
 ) -> Result<()> {
-    let mut document = ConfigDocument::load(config_path)?;
-    document.set_provider_enabled(provider.as_str(), enabled)?;
-    document.save_atomic(config_path)?;
+    let mut document = load_edit_document(&runtime.explicit_edit_path)?;
+    let orchestrator = ensure_override_table(document.as_table_mut(), "orchestrator")?;
+    let providers = ensure_override_table(orchestrator, "providers")?;
+    let provider_override = ensure_override_table(providers, provider.as_str())?;
+    provider_override.insert("enabled", toml_edit::value(enabled));
+    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    let reloaded = load_config_runtime(repository, cli_config, environment)?;
+    let persisted = provider_config(&reloaded.effective.config().orchestrator, provider)
+        .is_some_and(|config| config.enabled == enabled);
+    if !persisted {
+        bail!("provider override did not survive effective configuration reload");
+    }
     emit(
         json_output,
         "provider_updated",
@@ -314,15 +553,79 @@ fn set_provider_enabled(
     )
 }
 
+fn load_edit_document(path: &Path) -> Result<DocumentMut> {
+    if path.exists() {
+        orchestrator_state::reject_symlink_components(path)?;
+        fs::read_to_string(path)
+            .with_context(|| format!("cannot read configuration override: {}", path.display()))?
+            .parse::<DocumentMut>()
+            .map_err(Into::into)
+    } else {
+        CONFIG_TEMPLATE.parse::<DocumentMut>().map_err(Into::into)
+    }
+}
+
+fn ensure_override_table<'a>(
+    parent: &'a mut dyn TableLike,
+    key: &str,
+) -> Result<&'a mut dyn TableLike> {
+    if !parent.contains_key(key) {
+        parent.insert(key, Item::Table(Table::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| anyhow!("configuration override `{key}` must be a table"))
+}
+
+fn save_override_atomic(document: &DocumentMut, path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent: {}", path.display()))?;
+    orchestrator_state::ensure_private_directory(parent)?;
+    orchestrator_state::reject_symlink_components(path)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("cannot create temporary config in {}", parent.display()))?;
+    temporary.write_all(document.to_string().as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("cannot atomically replace config: {}", path.display()))?;
+    orchestrator_state::ensure_private_file(path)?;
+    sync_override_directory(parent)
+}
+
+#[cfg(windows)]
+fn sync_override_directory(path: &Path) -> Result<()> {
+    fs::metadata(path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_override_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
-async fn run_task(config_path: &Path, arguments: RunArgs, json_output: bool) -> Result<()> {
-    let repository = current_repository()?;
-    let document = ConfigDocument::load(config_path)?;
+async fn run_task(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    arguments: RunArgs,
+    json_output: bool,
+) -> Result<()> {
+    let document = effective.document();
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
-    let state = StatePaths::from_config(&repository, document.config())?;
-    let database = open_ready_database(&state)?;
+    let state = StatePaths::from_config(repository, document.config())?;
+    let database = if state.database.exists() {
+        open_ready_database(&state)?
+    } else {
+        initialize_repository_state(&state)?
+    };
+    reconcile_events(&state, &database)?;
     let input = load_task_input(&arguments)?;
     let redactor = Redactor::new(&process_redaction(&document.config().orchestrator))?;
     let runtime_prompt = input.original_request.clone();
@@ -452,7 +755,7 @@ async fn run_task(config_path: &Path, arguments: RunArgs, json_output: bool) -> 
     // gates above have passed. It uses public CLI adapters and never provider SDK tokens.
     let coordinator = acquire_task_coordinator(&database, plan.task.task_id, document.config())?;
     let result = execute_planned_task(
-        &repository,
+        repository,
         &state,
         document.config(),
         &database,
@@ -472,13 +775,17 @@ async fn run_task(config_path: &Path, arguments: RunArgs, json_output: bool) -> 
 }
 
 #[allow(clippy::too_many_lines)]
-async fn resume_task(config_path: &Path, task: &RequiredTask, json_output: bool) -> Result<()> {
-    let repository = current_repository()?;
-    let document = ConfigDocument::load(config_path)?;
+async fn resume_task(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    task: &RequiredTask,
+    json_output: bool,
+) -> Result<()> {
+    let document = effective.document();
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
-    let state = StatePaths::from_config(&repository, document.config())?;
+    let state = StatePaths::from_config(repository, document.config())?;
     let database = open_ready_database(&state)?;
     let task_id = TaskId::from_str(&task.task_id)?;
     let correlation_id = CorrelationId::new();
@@ -490,8 +797,8 @@ async fn resume_task(config_path: &Path, task: &RequiredTask, json_output: bool)
     }
     let coordinator = acquire_task_coordinator(&database, task_id, document.config())?;
     let result = resume_task_coordinated(
-        &repository,
-        &document,
+        repository,
+        document,
         &state,
         &database,
         task_id,
@@ -2052,7 +2359,11 @@ async fn run_worker(
         finished_at,
         output_truncated: output.truncated,
     };
-    persist_attempt_result(database, &result)?;
+    let process_execution = output
+        .resolved_executable
+        .as_ref()
+        .ok_or_else(|| anyhow!("completed worker omitted process execution evidence"))?;
+    persist_attempt_result(database, &result, process_execution)?;
     Ok(WorkerRunRecord {
         result,
         quota_exceeded,
@@ -2374,7 +2685,20 @@ fn block_for_unconfirmed_termination(
     Ok(())
 }
 
-fn persist_attempt_result(database: &Database, result: &WorkerResult) -> Result<()> {
+fn persist_attempt_result(
+    database: &Database,
+    result: &WorkerResult,
+    process_execution: &ResolvedExecutable,
+) -> Result<()> {
+    validate_resolution_evidence(process_execution)?;
+    let mut persisted = serde_json::to_value(result)?;
+    let object = persisted
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("worker result must serialize as a JSON object"))?;
+    object.insert(
+        "process_execution".to_owned(),
+        serde_json::to_value(process_execution)?,
+    );
     database.with_connection(|connection| {
         connection.execute(
             "UPDATE task_attempts SET ended_at = ?1, outcome = ?2,
@@ -2384,7 +2708,7 @@ fn persist_attempt_result(database: &Database, result: &WorkerResult) -> Result<
                 enum_name(&result.outcome).map_err(|error| {
                     orchestrator_state::StateError::InvalidRecord(error.to_string())
                 })?,
-                serde_json::to_string(result)?,
+                persisted.to_string(),
                 result.attempt_id.to_string(),
             ],
         )?;
@@ -3456,8 +3780,21 @@ fn acceptance_evidence(
     }
 }
 
-fn status(config_path: &Path, selector: &TaskSelector, json_output: bool) -> Result<()> {
-    let (state, database) = load_existing_state(config_path)?;
+fn status(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    selector: &TaskSelector,
+    json_output: bool,
+) -> Result<()> {
+    let state = StatePaths::from_config(repository, effective.config())?;
+    if !state.database.exists() {
+        return emit(
+            json_output,
+            "status",
+            &json!({"tasks": [], "database": Value::Null, "state_dir": state.root}),
+        );
+    }
+    let database = open_ready_database(&state)?;
     let tasks = database.with_connection(|connection| {
         let mut sql =
             "SELECT task_id, state, objective, created_at, updated_at FROM tasks".to_owned();
@@ -3494,26 +3831,25 @@ fn status(config_path: &Path, selector: &TaskSelector, json_output: bool) -> Res
     )
 }
 
-fn usage(config_path: &Path, json_output: bool) -> Result<()> {
-    let document = ConfigDocument::load(config_path)?;
-    let (_, database) = load_existing_state(config_path)?;
-    let snapshots = latest_usage_snapshots(&database, &document.config().orchestrator)?;
+fn usage(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    let (_, database) = load_existing_state(repository, effective)?;
+    let snapshots = latest_usage_snapshots(&database, &effective.config().orchestrator)?;
     emit(json_output, "usage", &snapshots)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn usage_override(
-    config_path: &Path,
+    repository: &Path,
+    effective: &EffectiveConfig,
     arguments: UsageOverrideArgs,
     json_output: bool,
 ) -> Result<()> {
     if arguments.entered_by.trim().is_empty() {
         bail!("--entered-by must be a non-empty audit identity");
     }
-    let document = ConfigDocument::load(config_path)?;
-    let (_, database) = load_existing_state(config_path)?;
+    let (_, database) = load_existing_state(repository, effective)?;
     let provider = ProviderId::from(arguments.provider);
-    let provider_config = provider_config(&document.config().orchestrator, provider)
+    let provider_config = provider_config(&effective.config().orchestrator, provider)
         .ok_or_else(|| anyhow!("provider {} is not configured", provider.as_str()))?;
     let scope = quota_scope(provider, provider_config)?;
     let period = scope.period;
@@ -3576,15 +3912,20 @@ fn usage_override(
         CorrelationId::new(),
         json!({"snapshot": snapshot, "entered_by": arguments.entered_by}),
     )?;
-    let repository = current_repository()?;
-    let state = StatePaths::from_config(&repository, document.config())?;
+    let state = StatePaths::from_config(repository, effective.config())?;
     reconcile_events(&state, &database)?;
     emit(json_output, "usage_override", &snapshot)
 }
 
-fn control_handover(config_path: &Path, arguments: HandoverArgs, json_output: bool) -> Result<()> {
+fn control_handover(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    arguments: HandoverArgs,
+    json_output: bool,
+) -> Result<()> {
     control(
-        config_path,
+        repository,
+        effective,
         RequiredTask {
             task_id: arguments.task_id,
         },
@@ -3596,13 +3937,14 @@ fn control_handover(config_path: &Path, arguments: HandoverArgs, json_output: bo
 
 #[allow(clippy::needless_pass_by_value)]
 fn control(
-    config_path: &Path,
+    repository: &Path,
+    effective: &EffectiveConfig,
     task: RequiredTask,
     action: &str,
     payload: Value,
     json_output: bool,
 ) -> Result<()> {
-    let (state, database) = load_existing_state(config_path)?;
+    let (state, database) = load_existing_state(repository, effective)?;
     let task_id = TaskId::from_str(&task.task_id)?;
     let current_state: Option<String> = database.with_connection(|connection| {
         connection
@@ -3656,8 +3998,13 @@ fn control(
     )
 }
 
-fn explain_routing(config_path: &Path, task_id: &str, json_output: bool) -> Result<()> {
-    let (_, database) = load_existing_state(config_path)?;
+fn explain_routing(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    task_id: &str,
+    json_output: bool,
+) -> Result<()> {
+    let (_, database) = load_existing_state(repository, effective)?;
     let task_id = TaskId::from_str(task_id)?;
     let decision = database
         .list_routing_audits(task_id, 1)?
@@ -3667,8 +4014,13 @@ fn explain_routing(config_path: &Path, task_id: &str, json_output: bool) -> Resu
     emit(json_output, "explain_routing", &decision)
 }
 
-fn checkpoint(config_path: &Path, task_id: &str, json_output: bool) -> Result<()> {
-    let (_, database) = load_existing_state(config_path)?;
+fn checkpoint(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    task_id: &str,
+    json_output: bool,
+) -> Result<()> {
+    let (_, database) = load_existing_state(repository, effective)?;
     let task_id = TaskId::from_str(task_id)?;
     let checkpoint = database
         .latest_sealed_checkpoint(task_id)?
@@ -3677,11 +4029,53 @@ fn checkpoint(config_path: &Path, task_id: &str, json_output: bool) -> Result<()
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn migrate(config_path: &Path, action: MigrationAction, json_output: bool) -> Result<()> {
-    let repository = current_repository()?;
-    let migratable = MigratableConfigDocument::load(config_path)?;
-    let config_preview = migratable.dry_run()?;
-    let state = StatePaths::from_config(&repository, config_preview.migrated().config())?;
+fn migrate(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    explicit_edit_path: &Path,
+    action: MigrationAction,
+    json_output: bool,
+) -> Result<()> {
+    migrate_inner(
+        repository,
+        Some(effective),
+        explicit_edit_path,
+        action,
+        json_output,
+    )
+}
+
+fn migrate_without_runtime(
+    repository: &Path,
+    explicit_edit_path: &Path,
+    action: MigrationAction,
+    json_output: bool,
+) -> Result<()> {
+    migrate_inner(repository, None, explicit_edit_path, action, json_output)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn migrate_inner(
+    repository: &Path,
+    effective: Option<&EffectiveConfig>,
+    explicit_edit_path: &Path,
+    action: MigrationAction,
+    json_output: bool,
+) -> Result<()> {
+    let migratable = MigratableConfigDocument::load(explicit_edit_path)?;
+    let source_is_current =
+        migratable.current_version() == orchestrator_state::CONFIG_SCHEMA_VERSION;
+    let config_preview = if source_is_current && effective.is_some() {
+        let effective = effective.ok_or_else(|| anyhow!("effective config disappeared"))?;
+        MigratableConfigDocument::parse(&effective.document().document().to_string())?.dry_run()?
+    } else {
+        migratable.dry_run()?
+    };
+    let config = effective.map_or_else(
+        || config_preview.migrated().config(),
+        EffectiveConfig::config,
+    );
+    let state = StatePaths::from_config(repository, config)?;
     let database = Database::open(&state.database)?;
     match action {
         MigrationAction::Status => emit(
@@ -3717,7 +4111,7 @@ fn migrate(config_path: &Path, action: MigrationAction, json_output: bool) -> Re
             }),
         ),
         MigrationAction::Apply { dry_run: false } => {
-            ensure_migration_write_allowed(config_preview.migrated().config())?;
+            ensure_migration_write_allowed(config)?;
             append_event_if_schema_available(
                 &database,
                 EventType::MigrationStarted,
@@ -3730,7 +4124,14 @@ fn migrate(config_path: &Path, action: MigrationAction, json_output: bool) -> Re
             // backup-first and DB migrations run transactionally with their own
             // backup; neither path skips an intermediate schema.
             let _ = database.dry_run_migrations()?;
-            let config_status = migratable.apply_to_file(config_path, Utc::now())?;
+            let config_status = if source_is_current {
+                orchestrator_state::ConfigMigrationApplyResult {
+                    result: config_preview.result().clone(),
+                    backup_path: None,
+                }
+            } else {
+                migratable.apply_to_file(explicit_edit_path, Utc::now())?
+            };
             let database_status = database.migrate_with_backup(&state.backups)?;
             let migration_payload = json!({
                 "config": {
@@ -3934,10 +4335,14 @@ fn ensure_migration_write_allowed(config: &RootConfig) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn rollback(config_path: &Path, action: RollbackAction, json_output: bool) -> Result<()> {
-    let repository = current_repository()?;
-    let document = ConfigDocument::load(config_path)?;
-    let state = StatePaths::from_config(&repository, document.config())?;
+fn rollback(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    explicit_edit_path: &Path,
+    action: RollbackAction,
+    json_output: bool,
+) -> Result<()> {
+    let state = StatePaths::from_config(repository, effective.config())?;
     match action {
         RollbackAction::Plan { to } => {
             validate_release_component(&to)?;
@@ -3951,11 +4356,18 @@ fn rollback(config_path: &Path, action: RollbackAction, json_output: bool) -> Re
             if manifest.schema_version != 1 || manifest.version != to {
                 bail!("rollback manifest schema/version does not match --to {to}");
             }
-            let steps = trusted_rollback_steps(
-                &repository,
-                config_path,
+            let resolution_context = rollback_resolution_context(
+                repository,
                 &state,
-                document.config(),
+                effective.config(),
+                &manifest.steps,
+            )?;
+            let steps = trusted_rollback_steps(
+                repository,
+                explicit_edit_path,
+                &state,
+                effective.config(),
+                &resolution_context,
                 &release_root,
                 manifest.steps,
             )?;
@@ -4020,11 +4432,18 @@ fn rollback(config_path: &Path, action: RollbackAction, json_output: bool) -> Re
             if manifest.schema_version != 1 || manifest.version != to {
                 bail!("rollback release manifest schema/version does not match the sealed plan");
             }
-            let manifest_steps = trusted_rollback_steps(
-                &repository,
-                config_path,
+            let resolution_context = rollback_resolution_context(
+                repository,
                 &state,
-                document.config(),
+                effective.config(),
+                &manifest.steps,
+            )?;
+            let manifest_steps = trusted_rollback_steps(
+                repository,
+                explicit_edit_path,
+                &state,
+                effective.config(),
+                &resolution_context,
                 &release_root,
                 manifest.steps,
             )?;
@@ -4032,10 +4451,11 @@ fn rollback(config_path: &Path, action: RollbackAction, json_output: bool) -> Re
                 bail!("rollback release manifest changed after the plan was sealed");
             }
             validate_sealed_rollback_destinations(
-                &repository,
-                config_path,
+                repository,
+                explicit_edit_path,
                 &state,
-                document.config(),
+                effective.config(),
+                &resolution_context,
                 &plan,
             )?;
             let manager = rollback_manager(&state, &plan.steps)?;
@@ -4182,11 +4602,127 @@ fn ensure_rollback_quiescent(database: &Database) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Default)]
+struct RollbackResolutionContext {
+    codex_execution: Option<ResolvedExecutable>,
+}
+
+impl RollbackResolutionContext {
+    fn working_directory_for(&self, component: &str) -> Option<&Path> {
+        is_codex_rollback_component(component)
+            .then_some(
+                self.codex_execution
+                    .as_ref()
+                    .map(|evidence| evidence.validation.working_directory.as_path()),
+            )
+            .flatten()
+    }
+
+    fn resolved_executable_for(&self, component: &str) -> Option<&Path> {
+        is_codex_rollback_component(component)
+            .then_some(
+                self.codex_execution
+                    .as_ref()
+                    .map(|evidence| evidence.path.as_path()),
+            )
+            .flatten()
+    }
+}
+
+fn rollback_resolution_context(
+    repository: &Path,
+    state: &StatePaths,
+    _config: &RootConfig,
+    steps: &[RollbackManifestStep],
+) -> Result<RollbackResolutionContext> {
+    if !steps
+        .iter()
+        .any(|step| is_codex_rollback_component(&step.component))
+    {
+        return Ok(RollbackResolutionContext::default());
+    }
+    if !state.database.exists() {
+        bail!(
+            "Codex rollback requires persisted process execution evidence; state database is missing"
+        );
+    }
+    let database = open_ready_database(state)?;
+    let selected = database.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT attempt_id, task_id, worker_result_json FROM task_attempts
+                 WHERE provider_id = 'codex' AND worker_mode = 'workspace_write'
+                   AND ended_at IS NOT NULL
+                 ORDER BY started_at DESC, ordinal DESC, attempt_id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    })?;
+    let (attempt_id, task_id, persisted) = selected
+        .ok_or_else(|| anyhow!("Codex rollback has no completed writable provider attempt"))?;
+    let attempt_id = AttemptId::from_str(&attempt_id)?;
+    let task_id = TaskId::from_str(&task_id)?;
+    let persisted = persisted
+        .ok_or_else(|| anyhow!("selected Codex attempt has no process execution evidence"))?;
+    let persisted: Value = serde_json::from_str(&persisted)
+        .context("selected Codex attempt has malformed persisted result JSON")?;
+    let worker_result: WorkerResult = serde_json::from_value(persisted.clone())
+        .context("selected Codex attempt does not contain a complete WorkerResult v1")?;
+    if worker_result.attempt_id != attempt_id
+        || worker_result.task_id != task_id
+        || worker_result.provider != ProviderId::Codex
+    {
+        bail!(
+            "selected Codex attempt process execution evidence does not match its attempt identity"
+        );
+    }
+    let process_execution: ResolvedExecutable = serde_json::from_value(
+        persisted
+            .get("process_execution")
+            .cloned()
+            .ok_or_else(|| anyhow!("selected Codex attempt has no process execution evidence"))?,
+    )
+    .context("selected Codex attempt has malformed process execution evidence")?;
+    validate_resolution_evidence(&process_execution)
+        .context("selected Codex attempt has invalid process execution evidence")?;
+    if process_execution.configured.is_absolute() {
+        return Ok(RollbackResolutionContext {
+            codex_execution: Some(process_execution),
+        });
+    }
+    let stored = database
+        .active_worktree(task_id)?
+        .ok_or_else(|| anyhow!("Codex rollback invocation has no active isolated worktree"))?;
+    let worktree = validate_recovered_worktree(repository, state, stored)?;
+    let canonical_worktree = fs::canonicalize(&worktree.path)?;
+    if fs::canonicalize(&process_execution.validation.working_directory)? != canonical_worktree {
+        bail!(
+            "selected Codex attempt process execution evidence does not match its trusted worktree"
+        );
+    }
+    Ok(RollbackResolutionContext {
+        codex_execution: Some(process_execution),
+    })
+}
+
+fn is_codex_rollback_component(component: &str) -> bool {
+    matches!(component, "codex" | "codex_binary")
+}
+
 fn trusted_rollback_steps(
     repository: &Path,
     config_path: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    resolution_context: &RollbackResolutionContext,
     release_root: &Path,
     steps: Vec<RollbackManifestStep>,
 ) -> Result<Vec<orchestrator_engine::RollbackStep>> {
@@ -4207,8 +4743,12 @@ fn trusted_rollback_steps(
                 state,
                 config,
                 &step.component,
+                resolution_context,
             )?;
-            let manifest_destination = resolve_from(repository, &step.destination);
+            let manifest_base = resolution_context
+                .working_directory_for(&step.component)
+                .unwrap_or(repository);
+            let manifest_destination = resolve_from(manifest_base, &step.destination);
             let manifest_destination =
                 fs::canonicalize(&manifest_destination).with_context(|| {
                     format!(
@@ -4248,23 +4788,19 @@ fn trusted_rollback_destination(
     repository: &Path,
     config_path: &Path,
     _state: &StatePaths,
-    config: &RootConfig,
+    _config: &RootConfig,
     component: &str,
+    resolution_context: &RollbackResolutionContext,
 ) -> Result<PathBuf> {
     let path = match component {
         "colay" | "colay_binary" | "orchestrator" | "orchestrator_binary" => {
             std::env::current_exe()?
         }
         "config" => resolve_from(repository, config_path),
-        "codex" | "codex_binary" => {
-            let executable = config
-                .orchestrator
-                .providers
-                .codex
-                .as_ref()
-                .ok_or_else(|| anyhow!("Codex is not configured for binary rollback"))?;
-            locate_configured_executable(repository, &executable.executable)?
-        }
+        "codex" | "codex_binary" => resolution_context
+            .resolved_executable_for(component)
+            .ok_or_else(|| anyhow!("rollback has no persisted Codex process execution evidence"))?
+            .to_path_buf(),
         "database" | "state_database" => bail!(
             "release rollback cannot replace the live task database; use validated schema migration recovery"
         ),
@@ -4280,28 +4816,6 @@ fn trusted_rollback_destination(
         bail!("trusted rollback destination must be a non-symlink regular file");
     }
     Ok(fs::canonicalize(path)?)
-}
-
-fn locate_configured_executable(repository: &Path, executable: &str) -> Result<PathBuf> {
-    let configured = PathBuf::from(executable);
-    if configured.is_absolute() || configured.components().count() > 1 {
-        return Ok(resolve_from(repository, &configured));
-    }
-    let path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is unavailable"))?;
-    for directory in std::env::split_paths(&path) {
-        let direct = directory.join(&configured);
-        if direct.is_file() {
-            return Ok(direct);
-        }
-        #[cfg(windows)]
-        {
-            let executable_path = directory.join(format!("{executable}.exe"));
-            if executable_path.is_file() {
-                return Ok(executable_path);
-            }
-        }
-    }
-    bail!("configured executable `{executable}` was not found")
 }
 
 fn rollback_manager(
@@ -4324,11 +4838,18 @@ fn validate_sealed_rollback_destinations(
     config_path: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    resolution_context: &RollbackResolutionContext,
     plan: &orchestrator_engine::RollbackRecoveryPlan,
 ) -> Result<()> {
     for step in &plan.steps {
-        let trusted =
-            trusted_rollback_destination(repository, config_path, state, config, &step.component)?;
+        let trusted = trusted_rollback_destination(
+            repository,
+            config_path,
+            state,
+            config,
+            &step.component,
+            resolution_context,
+        )?;
         if step.destination != trusted {
             bail!("sealed rollback plan contains an unapproved destination");
         }
@@ -4338,15 +4859,22 @@ fn validate_sealed_rollback_destinations(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> Result<()> {
-    let mut document = ConfigDocument::load(config_path)?;
-    if !document.config().features.orchestrator_tui {
+async fn tui(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+    runtime: &ConfigRuntime,
+    selector: &TaskSelector,
+    json_output: bool,
+) -> Result<()> {
+    let config = runtime.effective.config();
+    if !config.features.orchestrator_tui {
         bail!("orchestrator TUI is disabled by configuration");
     }
-    let (_, database) = load_existing_state(config_path)?;
+    let (_, database) = load_existing_state(repository, &runtime.effective)?;
     let rows = task_status_rows(&database, selector.task_id.as_deref())?;
     let task = rows.first();
-    let usage = latest_usage_snapshots(&database, &document.config().orchestrator)?;
+    let usage = latest_usage_snapshots(&database, &config.orchestrator)?;
     let selected_task_id = task
         .map(|task| TaskId::from_str(&task.task_id))
         .transpose()?;
@@ -4388,7 +4916,7 @@ async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> 
             entered_by: entered_by.clone(),
         })
         .collect();
-    let provider_controls = provider_configs(&document.config().orchestrator)
+    let provider_controls = provider_configs(&config.orchestrator)
         .map(
             |(provider, config)| orchestrator_tui::ProviderControlOption {
                 provider: provider.as_str().to_owned(),
@@ -4485,7 +5013,7 @@ async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> 
             },
         ),
         controls: orchestrator_tui::ControlContext {
-            automatic_routing_enabled: document.config().orchestrator.automatic_routing,
+            automatic_routing_enabled: config.orchestrator.automatic_routing,
             manual_provider: None,
             handover_target: None,
             usage_override: None,
@@ -4496,8 +5024,11 @@ async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> 
     let action = orchestrator_tui::run(&snapshot)?;
     match action {
         orchestrator_tui::ControlAction::SetAutomaticRouting { enabled } => {
-            document.set_automatic_routing(enabled)?;
-            document.save_atomic(config_path)?;
+            let mut document = load_edit_document(&runtime.explicit_edit_path)?;
+            ensure_override_table(document.as_table_mut(), "orchestrator")?
+                .insert("automatic_routing", toml_edit::value(enabled));
+            save_override_atomic(&document, &runtime.explicit_edit_path)?;
+            let _ = load_config_runtime(repository, cli_config, environment)?;
             emit(
                 json_output,
                 "automatic_routing_updated",
@@ -4506,7 +5037,10 @@ async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> 
         }
         orchestrator_tui::ControlAction::SetProviderEnabled { provider, enabled } => {
             set_provider_enabled(
-                config_path,
+                repository,
+                cli_config,
+                environment,
+                runtime,
                 parse_provider_id(&provider)?,
                 enabled,
                 json_output,
@@ -4517,24 +5051,33 @@ async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> 
             task_id,
             to_provider: provider,
         } => control(
-            config_path,
+            repository,
+            &runtime.effective,
             RequiredTask { task_id },
             "handover",
             json!({"to": parse_provider_id(&provider)?}),
             json_output,
         ),
         orchestrator_tui::ControlAction::Pause { task_id } => control(
-            config_path,
+            repository,
+            &runtime.effective,
             RequiredTask { task_id },
             "pause",
             json!({}),
             json_output,
         ),
         orchestrator_tui::ControlAction::Resume { task_id } => {
-            resume_task(config_path, &RequiredTask { task_id }, json_output).await
+            resume_task(
+                repository,
+                &runtime.effective,
+                &RequiredTask { task_id },
+                json_output,
+            )
+            .await
         }
         orchestrator_tui::ControlAction::Cancel { task_id } => control(
-            config_path,
+            repository,
+            &runtime.effective,
             RequiredTask { task_id },
             "cancel",
             json!({}),
@@ -4547,7 +5090,8 @@ async fn tui(config_path: &Path, selector: &TaskSelector, json_output: bool) -> 
             remaining,
             entered_by,
         } => usage_override(
-            config_path,
+            repository,
+            &runtime.effective,
             UsageOverrideArgs {
                 provider: parse_provider_name(&provider)?,
                 used,
@@ -4759,9 +5303,15 @@ async fn collect_usage(
             if format != "json" {
                 bail!("only JSON usage probes are supported");
             }
-            let result =
-                run_bounded_command(executable, args.iter().map(String::as_str), 30, redaction)
-                    .await?;
+            let working_directory = current_repository()?;
+            let result = run_bounded_command(
+                executable,
+                args.iter().map(String::as_str),
+                &working_directory,
+                30,
+                redaction,
+            )
+            .await?;
             if !result.success() {
                 bail!(
                     "configured {} usage probe failed: {}",
@@ -4972,11 +5522,13 @@ async fn probe_provider(
         ));
     }
 
-    let version = diagnostic_command(&config.executable, ["--version"], redaction).await?;
+    let repository = current_repository()?;
+    let version =
+        diagnostic_command(&config.executable, ["--version"], &repository, redaction).await?;
     if !version.success() {
         bail!("{} --version failed", provider.as_str());
     }
-    let help = diagnostic_command(&config.executable, ["--help"], redaction).await?;
+    let help = diagnostic_command(&config.executable, ["--help"], &repository, redaction).await?;
     let help_text = format!(
         "{}\n{}",
         help.stdout.redacted_text, help.stderr.redacted_text
@@ -5070,14 +5622,16 @@ impl CapabilitySource for ProcessCapabilitySource {
 async fn diagnostic_command<const N: usize>(
     executable: &str,
     args: [&str; N],
+    working_directory: &Path,
     redaction: &RedactionConfig,
 ) -> Result<orchestrator_process::ProcessResult> {
-    run_bounded_command(executable, args, 20, redaction).await
+    run_bounded_command(executable, args, working_directory, 20, redaction).await
 }
 
 async fn run_bounded_command<I, S>(
     executable: &str,
     args: I,
+    working_directory: &Path,
     timeout_seconds: u64,
     redaction: &RedactionConfig,
 ) -> Result<orchestrator_process::ProcessResult>
@@ -5085,7 +5639,9 @@ where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
 {
-    let mut spec = CommandSpec::new(executable).args(args);
+    let mut spec = CommandSpec::new(executable)
+        .args(args)
+        .current_dir(working_directory);
     spec.timeout = Duration::from_secs(timeout_seconds);
     spec.stdout_limit = 4 * 1024 * 1024;
     spec.stderr_limit = 2 * 1024 * 1024;
@@ -5763,10 +6319,18 @@ fn open_ready_database(state: &StatePaths) -> Result<Database> {
     Ok(database)
 }
 
-fn load_existing_state(config_path: &Path) -> Result<(StatePaths, Database)> {
-    let repository = current_repository()?;
-    let document = ConfigDocument::load(config_path)?;
-    let state = StatePaths::from_config(&repository, document.config())?;
+fn initialize_repository_state(state: &StatePaths) -> Result<Database> {
+    let database = Database::open(&state.database)?;
+    database.migrate_with_backup(&state.backups)?;
+    EventLog::open(&state.events)?.reconcile(&database)?;
+    Ok(database)
+}
+
+fn load_existing_state(
+    repository: &Path,
+    effective: &EffectiveConfig,
+) -> Result<(StatePaths, Database)> {
+    let state = StatePaths::from_config(repository, effective.config())?;
     let database = open_ready_database(&state)?;
     Ok((state, database))
 }
@@ -6062,47 +6626,319 @@ struct RollbackManifestStep {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
+    use crate::args::MigrationAction;
+    use anyhow::Result;
     use chrono::Utc;
     use orchestrator_domain::{
         AttemptId, ModelProfile, ProviderId, SandboxMode, SchemaVersion, TaskEnvelope, TaskEvent,
-        TaskState, TestEvidence, TestStatus, VerificationStatus, WorkerRequest,
+        TaskState, TestEvidence, TestStatus, VerificationStatus, WorkerOutcome, WorkerRequest,
+        WorkerResult,
     };
-    use orchestrator_process::{RedactionConfig, Redactor};
-    use orchestrator_state::{Database, NewTaskRecord};
+    use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
+    use orchestrator_state::{ConfigEnvironment, Database, NewTaskRecord, RootConfig};
     use rusqlite::params;
+    use toml_edit::DocumentMut;
 
     use super::{
-        ReviewOutcome, StatePaths, acceptance_evidence, block_for_unconfirmed_termination,
-        select_config_path,
+        ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
+        block_for_unconfirmed_termination, initialize, load_config_runtime,
+        rollback_resolution_context, set_provider_enabled, trusted_rollback_steps,
     };
 
+    fn test_state(root: PathBuf) -> StatePaths {
+        StatePaths {
+            database: root.join("orchestrator.db"),
+            events: root.join("events.jsonl"),
+            backups: root.join("backups"),
+            tasks: root.join("tasks"),
+            checkpoints: root.join("checkpoints"),
+            handovers: root.join("handovers"),
+            worktrees: root.join("worktrees"),
+            root,
+        }
+    }
+
+    fn write_fake_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    fn canonical_tempdir() -> Result<(tempfile::TempDir, PathBuf)> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        Ok((temporary, root))
+    }
+
     #[test]
-    fn config_discovery_preserves_legacy_state_and_blocks_split_brain()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let repository = tempfile::tempdir()?;
-        let root = fs::canonicalize(repository.path())?;
+    fn cli_config_is_the_highest_layer() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let global = root.join("home/config.toml");
+        let environment = root.join("environment.toml");
+        let cli = root.join("cli.toml");
+        write_layer(&global, 2)?;
+        write_layer(&root.join(".colay/config.toml"), 3)?;
+        write_layer(&environment, 4)?;
+        write_layer(&cli, 5)?;
 
+        let runtime = load_config_runtime(
+            &root,
+            Some(&cli),
+            ConfigEnvironment {
+                colay_home: Some(root.join("home")),
+                user_home: None,
+                colay_config: Some(environment),
+            },
+        )?;
         assert_eq!(
-            select_config_path(None, &root, false)?,
-            root.join(".colay/config.toml")
+            runtime.effective.config().orchestrator.max_parallel_workers,
+            5
         );
+        Ok(())
+    }
 
+    fn write_layer(path: &Path, workers: u32) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            format!("config_version = 4\n[orchestrator]\nmax_parallel_workers = {workers}\n"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn init_writes_only_a_minimal_override() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let runtime = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
+
+        initialize(&root, &runtime, true)?;
+
+        let persisted = fs::read_to_string(root.join(".colay/config.toml"))?;
+        assert!(!persisted.contains("quota_limit"));
+        assert!(!persisted.contains("warning_threshold_percent"));
+        assert!(!persisted.to_ascii_lowercase().contains("credential"));
+        assert!(!persisted.to_ascii_lowercase().contains("api_key"));
+        assert!(!persisted.to_ascii_lowercase().contains("token"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_enable_adds_only_the_requested_boolean() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let environment = ConfigEnvironment::isolated();
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
+
+        set_provider_enabled(
+            &root,
+            None,
+            environment,
+            &runtime,
+            ProviderId::Codex,
+            true,
+            true,
+        )?;
+
+        let persisted = fs::read_to_string(&runtime.explicit_edit_path)?.parse::<DocumentMut>()?;
+        let provider = persisted["orchestrator"]["providers"]["codex"]
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("codex override is not a table"))?;
+        assert_eq!(provider.len(), 1);
+        assert_eq!(provider["enabled"].as_bool(), Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_provider_edit_preserves_global_comments() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let global = root.join("home/config.toml");
+        fs::create_dir_all(
+            global
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("global config has no parent"))?,
+        )?;
+        let original = "# retain this administrator comment\nconfig_version = 4\n[orchestrator]\nmax_parallel_workers = 7\n";
+        fs::write(&global, original)?;
+        let environment = ConfigEnvironment {
+            colay_home: Some(root.join("home")),
+            user_home: None,
+            colay_config: None,
+        };
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
+
+        set_provider_enabled(
+            &root,
+            None,
+            environment,
+            &runtime,
+            ProviderId::Claude,
+            false,
+            true,
+        )?;
+
+        assert_eq!(fs::read_to_string(global)?, original);
+        assert!(runtime.explicit_edit_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_edit_targets_the_environment_override() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let environment_path = root.join("environment.toml");
+        fs::write(
+            &environment_path,
+            "# environment comment\nconfig_version = 4\n",
+        )?;
+        let environment = ConfigEnvironment {
+            colay_home: None,
+            user_home: None,
+            colay_config: Some(environment_path.clone()),
+        };
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
+
+        set_provider_enabled(
+            &root,
+            None,
+            environment,
+            &runtime,
+            ProviderId::Gemini,
+            false,
+            true,
+        )?;
+
+        let persisted = fs::read_to_string(environment_path)?;
+        assert!(persisted.starts_with("# environment comment\n"));
+        assert!(persisted.contains("enabled = false"));
+        assert!(!root.join(".colay/config.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_full_config_can_enter_cli_migration() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let path = root.join("legacy-v3.toml");
+        let current = toml_edit::ser::to_string(&RootConfig::default())?;
+        fs::write(
+            &path,
+            current.replacen("config_version = 4", "config_version = 3", 1),
+        )?;
+        assert!(load_config_runtime(&root, Some(&path), ConfigEnvironment::isolated()).is_err());
+
+        super::migrate_without_runtime(&root, &path, MigrationAction::Status, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
         let legacy = root.join(".codex/orchestrator/config.toml");
-        fs::create_dir_all(legacy.parent().ok_or("legacy config has no parent")?)?;
-        fs::write(&legacy, b"legacy")?;
-        assert_eq!(select_config_path(None, &root, false)?, legacy);
-        assert!(select_config_path(None, &root, true).is_err());
+        write_layer(&legacy, 3)?;
+        let environment = ConfigEnvironment::isolated();
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
 
-        let current = root.join(".colay/config.toml");
-        fs::create_dir_all(current.parent().ok_or("current config has no parent")?)?;
-        fs::write(&current, b"current")?;
-        assert!(select_config_path(None, &root, false).is_err());
+        set_provider_enabled(
+            &root,
+            None,
+            environment,
+            &runtime,
+            ProviderId::Codex,
+            false,
+            true,
+        )?;
+
+        assert!(fs::read_to_string(&legacy)?.contains("enabled = false"));
+        assert!(!root.join(".colay/config.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_legacy_migration_targets_legacy_source() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let legacy = root.join(".codex/orchestrator/config.toml");
+        write_full_version(&legacy, 3)?;
+
         assert_eq!(
-            select_config_path(Some(Path::new(".colay/config.toml")), &root, false)?,
-            current
+            super::migration_fallback_path(&root, None, &ConfigEnvironment::isolated())?,
+            Some(legacy)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_does_not_bypass_current_legacy_conflict() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        write_full_version(&root.join(".colay/config.toml"), 3)?;
+        write_full_version(&root.join(".codex/orchestrator/config.toml"), 3)?;
+
+        assert!(
+            super::migration_fallback_path(&root, None, &ConfigEnvironment::isolated())?.is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_repository_config_resolves_migration_conflict() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let current = root.join(".colay/config.toml");
+        let legacy = root.join(".codex/orchestrator/config.toml");
+        write_full_version(&current, 3)?;
+        write_full_version(&legacy, 3)?;
+
+        assert_eq!(
+            super::migration_fallback_path(&root, Some(&current), &ConfigEnvironment::isolated())?,
+            Some(current)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_does_not_bypass_invalid_global_layer() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let global = root.join("home/config.toml");
+        fs::create_dir_all(
+            global
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("no global parent"))?,
+        )?;
+        fs::write(&global, "not valid toml = [")?;
+        write_full_version(&root.join(".colay/config.toml"), 3)?;
+        let environment = ConfigEnvironment {
+            colay_home: Some(root.join("home")),
+            user_home: None,
+            colay_config: None,
+        };
+
+        let Err(error) = super::migration_fallback_path(&root, None, &environment) else {
+            anyhow::bail!("invalid global layer did not fail closed");
+        };
+        assert!(error.to_string().contains("global config layer"));
+        Ok(())
+    }
+
+    fn write_full_version(path: &Path, version: u32) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let current = toml_edit::ser::to_string(&RootConfig::default())?;
+        fs::write(
+            path,
+            current.replacen(
+                "config_version = 4",
+                &format!("config_version = {version}"),
+                1,
+            ),
+        )?;
         Ok(())
     }
 
@@ -6175,21 +7011,344 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rollback_relative_codex_target_matches_persisted_writable_worker_worktree() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let repository = fs::canonicalize(temporary.path())?;
+        let state = test_state(repository.join(".colay"));
+        let worktree = state.worktrees.join("writable-worker");
+        let configured = PathBuf::from("tools/fake-provider.exe");
+        let repository_executable = repository.join(&configured);
+        let worktree_executable = worktree.join(&configured);
+        for (path, bytes) in [
+            (&repository_executable, b"repository fake".as_slice()),
+            (&worktree_executable, b"worktree fake".as_slice()),
+        ] {
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("fake executable has no parent"))?,
+            )?;
+            write_fake_executable(path, bytes)?;
+        }
+
+        let database = Database::open(&state.database)?;
+        database.migrate_with_backup(&state.backups)?;
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("writable fake provider", "writable fake provider", now);
+        database.create_task(&NewTaskRecord {
+            task_id: envelope.task_id,
+            schema_version: envelope.schema_version.to_string(),
+            state: TaskState::Completed,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope: &envelope,
+            created_at: now,
+        })?;
+        let attempt_id = AttemptId::new();
+        let worker_result = WorkerResult {
+            schema_version: SchemaVersion::v1(),
+            task_id: envelope.task_id,
+            attempt_id,
+            provider: ProviderId::Codex,
+            outcome: WorkerOutcome::Succeeded,
+            exit_code: Some(0),
+            session_id: None,
+            summary: None,
+            commands: Vec::new(),
+            tests: Vec::new(),
+            started_at: now,
+            finished_at: now,
+            output_truncated: false,
+        };
+        let mut persisted = serde_json::to_value(&worker_result)?;
+        persisted["process_execution"] = serde_json::json!({
+            "configured": configured,
+            "path": fs::canonicalize(&worktree_executable)?,
+            "kind": "native",
+            "validation": {
+                "working_directory": fs::canonicalize(&worktree)?,
+                "search_directory": null
+            }
+        });
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO worktrees(
+                    worktree_id, task_id, repo_root, worktree_path, branch_name,
+                    base_revision, state, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'codex/test', 'base', 'active', ?5)",
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    envelope.task_id.to_string(),
+                    repository.to_string_lossy(),
+                    worktree.to_string_lossy(),
+                    now.to_rfc3339(),
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO task_attempts(
+                    attempt_id, task_id, ordinal, provider_id, worker_mode, started_at,
+                    ended_at, outcome, worker_result_json
+                 ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3, ?3, 'succeeded', ?4)",
+                params![
+                    attempt_id.to_string(),
+                    envelope.task_id.to_string(),
+                    now.to_rfc3339(),
+                    persisted.to_string(),
+                ],
+            )?;
+            Ok(())
+        })?;
+
+        let mut config = RootConfig::default();
+        config
+            .orchestrator
+            .providers
+            .codex
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("default Codex provider is missing"))?
+            .executable = "tools/changed-after-attempt.exe".to_owned();
+        let changed_executable = worktree.join("tools/changed-after-attempt.exe");
+        write_fake_executable(&changed_executable, b"changed fake")?;
+        let release_root = state.backups.join("releases/fake-v1");
+        fs::create_dir_all(&release_root)?;
+        fs::write(release_root.join("fake-provider.backup"), b"rollback fake")?;
+        let steps = vec![RollbackManifestStep {
+            component: "codex".to_owned(),
+            backup_source: PathBuf::from("fake-provider.backup"),
+            destination: configured.clone(),
+        }];
+        let context = rollback_resolution_context(&repository, &state, &config, &steps)?;
+        let planned = trusted_rollback_steps(
+            &repository,
+            &repository.join(".colay/config.toml"),
+            &state,
+            &config,
+            &context,
+            &release_root,
+            steps,
+        )?;
+        let trusted = planned
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("rollback planning omitted Codex step"))?
+            .destination
+            .clone();
+
+        let actual_worker = resolve_executable(
+            &configured,
+            &EnvironmentPolicy::default().executable_search(&worktree),
+        )?;
+        assert_eq!(trusted, fs::canonicalize(actual_worker.path)?);
+        assert_ne!(trusted, fs::canonicalize(&repository_executable)?);
+
+        let path_a = worktree.join("path-a");
+        let path_b = worktree.join("path-b");
+        fs::create_dir_all(&path_a)?;
+        fs::create_dir_all(&path_b)?;
+        let bare = PathBuf::from("fake-path-provider");
+        #[cfg(windows)]
+        let filename = "fake-path-provider.exe";
+        #[cfg(not(windows))]
+        let filename = "fake-path-provider";
+        let executable_a = path_a.join(filename);
+        let executable_b = path_b.join(filename);
+        write_fake_executable(&executable_a, b"path A fake")?;
+        write_fake_executable(&executable_b, b"path B fake")?;
+        let mut attempt_environment = EnvironmentPolicy::empty();
+        attempt_environment.set("PATH", std::env::join_paths([&path_a])?)?;
+        #[cfg(windows)]
+        attempt_environment.set("PATHEXT", ".EXE")?;
+        let attempt_execution =
+            resolve_executable(&bare, &attempt_environment.executable_search(&worktree))?;
+        let mut current_environment = EnvironmentPolicy::empty();
+        current_environment.set("PATH", std::env::join_paths([&path_b])?)?;
+        #[cfg(windows)]
+        current_environment.set("PATHEXT", ".EXE")?;
+        let current_resolution =
+            resolve_executable(&bare, &current_environment.executable_search(&worktree))?;
+        assert_eq!(current_resolution.path, fs::canonicalize(&executable_b)?);
+
+        let mut path_persisted = serde_json::to_value(&worker_result)?;
+        path_persisted["process_execution"] = serde_json::to_value(&attempt_execution)?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![path_persisted.to_string(), attempt_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        config
+            .orchestrator
+            .providers
+            .codex
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("default Codex provider is missing"))?
+            .executable = bare.to_string_lossy().into_owned();
+        let path_steps = vec![RollbackManifestStep {
+            component: "codex".to_owned(),
+            backup_source: PathBuf::from("fake-provider.backup"),
+            destination: PathBuf::from("path-a").join(filename),
+        }];
+        let path_context = rollback_resolution_context(&repository, &state, &config, &path_steps)?;
+        let path_plan = trusted_rollback_steps(
+            &repository,
+            &repository.join(".colay/config.toml"),
+            &state,
+            &config,
+            &path_context,
+            &release_root,
+            path_steps,
+        )?;
+        assert_eq!(path_plan[0].destination, fs::canonicalize(&executable_a)?);
+        assert_ne!(path_plan[0].destination, current_resolution.path);
+
+        let mut mismatched = path_persisted;
+        mismatched["process_execution"]["path"] =
+            serde_json::to_value(fs::canonicalize(&executable_b)?)?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![mismatched.to_string(), attempt_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        let mismatched_result = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: PathBuf::from("path-a").join(filename),
+            }],
+        );
+        let Err(error) = mismatched_result else {
+            anyhow::bail!("mismatched process execution evidence authorized rollback");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("invalid process execution evidence")
+        );
+
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![
+                    serde_json::to_string(&worker_result)?,
+                    attempt_id.to_string()
+                ],
+            )?;
+            Ok(())
+        })?;
+        let legacy_result = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: configured.clone(),
+            }],
+        );
+        let Err(error) = legacy_result else {
+            anyhow::bail!("legacy worker result authorized executable rollback");
+        };
+        assert!(error.to_string().contains("process execution evidence"));
+
+        let mut relative_persisted = serde_json::to_value(&worker_result)?;
+        relative_persisted["process_execution"] = serde_json::json!({
+            "configured": configured,
+            "path": fs::canonicalize(&worktree_executable)?,
+            "kind": "native",
+            "validation": {
+                "working_directory": fs::canonicalize(&worktree)?,
+                "search_directory": null
+            }
+        });
+        let other_worktree = state.worktrees.join("other-writable-worker");
+        fs::create_dir_all(&other_worktree)?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![relative_persisted.to_string(), attempt_id.to_string()],
+            )?;
+            connection.execute(
+                "UPDATE worktrees SET worktree_path = ?1 WHERE task_id = ?2 AND state = 'active'",
+                params![
+                    other_worktree.to_string_lossy(),
+                    envelope.task_id.to_string()
+                ],
+            )?;
+            Ok(())
+        })?;
+        let relative_mismatch = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: configured.clone(),
+            }],
+        );
+        let Err(error) = relative_mismatch else {
+            anyhow::bail!("relative identity bypassed its trusted active worktree");
+        };
+        assert!(error.to_string().contains("trusted worktree"));
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE worktrees SET worktree_path = ?1 WHERE task_id = ?2 AND state = 'active'",
+                params![worktree.to_string_lossy(), envelope.task_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+
+        let mut absolute_persisted = serde_json::to_value(&worker_result)?;
+        absolute_persisted["process_execution"] = serde_json::json!({
+            "configured": fs::canonicalize(&repository_executable)?,
+            "path": fs::canonicalize(&repository_executable)?,
+            "kind": "native",
+            "validation": {
+                "working_directory": fs::canonicalize(&worktree)?,
+                "search_directory": null
+            }
+        });
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![absolute_persisted.to_string(), attempt_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        fs::remove_dir_all(&worktree)?;
+
+        let absolute_context = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: repository_executable.clone(),
+            }],
+        )?;
+        assert_eq!(
+            absolute_context
+                .codex_execution
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("absolute execution identity was omitted"))?
+                .path,
+            fs::canonicalize(repository_executable)?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unconfirmed_process_tree_blocks_task_and_redacts_audit_detail()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let temporary_root = fs::canonicalize(temporary.path())?;
-        let root = temporary_root.join("state");
-        let state = StatePaths {
-            database: root.join("orchestrator.db"),
-            events: root.join("events.jsonl"),
-            backups: root.join("backups"),
-            tasks: root.join("tasks"),
-            checkpoints: root.join("checkpoints"),
-            handovers: root.join("handovers"),
-            worktrees: root.join("worktrees"),
-            root,
-        };
+        let state = test_state(temporary_root.join("state"));
         let database = Database::open(&state.database)?;
         database.migrate_with_backup(&state.backups)?;
         let now = Utc::now();

@@ -1,0 +1,333 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  COLAY_TEST_FAKE_PROVIDERS_ONLY: "1"
+  CODEX_API_KEY: ""
+  OPENAI_API_KEY: ""
+  ANTHROPIC_API_KEY: ""
+  GEMINI_API_KEY: ""
+
+jobs:
+  classify:
+    runs-on: ubuntu-22.04
+    outputs:
+      channel: ${{ steps.metadata.outputs.channel }}
+      version: ${{ steps.metadata.outputs.version }}
+      dist_tag: ${{ steps.metadata.outputs.dist_tag }}
+      github_mode: ${{ steps.metadata.outputs.github_mode }}
+      retention_days: ${{ steps.metadata.outputs.retention_days }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.14.0
+          cache: ""
+      - name: Verify release inputs without provider credentials
+        run: |
+          npm test
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+      - id: metadata
+        name: Classify immutable release version
+        run: |
+          node scripts/release/metadata.mjs --github-output "$GITHUB_OUTPUT"
+          if ! grep -q '^retention_days=[0-9]' "$GITHUB_OUTPUT"; then
+            echo 'retention_days=90' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: classify
+    runs-on: ${{ matrix.os }}
+    env:
+      COLAY_BUILD_VERSION: ${{ needs.classify.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            package_name: "@kimohy/colay-win32-x64"
+            executable: colay.exe
+            archive_kind: zip
+          - os: macos-15
+            target: aarch64-apple-darwin
+            package_name: "@kimohy/colay-darwin-arm64"
+            executable: colay
+            archive_kind: tar.gz
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            package_name: "@kimohy/colay-linux-x64"
+            executable: colay
+            archive_kind: tar.gz
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.14.0
+          cache: ""
+      - name: Install Linux musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Build the native Colay binary
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --locked --release --target "${{ matrix.target }}" --bin colay
+      - name: Assert the embedded release version
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected version: ' + output);" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+      - name: Assert the embedded release version on Windows
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected version: ' + output);" "target/${{ matrix.target }}/release/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+      - name: Package Windows archive and descriptor
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force native | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "native/${{ matrix.executable }}"
+          Copy-Item LICENSE native/LICENSE
+          $archive = "colay-v${{ needs.classify.outputs.version }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "native/${{ matrix.executable }}", 'native/LICENSE' -DestinationPath "native/$archive" -CompressionLevel Optimal
+          $digest = (Get-FileHash -Algorithm SHA256 "native/$archive").Hash.ToLowerInvariant()
+          New-Item -ItemType Directory -Force archive-check | Out-Null
+          Expand-Archive -Path "native/$archive" -DestinationPath archive-check
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+          if ((Get-FileHash -Algorithm SHA256 "native/$archive").Hash.ToLowerInvariant() -ne $digest) { throw 'archive checksum changed after verification' }
+          node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
+      - name: Package macOS archive and descriptor
+        shell: bash
+        if: runner.os == 'macOS'
+        run: |
+          mkdir native
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "native/${{ matrix.executable }}"
+          cp LICENSE native/LICENSE
+          archive="colay-v${{ needs.classify.outputs.version }}-${{ matrix.target }}.tar.gz"
+          tar -czf "native/$archive" -C native "${{ matrix.executable }}" LICENSE
+          digest="$(shasum -a 256 "native/$archive" | awk '{print $1}')"
+          mkdir archive-check
+          tar -xzf "native/$archive" -C archive-check
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+          test "$digest" = "$(shasum -a 256 "native/$archive" | awk '{print $1}')"
+          node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
+      - name: Package Linux archive and descriptor
+        shell: bash
+        if: runner.os == 'Linux'
+        run: |
+          mkdir native
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "native/${{ matrix.executable }}"
+          cp LICENSE native/LICENSE
+          archive="colay-v${{ needs.classify.outputs.version }}-${{ matrix.target }}.tar.gz"
+          tar -czf "native/$archive" -C native "${{ matrix.executable }}" LICENSE
+          digest="$(sha256sum "native/$archive" | awk '{print $1}')"
+          mkdir archive-check
+          tar -xzf "native/$archive" -C archive-check
+          node -e "const { execFileSync } = require('node:child_process'); const [binary, version] = process.argv.slice(1); const output = execFileSync(binary, ['--version'], { encoding: 'utf8' }).trim(); if (output !== 'colay ' + version) throw new Error('unexpected archived version: ' + output);" "archive-check/${{ matrix.executable }}" "${{ needs.classify.outputs.version }}"
+          test "$digest" = "$(sha256sum "native/$archive" | awk '{print $1}')"
+          node -e "const fs = require('node:fs'); const [target, packageName, binary, archive, digest] = process.argv.slice(1); fs.writeFileSync('native/native-descriptor.json', JSON.stringify({ target, package_name: packageName, binary_path: binary, archive_path: archive, archive_sha256: digest }) + '\n');" "${{ matrix.target }}" "${{ matrix.package_name }}" "${{ matrix.executable }}" "$archive" "$digest"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.target }}
+          path: native
+          retention-days: ${{ needs.classify.outputs.retention_days }}
+          if-no-files-found: error
+
+  validate:
+    needs: [classify, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.14.0
+          cache: ""
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: native-x86_64-pc-windows-msvc
+          path: artifacts/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: native-aarch64-apple-darwin
+          path: artifacts/aarch64-apple-darwin
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: native-x86_64-unknown-linux-musl
+          path: artifacts/x86_64-unknown-linux-musl
+      - name: Stage and validate the immutable release bundle
+        run: |
+          node scripts/release/stage.mjs \
+            --output dist \
+            --channel "${{ needs.classify.outputs.channel }}" \
+            --version "${{ needs.classify.outputs.version }}" \
+            --source-commit "${{ github.sha }}" \
+            --native-descriptor artifacts/x86_64-pc-windows-msvc/native-descriptor.json \
+            --native-descriptor artifacts/aarch64-apple-darwin/native-descriptor.json \
+            --native-descriptor artifacts/x86_64-unknown-linux-musl/native-descriptor.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ needs.classify.outputs.version }}
+          path: |
+            dist/release
+            dist/tarballs
+          retention-days: ${{ needs.classify.outputs.retention_days }}
+          if-no-files-found: error
+
+  smoke:
+    needs: [classify, validate]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            package_name: "@kimohy/colay-win32-x64"
+          - os: macos-15
+            package_name: "@kimohy/colay-darwin-arm64"
+          - os: ubuntu-22.04
+            package_name: "@kimohy/colay-linux-x64"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.14.0
+          cache: ""
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: release-${{ needs.classify.outputs.version }}
+          path: dist
+      - name: Smoke test the selected native npm package
+        run: node scripts/release/smoke.mjs --tarballs-dir dist/tarballs --prefix "${{ runner.temp }}/colay-smoke" --package-name "${{ matrix.package_name }}" --version "${{ needs.classify.outputs.version }}"
+
+  attest:
+    needs: [classify, validate, smoke]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: release-${{ needs.classify.outputs.version }}
+          path: dist
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+        with:
+          subject-path: |
+            dist/release/colay-v${{ needs.classify.outputs.version }}-x86_64-pc-windows-msvc.zip
+            dist/release/colay-v${{ needs.classify.outputs.version }}-aarch64-apple-darwin.tar.gz
+            dist/release/colay-v${{ needs.classify.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
+            dist/release/SHA256SUMS
+            dist/release/release-manifest.json
+            dist/tarballs/*.tgz
+
+  publish-npm:
+    needs: [classify, validate, smoke, attest]
+    runs-on: ubuntu-22.04
+    environment: npm-${{ needs.classify.outputs.channel }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.14.0
+          cache: ""
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: release-${{ needs.classify.outputs.version }}
+          path: dist
+      - name: Install npm Trusted Publishing client
+        run: npm install --global npm@11.18.0
+      - name: Publish immutable packages in native-first order
+        run: |
+          node scripts/release/publish.mjs \
+            --tarballs-dir dist/tarballs \
+            --version "${{ needs.classify.outputs.version }}" \
+            --dist-tag "${{ needs.classify.outputs.dist_tag }}"
+
+  publish-github:
+    needs: [classify, validate, smoke, attest]
+    if: needs.classify.outputs.github_mode != 'artifact'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          name: release-${{ needs.classify.outputs.version }}
+          path: dist
+      - name: Generate release notes from the validated manifest
+        run: |
+          node scripts/release/notes.mjs --manifest dist/release/release-manifest.json --release-guide docs/release.md --output dist/release/RELEASE_NOTES.md
+      - name: Create or immutably reconcile GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(dist/release/colay-v* dist/release/SHA256SUMS dist/release/release-manifest.json)
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            prerelease=()
+            if [ "${{ needs.classify.outputs.github_mode }}" = prerelease ]; then
+              prerelease=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --notes-file dist/release/RELEASE_NOTES.md "${prerelease[@]}"
+            exit 0
+          fi
+          release_json="$(gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease,body)"
+          node -e "const fs = require('node:fs'); const [json, tag, mode, notesPath] = process.argv.slice(1); const release = JSON.parse(json); const notes = fs.readFileSync(notesPath, 'utf8'); if (release.tagName !== tag || release.isDraft !== false || release.isPrerelease !== (mode === 'prerelease') || release.body !== notes) throw new Error('existing GitHub release metadata does not match the immutable release contract');" "$release_json" "$GITHUB_REF_NAME" "${{ needs.classify.outputs.github_mode }}" dist/release/RELEASE_NOTES.md
+          remote_dir="$(mktemp -d)"
+          asset_count="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')"
+          if [ "$asset_count" -gt 0 ]; then
+            gh release download "$GITHUB_REF_NAME" --dir "$remote_dir"
+          fi
+          shopt -s nullglob
+          remote_assets=("$remote_dir"/*)
+          for remote_asset in "${remote_assets[@]}"; do
+            asset_name="$(basename "$remote_asset")"
+            if [ ! -f "dist/release/$asset_name" ]; then
+              echo "unexpected immutable remote release asset: $asset_name" >&2
+              exit 1
+            fi
+          done
+          for local_asset in "${assets[@]}"; do
+            asset_name="$(basename "$local_asset")"
+            remote_asset="$remote_dir/$asset_name"
+            if [ -f "$remote_asset" ]; then
+              test "$(sha256sum "$local_asset" | awk '{print $1}')" = "$(sha256sum "$remote_asset" | awk '{print $1}')"
+            else
+              gh release upload "$GITHUB_REF_NAME" "$local_asset"
+            fi
+          done

@@ -1,16 +1,16 @@
-supported_min = "0.144.4"
-tested_versions = ["0.144.4", "0.144.5"]
-recommended = "0.144.5"
-pinned_revision = "87db9bc18ba5bc82c1cb4e4381b44f693ee35623"
+supported_min = "0.144.5"
+tested_versions = ["0.144.5", "0.144.6"]
+recommended = "0.144.6"
+pinned_revision = "5d1fbf26c43abc65a203928b2e31561cb039e06d"
+
+[[versions]]
+version = "0.144.6"
+status = "supported"
+fixture = "fixtures/codex/versions/0.144.6"
+revision = "5d1fbf26c43abc65a203928b2e31561cb039e06d"
 
 [[versions]]
 version = "0.144.5"
 status = "supported"
 fixture = "fixtures/codex/versions/0.144.5"
 revision = "87db9bc18ba5bc82c1cb4e4381b44f693ee35623"
-
-[[versions]]
-version = "0.144.4"
-status = "supported"
-fixture = "fixtures/codex/versions/0.144.4"
-revision = "8c68d4c87dc54d38861f5114e920c3de2efa5876"

@@ -1,5 +1,30 @@
 # Colay
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+## Install
+
+Requires Node.js 22 or newer. Install the stable channel (the default) with:
+
+```text
+npm install --global @kimohy/colay
+colay --version
+```
+
+Beta and nightly channels are available when you explicitly opt in:
+
+```text
+npm install --global @kimohy/colay@beta
+npm install --global @kimohy/colay@nightly
+```
+
+Colay currently supports Windows x64, macOS Apple Silicon (ARM64), and Linux
+x64. The Linux x64 package contains a musl-linked binary and deliberately has
+no npm `libc` selector, so it can install on both musl and glibc Linux hosts.
+For beta and stable builds without Node.js, download the matching archive from
+[GitHub Releases](https://github.com/kimohy/colay/releases). Nightly workflow
+artifacts expire after 14 days; npm is the normal way to install a nightly.
+
 Colay is a local-first enterprise orchestrator for approved Codex CLI, Claude Code, and Gemini CLI installations. It selects a provider and logical model profile, records why it made that decision, preserves work in isolated Git worktrees, and can resume from a vendor-neutral checkpoint after a provider becomes unavailable.
 
 The orchestrator never rotates identities, bypasses quotas, scrapes usage pages, extracts credentials, purchases credits, or calls unofficial provider endpoints. Provider inference is performed only by the official CLIs with their existing authenticated state. Tests use fake binaries and consume no provider credit.
@@ -33,4 +58,20 @@ colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity
 colay tui [task-id]
 ```
 
-Configuration is local to the repository at `.colay/config.toml`. Start from [`config.example.toml`](config.example.toml). A legacy `.codex/orchestrator/config.toml` is discovered without moving its state; if both locations exist, Colay fails closed until an administrator selects one with `--config`. See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.
+## Configuration
+
+Colay resolves versioned TOML configuration in this order, with later layers overriding earlier ones:
+
+```text
+compiled defaults
+< $COLAY_HOME/config.toml
+< <repository>/.colay/config.toml
+< $COLAY_CONFIG
+< --config
+```
+
+`COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Configuration files are partial overrides: tables merge by key, while arrays replace the lower-precedence array rather than concatenate. Every loaded file must declare the supported `config_version`. Absent automatic layers are ignored, but normal runtime commands fail when an explicitly selected `$COLAY_CONFIG` or `--config` file is missing. `init` is the creation-path exception: it treats a missing explicit selector as the destination for its new minimal override.
+
+Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely. Other read-only commands do not create repository state, but the first `run`—including `run --plan-only`—initializes and persists repository state. Start from [`config.example.toml`](config.example.toml).
+
+See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.

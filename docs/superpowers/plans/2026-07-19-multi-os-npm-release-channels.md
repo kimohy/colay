@@ -14,7 +14,7 @@
 - Support exactly Windows x64 (`x86_64-pc-windows-msvc`), macOS ARM64 (`aarch64-apple-darwin`), and Linux x64 musl (`x86_64-unknown-linux-musl`).
 - Support Node.js 22 or newer and use no npm runtime dependencies other than exact-version optional native packages.
 - `main` publishes `nightly`; `vX.Y.Z-beta.N` publishes `beta`; `vX.Y.Z` publishes `latest`.
-- Nightly versions use `X.Y.Z-nightly.YYYYMMDD.{7-char-sha}` and never modify checked-in versions.
+- Nightly versions use `X.Y.Z-nightly.YYYYMMDD.{7-char-sha}` and never modify checked-in versions. If the first seven SHA characters are all decimal digits, prefix that identifier with `g` (for example, `g0123456`) so the commit-derived identifier is non-numeric and never creates a leading-zero numeric SemVer identifier.
 - All Rust crates, npm packages, archives, README metadata, and release metadata use Apache-2.0.
 - Do not add lifecycle download scripts, shell-constructed provider commands, external telemetry, provider credentials, code signing, auto-update behavior, or unsupported platform packages.
 - All provider tests use `orchestrator-test-support` fake binaries; release smoke tests may invoke only `colay --version`.
@@ -163,7 +163,7 @@ Create each native manifest with the same description/repository/homepage/bugs/l
 ```json
 { "name": "@kimohy/colay-win32-x64", "os": ["win32"], "cpu": ["x64"], "binary": "bin/colay.exe" }
 { "name": "@kimohy/colay-darwin-arm64", "os": ["darwin"], "cpu": ["arm64"], "binary": "bin/colay" }
-{ "name": "@kimohy/colay-linux-x64", "os": ["linux"], "cpu": ["x64"], "libc": ["musl"], "binary": "bin/colay" }
+{ "name": "@kimohy/colay-linux-x64", "os": ["linux"], "cpu": ["x64"], "binary": "bin/colay" }
 ```
 
 The shown `binary` field is package metadata used by the staging script; every native manifest must also contain `"version": "0.1.0"`, `"files": ["bin", "LICENSE"]`, and `"publishConfig": { "access": "public" }`. Do not add registry dependencies or a lockfile: all developer tests use Node built-ins and release packages are packed independently. Add `/dist/` to `.gitignore`.
@@ -630,7 +630,7 @@ assert.match(workflow, /branches:\s*\[main\]/);
 assert.match(workflow, /tags:\s*\["v\*\.\*\.\*"\]/);
 assert.match(workflow, /permissions:\s*\n\s*contents: read/);
 assert.match(workflow, /windows-2022/);
-assert.match(workflow, /macos-14/);
+assert.match(workflow, /macos-15/);
 assert.match(workflow, /ubuntu-22\.04/);
 assert.match(workflow, /x86_64-pc-windows-msvc/);
 assert.match(workflow, /aarch64-apple-darwin/);
@@ -648,7 +648,7 @@ actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
 actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
 actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
 actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
-actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
 ```
 
 Also assert `publish-npm` depends on `smoke` and `attest`, `publish-github` excludes nightly, provider credential variables are empty, and the workflow never contains the invocation patterns `codex exec`, `claude `, or `gemini `, nor the strings `npm_token`, `--clobber`, `git push`, or `gh pr`.
@@ -700,7 +700,7 @@ strategy:
         target: x86_64-pc-windows-msvc
         executable: colay.exe
         archive_kind: zip
-      - os: macos-14
+      - os: macos-15
         target: aarch64-apple-darwin
         executable: colay
         archive_kind: tar.gz
@@ -752,7 +752,7 @@ permissions:
   attestations: write
 ```
 
-Invoke `actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661` once with `subject-path` containing the three archives, `SHA256SUMS`, `release-manifest.json`, and four npm tarballs.
+Invoke `actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32` once with `subject-path` containing the three archives, `SHA256SUMS`, `release-manifest.json`, and four npm tarballs.
 
 The `publish-npm` job depends on `classify`, `validate`, `smoke`, and `attest`; uses `environment: npm-${{ needs.classify.outputs.channel }}`; grants `contents: read` and `id-token: write`; sets up exact Node `22.14.0` with registry URL `https://registry.npmjs.org` and package-manager caching disabled; installs exact `npm@11.18.0`; and runs:
 

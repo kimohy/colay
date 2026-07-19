@@ -77,13 +77,15 @@ uses npm `os` and `cpu` metadata so npm installs only the matching artifact:
 | npm package | npm OS/CPU | Rust target | Release runner |
 |---|---|---|---|
 | `@kimohy/colay-win32-x64` | `win32` / `x64` | `x86_64-pc-windows-msvc` | `windows-2022` |
-| `@kimohy/colay-darwin-arm64` | `darwin` / `arm64` | `aarch64-apple-darwin` | `macos-14` |
+| `@kimohy/colay-darwin-arm64` | `darwin` / `arm64` | `aarch64-apple-darwin` | `macos-15` |
 | `@kimohy/colay-linux-x64` | `linux` / `x64` | `x86_64-unknown-linux-musl` | `ubuntu-22.04` |
 
 The Linux binary uses musl so the initial Linux x64 artifact is independent of
-a distribution's glibc version. The implementation must prove that the current
-bundled SQLite and process dependencies build and run on this target before the
-target is considered supported.
+a distribution's glibc version. Its npm package deliberately declares no
+`libc` selector: the musl-linked binary must remain installable on both musl and
+glibc Linux hosts. The implementation must prove that the current bundled
+SQLite and process dependencies build and run on this target before the target
+is considered supported.
 
 The CommonJS launcher maps `process.platform` and `process.arch` to one native
 package, resolves only that package's known binary path, and starts it with the
@@ -125,6 +127,10 @@ The generated nightly version is embedded in the Rust binary so `colay
 metadata agree. A beta or stable tag is accepted only when its version exactly
 matches the Rust workspace version and the checked-in npm package template
 version. A tag outside the two documented patterns is not a release event.
+If the first seven SHA characters are all decimal digits, the generated nightly
+identifier prefixes them with `g` (for example, `g0123456`) so it is a valid
+non-numeric SemVer identifier. Otherwise it uses the seven lowercase hexadecimal
+characters unchanged.
 
 User-facing channel commands are:
 

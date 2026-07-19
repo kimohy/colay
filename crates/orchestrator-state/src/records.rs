@@ -1737,8 +1737,55 @@ mod tests {
 
     use crate::{
         ArtifactStore, ClaimedControlRecoveryPolicy, ControlAction, ControlRecoveryDisposition,
-        Database, NewTaskRecord, RoutingAuditRecord, TaskListFilter,
+        Database, NewTaskRecord, RoutingAuditRecord, StoredTaskAttempt, TaskListFilter,
     };
+
+    #[test]
+    fn augmented_attempt_record_preserves_worker_result_v1_decoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let task_id = TaskId::new();
+        let attempt_id = AttemptId::new();
+        let worker_result = WorkerResult {
+            schema_version: SchemaVersion::v1(),
+            task_id,
+            attempt_id,
+            provider: ProviderId::Codex,
+            outcome: WorkerOutcome::Succeeded,
+            exit_code: Some(0),
+            session_id: None,
+            summary: Some("complete".to_owned()),
+            commands: Vec::new(),
+            tests: Vec::new(),
+            started_at: now,
+            finished_at: now,
+            output_truncated: false,
+        };
+        let mut persisted = serde_json::to_value(&worker_result)?;
+        persisted["process_execution"] = json!({
+            "configured": "tools/fake-provider.exe",
+            "path": "C:/worktree/tools/fake-provider.exe",
+            "kind": "native",
+            "validation": {
+                "working_directory": "C:/worktree",
+                "search_directory": null
+            }
+        });
+        let stored = StoredTaskAttempt {
+            attempt_id,
+            task_id,
+            ordinal: 1,
+            provider: Some(ProviderId::Codex),
+            worker_mode: Some("workspace_write".to_owned()),
+            started_at: now,
+            ended_at: Some(now),
+            outcome: Some("succeeded".to_owned()),
+            worker_result: Some(persisted),
+        };
+
+        assert_eq!(stored.decoded_worker_result()?, Some(worker_result));
+        Ok(())
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
