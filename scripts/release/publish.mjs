@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFilePromise = promisify(execFile);
@@ -100,7 +101,45 @@ async function loadPackRecords(tarballsDir, version) {
   } catch {
     fail("could not read npm-pack.json");
   }
-  return validatePackRecords(records, version);
+  return validateTarballs(tarballsDir, validatePackRecords(records, version));
+}
+
+function isContained(root, candidate) {
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot !== "" && !pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot);
+}
+
+async function validateTarballs(tarballsDir, records) {
+  const lexicalRoot = resolve(tarballsDir);
+  let realRoot;
+  try {
+    realRoot = await realpath(lexicalRoot);
+    if (!(await lstat(realRoot)).isDirectory()) fail("tarballsDir must be a directory");
+  } catch (error) {
+    if (error?.message?.startsWith("Invalid npm publication:")) throw error;
+    fail("could not resolve tarballsDir");
+  }
+
+  const validated = new Map();
+  for (const record of records.values()) {
+    const lexicalTarball = resolve(lexicalRoot, record.filename);
+    if (!isContained(lexicalRoot, lexicalTarball)) fail(`tarball path escapes tarballsDir for ${record.name}`);
+    let stat;
+    let realTarball;
+    try {
+      stat = await lstat(lexicalTarball);
+      if (!stat.isFile() || stat.isSymbolicLink()) fail(`tarball must be a regular non-symlink file for ${record.name}`);
+      realTarball = await realpath(lexicalTarball);
+    } catch (error) {
+      if (error?.message?.startsWith("Invalid npm publication:")) throw error;
+      fail(`could not read tarball for ${record.name}`);
+    }
+    if (!isContained(realRoot, realTarball)) fail(`tarball realpath escapes tarballsDir for ${record.name}`);
+    const actualIntegrity = `sha512-${createHash("sha512").update(await readFile(realTarball)).digest("base64")}`;
+    if (actualIntegrity !== record.integrity) fail(`tarball integrity mismatch for ${record.name}`);
+    validated.set(record.name, Object.freeze({ ...record, tarballPath: realTarball }));
+  }
+  return validated;
 }
 
 async function defaultRetryDelay() {
@@ -126,7 +165,7 @@ async function waitForIntegrity({ npmClient, name, version, integrity, retryDela
   fail(`${name}@${version} did not become visible with the published integrity after six retries`);
 }
 
-async function verifyOrPublish({ npmClient, record, tarballsDir, tag, retryDelay }) {
+async function verifyOrPublish({ npmClient, record, tag, retryDelay }) {
   const existing = await npmClient.viewIntegrity(record.name, record.version);
   if (existing !== undefined && existing !== null) {
     if (existing !== record.integrity) {
@@ -135,7 +174,7 @@ async function verifyOrPublish({ npmClient, record, tarballsDir, tag, retryDelay
     return "existing";
   }
 
-  const published = await npmClient.publish(join(tarballsDir, record.filename), tag);
+  const published = await npmClient.publish(record.tarballPath, tag);
   // Test clients may return the registry's exact immutable integrity directly.
   // npm itself returns no machine-readable integrity here, so production performs
   // the explicit public-registry visibility check below.
@@ -149,16 +188,22 @@ async function verifyOrPublish({ npmClient, record, tarballsDir, tag, retryDelay
   return "published";
 }
 
-async function requireRootChannel({ npmClient, version, distTag, retryDelay }) {
+function manualRecoveryMessage({ version, distTag, channelVersion = undefined }) {
+  const current = channelVersion === undefined || channelVersion === null ? "is not currently visible" : `currently ${channelVersion}`;
+  return `root package ${ROOT_PACKAGE}@${version} is not the ${distTag} channel target (${current}). Recover manually with: npm dist-tag add ${ROOT_PACKAGE}@${version} ${distTag}`;
+}
+
+async function requireRootChannel({ npmClient, version, distTag, rootState, retryDelay }) {
   for (let attempt = 0; attempt < VISIBILITY_ATTEMPTS; attempt += 1) {
     const channelVersion = await npmClient.viewChannelVersion(ROOT_PACKAGE, distTag);
     if (channelVersion === version) return;
-    if (channelVersion !== undefined && channelVersion !== null) {
-      fail(`root package ${ROOT_PACKAGE}@${version} is not the ${distTag} channel target (currently ${channelVersion}). Recover manually with: npm dist-tag add ${ROOT_PACKAGE}@${version} ${distTag}`);
+    if (rootState === "existing" && channelVersion !== undefined && channelVersion !== null) {
+      fail(manualRecoveryMessage({ version, distTag, channelVersion }));
     }
     if (attempt + 1 < VISIBILITY_ATTEMPTS) await retryDelay();
   }
-  fail(`${ROOT_PACKAGE}@${version} did not become the ${distTag} channel target after six retries`);
+  if (rootState === "existing") fail(manualRecoveryMessage({ version, distTag }));
+  fail(`newly published root package ${ROOT_PACKAGE}@${version} did not become the ${distTag} channel target after six retries`);
 }
 
 export async function publishRelease({ tarballsDir, version, distTag, npmClient, retryDelay = defaultRetryDelay }) {
@@ -170,10 +215,11 @@ export async function publishRelease({ tarballsDir, version, distTag, npmClient,
   const results = [];
   for (const name of NATIVE_PACKAGES) {
     const record = records.get(name);
-    results.push({ name, state: await verifyOrPublish({ npmClient, record, tarballsDir, tag: "colay-candidate", retryDelay }) });
+    results.push({ name, state: await verifyOrPublish({ npmClient, record, tag: "colay-candidate", retryDelay }) });
   }
   const rootRecord = records.get(ROOT_PACKAGE);
-  results.push({ name: ROOT_PACKAGE, state: await verifyOrPublish({ npmClient, record: rootRecord, tarballsDir, tag: distTag, retryDelay }) });
-  await requireRootChannel({ npmClient, version, distTag, retryDelay });
+  const rootState = await verifyOrPublish({ npmClient, record: rootRecord, tag: distTag, retryDelay });
+  results.push({ name: ROOT_PACKAGE, state: rootState });
+  await requireRootChannel({ npmClient, version, distTag, rootState, retryDelay });
   return { version, distTag, packages: results };
 }

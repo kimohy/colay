@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,16 +15,20 @@ const nativeNames = [
 ];
 const rootName = "@kimohy/colay";
 
+function sha512Integrity(name) {
+  return `sha512-${createHash("sha512").update(`${name}\n`).digest("base64")}`;
+}
+
 async function tarballs() {
   const directory = await mkdtemp(join(tmpdir(), "colay-publish-"));
   const records = [...nativeNames, rootName].map((name) => ({
     name,
     version,
     filename: `${name.replace("@kimohy/", "").replaceAll("/", "-")}-${version}.tgz`,
-    integrity: `sha512-${name}`,
+    integrity: sha512Integrity(name),
   }));
+  await Promise.all(records.map((record) => writeFile(join(directory, record.filename), `${record.name}\n`)));
   await writeFile(join(directory, "npm-pack.json"), `${JSON.stringify(records)}\n`);
-  await Promise.all(records.map((record) => writeFile(join(directory, record.filename), JSON.stringify(record))));
   return { directory, records };
 }
 
@@ -38,9 +43,9 @@ function fakeClient({ existing = new Map(), channel = undefined, publishResult =
       return existing.get(`${name}@${releaseVersion}`);
     },
     async publish(tarball, tag) {
-      const record = JSON.parse(await readFile(tarball, "utf8"));
-      calls.push(["publish", record.name, tag]);
-      return publishResult === "matching" ? { integrity: record.integrity } : publishResult;
+      const name = (await readFile(tarball, "utf8")).trim();
+      calls.push(["publish", name, tag]);
+      return publishResult === "matching" ? { integrity: sha512Integrity(name) } : publishResult;
     },
     async viewChannelVersion(name, tag) {
       calls.push(["channel", name, tag]);
@@ -71,9 +76,9 @@ test("publishes a new release in lexical native order before the root channel", 
       return undefined;
     },
     async publish(tarball, tag) {
-      const record = JSON.parse(await (await import("node:fs/promises")).readFile(tarball, "utf8"));
-      calls.push(["publish", record.name, tag]);
-      return { integrity: record.integrity };
+      const name = (await readFile(tarball, "utf8")).trim();
+      calls.push(["publish", name, tag]);
+      return { integrity: sha512Integrity(name) };
     },
     async viewChannelVersion(name, tag) {
       calls.push(["channel", name, tag]);
@@ -96,7 +101,7 @@ test("publishes a new release in lexical native order before the root channel", 
 });
 
 test("skips an immutable existing package with matching integrity", async () => {
-  const existing = new Map([[`@kimohy/colay-darwin-arm64@${version}`, "sha512-@kimohy/colay-darwin-arm64"]]);
+  const existing = new Map([[`@kimohy/colay-darwin-arm64@${version}`, sha512Integrity("@kimohy/colay-darwin-arm64")]]);
   const client = fakeClient({ existing, channel: version });
   await releaseWith(client);
   assert.equal(client.calls.some(([kind, name]) => kind === "publish" && name === "@kimohy/colay-darwin-arm64"), false);
@@ -114,9 +119,9 @@ test("does not publish the root after a native publish failure", async () => {
   const client = {
     async viewIntegrity() { return undefined; },
     async publish(tarball) {
-      const record = JSON.parse(await (await import("node:fs/promises")).readFile(tarball, "utf8"));
-      if (record.name === "@kimohy/colay-linux-x64") throw new Error("native publish failed");
-      return { integrity: record.integrity };
+      const name = (await readFile(tarball, "utf8")).trim();
+      if (name === "@kimohy/colay-linux-x64") throw new Error("native publish failed");
+      return { integrity: sha512Integrity(name) };
     },
     async viewChannelVersion() { return version; },
   };
@@ -132,9 +137,11 @@ test("allows only the three public release tags", async () => {
 });
 
 test("reports manual root-channel recovery instead of mutating a dist-tag", async () => {
-  const client = fakeClient({ channel: "0.1.0" });
+  const fixture = await tarballs();
+  const existing = new Map(fixture.records.map((record) => [`${record.name}@${version}`, record.integrity]));
+  const client = fakeClient({ existing, channel: "0.1.0" });
   await assert.rejects(
-    releaseWith(client),
+    publishRelease({ tarballsDir: fixture.directory, version, distTag: "nightly", npmClient: client, retryDelay: async () => {} }),
     new RegExp(`npm dist-tag add @kimohy/colay@${version} nightly`),
   );
   assert.equal(client.calls.some(([kind]) => kind === "dist-tag"), false);
@@ -156,5 +163,67 @@ test("retries registry integrity visibility at most six times and identifies the
     /@kimohy\/colay-darwin-arm64@0\.1\.1-nightly.*did not become visible/,
   );
   assert.equal(client.calls.filter(([kind, name]) => kind === "view" && name === "@kimohy/colay-darwin-arm64").length, 8);
+  assert.equal(waits, 6);
+});
+
+test("rejects a tampered tarball before any package is published", async () => {
+  const fixture = await tarballs();
+  const target = fixture.records.find(({ name }) => name === "@kimohy/colay-win32-x64");
+  await writeFile(join(fixture.directory, target.filename), "tampered\n");
+  const calls = [];
+  const client = {
+    async viewIntegrity(name) { calls.push(["view", name]); return undefined; },
+    async publish() { calls.push(["publish"]); },
+    async viewChannelVersion() { return version; },
+  };
+  await assert.rejects(
+    publishRelease({ tarballsDir: fixture.directory, version, distTag: "nightly", npmClient: client, retryDelay: async () => {} }),
+    /tarball integrity mismatch for @kimohy\/colay-win32-x64/,
+  );
+  assert.equal(calls.some(([kind]) => kind === "publish"), false);
+});
+
+test("retries a newly published root channel while its previous tag target propagates", async () => {
+  const fixture = await tarballs();
+  let channelReads = 0;
+  let waits = 0;
+  const client = {
+    async viewIntegrity() { return undefined; },
+    async publish(tarball) {
+      const record = fixture.records.find(({ filename }) => tarball.endsWith(filename));
+      return { integrity: record.integrity };
+    },
+    async viewChannelVersion() {
+      channelReads += 1;
+      return channelReads < 3 ? "0.1.0" : version;
+    },
+  };
+  await publishRelease({
+    tarballsDir: fixture.directory,
+    version,
+    distTag: "nightly",
+    npmClient: client,
+    retryDelay: async () => { waits += 1; },
+  });
+  assert.equal(channelReads, 3);
+  assert.equal(waits, 2);
+});
+
+test("requires manual recovery when an existing root remains absent from its public channel", async () => {
+  const fixture = await tarballs();
+  const existing = new Map(fixture.records.map((record) => [`${record.name}@${version}`, record.integrity]));
+  let waits = 0;
+  const client = fakeClient({ existing, channel: undefined });
+  await assert.rejects(
+    publishRelease({
+      tarballsDir: fixture.directory,
+      version,
+      distTag: "nightly",
+      npmClient: client,
+      retryDelay: async () => { waits += 1; },
+    }),
+    new RegExp(`npm dist-tag add @kimohy/colay@${version} nightly`),
+  );
+  assert.equal(client.calls.filter(([kind]) => kind === "channel").length, 7);
   assert.equal(waits, 6);
 });
