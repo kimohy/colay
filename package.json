@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "workspaces": ["npm/*"],
   "scripts": {
-    "test": "node --test scripts/release/test/*.test.mjs"
+    "test": "node --test scripts/release/test/*.test.mjs npm/colay/test/*.test.cjs"
   },
   "engines": { "node": ">=22" }
 }
