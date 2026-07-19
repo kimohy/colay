@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the failing Linux/macOS Clippy jobs and Windows permission test pass without broadening trusted principals.
+**Goal:** Make every Linux, macOS, and Windows CI job pass without broadening trusted principals or hiding verification failures.
 
-**Architecture:** Keep platform-specific permission logic in `orchestrator-state`. Represent the current Windows identity as an exact SID plus a locally verified SDDL alias, and feed that identity into the existing DACL parser and verifier.
+**Architecture:** Keep platform-specific permission logic in `orchestrator-state`. Represent the current Windows identity as an exact SID plus a locally verified SDDL alias, canonicalize security-sensitive test roots before persistence, and expose redacted nested-command diagnostics from the fake CLI E2E fixture when its verification gate fails.
 
 **Tech Stack:** Rust 1.95, standard library `Command`, `icacls.exe`, `whoami.exe`, `hostname.exe`, Cargo tests and Clippy.
 
@@ -13,7 +13,7 @@
 - Use separated executable and argument values; no shell interpolation.
 - Preserve fail-closed DACL verification and existing redaction/audit behavior.
 - Tests and CI must not invoke real provider inference.
-- Do not push, merge, or delete the worktree.
+- Do not merge or delete the worktree. Push only because the user explicitly requested branch publication and CI monitoring.
 
 ---
 
@@ -105,3 +105,98 @@ Expected: all tests pass; if the known transient Windows `git` process Access De
 Run: `git diff --check` and `git status --short`.
 
 Expected: no whitespace errors and only the planned permission/test/documentation changes.
+
+### Task 4: Canonical macOS test root
+
+**Files:**
+- Modify and test: `crates/orchestrator-cli/src/app.rs:6178`
+
+**Interfaces:**
+- Consumes: `std::fs::canonicalize(&Path) -> io::Result<PathBuf>`.
+- Produces: a canonical temporary root shared by `StatePaths` and `WorkerRequest::workspace_root`.
+
+- [x] **Step 1: Confirm the existing regression is red on macOS CI**
+
+Use CI run `29666672339` as the RED result: `app::tests::unconfirmed_process_tree_blocks_task_and_redacts_audit_detail` fails with `SymlinkEscape("/var")` because macOS exposes the temporary directory through the `/var` symlink.
+
+- [x] **Step 2: Canonicalize the temporary root before deriving state paths**
+
+Replace direct uses of `temporary.path()` in the test with:
+
+```rust
+let temporary_root = fs::canonicalize(temporary.path())?;
+let root = temporary_root.join("state");
+```
+
+Set `WorkerRequest::workspace_root` to `temporary_root` so the state root and workspace root use the same canonical path.
+
+- [x] **Step 3: Run the focused test locally**
+
+Run: `cargo test -p colay --all-features unconfirmed_process_tree_blocks_task_and_redacts_audit_detail -- --nocapture`
+
+Expected: the focused test passes. The pushed macOS CI job supplies the platform-specific GREEN verification.
+
+### Task 5: Windows fake CLI failure diagnostics
+
+**Files:**
+- Modify and test: `crates/orchestrator-cli/tests/fake_cli_handover_e2e.rs`
+
+**Interfaces:**
+- Produces: `verification_stderr(repository: &Path, output: &Value) -> Result<String>`, which reads only the already-redacted `.stderr.log` artifacts for the reported task ID.
+
+- [x] **Step 1: Establish the failure classification**
+
+Run the full `fake_cli_handover_e2e` test binary three times with `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` and empty provider API keys.
+
+Expected: if all three runs pass, record the Windows CI failure as non-reproducible and avoid changing production verification behavior. If a run fails, use its saved stderr to form and test a concrete root-cause hypothesis before modifying production code.
+
+- [x] **Step 2: Add a focused diagnostics test**
+
+Create a temporary `.colay/results/task-1/commands/` tree containing two `.stderr.log` files and one `.stdout.log`. Assert that `verification_stderr` returns the two stderr logs in sorted path order and excludes stdout.
+
+- [x] **Step 3: Verify the diagnostics test is red**
+
+Run: `cargo test -p colay --test fake_cli_handover_e2e --all-features verification_stderr_reports_redacted_command_logs -- --nocapture`
+
+Expected: compilation fails because `verification_stderr` does not exist.
+
+- [x] **Step 4: Implement the minimal diagnostic reader**
+
+Extract `/data/task_id`, construct `.colay/results/<task_id>/commands`, read only regular files ending in `.stderr.log`, sort their paths, and return a bounded diagnostic string. Do not read raw provider output or bypass redaction.
+
+- [x] **Step 5: Attach diagnostics to the completion assertion**
+
+Before asserting `run_completed`, call `verification_stderr(&repository, &output)?` and include it in the assertion message after the JSON envelope.
+
+- [x] **Step 6: Verify the focused and full E2E tests**
+
+Run: `cargo test -p colay --test fake_cli_handover_e2e --all-features -- --nocapture`
+
+Expected: both integration tests pass, and the diagnostic helper test passes.
+
+### Task 6: Required verification, commit, push, and CI
+
+**Files:**
+- Review all changed files.
+
+- [x] **Step 1: Run repository-required verification**
+
+Run: `cargo fmt --all -- --check`
+
+Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Run: `cargo test --workspace --all-features`
+
+Expected: all three commands exit successfully.
+
+- [x] **Step 2: Inspect and commit the final diff**
+
+Run: `git diff --check`, `git status --short`, then commit only the plan and two test files with message `test: stabilize cross-platform CI diagnostics`.
+
+Expected: no whitespace errors and no unrelated files in the commit.
+
+- [ ] **Step 3: Push and monitor the new CI run**
+
+Push `codex/fix-ci-permissions` to `origin`, find the new workflow run for the pushed SHA, and wait for all matrix jobs to complete.
+
+Expected: Ubuntu, macOS, and Windows jobs all succeed. If Windows recurs, its assertion includes the nested redacted `cargo test` stderr required for a root-cause fix.

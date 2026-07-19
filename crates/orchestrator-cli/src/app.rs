@@ -6178,7 +6178,8 @@ mod tests {
     fn unconfirmed_process_tree_blocks_task_and_redacts_audit_detail()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        let root = temporary.path().join("state");
+        let temporary_root = fs::canonicalize(temporary.path())?;
+        let root = temporary_root.join("state");
         let state = StatePaths {
             database: root.join("orchestrator.db"),
             events: root.join("events.jsonl"),
@@ -6225,7 +6226,7 @@ mod tests {
             prompt: "test".to_owned(),
             constraints: Vec::new(),
             acceptance_criteria: Vec::new(),
-            workspace_root: temporary.path().to_path_buf(),
+            workspace_root: temporary_root,
             sandbox: SandboxMode::WorkspaceWrite,
             profile: ModelProfile::Standard,
             model: None,

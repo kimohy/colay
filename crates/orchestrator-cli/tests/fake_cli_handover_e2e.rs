@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 
 use anyhow::{Context as _, Result, bail};
 use orchestrator_domain::{
-    Checkpoint, EventType, HandoverAcknowledgement, HandoverBundle, ProviderId, TaskEvent,
+    Checkpoint, EventType, HandoverAcknowledgement, HandoverBundle, ProviderId, TaskEvent, TaskId,
 };
 use orchestrator_state::{MigrationManager, ensure_private_file};
 use rusqlite::Connection;
@@ -144,6 +144,82 @@ fn write_task_file(repository: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn verification_stderr(repository: &Path, output: &Value) -> Result<String> {
+    const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+    const TRUNCATED_SUFFIX: &str = "\n...[diagnostics truncated]\n";
+
+    let Some(task_id) = output.pointer("/data/task_id").and_then(Value::as_str) else {
+        return Ok(String::new());
+    };
+    let task_id = task_id
+        .parse::<TaskId>()
+        .context("run output contained an invalid task_id")?;
+    let commands = repository
+        .join(".colay/results")
+        .join(task_id.to_string())
+        .join("commands");
+    if !commands.is_dir() {
+        return Ok(String::new());
+    }
+
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&commands)? {
+        let path = entry?.path();
+        let is_stderr_log = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".stderr.log"));
+        if is_stderr_log && fs::symlink_metadata(&path)?.file_type().is_file() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    let mut diagnostics = String::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("verification stderr artifact had a non-UTF-8 name")?;
+        diagnostics.push_str(name);
+        diagnostics.push_str(":\n");
+        diagnostics.push_str(&fs::read_to_string(path)?);
+    }
+    if diagnostics.len() > DIAGNOSTIC_LIMIT {
+        let mut end = DIAGNOSTIC_LIMIT - TRUNCATED_SUFFIX.len();
+        while !diagnostics.is_char_boundary(end) {
+            end -= 1;
+        }
+        diagnostics.truncate(end);
+        diagnostics.push_str(TRUNCATED_SUFFIX);
+    }
+    Ok(diagnostics)
+}
+
+#[test]
+fn verification_stderr_reports_redacted_command_logs() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let repository = temporary.path().join("repository");
+    let task_id = TaskId::new();
+    let commands = repository
+        .join(".colay/results")
+        .join(task_id.to_string())
+        .join("commands");
+    fs::create_dir_all(&commands)?;
+    fs::write(commands.join("b.stderr.log"), "second failure\n")?;
+    fs::write(commands.join("a.stderr.log"), "first failure\n")?;
+    fs::write(commands.join("a.stdout.log"), "excluded output\n")?;
+    let output = json!({"data": {"task_id": task_id.to_string()}});
+
+    let diagnostics = verification_stderr(&repository, &output)?;
+
+    assert!(diagnostics.contains("a.stderr.log:\nfirst failure"));
+    assert!(diagnostics.contains("b.stderr.log:\nsecond failure"));
+    assert!(diagnostics.find("a.stderr.log") < diagnostics.find("b.stderr.log"));
+    assert!(!diagnostics.contains("excluded output"));
+    Ok(())
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> Result<()> {
@@ -162,11 +238,13 @@ fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> R
             task_file.as_os_str().to_owned(),
         ],
     )?;
+    let verification_stderr = verification_stderr(&repository, &output)?;
     assert_eq!(
         output.get("command").and_then(Value::as_str),
         Some("run_completed"),
-        "unexpected CLI output: {}",
-        serde_json::to_string_pretty(&output)?
+        "unexpected CLI output: {}\nverification stderr:\n{}",
+        serde_json::to_string_pretty(&output)?,
+        verification_stderr
     );
     let data = output
         .get("data")
