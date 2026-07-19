@@ -1050,7 +1050,65 @@ fn default_json() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigDocument;
+    use super::{ConfigDocument, RootConfig, UsageProbeConfig};
+
+    #[test]
+    fn compiled_provider_defaults_are_safe_and_complete() {
+        let config = RootConfig::default();
+        let cases = [
+            ("codex", "codex", "calendar_month", Some(1), 100),
+            ("claude", "claude", "calendar_month", Some(1), 90),
+            ("gemini", "gemini", "calendar_day", None, 70),
+        ];
+
+        for (identity, executable, period, reset_day, priority) in cases {
+            let provider = match identity {
+                "codex" => config.orchestrator.providers.codex.as_ref(),
+                "claude" => config.orchestrator.providers.claude.as_ref(),
+                "gemini" => config.orchestrator.providers.gemini.as_ref(),
+                _ => unreachable!("provider table contains only compiled identities"),
+            }
+            .unwrap_or_else(|| panic!("compiled {identity} provider is missing"));
+
+            assert!(provider.enabled, "{identity} must be enabled");
+            assert_eq!(provider.executable, executable, "{identity} executable");
+            assert_eq!(provider.quota_period, period, "{identity} quota period");
+            assert_eq!(provider.reset_day, reset_day, "{identity} reset day");
+            assert_eq!(provider.priority, priority, "{identity} priority");
+            assert_eq!(provider.reset_timezone, "UTC", "{identity} reset zone");
+            assert_eq!(provider.quota_unit, "provider_defined");
+            assert!(provider.quota_limit.is_none(), "{identity} quota limit");
+            assert!(provider.quota_scope.is_none(), "{identity} quota scope");
+            assert!(
+                provider.quota_units_per_work_unit.is_none(),
+                "{identity} work-unit calibration"
+            );
+            assert!(
+                provider.ledger_units_per_execution.is_none(),
+                "{identity} execution calibration"
+            );
+            assert!(
+                provider.rolling_anchor.is_none(),
+                "{identity} rolling anchor"
+            );
+            assert!(
+                provider.rolling_period_seconds.is_none(),
+                "{identity} rolling period"
+            );
+            assert!(
+                provider.custom_started_at.is_none(),
+                "{identity} custom start"
+            );
+            assert!(
+                provider.custom_resets_at.is_none(),
+                "{identity} custom reset"
+            );
+            assert!(matches!(
+                provider.usage_probe,
+                UsageProbeConfig::ManualOrLedger
+            ));
+        }
+    }
 
     const VALID: &str = r#"
 config_version = 4

@@ -105,6 +105,16 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
     assert!(!fixture.repository.join(".colay").exists());
     let json: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(json["data"]["checks"][0]["status"], "pass");
+    let database = json["data"]["checks"]
+        .as_array()
+        .context("doctor checks must be an array")?
+        .iter()
+        .find(|check| check["name"] == "database")
+        .context("doctor must report absent database state")?;
+    assert_eq!(
+        database["detail"],
+        "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas"
+    );
     Ok(())
 }
 

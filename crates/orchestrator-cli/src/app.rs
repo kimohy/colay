@@ -435,7 +435,7 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
         } else {
             checks.push(Check::warn(
                 "database",
-                "state database does not exist; run init or migrate apply",
+                "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas",
             ));
         }
 
@@ -4691,6 +4691,11 @@ fn rollback_resolution_context(
     .context("selected Codex attempt has malformed process execution evidence")?;
     validate_resolution_evidence(&process_execution)
         .context("selected Codex attempt has invalid process execution evidence")?;
+    if process_execution.configured.is_absolute() {
+        return Ok(RollbackResolutionContext {
+            codex_execution: Some(process_execution),
+        });
+    }
     let stored = database
         .active_worktree(task_id)?
         .ok_or_else(|| anyhow!("Codex rollback invocation has no active isolated worktree"))?;
@@ -7132,7 +7137,7 @@ mod tests {
             &EnvironmentPolicy::default().executable_search(&worktree),
         )?;
         assert_eq!(trusted, fs::canonicalize(actual_worker.path)?);
-        assert_ne!(trusted, fs::canonicalize(repository_executable)?);
+        assert_ne!(trusted, fs::canonicalize(&repository_executable)?);
 
         let path_a = worktree.join("path-a");
         let path_b = worktree.join("path-b");
@@ -7241,13 +7246,99 @@ mod tests {
             &[RollbackManifestStep {
                 component: "codex".to_owned(),
                 backup_source: PathBuf::from("fake-provider.backup"),
-                destination: configured,
+                destination: configured.clone(),
             }],
         );
         let Err(error) = legacy_result else {
             anyhow::bail!("legacy worker result authorized executable rollback");
         };
         assert!(error.to_string().contains("process execution evidence"));
+
+        let mut relative_persisted = serde_json::to_value(&worker_result)?;
+        relative_persisted["process_execution"] = serde_json::json!({
+            "configured": configured,
+            "path": fs::canonicalize(&worktree_executable)?,
+            "kind": "native",
+            "validation": {
+                "working_directory": fs::canonicalize(&worktree)?,
+                "search_directory": null
+            }
+        });
+        let other_worktree = state.worktrees.join("other-writable-worker");
+        fs::create_dir_all(&other_worktree)?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![relative_persisted.to_string(), attempt_id.to_string()],
+            )?;
+            connection.execute(
+                "UPDATE worktrees SET worktree_path = ?1 WHERE task_id = ?2 AND state = 'active'",
+                params![
+                    other_worktree.to_string_lossy(),
+                    envelope.task_id.to_string()
+                ],
+            )?;
+            Ok(())
+        })?;
+        let relative_mismatch = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: configured.clone(),
+            }],
+        );
+        let Err(error) = relative_mismatch else {
+            anyhow::bail!("relative identity bypassed its trusted active worktree");
+        };
+        assert!(error.to_string().contains("trusted worktree"));
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE worktrees SET worktree_path = ?1 WHERE task_id = ?2 AND state = 'active'",
+                params![worktree.to_string_lossy(), envelope.task_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+
+        let mut absolute_persisted = serde_json::to_value(&worker_result)?;
+        absolute_persisted["process_execution"] = serde_json::json!({
+            "configured": fs::canonicalize(&repository_executable)?,
+            "path": fs::canonicalize(&repository_executable)?,
+            "kind": "native",
+            "validation": {
+                "working_directory": fs::canonicalize(&worktree)?,
+                "search_directory": null
+            }
+        });
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![absolute_persisted.to_string(), attempt_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        fs::remove_dir_all(&worktree)?;
+
+        let absolute_context = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: repository_executable.clone(),
+            }],
+        )?;
+        assert_eq!(
+            absolute_context
+                .codex_execution
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("absolute execution identity was omitted"))?
+                .path,
+            fs::canonicalize(repository_executable)?
+        );
         Ok(())
     }
 
