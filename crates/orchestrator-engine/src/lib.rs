@@ -24,3 +24,28 @@ pub use worktree::{
     FileOwnershipRegistry, GitSnapshot, GitWorktree, GitWorktreeManager, WorktreeCleanupPlan,
     canonicalize_directory,
 };
+
+#[cfg(test)]
+mod test_support {
+    use std::{io, path::Path};
+
+    pub(crate) struct CanonicalTempDir {
+        _directory: tempfile::TempDir,
+        canonical_path: std::path::PathBuf,
+    }
+
+    impl CanonicalTempDir {
+        pub(crate) fn new() -> io::Result<Self> {
+            let directory = tempfile::tempdir()?;
+            let canonical_path = std::fs::canonicalize(directory.path())?;
+            Ok(Self {
+                _directory: directory,
+                canonical_path,
+            })
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.canonical_path
+        }
+    }
+}

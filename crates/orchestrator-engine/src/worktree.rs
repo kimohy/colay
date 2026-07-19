@@ -691,7 +691,7 @@ mod tests {
     #[test]
     fn oversized_untracked_file_is_rejected_before_content_capture()
     -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let path = directory.path().join("large.bin");
         let file = std::fs::File::create(&path)?;
         file.set_len(40 * 1024 * 1024)?;
@@ -711,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_includes_worker_commits_and_untracked_contents()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let directory = tempfile::tempdir()?;
+        let directory = crate::test_support::CanonicalTempDir::new()?;
         let repository = directory.path().join("repository");
         let worktrees = directory.path().join("worktrees");
         std::fs::create_dir(&repository)?;

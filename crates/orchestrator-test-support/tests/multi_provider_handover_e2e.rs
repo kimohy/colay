@@ -128,7 +128,9 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
 -> Result<(), Box<dyn std::error::Error>> {
     let state = tempfile::tempdir()?;
     let workspace = tempfile::tempdir()?;
-    std::fs::create_dir_all(workspace.path().join("src"))?;
+    let state_root = std::fs::canonicalize(state.path())?;
+    let workspace_root = std::fs::canonicalize(workspace.path())?;
+    std::fs::create_dir_all(workspace_root.join("src"))?;
     let task_id = TaskId::new();
     let gemini_attempt = AttemptId::new();
     let codex_attempt = AttemptId::new();
@@ -156,7 +158,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
             task_id,
             gemini_attempt,
             ProviderId::Gemini,
-            workspace.path().to_path_buf(),
+            workspace_root.clone(),
             SandboxMode::ReadOnly,
             ModelProfile::Economy,
             "survey the repository; scenario:quota",
@@ -173,7 +175,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
 
     lifecycle.transition(TaskState::CheckpointRequested, TransitionGuards::default())?;
     lifecycle.transition(TaskState::Checkpointing, TransitionGuards::default())?;
-    let checkpoint_manager = CheckpointManager::new(ArtifactStore::open(state.path())?);
+    let checkpoint_manager = CheckpointManager::new(ArtifactStore::open(&state_root)?);
     let investigation_checkpoint = checkpoint_manager.create(
         CheckpointInput {
             task_id,
@@ -271,7 +273,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
             task_id,
             codex_attempt,
             ProviderId::Codex,
-            workspace.path().to_path_buf(),
+            workspace_root.clone(),
             SandboxMode::WorkspaceWrite,
             ModelProfile::Premium,
             "continue from the sealed handover and implement",
@@ -286,7 +288,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
             .any(|event| matches!(event, WorkerEvent::Completed { .. }))
     );
     std::fs::write(
-        workspace.path().join("src/lib.rs"),
+        workspace_root.join("src/lib.rs"),
         b"pub fn answer() -> u32 { 42 }\n",
     )?;
     let changed = RepoPath::try_from("src/lib.rs")?;
@@ -300,7 +302,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
     };
     assert!(
         VerificationEngine::new()?
-            .preflight_persistence(workspace.path(), &implementation_snapshot)?
+            .preflight_persistence(&workspace_root, &implementation_snapshot)?
             .safe_to_persist_or_share()
     );
 
@@ -402,7 +404,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
             task_id,
             claude_attempt,
             ProviderId::Claude,
-            workspace.path().to_path_buf(),
+            workspace_root.clone(),
             SandboxMode::ReadOnly,
             ModelProfile::Premium,
             "review the implementation without changing files",
@@ -424,7 +426,7 @@ async fn gemini_quota_checkpoint_codex_implementation_and_claude_review_complete
         independent_review_required: true,
         independent_review_passed: true,
         snapshot: implementation_snapshot,
-        worktree_root: workspace.path().to_path_buf(),
+        worktree_root: workspace_root,
         expected_paths: vec![changed],
         commands: Vec::new(),
         tests: vec![TestEvidence {

@@ -121,7 +121,7 @@ fn set_file_permissions(path: &Path) -> StateResult<()> {
 fn verify_file_permissions(path: &Path, metadata: &fs::Metadata) -> StateResult<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    if metadata.permissions().mode() & 0o077 == 0 {
+    if metadata.permissions().mode().trailing_zeros() >= 6 {
         Ok(())
     } else {
         Err(StateError::InvalidRecord(format!(
@@ -137,7 +137,11 @@ fn verify_file_permissions(path: &Path, _metadata: &fs::Metadata) -> StateResult
     let target = canonical_acl_target(path)?;
     let icacls = trusted_system_utility("icacls.exe")?;
     let descriptor = load_dacl(&icacls, &target)?;
-    verify_private_dacl(&descriptor, &current_user_sid()?, WindowsArtifactKind::File)
+    verify_private_dacl(
+        &descriptor,
+        &current_windows_identity()?,
+        WindowsArtifactKind::File,
+    )
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -164,6 +168,12 @@ const WINDOWS_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const MAX_WINDOWS_TOOL_OUTPUT: u64 = 64 * 1024;
 
 #[cfg(windows)]
+struct WindowsIdentity {
+    sid: String,
+    alias: Option<&'static str>,
+}
+
+#[cfg(windows)]
 fn set_windows_permissions(path: &Path, kind: WindowsArtifactKind) -> StateResult<()> {
     use std::ffi::OsString;
 
@@ -173,8 +183,12 @@ fn set_windows_permissions(path: &Path, kind: WindowsArtifactKind) -> StateResul
     let _acl_guard = windows_acl_guard()?;
     let target = canonical_acl_target(path)?;
     let icacls = trusted_system_utility("icacls.exe")?;
-    let current_sid = current_user_sid()?;
-    let trusted_sids = [current_sid.as_str(), SYSTEM_SID, ADMINISTRATORS_SID];
+    let current_identity = current_windows_identity()?;
+    let trusted_sids = [
+        current_identity.sid.as_str(),
+        SYSTEM_SID,
+        ADMINISTRATORS_SID,
+    ];
 
     let mut remove_denials = vec![OsString::from("/remove:d")];
     remove_denials.extend(
@@ -230,7 +244,7 @@ fn set_windows_permissions(path: &Path, kind: WindowsArtifactKind) -> StateResul
         &[OsString::from("/verify"), OsString::from("/q")],
     )?;
     let descriptor = load_dacl(&icacls, &target)?;
-    verify_private_dacl(&descriptor, &current_sid, kind)
+    verify_private_dacl(&descriptor, &current_identity, kind)
 }
 
 #[cfg(windows)]
@@ -299,7 +313,7 @@ fn trusted_system_utility(file_name: &str) -> StateResult<PathBuf> {
 }
 
 #[cfg(windows)]
-fn current_user_sid() -> StateResult<String> {
+fn current_windows_identity() -> StateResult<WindowsIdentity> {
     use std::ffi::OsString;
 
     let whoami = trusted_system_utility("whoami.exe")?;
@@ -312,8 +326,50 @@ fn current_user_sid() -> StateResult<String> {
             OsString::from("/nh"),
         ],
     )?;
-    extract_sid(&output.stdout)
-        .ok_or_else(|| permission_error("whoami returned no valid current-user SID"))
+    let sid = extract_sid(&output.stdout)
+        .ok_or_else(|| permission_error("whoami returned no valid current-user SID"))?;
+    let alias = if has_account_rid(&sid, "500") {
+        let account_authority = extract_account_authority(&output.stdout).ok_or_else(|| {
+            permission_error("whoami returned no valid current-user account authority")
+        })?;
+        let hostname = trusted_system_utility("hostname.exe")?;
+        let hostname = run_windows_utility(&hostname, &[])?;
+        local_administrator_alias(&sid, account_authority, &hostname.stdout)
+    } else {
+        None
+    };
+    Ok(WindowsIdentity { sid, alias })
+}
+
+#[cfg(windows)]
+fn extract_account_authority(output: &[u8]) -> Option<&[u8]> {
+    let field_start = output.iter().position(|byte| *byte == b'"')? + 1;
+    let field_end = output[field_start..]
+        .iter()
+        .position(|byte| *byte == b'"')?
+        + field_start;
+    let separator = output[field_start..field_end]
+        .iter()
+        .position(|byte| *byte == b'\\')?
+        + field_start;
+    (separator > field_start).then_some(&output[field_start..separator])
+}
+
+#[cfg(windows)]
+fn local_administrator_alias(
+    sid: &str,
+    account_authority: &[u8],
+    hostname: &[u8],
+) -> Option<&'static str> {
+    (has_account_rid(sid, "500") && account_authority.eq_ignore_ascii_case(hostname.trim_ascii()))
+        .then_some("LA")
+}
+
+#[cfg(windows)]
+fn has_account_rid(sid: &str, expected_rid: &str) -> bool {
+    sid.strip_prefix("S-1-5-21-")
+        .and_then(|suffix| suffix.rsplit_once('-'))
+        .is_some_and(|(authority, rid)| !authority.is_empty() && rid == expected_rid)
 }
 
 #[cfg(windows)]
@@ -555,7 +611,7 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> StateResult<String> {
 #[cfg(windows)]
 fn verify_private_dacl(
     saved_acl: &str,
-    current_sid: &str,
+    current_identity: &WindowsIdentity,
     kind: WindowsArtifactKind,
 ) -> StateResult<()> {
     let descriptor = saved_acl
@@ -571,7 +627,7 @@ fn verify_private_dacl(
     }
     let aces = parse_aces(&descriptor[first_ace..])?;
     let required = [
-        (current_sid, None),
+        (current_identity.sid.as_str(), current_identity.alias),
         (SYSTEM_SID, Some("SY")),
         (ADMINISTRATORS_SID, Some("BA")),
     ];
@@ -725,7 +781,7 @@ mod tests {
     fn unix_private_permissions_remain_owner_only() -> StateResult<()> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let directory = temporary.path().join("state");
         ensure_private_directory(&directory)?;
         let file = directory.join("state.json");
@@ -753,7 +809,7 @@ mod tests {
     fn windows_private_file_removes_untrusted_temp_file_grants() -> StateResult<()> {
         use std::ffi::OsString;
 
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let directory = temporary.path().join("state");
         ensure_private_directory(&directory)?;
         let file = directory.join("state.json");
@@ -775,13 +831,17 @@ mod tests {
         verify_private_file(&file)?;
 
         let descriptor = load_dacl(&icacls, &target)?;
-        verify_private_dacl(&descriptor, &current_user_sid()?, WindowsArtifactKind::File)
+        verify_private_dacl(
+            &descriptor,
+            &current_windows_identity()?,
+            WindowsArtifactKind::File,
+        )
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_private_temp_directory_is_idempotent() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let directory = temporary.path().join("state");
         ensure_private_directory(&directory)?;
         ensure_private_directory(&directory)?;
@@ -790,8 +850,50 @@ mod tests {
         let descriptor = load_dacl(&trusted_system_utility("icacls.exe")?, &target)?;
         verify_private_dacl(
             &descriptor,
-            &current_user_sid()?,
+            &current_windows_identity()?,
             WindowsArtifactKind::Directory,
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_administrator_alias_requires_local_rid_500() {
+        let local_admin_sid = "S-1-5-21-111-222-333-500";
+        assert_eq!(
+            local_administrator_alias(local_admin_sid, b"GITHUB-RUNNER", b"github-runner\r\n"),
+            Some("LA")
+        );
+        assert_eq!(
+            local_administrator_alias(local_admin_sid, b"DOMAIN", b"github-runner\r\n"),
+            None
+        );
+        assert_eq!(
+            local_administrator_alias(
+                "S-1-5-21-111-222-333-1001",
+                b"GITHUB-RUNNER",
+                b"github-runner\r\n",
+            ),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_administrator_alias_is_accepted_as_current_identity() -> StateResult<()> {
+        let descriptor = "D:P(A;;FA;;;LA)(A;;FA;;;SY)(A;;FA;;;BA)";
+        let identity = WindowsIdentity {
+            sid: "S-1-5-21-111-222-333-500".to_owned(),
+            alias: Some("LA"),
+        };
+        verify_private_dacl(descriptor, &identity, WindowsArtifactKind::File)?;
+
+        let ordinary_identity = WindowsIdentity {
+            sid: "S-1-5-21-111-222-333-1001".to_owned(),
+            alias: None,
+        };
+        assert!(
+            verify_private_dacl(descriptor, &ordinary_identity, WindowsArtifactKind::File).is_err()
+        );
+        Ok(())
     }
 }

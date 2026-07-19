@@ -25,8 +25,9 @@ fn seed_v1(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn v1_to_v3_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let database_path = directory.path().join("orchestrator.db");
-    let backup_directory = directory.path().join("backups");
+    let root = std::fs::canonicalize(directory.path())?;
+    let database_path = root.join("orchestrator.db");
+    let backup_directory = root.join("backups");
     seed_v1(&database_path)?;
     let database = Database::open(&database_path)?;
 
@@ -60,10 +61,11 @@ fn v1_to_v3_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 #[test]
 fn checksum_tampering_and_future_schemas_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
     let first = tempfile::tempdir()?;
-    let first_path = first.path().join("orchestrator.db");
+    let first_root = std::fs::canonicalize(first.path())?;
+    let first_path = first_root.join("orchestrator.db");
     seed_v1(&first_path)?;
     let first_database = Database::open(&first_path)?;
-    first_database.migrate_with_backup(&first.path().join("backups"))?;
+    first_database.migrate_with_backup(&first_root.join("backups"))?;
     first_database.with_connection(|connection| {
         connection.execute(
             "UPDATE schema_migrations SET checksum = ?1 WHERE version = 2",
@@ -77,10 +79,11 @@ fn checksum_tampering_and_future_schemas_fail_closed() -> Result<(), Box<dyn std
     ));
 
     let second = tempfile::tempdir()?;
-    let second_path = second.path().join("orchestrator.db");
+    let second_root = std::fs::canonicalize(second.path())?;
+    let second_path = second_root.join("orchestrator.db");
     seed_v1(&second_path)?;
     let second_database = Database::open(&second_path)?;
-    second_database.migrate_with_backup(&second.path().join("backups"))?;
+    second_database.migrate_with_backup(&second_root.join("backups"))?;
     second_database.with_connection(|connection| {
         connection.execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) \

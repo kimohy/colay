@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn database_wrapper_keeps_migration_restore_inside_connection_lock() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let database = Database::open(temporary.path().join("live.db"))?;
         database.migrate_with_backup(&temporary.path().join("migration-backups"))?;
         database.with_connection(|connection| {

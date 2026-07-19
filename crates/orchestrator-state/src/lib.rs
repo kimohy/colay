@@ -41,3 +41,25 @@ pub use records::{
     NewTaskRecord, RecoveredControl, RoutingAuditRecord, StoredHandover, StoredTask,
     StoredTaskAttempt, StoredWorktree, TaskListFilter,
 };
+
+pub(crate) struct CanonicalTempDir {
+    _directory: tempfile::TempDir,
+    canonical_path: std::path::PathBuf,
+}
+
+impl CanonicalTempDir {
+    pub(crate) fn new(context: impl Into<std::path::PathBuf>) -> StateResult<Self> {
+        let context = context.into();
+        let directory = tempfile::tempdir().map_err(|error| StateError::io(&context, error))?;
+        let canonical_path = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io(directory.path(), error))?;
+        Ok(Self {
+            _directory: directory,
+            canonical_path,
+        })
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.canonical_path
+    }
+}

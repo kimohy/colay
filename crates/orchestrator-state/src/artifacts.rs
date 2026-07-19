@@ -185,7 +185,8 @@ mod tests {
 
     #[test]
     fn artifacts_are_immutable_and_hash_verified() {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let directory = crate::CanonicalTempDir::new("tempdir")
+            .unwrap_or_else(|error| panic!("tempdir: {error}"));
         let store =
             ArtifactStore::open(directory.path()).unwrap_or_else(|error| panic!("store: {error}"));
         let path = RepoPath::try_from("tasks/task-1/diff.patch")
