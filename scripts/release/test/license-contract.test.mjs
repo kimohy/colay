@@ -13,7 +13,7 @@ test("Apache license and Cargo metadata use Apache-2.0", async () => {
   const license = await readFile(join(repoRoot, "LICENSE"));
   assert.match(
     license.toString("utf8"),
-    /Apache License\n                           Version 2\.0, January 2004/,
+    /Apache License\r?\n                           Version 2\.0, January 2004/,
   );
 
   const { stdout } = await execFileAsync(

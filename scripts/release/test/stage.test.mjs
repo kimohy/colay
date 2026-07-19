@@ -102,8 +102,8 @@ test("stages exact packages, archives, checksums, and authoritative release meta
   assert.equal(result.manifest.license, "Apache-2.0");
   assert.equal(result.manifest.state_schema_version, 3);
   assert.equal(result.manifest.config_schema_version, 4);
-  assert.deepEqual(result.manifest.codex.tested_versions, ["0.144.4", "0.144.5"]);
-  assert.equal(result.manifest.codex.recommended, "0.144.5");
+  assert.deepEqual(result.manifest.codex.tested_versions, ["0.144.5", "0.144.6"]);
+  assert.equal(result.manifest.codex.recommended, "0.144.6");
 
   const rootLicenseDigest = await sha256File(join(repoRoot, "LICENSE"));
   for (const [packageName, directory] of packageDirectories) {

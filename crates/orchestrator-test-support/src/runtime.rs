@@ -12,7 +12,8 @@ use orchestrator_domain::{
     UntrustedWorkerClaim, WorkerHandle, WorkerRequest,
 };
 use orchestrator_providers::{
-    AdapterRuntime, PreparedInvocation, ProviderError, RuntimeOutput, RuntimeTermination,
+    AdapterRuntime, ExecutableKind, ExecutableValidationContext, PreparedInvocation, ProviderError,
+    ResolvedExecutable, RuntimeOutput, RuntimeTermination,
 };
 use tokio::sync::Mutex;
 
@@ -101,6 +102,7 @@ impl AdapterRuntime for FakeAdapterRuntime {
             .collect::<Vec<_>>();
         let stdout = fake_probe_output(&args).into_bytes();
         Ok(RuntimeOutput {
+            resolved_executable: None,
             exit_code: Some(0),
             termination: RuntimeTermination::Exited,
             tree_termination_error: None,
@@ -129,6 +131,16 @@ impl AdapterRuntime for FakeAdapterRuntime {
             })
             .collect::<VecDeque<_>>();
         let output = RuntimeOutput {
+            resolved_executable: Some(ResolvedExecutable {
+                configured: invocation.executable.clone(),
+                path: self.allowed_executable.clone(),
+                kind: ExecutableKind::Native,
+                validation: ExecutableValidationContext {
+                    working_directory: std::fs::canonicalize(&invocation.working_directory)
+                        .map_err(|error| ProviderError::Runtime(error.to_string()))?,
+                    search_directory: None,
+                },
+            }),
             exit_code: match self.scenario {
                 FakeRuntimeScenario::ProcessCrash => Some(17),
                 FakeRuntimeScenario::Timeout => None,
@@ -179,6 +191,7 @@ impl AdapterRuntime for FakeAdapterRuntime {
             .ok_or_else(|| ProviderError::Runtime("unknown fake worker".to_owned()))?;
         if job.cancelled {
             return Ok(RuntimeOutput {
+                resolved_executable: job.output.resolved_executable.clone(),
                 exit_code: Some(130),
                 termination: RuntimeTermination::Cancelled,
                 tree_termination_error: None,
@@ -229,6 +242,7 @@ impl AdapterRuntime for FakeAdapterRuntime {
     ) -> Result<RuntimeOutput, ProviderError> {
         self.ensure_fake(&invocation.executable)?;
         Ok(RuntimeOutput {
+            resolved_executable: None,
             exit_code: Some(0),
             termination: RuntimeTermination::Exited,
             tree_termination_error: None,

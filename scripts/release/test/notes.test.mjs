@@ -15,8 +15,8 @@ test("release notes derive every current limitation and compatibility obligation
   ]);
   const notes = renderReleaseNotes({ guide, manifest: JSON.parse(manifestText) });
 
-  assert.match(notes, /Supported Codex versions: 0\.144\.4, 0\.144\.5/);
-  assert.match(notes, /Recommended Codex version: 0\.144\.5/);
+  assert.match(notes, /Supported Codex versions: 0\.144\.5, 0\.144\.6/);
+  assert.match(notes, /Recommended Codex version: 0\.144\.6/);
   assert.match(notes, /State schema 3 and config schema 4/);
   assert.match(notes, /codex exec --json/);
   assert.match(notes, /sensitive local source artifacts/);

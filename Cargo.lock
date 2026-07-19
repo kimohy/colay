@@ -257,6 +257,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -919,12 +920,14 @@ dependencies = [
  "chrono",
  "orchestrator-domain",
  "orchestrator-engine",
+ "orchestrator-process",
  "orchestrator-providers",
  "orchestrator-state",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

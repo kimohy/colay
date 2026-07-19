@@ -83,6 +83,16 @@ pub struct RootConfig {
     pub features: FeatureConfig,
 }
 
+impl Default for RootConfig {
+    fn default() -> Self {
+        Self {
+            config_version: CONFIG_SCHEMA_VERSION,
+            orchestrator: OrchestratorConfig::default(),
+            features: FeatureConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OrchestratorConfig {
     #[serde(default = "default_true")]
@@ -126,13 +136,39 @@ pub struct OrchestratorConfig {
     pub redaction: RedactionSettings,
 }
 
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            automatic_routing: true,
+            state_dir: PathBuf::from(".colay"),
+            timezone: "UTC".to_owned(),
+            max_parallel_workers: 1,
+            default_timeout_minutes: 30,
+            max_retries: 1,
+            warning_threshold_percent: 30.0,
+            handover_threshold_percent: 15.0,
+            critical_reserve_percent: 15.0,
+            require_review_from_difficulty: 7,
+            minimum_progress: 0.05,
+            daily_grace_minutes: 60,
+            monthly_grace_minutes: 1_440,
+            forecast_alpha: 0.3,
+            minimum_forecast_observations: 3,
+            providers: ProviderConfigs::default(),
+            model_profiles: BTreeMap::new(),
+            redaction: RedactionSettings::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RedactionSettings {
     #[serde(default)]
     pub patterns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfigs {
     #[serde(default)]
     pub gemini: Option<ProviderConfig>,
@@ -140,6 +176,16 @@ pub struct ProviderConfigs {
     pub codex: Option<ProviderConfig>,
     #[serde(default)]
     pub claude: Option<ProviderConfig>,
+}
+
+impl Default for ProviderConfigs {
+    fn default() -> Self {
+        Self {
+            gemini: Some(default_gemini_provider()),
+            codex: Some(default_codex_provider()),
+            claude: Some(default_claude_provider()),
+        }
+    }
 }
 
 impl ProviderConfigs {
@@ -151,6 +197,45 @@ impl ProviderConfigs {
         ]
         .into_iter()
         .filter_map(|(name, value)| value.map(|config| (name, config)))
+    }
+}
+
+fn default_gemini_provider() -> ProviderConfig {
+    default_provider("gemini", "calendar_day", None, 70)
+}
+
+fn default_codex_provider() -> ProviderConfig {
+    default_provider("codex", "calendar_month", Some(1), 100)
+}
+
+fn default_claude_provider() -> ProviderConfig {
+    default_provider("claude", "calendar_month", Some(1), 90)
+}
+
+fn default_provider(
+    executable: &str,
+    quota_period: &str,
+    reset_day: Option<u8>,
+    priority: i32,
+) -> ProviderConfig {
+    ProviderConfig {
+        enabled: true,
+        executable: executable.to_owned(),
+        quota_period: quota_period.to_owned(),
+        quota_limit: None,
+        quota_unit: default_usage_unit(),
+        quota_scope: None,
+        quota_units_per_work_unit: None,
+        ledger_units_per_execution: None,
+        reset_day,
+        reset_timezone: "UTC".to_owned(),
+        rolling_anchor: None,
+        rolling_period_seconds: None,
+        custom_started_at: None,
+        custom_resets_at: None,
+        priority,
+        effort_flag_enabled: false,
+        usage_probe: UsageProbeConfig::ManualOrLedger,
     }
 }
 
@@ -965,7 +1050,65 @@ fn default_json() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigDocument;
+    use super::{ConfigDocument, RootConfig, UsageProbeConfig};
+
+    #[test]
+    fn compiled_provider_defaults_are_safe_and_complete() {
+        let config = RootConfig::default();
+        let cases = [
+            ("codex", "codex", "calendar_month", Some(1), 100),
+            ("claude", "claude", "calendar_month", Some(1), 90),
+            ("gemini", "gemini", "calendar_day", None, 70),
+        ];
+
+        for (identity, executable, period, reset_day, priority) in cases {
+            let provider = match identity {
+                "codex" => config.orchestrator.providers.codex.as_ref(),
+                "claude" => config.orchestrator.providers.claude.as_ref(),
+                "gemini" => config.orchestrator.providers.gemini.as_ref(),
+                _ => unreachable!("provider table contains only compiled identities"),
+            }
+            .unwrap_or_else(|| panic!("compiled {identity} provider is missing"));
+
+            assert!(provider.enabled, "{identity} must be enabled");
+            assert_eq!(provider.executable, executable, "{identity} executable");
+            assert_eq!(provider.quota_period, period, "{identity} quota period");
+            assert_eq!(provider.reset_day, reset_day, "{identity} reset day");
+            assert_eq!(provider.priority, priority, "{identity} priority");
+            assert_eq!(provider.reset_timezone, "UTC", "{identity} reset zone");
+            assert_eq!(provider.quota_unit, "provider_defined");
+            assert!(provider.quota_limit.is_none(), "{identity} quota limit");
+            assert!(provider.quota_scope.is_none(), "{identity} quota scope");
+            assert!(
+                provider.quota_units_per_work_unit.is_none(),
+                "{identity} work-unit calibration"
+            );
+            assert!(
+                provider.ledger_units_per_execution.is_none(),
+                "{identity} execution calibration"
+            );
+            assert!(
+                provider.rolling_anchor.is_none(),
+                "{identity} rolling anchor"
+            );
+            assert!(
+                provider.rolling_period_seconds.is_none(),
+                "{identity} rolling period"
+            );
+            assert!(
+                provider.custom_started_at.is_none(),
+                "{identity} custom start"
+            );
+            assert!(
+                provider.custom_resets_at.is_none(),
+                "{identity} custom reset"
+            );
+            assert!(matches!(
+                provider.usage_probe,
+                UsageProbeConfig::ManualOrLedger
+            ));
+        }
+    }
 
     const VALID: &str = r#"
 config_version = 4

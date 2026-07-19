@@ -20,8 +20,8 @@ const COLAY_VERSION: &str = selected_build_version(option_env!("COLAY_BUILD_VERS
     long_about = None
 )]
 pub struct Cli {
-    /// Path to the versioned Colay TOML configuration.
-    /// Defaults to `.colay/config.toml`; an existing legacy location is detected safely.
+    /// Highest-precedence versioned Colay TOML configuration override.
+    /// Relative paths resolve from the repository; otherwise layered discovery is used.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
     /// Emit a stable machine-readable JSON document.

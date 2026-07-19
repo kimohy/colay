@@ -3,8 +3,8 @@
   "state_schema_version": 3,
   "config_schema_version": 4,
   "codex": {
-    "supported_min": "0.144.4",
-    "tested_versions": ["0.144.4", "0.144.5"],
-    "recommended": "0.144.5"
+    "supported_min": "0.144.5",
+    "tested_versions": ["0.144.5", "0.144.6"],
+    "recommended": "0.144.6"
   }
 }

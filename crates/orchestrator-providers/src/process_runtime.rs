@@ -596,6 +596,7 @@ fn command_spec(invocation: &PreparedInvocation, redaction: &RedactionConfig) ->
 
 fn process_output(result: &orchestrator_process::ProcessResult) -> RuntimeOutput {
     RuntimeOutput {
+        resolved_executable: Some(result.resolved_executable.clone()),
         exit_code: result.exit_code,
         termination: match result.termination {
             orchestrator_process::TerminationReason::Exited => RuntimeTermination::Exited,
@@ -711,6 +712,15 @@ mod tests {
     ) -> Result<orchestrator_process::ProcessResult, orchestrator_process::RedactionError> {
         let redactor = Redactor::new(&RedactionConfig::default())?;
         Ok(orchestrator_process::ProcessResult {
+            resolved_executable: orchestrator_process::ResolvedExecutable {
+                configured: "fake-provider-cli".into(),
+                path: "fake-provider-cli".into(),
+                kind: orchestrator_process::ExecutableKind::Native,
+                validation: orchestrator_process::ExecutableValidationContext {
+                    working_directory: ".".into(),
+                    search_directory: None,
+                },
+            },
             exit_code: None,
             termination,
             tree_termination_error: Some("process-tree termination was not confirmed".to_owned()),

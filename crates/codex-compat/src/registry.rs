@@ -79,7 +79,7 @@ pub struct CompatibilityRegistry {
 impl Default for CompatibilityRegistry {
     fn default() -> Self {
         let n = VersionContract {
-            version: Version::new(0, 144, 5),
+            version: Version::new(0, 144, 6),
             adapter_name: "v0_144_generic".to_owned(),
             maintenance: false,
             exec: true,
@@ -91,7 +91,7 @@ impl Default for CompatibilityRegistry {
             usage_events: true,
         };
         let n_minus_one = VersionContract {
-            version: Version::new(0, 144, 4),
+            version: Version::new(0, 144, 5),
             adapter_name: "v0_144_generic".to_owned(),
             maintenance: false,
             exec: true,
@@ -152,14 +152,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selects_only_exact_tested_versions() {
+    fn selects_current_and_previous_versions_exactly() {
         let registry = CompatibilityRegistry::default();
+        assert!(matches!(
+            registry.select(Some(&Version::new(0, 144, 6))),
+            AdapterSelection::Exact { .. }
+        ));
         assert!(matches!(
             registry.select(Some(&Version::new(0, 144, 5))),
             AdapterSelection::Exact { .. }
         ));
         assert_eq!(
-            registry.select(Some(&Version::new(0, 145, 0))),
+            registry.select(Some(&Version::new(0, 144, 4))),
             AdapterSelection::GenericUntested
         );
         assert_eq!(registry.select(None), AdapterSelection::SafeMode);
