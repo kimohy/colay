@@ -513,11 +513,10 @@ impl ProcessSupervisor {
     pub async fn start(&self, spec: CommandSpec) -> Result<ProcessSession, ProcessError> {
         validate_spec(&spec)?;
         let redactor = Redactor::new(&spec.redaction)?;
-        let working_directory = match &spec.working_dir {
-            Some(directory) => directory.clone(),
-            None => std::env::current_dir()?,
-        };
-        let search = spec.environment.executable_search(working_directory);
+        let working_directory = absolute_working_directory(spec.working_dir.as_deref())?;
+        let search = spec
+            .environment
+            .executable_search(working_directory.clone());
         let resolved_executable = resolve_executable(&spec.executable, &search)?;
         let mut command = Command::new(&resolved_executable.path);
         command
@@ -526,8 +525,8 @@ impl ProcessSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(directory) = &spec.working_dir {
-            command.current_dir(directory);
+        if spec.working_dir.is_some() {
+            command.current_dir(&working_directory);
         }
         spec.environment.apply(&mut command);
         configure_process_group(&mut command);
@@ -613,6 +612,16 @@ impl ProcessSupervisor {
             completion: Some(completion),
         })
     }
+}
+
+fn absolute_working_directory(configured: Option<&std::path::Path>) -> io::Result<PathBuf> {
+    let current = std::env::current_dir()?;
+    let configured = configured.unwrap_or(&current);
+    Ok(if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        current.join(configured)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

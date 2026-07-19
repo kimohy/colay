@@ -7,9 +7,9 @@ use orchestrator_domain::{
 };
 use orchestrator_process::{CommandSpec, EnvironmentPolicy, ExecutableKind, ProcessRunner};
 use orchestrator_providers::{
-    ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig, GeminiAdapter,
-    GeminiAdapterConfig, ProcessAdapterRuntime, ProviderError, RuntimeTermination,
-    UsageProbeConfig, UsageProbeFormat, WorkerAdapter,
+    AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
+    GeminiAdapter, GeminiAdapterConfig, PreparedInvocation, ProcessAdapterRuntime, ProviderError,
+    RuntimeTermination, StructuredOutput, UsageProbeConfig, UsageProbeFormat, WorkerAdapter,
 };
 use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
 use tokio_util::sync::CancellationToken;
@@ -110,6 +110,45 @@ async fn fake_provider_cmd_wrapper_is_selected_from_injected_path()
 fn in_memory_runtime_is_locked_to_the_compiled_fake_binary() {
     assert!(FakeAdapterRuntime::new(fake_binary(), FakeRuntimeScenario::Success).is_ok());
     assert!(FakeAdapterRuntime::new("codex", FakeRuntimeScenario::Success).is_err());
+}
+
+#[tokio::test]
+async fn startup_fallback_reports_the_actually_executed_resolved_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = tempfile::tempdir()?;
+    let working_directory = std::fs::canonicalize(fixture.path())?;
+    let fallback = PreparedInvocation {
+        executable: fake_binary(),
+        args: vec!["--version".into()],
+        stdin: Vec::new(),
+        working_directory: working_directory.clone(),
+        timeout_seconds: 10,
+        stdout_limit: 1024 * 1024,
+        stderr_limit: 1024 * 1024,
+        output: StructuredOutput::CodexJsonl,
+        codex_app_server: None,
+        fallback: None,
+    };
+    let primary = PreparedInvocation {
+        executable: working_directory.join("missing-fake-provider"),
+        fallback: Some(Box::new(fallback.clone())),
+        ..fallback
+    };
+    let request = request(ProviderId::Codex, "success")?;
+    let runtime = ProcessAdapterRuntime::default();
+    let handle = runtime
+        .start_worker(ProviderId::Codex, &request, primary)
+        .await?;
+    while runtime.next_event(&handle).await?.is_some() {}
+    let output = runtime.wait(&handle).await?;
+    let evidence = output
+        .resolved_executable
+        .ok_or("completed worker omitted process resolution evidence")?;
+
+    assert_eq!(evidence.configured, fake_binary());
+    assert_eq!(evidence.path, fake_binary());
+    assert_eq!(evidence.validation.working_directory, working_directory);
+    Ok(())
 }
 
 #[tokio::test]

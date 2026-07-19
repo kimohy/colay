@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +23,7 @@ impl ExecutablePlatform {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutableKind {
     Native,
@@ -38,11 +38,19 @@ pub struct ExecutableSearch {
     pub working_directory: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableValidationContext {
+    pub working_directory: PathBuf,
+    /// Present only for a bare executable selected from the effective PATH.
+    pub search_directory: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedExecutable {
     pub configured: PathBuf,
     pub path: PathBuf,
     pub kind: ExecutableKind,
+    pub validation: ExecutableValidationContext,
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +75,14 @@ pub enum ExecutableResolutionError {
         configured: PathBuf,
         search_path: Vec<PathBuf>,
     },
+    #[error("could not canonicalize executable resolution path `{path}`: {source}")]
+    Canonicalize {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("persisted executable resolution evidence is invalid: {0}")]
+    InvalidEvidence(String),
 }
 
 pub fn resolve_executable(
@@ -80,6 +96,127 @@ pub fn resolve_executable(
     match search.platform {
         ExecutablePlatform::Windows => resolve_windows_bare(configured, search),
         ExecutablePlatform::Unix => resolve_unix_bare(configured, search),
+    }
+}
+
+/// Validates persisted process-boundary evidence without consulting the
+/// current configuration or PATH.
+pub fn validate_resolution_evidence(
+    evidence: &ResolvedExecutable,
+) -> Result<(), ExecutableResolutionError> {
+    if evidence.configured.as_os_str().is_empty() {
+        return Err(ExecutableResolutionError::InvalidEvidence(
+            "configured executable is empty".to_owned(),
+        ));
+    }
+    if !evidence.path.is_absolute() || !evidence.validation.working_directory.is_absolute() {
+        return Err(ExecutableResolutionError::InvalidEvidence(
+            "resolved path and working directory must be absolute".to_owned(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(&evidence.path).map_err(|_| {
+        ExecutableResolutionError::InvalidEvidence("resolved executable is missing".to_owned())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ExecutableResolutionError::InvalidEvidence(
+            "resolved executable must be a non-symlink regular file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    if !unix_executable(&metadata) {
+        return Err(ExecutableResolutionError::InvalidEvidence(
+            "resolved executable is not executable".to_owned(),
+        ));
+    }
+    let canonical_path = canonicalize_resolution_path(evidence.path.clone())?;
+    let _canonical_working_directory =
+        canonicalize_resolution_path(evidence.validation.working_directory.clone())?;
+    if executable_kind(&evidence.path, ExecutablePlatform::current()) != evidence.kind {
+        return Err(ExecutableResolutionError::InvalidEvidence(
+            "executable kind does not match the resolved path".to_owned(),
+        ));
+    }
+
+    if is_explicit(&evidence.configured) {
+        if evidence.validation.search_directory.is_some() {
+            return Err(ExecutableResolutionError::InvalidEvidence(
+                "explicit executable unexpectedly records a PATH directory".to_owned(),
+            ));
+        }
+        let configured_path = if evidence.configured.is_absolute() {
+            evidence.configured.clone()
+        } else {
+            evidence
+                .validation
+                .working_directory
+                .join(&evidence.configured)
+        };
+        if canonicalize_resolution_path(configured_path)? != canonical_path {
+            return Err(ExecutableResolutionError::InvalidEvidence(
+                "configured executable does not match the resolved path".to_owned(),
+            ));
+        }
+    } else {
+        let search_directory = evidence
+            .validation
+            .search_directory
+            .as_ref()
+            .ok_or_else(|| {
+                ExecutableResolutionError::InvalidEvidence(
+                    "bare executable omitted its selected PATH directory".to_owned(),
+                )
+            })?;
+        let canonical_search_directory = canonicalize_resolution_path(search_directory.clone())?;
+        if Some(canonical_search_directory.as_path()) != canonical_path.parent() {
+            return Err(ExecutableResolutionError::InvalidEvidence(
+                "selected PATH directory does not contain the resolved executable".to_owned(),
+            ));
+        }
+        validate_bare_filename(evidence)?;
+    }
+    Ok(())
+}
+
+fn validate_bare_filename(evidence: &ResolvedExecutable) -> Result<(), ExecutableResolutionError> {
+    let configured = evidence
+        .configured
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let resolved = evidence
+        .path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let matches = if ExecutablePlatform::current() == ExecutablePlatform::Windows {
+        if evidence.configured.extension().is_some() {
+            configured.eq_ignore_ascii_case(resolved)
+        } else {
+            evidence
+                .path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(configured))
+                && evidence
+                    .path
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "exe" | "com" | "cmd" | "bat"
+                        )
+                    })
+        }
+    } else {
+        configured == resolved
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(ExecutableResolutionError::InvalidEvidence(
+            "configured bare executable does not match the resolved filename".to_owned(),
+        ))
     }
 }
 
@@ -132,6 +269,10 @@ fn resolve_explicit(
         configured: configured.to_path_buf(),
         path: resolved,
         kind,
+        validation: ExecutableValidationContext {
+            working_directory: search.working_directory.clone(),
+            search_directory: None,
+        },
     })
 }
 
@@ -150,11 +291,7 @@ fn resolve_windows_bare(
                 .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
                 && let Some(path) = windows_regular_file(directory, configured.as_os_str())
             {
-                return Ok(ResolvedExecutable {
-                    configured: configured.to_path_buf(),
-                    kind: executable_kind(&path, search.platform),
-                    path,
-                });
+                return resolved_bare(configured, path, search);
             }
             continue;
         }
@@ -163,11 +300,7 @@ fn resolve_windows_bare(
             let mut candidate = configured.as_os_str().to_os_string();
             candidate.push(extension);
             if let Some(path) = windows_regular_file(directory, &candidate) {
-                return Ok(ResolvedExecutable {
-                    configured: configured.to_path_buf(),
-                    kind: executable_kind(&path, search.platform),
-                    path,
-                });
+                return resolved_bare(configured, path, search);
             }
         }
     }
@@ -188,17 +321,40 @@ fn resolve_unix_bare(
             && metadata.is_file()
             && unix_executable(&metadata)
         {
-            return Ok(ResolvedExecutable {
-                configured: configured.to_path_buf(),
-                path: candidate,
-                kind: ExecutableKind::Native,
-            });
+            return resolved_bare(configured, candidate, search);
         }
     }
     Err(ExecutableResolutionError::NotFound {
         configured: configured.to_path_buf(),
         search_path: search.path.clone(),
     })
+}
+
+fn resolved_bare(
+    configured: &Path,
+    path: PathBuf,
+    search: &ExecutableSearch,
+) -> Result<ResolvedExecutable, ExecutableResolutionError> {
+    let search_directory = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        ExecutableResolutionError::ExplicitNotFile {
+            configured: configured.to_path_buf(),
+            resolved: path.clone(),
+        }
+    })?;
+    Ok(ResolvedExecutable {
+        configured: configured.to_path_buf(),
+        kind: executable_kind(&path, search.platform),
+        path,
+        validation: ExecutableValidationContext {
+            working_directory: search.working_directory.clone(),
+            search_directory: Some(search_directory),
+        },
+    })
+}
+
+fn canonicalize_resolution_path(path: PathBuf) -> Result<PathBuf, ExecutableResolutionError> {
+    fs::canonicalize(&path)
+        .map_err(|source| ExecutableResolutionError::Canonicalize { path, source })
 }
 
 fn allowed_windows_extensions(pathext: &[OsString]) -> Vec<String> {

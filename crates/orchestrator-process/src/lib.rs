@@ -10,7 +10,8 @@ mod runner;
 
 pub use executable::{
     ExecutableKind, ExecutablePlatform, ExecutableResolutionError, ExecutableSearch,
-    ResolvedExecutable, resolve_executable,
+    ExecutableValidationContext, ResolvedExecutable, resolve_executable,
+    validate_resolution_evidence,
 };
 pub use git::{GitCommandBuilder, GitSafetyError, resolve_repo_path};
 pub use jsonl::{JsonLines, MalformedJsonLine, parse_json_lines};

@@ -596,6 +596,7 @@ fn command_spec(invocation: &PreparedInvocation, redaction: &RedactionConfig) ->
 
 fn process_output(result: &orchestrator_process::ProcessResult) -> RuntimeOutput {
     RuntimeOutput {
+        resolved_executable: Some(result.resolved_executable.clone()),
         exit_code: result.exit_code,
         termination: match result.termination {
             orchestrator_process::TerminationReason::Exited => RuntimeTermination::Exited,
@@ -715,6 +716,10 @@ mod tests {
                 configured: "fake-provider-cli".into(),
                 path: "fake-provider-cli".into(),
                 kind: orchestrator_process::ExecutableKind::Native,
+                validation: orchestrator_process::ExecutableValidationContext {
+                    working_directory: ".".into(),
+                    search_directory: None,
+                },
             },
             exit_code: None,
             termination,

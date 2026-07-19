@@ -32,8 +32,8 @@ use orchestrator_policy::{
     RoutingContext, RoutingEngine, TaskAnalysisInput, TaskAnalyzer, TaskRole, period_window,
 };
 use orchestrator_process::{
-    CommandSpec, EnvironmentPolicy, ProcessError, ProcessRunner, RedactionConfig, Redactor,
-    resolve_executable,
+    CommandSpec, ProcessError, ProcessRunner, RedactionConfig, Redactor, ResolvedExecutable,
+    validate_resolution_evidence,
 };
 use orchestrator_providers::{
     AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
@@ -2357,7 +2357,11 @@ async fn run_worker(
         finished_at,
         output_truncated: output.truncated,
     };
-    persist_attempt_result(database, &result)?;
+    let process_execution = output
+        .resolved_executable
+        .as_ref()
+        .ok_or_else(|| anyhow!("completed worker omitted process execution evidence"))?;
+    persist_attempt_result(database, &result, process_execution)?;
     Ok(WorkerRunRecord {
         result,
         quota_exceeded,
@@ -2679,7 +2683,20 @@ fn block_for_unconfirmed_termination(
     Ok(())
 }
 
-fn persist_attempt_result(database: &Database, result: &WorkerResult) -> Result<()> {
+fn persist_attempt_result(
+    database: &Database,
+    result: &WorkerResult,
+    process_execution: &ResolvedExecutable,
+) -> Result<()> {
+    validate_resolution_evidence(process_execution)?;
+    let mut persisted = serde_json::to_value(result)?;
+    let object = persisted
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("worker result must serialize as a JSON object"))?;
+    object.insert(
+        "process_execution".to_owned(),
+        serde_json::to_value(process_execution)?,
+    );
     database.with_connection(|connection| {
         connection.execute(
             "UPDATE task_attempts SET ended_at = ?1, outcome = ?2,
@@ -2689,7 +2706,7 @@ fn persist_attempt_result(database: &Database, result: &WorkerResult) -> Result<
                 enum_name(&result.outcome).map_err(|error| {
                     orchestrator_state::StateError::InvalidRecord(error.to_string())
                 })?,
-                serde_json::to_string(result)?,
+                persisted.to_string(),
                 result.attempt_id.to_string(),
             ],
         )?;
@@ -4585,13 +4602,27 @@ fn ensure_rollback_quiescent(database: &Database) -> Result<()> {
 
 #[derive(Clone, Debug, Default)]
 struct RollbackResolutionContext {
-    codex_working_directory: Option<PathBuf>,
+    codex_execution: Option<ResolvedExecutable>,
 }
 
 impl RollbackResolutionContext {
     fn working_directory_for(&self, component: &str) -> Option<&Path> {
         is_codex_rollback_component(component)
-            .then_some(self.codex_working_directory.as_deref())
+            .then_some(
+                self.codex_execution
+                    .as_ref()
+                    .map(|evidence| evidence.validation.working_directory.as_path()),
+            )
+            .flatten()
+    }
+
+    fn resolved_executable_for(&self, component: &str) -> Option<&Path> {
+        is_codex_rollback_component(component)
+            .then_some(
+                self.codex_execution
+                    .as_ref()
+                    .map(|evidence| evidence.path.as_path()),
+            )
             .flatten()
     }
 }
@@ -4599,7 +4630,7 @@ impl RollbackResolutionContext {
 fn rollback_resolution_context(
     repository: &Path,
     state: &StatePaths,
-    config: &RootConfig,
+    _config: &RootConfig,
     steps: &[RollbackManifestStep],
 ) -> Result<RollbackResolutionContext> {
     if !steps
@@ -4608,45 +4639,70 @@ fn rollback_resolution_context(
     {
         return Ok(RollbackResolutionContext::default());
     }
-    let configured = config
-        .orchestrator
-        .providers
-        .codex
-        .as_ref()
-        .ok_or_else(|| anyhow!("Codex is not configured for binary rollback"))?;
-    if Path::new(&configured.executable).is_absolute() {
-        return Ok(RollbackResolutionContext {
-            codex_working_directory: Some(repository.to_path_buf()),
-        });
-    }
     if !state.database.exists() {
         bail!(
-            "Codex rollback requires persisted writable worker invocation context; state database is missing"
+            "Codex rollback requires persisted process execution evidence; state database is missing"
         );
     }
     let database = open_ready_database(state)?;
-    let task_id = database.with_connection(|connection| {
+    let selected = database.with_connection(|connection| {
         connection
             .query_row(
-                "SELECT task_id FROM task_attempts
+                "SELECT attempt_id, task_id, worker_result_json FROM task_attempts
                  WHERE provider_id = 'codex' AND worker_mode = 'workspace_write'
+                   AND ended_at IS NOT NULL
                  ORDER BY started_at DESC, ordinal DESC, attempt_id DESC LIMIT 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(Into::into)
     })?;
-    let task_id = task_id
-        .map(|value| TaskId::from_str(&value))
-        .transpose()?
-        .ok_or_else(|| anyhow!("Codex rollback has no persisted writable provider invocation"))?;
+    let (attempt_id, task_id, persisted) = selected
+        .ok_or_else(|| anyhow!("Codex rollback has no completed writable provider attempt"))?;
+    let attempt_id = AttemptId::from_str(&attempt_id)?;
+    let task_id = TaskId::from_str(&task_id)?;
+    let persisted = persisted
+        .ok_or_else(|| anyhow!("selected Codex attempt has no process execution evidence"))?;
+    let persisted: Value = serde_json::from_str(&persisted)
+        .context("selected Codex attempt has malformed persisted result JSON")?;
+    let worker_result: WorkerResult = serde_json::from_value(persisted.clone())
+        .context("selected Codex attempt does not contain a complete WorkerResult v1")?;
+    if worker_result.attempt_id != attempt_id
+        || worker_result.task_id != task_id
+        || worker_result.provider != ProviderId::Codex
+    {
+        bail!(
+            "selected Codex attempt process execution evidence does not match its attempt identity"
+        );
+    }
+    let process_execution: ResolvedExecutable = serde_json::from_value(
+        persisted
+            .get("process_execution")
+            .cloned()
+            .ok_or_else(|| anyhow!("selected Codex attempt has no process execution evidence"))?,
+    )
+    .context("selected Codex attempt has malformed process execution evidence")?;
+    validate_resolution_evidence(&process_execution)
+        .context("selected Codex attempt has invalid process execution evidence")?;
     let stored = database
         .active_worktree(task_id)?
         .ok_or_else(|| anyhow!("Codex rollback invocation has no active isolated worktree"))?;
     let worktree = validate_recovered_worktree(repository, state, stored)?;
+    let canonical_worktree = fs::canonicalize(&worktree.path)?;
+    if fs::canonicalize(&process_execution.validation.working_directory)? != canonical_worktree {
+        bail!(
+            "selected Codex attempt process execution evidence does not match its trusted worktree"
+        );
+    }
     Ok(RollbackResolutionContext {
-        codex_working_directory: Some(worktree.path),
+        codex_execution: Some(process_execution),
     })
 }
 
@@ -4725,7 +4781,7 @@ fn trusted_rollback_destination(
     repository: &Path,
     config_path: &Path,
     _state: &StatePaths,
-    config: &RootConfig,
+    _config: &RootConfig,
     component: &str,
     resolution_context: &RollbackResolutionContext,
 ) -> Result<PathBuf> {
@@ -4734,20 +4790,10 @@ fn trusted_rollback_destination(
             std::env::current_exe()?
         }
         "config" => resolve_from(repository, config_path),
-        "codex" | "codex_binary" => {
-            let executable = config
-                .orchestrator
-                .providers
-                .codex
-                .as_ref()
-                .ok_or_else(|| anyhow!("Codex is not configured for binary rollback"))?;
-            let working_directory = resolution_context
-                .working_directory_for(component)
-                .ok_or_else(|| anyhow!("rollback has no persisted writable Codex context"))?;
-            let environment = EnvironmentPolicy::default();
-            let search = environment.executable_search(working_directory);
-            resolve_executable(Path::new(&executable.executable), &search)?.path
-        }
+        "codex" | "codex_binary" => resolution_context
+            .resolved_executable_for(component)
+            .ok_or_else(|| anyhow!("rollback has no persisted Codex process execution evidence"))?
+            .to_path_buf(),
         "database" | "state_database" => bail!(
             "release rollback cannot replace the live task database; use validated schema migration recovery"
         ),
@@ -6583,7 +6629,8 @@ mod tests {
     use chrono::Utc;
     use orchestrator_domain::{
         AttemptId, ModelProfile, ProviderId, SandboxMode, SchemaVersion, TaskEnvelope, TaskEvent,
-        TaskState, TestEvidence, TestStatus, VerificationStatus, WorkerRequest,
+        TaskState, TestEvidence, TestStatus, VerificationStatus, WorkerOutcome, WorkerRequest,
+        WorkerResult,
     };
     use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
     use orchestrator_state::{ConfigEnvironment, Database, NewTaskRecord, RootConfig};
@@ -6958,6 +7005,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn rollback_relative_codex_target_matches_persisted_writable_worker_worktree() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let repository = fs::canonicalize(temporary.path())?;
@@ -6990,6 +7038,32 @@ mod tests {
             envelope: &envelope,
             created_at: now,
         })?;
+        let attempt_id = AttemptId::new();
+        let worker_result = WorkerResult {
+            schema_version: SchemaVersion::v1(),
+            task_id: envelope.task_id,
+            attempt_id,
+            provider: ProviderId::Codex,
+            outcome: WorkerOutcome::Succeeded,
+            exit_code: Some(0),
+            session_id: None,
+            summary: None,
+            commands: Vec::new(),
+            tests: Vec::new(),
+            started_at: now,
+            finished_at: now,
+            output_truncated: false,
+        };
+        let mut persisted = serde_json::to_value(&worker_result)?;
+        persisted["process_execution"] = serde_json::json!({
+            "configured": configured,
+            "path": fs::canonicalize(&worktree_executable)?,
+            "kind": "native",
+            "validation": {
+                "working_directory": fs::canonicalize(&worktree)?,
+                "search_directory": null
+            }
+        });
         database.with_connection(|connection| {
             connection.execute(
                 "INSERT INTO worktrees(
@@ -7006,12 +7080,14 @@ mod tests {
             )?;
             connection.execute(
                 "INSERT INTO task_attempts(
-                    attempt_id, task_id, ordinal, provider_id, worker_mode, started_at
-                 ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3)",
+                    attempt_id, task_id, ordinal, provider_id, worker_mode, started_at,
+                    ended_at, outcome, worker_result_json
+                 ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3, ?3, 'succeeded', ?4)",
                 params![
-                    AttemptId::new().to_string(),
+                    attempt_id.to_string(),
                     envelope.task_id.to_string(),
                     now.to_rfc3339(),
+                    persisted.to_string(),
                 ],
             )?;
             Ok(())
@@ -7024,7 +7100,9 @@ mod tests {
             .codex
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("default Codex provider is missing"))?
-            .executable = configured.to_string_lossy().into_owned();
+            .executable = "tools/changed-after-attempt.exe".to_owned();
+        let changed_executable = worktree.join("tools/changed-after-attempt.exe");
+        write_fake_executable(&changed_executable, b"changed fake")?;
         let release_root = state.backups.join("releases/fake-v1");
         fs::create_dir_all(&release_root)?;
         fs::write(release_root.join("fake-provider.backup"), b"rollback fake")?;
@@ -7055,6 +7133,121 @@ mod tests {
         )?;
         assert_eq!(trusted, fs::canonicalize(actual_worker.path)?);
         assert_ne!(trusted, fs::canonicalize(repository_executable)?);
+
+        let path_a = worktree.join("path-a");
+        let path_b = worktree.join("path-b");
+        fs::create_dir_all(&path_a)?;
+        fs::create_dir_all(&path_b)?;
+        let bare = PathBuf::from("fake-path-provider");
+        #[cfg(windows)]
+        let filename = "fake-path-provider.exe";
+        #[cfg(not(windows))]
+        let filename = "fake-path-provider";
+        let executable_a = path_a.join(filename);
+        let executable_b = path_b.join(filename);
+        write_fake_executable(&executable_a, b"path A fake")?;
+        write_fake_executable(&executable_b, b"path B fake")?;
+        let mut attempt_environment = EnvironmentPolicy::empty();
+        attempt_environment.set("PATH", std::env::join_paths([&path_a])?)?;
+        #[cfg(windows)]
+        attempt_environment.set("PATHEXT", ".EXE")?;
+        let attempt_execution =
+            resolve_executable(&bare, &attempt_environment.executable_search(&worktree))?;
+        let mut current_environment = EnvironmentPolicy::empty();
+        current_environment.set("PATH", std::env::join_paths([&path_b])?)?;
+        #[cfg(windows)]
+        current_environment.set("PATHEXT", ".EXE")?;
+        let current_resolution =
+            resolve_executable(&bare, &current_environment.executable_search(&worktree))?;
+        assert_eq!(current_resolution.path, fs::canonicalize(&executable_b)?);
+
+        let mut path_persisted = serde_json::to_value(&worker_result)?;
+        path_persisted["process_execution"] = serde_json::to_value(&attempt_execution)?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![path_persisted.to_string(), attempt_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        config
+            .orchestrator
+            .providers
+            .codex
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("default Codex provider is missing"))?
+            .executable = bare.to_string_lossy().into_owned();
+        let path_steps = vec![RollbackManifestStep {
+            component: "codex".to_owned(),
+            backup_source: PathBuf::from("fake-provider.backup"),
+            destination: PathBuf::from("path-a").join(filename),
+        }];
+        let path_context = rollback_resolution_context(&repository, &state, &config, &path_steps)?;
+        let path_plan = trusted_rollback_steps(
+            &repository,
+            &repository.join(".colay/config.toml"),
+            &state,
+            &config,
+            &path_context,
+            &release_root,
+            path_steps,
+        )?;
+        assert_eq!(path_plan[0].destination, fs::canonicalize(&executable_a)?);
+        assert_ne!(path_plan[0].destination, current_resolution.path);
+
+        let mut mismatched = path_persisted;
+        mismatched["process_execution"]["path"] =
+            serde_json::to_value(fs::canonicalize(&executable_b)?)?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![mismatched.to_string(), attempt_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        let mismatched_result = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: PathBuf::from("path-a").join(filename),
+            }],
+        );
+        let Err(error) = mismatched_result else {
+            anyhow::bail!("mismatched process execution evidence authorized rollback");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("invalid process execution evidence")
+        );
+
+        database.with_connection(|connection| {
+            connection.execute(
+                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                params![
+                    serde_json::to_string(&worker_result)?,
+                    attempt_id.to_string()
+                ],
+            )?;
+            Ok(())
+        })?;
+        let legacy_result = rollback_resolution_context(
+            &repository,
+            &state,
+            &config,
+            &[RollbackManifestStep {
+                component: "codex".to_owned(),
+                backup_source: PathBuf::from("fake-provider.backup"),
+                destination: configured,
+            }],
+        );
+        let Err(error) = legacy_result else {
+            anyhow::bail!("legacy worker result authorized executable rollback");
+        };
+        assert!(error.to_string().contains("process execution evidence"));
         Ok(())
     }
 
