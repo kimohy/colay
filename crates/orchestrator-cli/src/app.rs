@@ -4337,11 +4337,18 @@ fn rollback(
             if manifest.schema_version != 1 || manifest.version != to {
                 bail!("rollback manifest schema/version does not match --to {to}");
             }
+            let resolution_context = rollback_resolution_context(
+                repository,
+                &state,
+                effective.config(),
+                &manifest.steps,
+            )?;
             let steps = trusted_rollback_steps(
                 repository,
                 explicit_edit_path,
                 &state,
                 effective.config(),
+                &resolution_context,
                 &release_root,
                 manifest.steps,
             )?;
@@ -4406,11 +4413,18 @@ fn rollback(
             if manifest.schema_version != 1 || manifest.version != to {
                 bail!("rollback release manifest schema/version does not match the sealed plan");
             }
+            let resolution_context = rollback_resolution_context(
+                repository,
+                &state,
+                effective.config(),
+                &manifest.steps,
+            )?;
             let manifest_steps = trusted_rollback_steps(
                 repository,
                 explicit_edit_path,
                 &state,
                 effective.config(),
+                &resolution_context,
                 &release_root,
                 manifest.steps,
             )?;
@@ -4422,6 +4436,7 @@ fn rollback(
                 explicit_edit_path,
                 &state,
                 effective.config(),
+                &resolution_context,
                 &plan,
             )?;
             let manager = rollback_manager(&state, &plan.steps)?;
@@ -4568,11 +4583,83 @@ fn ensure_rollback_quiescent(database: &Database) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Default)]
+struct RollbackResolutionContext {
+    codex_working_directory: Option<PathBuf>,
+}
+
+impl RollbackResolutionContext {
+    fn working_directory_for(&self, component: &str) -> Option<&Path> {
+        is_codex_rollback_component(component)
+            .then_some(self.codex_working_directory.as_deref())
+            .flatten()
+    }
+}
+
+fn rollback_resolution_context(
+    repository: &Path,
+    state: &StatePaths,
+    config: &RootConfig,
+    steps: &[RollbackManifestStep],
+) -> Result<RollbackResolutionContext> {
+    if !steps
+        .iter()
+        .any(|step| is_codex_rollback_component(&step.component))
+    {
+        return Ok(RollbackResolutionContext::default());
+    }
+    let configured = config
+        .orchestrator
+        .providers
+        .codex
+        .as_ref()
+        .ok_or_else(|| anyhow!("Codex is not configured for binary rollback"))?;
+    if Path::new(&configured.executable).is_absolute() {
+        return Ok(RollbackResolutionContext {
+            codex_working_directory: Some(repository.to_path_buf()),
+        });
+    }
+    if !state.database.exists() {
+        bail!(
+            "Codex rollback requires persisted writable worker invocation context; state database is missing"
+        );
+    }
+    let database = open_ready_database(state)?;
+    let task_id = database.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT task_id FROM task_attempts
+                 WHERE provider_id = 'codex' AND worker_mode = 'workspace_write'
+                 ORDER BY started_at DESC, ordinal DESC, attempt_id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    })?;
+    let task_id = task_id
+        .map(|value| TaskId::from_str(&value))
+        .transpose()?
+        .ok_or_else(|| anyhow!("Codex rollback has no persisted writable provider invocation"))?;
+    let stored = database
+        .active_worktree(task_id)?
+        .ok_or_else(|| anyhow!("Codex rollback invocation has no active isolated worktree"))?;
+    let worktree = validate_recovered_worktree(repository, state, stored)?;
+    Ok(RollbackResolutionContext {
+        codex_working_directory: Some(worktree.path),
+    })
+}
+
+fn is_codex_rollback_component(component: &str) -> bool {
+    matches!(component, "codex" | "codex_binary")
+}
+
 fn trusted_rollback_steps(
     repository: &Path,
     config_path: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    resolution_context: &RollbackResolutionContext,
     release_root: &Path,
     steps: Vec<RollbackManifestStep>,
 ) -> Result<Vec<orchestrator_engine::RollbackStep>> {
@@ -4593,8 +4680,12 @@ fn trusted_rollback_steps(
                 state,
                 config,
                 &step.component,
+                resolution_context,
             )?;
-            let manifest_destination = resolve_from(repository, &step.destination);
+            let manifest_base = resolution_context
+                .working_directory_for(&step.component)
+                .unwrap_or(repository);
+            let manifest_destination = resolve_from(manifest_base, &step.destination);
             let manifest_destination =
                 fs::canonicalize(&manifest_destination).with_context(|| {
                     format!(
@@ -4636,6 +4727,7 @@ fn trusted_rollback_destination(
     _state: &StatePaths,
     config: &RootConfig,
     component: &str,
+    resolution_context: &RollbackResolutionContext,
 ) -> Result<PathBuf> {
     let path = match component {
         "colay" | "colay_binary" | "orchestrator" | "orchestrator_binary" => {
@@ -4649,8 +4741,11 @@ fn trusted_rollback_destination(
                 .codex
                 .as_ref()
                 .ok_or_else(|| anyhow!("Codex is not configured for binary rollback"))?;
+            let working_directory = resolution_context
+                .working_directory_for(component)
+                .ok_or_else(|| anyhow!("rollback has no persisted writable Codex context"))?;
             let environment = EnvironmentPolicy::default();
-            let search = environment.executable_search(repository);
+            let search = environment.executable_search(working_directory);
             resolve_executable(Path::new(&executable.executable), &search)?.path
         }
         "database" | "state_database" => bail!(
@@ -4690,11 +4785,18 @@ fn validate_sealed_rollback_destinations(
     config_path: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    resolution_context: &RollbackResolutionContext,
     plan: &orchestrator_engine::RollbackRecoveryPlan,
 ) -> Result<()> {
     for step in &plan.steps {
-        let trusted =
-            trusted_rollback_destination(repository, config_path, state, config, &step.component)?;
+        let trusted = trusted_rollback_destination(
+            repository,
+            config_path,
+            state,
+            config,
+            &step.component,
+            resolution_context,
+        )?;
         if step.destination != trusted {
             bail!("sealed rollback plan contains an unapproved destination");
         }
@@ -6471,7 +6573,10 @@ struct RollbackManifestStep {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use crate::args::MigrationAction;
     use anyhow::Result;
@@ -6480,15 +6585,40 @@ mod tests {
         AttemptId, ModelProfile, ProviderId, SandboxMode, SchemaVersion, TaskEnvelope, TaskEvent,
         TaskState, TestEvidence, TestStatus, VerificationStatus, WorkerRequest,
     };
-    use orchestrator_process::{RedactionConfig, Redactor};
+    use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
     use orchestrator_state::{ConfigEnvironment, Database, NewTaskRecord, RootConfig};
     use rusqlite::params;
     use toml_edit::DocumentMut;
 
     use super::{
-        ReviewOutcome, StatePaths, acceptance_evidence, block_for_unconfirmed_termination,
-        initialize, load_config_runtime, set_provider_enabled,
+        ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
+        block_for_unconfirmed_termination, initialize, load_config_runtime,
+        rollback_resolution_context, set_provider_enabled, trusted_rollback_steps,
     };
+
+    fn test_state(root: PathBuf) -> StatePaths {
+        StatePaths {
+            database: root.join("orchestrator.db"),
+            events: root.join("events.jsonl"),
+            backups: root.join("backups"),
+            tasks: root.join("tasks"),
+            checkpoints: root.join("checkpoints"),
+            handovers: root.join("handovers"),
+            worktrees: root.join("worktrees"),
+            root,
+        }
+    }
+
+    fn write_fake_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+        fs::write(path, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn cli_config_is_the_highest_layer() -> Result<()> {
@@ -6828,21 +6958,112 @@ mod tests {
     }
 
     #[test]
+    fn rollback_relative_codex_target_matches_persisted_writable_worker_worktree() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let repository = fs::canonicalize(temporary.path())?;
+        let state = test_state(repository.join(".colay"));
+        let worktree = state.worktrees.join("writable-worker");
+        let configured = PathBuf::from("tools/fake-provider.exe");
+        let repository_executable = repository.join(&configured);
+        let worktree_executable = worktree.join(&configured);
+        for (path, bytes) in [
+            (&repository_executable, b"repository fake".as_slice()),
+            (&worktree_executable, b"worktree fake".as_slice()),
+        ] {
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("fake executable has no parent"))?,
+            )?;
+            write_fake_executable(path, bytes)?;
+        }
+
+        let database = Database::open(&state.database)?;
+        database.migrate_with_backup(&state.backups)?;
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("writable fake provider", "writable fake provider", now);
+        database.create_task(&NewTaskRecord {
+            task_id: envelope.task_id,
+            schema_version: envelope.schema_version.to_string(),
+            state: TaskState::Completed,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope: &envelope,
+            created_at: now,
+        })?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO worktrees(
+                    worktree_id, task_id, repo_root, worktree_path, branch_name,
+                    base_revision, state, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'codex/test', 'base', 'active', ?5)",
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    envelope.task_id.to_string(),
+                    repository.to_string_lossy(),
+                    worktree.to_string_lossy(),
+                    now.to_rfc3339(),
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO task_attempts(
+                    attempt_id, task_id, ordinal, provider_id, worker_mode, started_at
+                 ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3)",
+                params![
+                    AttemptId::new().to_string(),
+                    envelope.task_id.to_string(),
+                    now.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })?;
+
+        let mut config = RootConfig::default();
+        config
+            .orchestrator
+            .providers
+            .codex
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("default Codex provider is missing"))?
+            .executable = configured.to_string_lossy().into_owned();
+        let release_root = state.backups.join("releases/fake-v1");
+        fs::create_dir_all(&release_root)?;
+        fs::write(release_root.join("fake-provider.backup"), b"rollback fake")?;
+        let steps = vec![RollbackManifestStep {
+            component: "codex".to_owned(),
+            backup_source: PathBuf::from("fake-provider.backup"),
+            destination: configured.clone(),
+        }];
+        let context = rollback_resolution_context(&repository, &state, &config, &steps)?;
+        let planned = trusted_rollback_steps(
+            &repository,
+            &repository.join(".colay/config.toml"),
+            &state,
+            &config,
+            &context,
+            &release_root,
+            steps,
+        )?;
+        let trusted = planned
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("rollback planning omitted Codex step"))?
+            .destination
+            .clone();
+
+        let actual_worker = resolve_executable(
+            &configured,
+            &EnvironmentPolicy::default().executable_search(&worktree),
+        )?;
+        assert_eq!(trusted, fs::canonicalize(actual_worker.path)?);
+        assert_ne!(trusted, fs::canonicalize(repository_executable)?);
+        Ok(())
+    }
+
+    #[test]
     fn unconfirmed_process_tree_blocks_task_and_redacts_audit_detail()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let temporary_root = fs::canonicalize(temporary.path())?;
-        let root = temporary_root.join("state");
-        let state = StatePaths {
-            database: root.join("orchestrator.db"),
-            events: root.join("events.jsonl"),
-            backups: root.join("backups"),
-            tasks: root.join("tasks"),
-            checkpoints: root.join("checkpoints"),
-            handovers: root.join("handovers"),
-            worktrees: root.join("worktrees"),
-            root,
-        };
+        let state = test_state(temporary_root.join("state"));
         let database = Database::open(&state.database)?;
         database.migrate_with_backup(&state.backups)?;
         let now = Utc::now();

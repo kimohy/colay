@@ -137,9 +137,22 @@ impl EnvironmentPolicy {
     #[must_use]
     pub fn executable_search(&self, working_directory: impl Into<PathBuf>) -> ExecutableSearch {
         let platform = ExecutablePlatform::current();
+        let working_directory = working_directory.into();
         let path = self
             .effective_value("PATH", platform)
-            .map(|value| std::env::split_paths(&value).collect())
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .map(|directory| {
+                        if directory.as_os_str().is_empty() {
+                            working_directory.clone()
+                        } else if directory.is_absolute() {
+                            directory
+                        } else {
+                            working_directory.join(directory)
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let pathext = self
             .effective_value("PATHEXT", platform)
@@ -156,7 +169,7 @@ impl EnvironmentPolicy {
             platform,
             path,
             pathext,
-            working_directory: working_directory.into(),
+            working_directory,
         }
     }
 
@@ -990,7 +1003,9 @@ fn validate_environment_name(name: &str) -> Result<(), ProcessError> {
 mod tests {
     use std::{
         ffi::OsString,
+        fs,
         io::{BufRead as _, Write as _},
+        path::Path,
         time::Duration,
     };
 
@@ -1079,6 +1094,62 @@ mod tests {
             [OsString::from(".EXE"), OsString::from(".CMD")]
         );
         assert_eq!(search.working_directory, root.path());
+    }
+
+    #[test]
+    fn environment_policy_anchors_relative_and_empty_path_entries_to_working_directory() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let encoded_path = std::env::join_paths([Path::new("bin"), Path::new("")])
+            .unwrap_or_else(|error| panic!("encode PATH: {error}"));
+        let mut environment = EnvironmentPolicy::empty();
+        environment
+            .set("PATH", encoded_path)
+            .unwrap_or_else(|error| panic!("set PATH: {error}"));
+
+        let search = environment.executable_search(root.path());
+
+        assert_eq!(
+            search.path,
+            [root.path().join("bin"), root.path().to_path_buf()]
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_path_entry_resolves_from_command_working_directory() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("create fixture bin: {error}"));
+        let executable_name = if cfg!(windows) { "tool.exe" } else { "tool" };
+        let executable = bin.join(executable_name);
+        fs::copy(
+            std::env::current_exe()
+                .unwrap_or_else(|error| panic!("current test executable: {error}")),
+            &executable,
+        )
+        .unwrap_or_else(|error| panic!("copy fixture executable: {error}"));
+
+        let mut spec = CommandSpec::new("tool")
+            .args(["--exact", "runner::tests::fixture_child", "--nocapture"])
+            .current_dir(root.path());
+        spec.environment = EnvironmentPolicy::empty();
+        spec.environment
+            .set("PATH", "bin")
+            .unwrap_or_else(|error| panic!("set PATH: {error}"));
+        spec.environment
+            .set("PATHEXT", ".EXE")
+            .unwrap_or_else(|error| panic!("set PATHEXT: {error}"));
+        spec.environment
+            .set("ORCHESTRATOR_PROCESS_FIXTURE", "output")
+            .unwrap_or_else(|error| panic!("fixture environment: {error}"));
+
+        let result = ProcessRunner
+            .run(spec, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("process: {error}"));
+
+        assert!(result.success());
+        assert_eq!(result.resolved_executable.path, executable);
+        assert!(result.stdout.redacted_text.contains("[REDACTED]"));
     }
 
     #[tokio::test]
