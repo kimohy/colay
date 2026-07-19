@@ -297,9 +297,11 @@ fn migration_fallback_path(
         preflight_environment.colay_config = None;
     }
     let temporary_repository;
+    let canonical_temporary_repository;
     let preflight_repository = if target == current || target == legacy {
         temporary_repository = tempfile::tempdir()?;
-        temporary_repository.path()
+        canonical_temporary_repository = fs::canonicalize(temporary_repository.path())?;
+        &canonical_temporary_repository
     } else {
         repository
     };
