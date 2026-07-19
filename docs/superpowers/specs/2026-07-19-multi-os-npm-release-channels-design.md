@@ -112,9 +112,9 @@ provide the mutable channel pointers:
 | tag `vX.Y.Z` | `X.Y.Z` | `latest` | permanent GitHub release |
 
 For a stable workspace version `X.Y.Z`, the next main build is
-`X.Y.(Z+1)-nightly.YYYYMMDD.<short-sha>`. For a prerelease workspace version,
+`X.Y.(Z+1)-nightly.YYYYMMDD.{short-sha}`. For a prerelease workspace version,
 the nightly build keeps the same `X.Y.Z` core and replaces its prerelease part
-with `nightly.YYYYMMDD.<short-sha>`. The date is UTC and the commit identifier
+with `nightly.YYYYMMDD.{short-sha}`. The date is UTC and the commit identifier
 makes every main build version unique. For example, workspace version `0.1.0`
 produces a version shaped like `0.1.1-nightly.20260719.a1b2c3d`. The short
 identifier is the first seven lowercase hexadecimal characters of the Git
@@ -159,8 +159,10 @@ tags. Its jobs have these boundaries:
    to create attestations.
 5. **Publish npm** publishes the three native packages first through npm Trusted
    Publishing, verifies that all three exact versions are visible in the npm
-   registry, publishes the root package last, and moves only the selected npm
-   dist-tag. This job receives `id-token: write` and no long-lived npm token.
+   registry, then publishes the root package last with the selected npm dist-tag.
+   Native packages use the internal `colay-candidate` tag because users install
+   only the root package and its dependencies are exact versions. This job
+   receives `id-token: write` and no long-lived npm token.
 6. **Publish GitHub** uploads beta artifacts to a prerelease and stable artifacts
    to a normal release. A nightly uploads the same validated bundle as a workflow
    artifact with 14-day retention and does not create a permanent GitHub release.
@@ -173,9 +175,9 @@ rebuilding them.
 Direct-download archives use deterministic names:
 
 ```text
-colay-v<version>-x86_64-pc-windows-msvc.zip
-colay-v<version>-aarch64-apple-darwin.tar.gz
-colay-v<version>-x86_64-unknown-linux-musl.tar.gz
+colay-v{version}-x86_64-pc-windows-msvc.zip
+colay-v{version}-aarch64-apple-darwin.tar.gz
+colay-v{version}-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Every direct-download archive includes the matching binary and a byte-for-byte
@@ -196,11 +198,19 @@ and `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` remains active.
 ## Publication prerequisites
 
 Repository automation cannot create or authorize the npm identity. Before the
-first real publication, the maintainer must own the `@kimohy` npm scope, make
-the four packages public, and configure npm Trusted Publishing to allow only
-this repository's release workflow. GitHub environments named `npm-nightly`,
-`npm-beta`, and `npm-stable` provide independent policy gates; the stable
-environment should require human approval.
+first OIDC publication, the maintainer must own the `@kimohy` npm scope. npm
+requires a package to exist before it can receive a trusted-publisher
+configuration, so the first validated four-package bundle is a one-time
+interactive bootstrap: a maintainer downloads the attested workflow tarballs,
+publishes the three native packages with `colay-candidate` and the root package
+with its selected channel tag using npm login plus 2FA, then configures each
+package to allow `npm publish` only from this repository's `release.yml`.
+
+Each npm package supports one trusted-publisher configuration. The configuration
+therefore binds to the workflow filename without an npm environment claim, while
+GitHub environments named `npm-nightly`, `npm-beta`, and `npm-stable` provide
+independent policy gates inside that workflow; the stable environment should
+require human approval.
 
 No npm access token, provider credential, signing key, or GitHub personal access
 token is committed to the repository. If the npm scope or trusted-publisher
@@ -217,9 +227,13 @@ npm does not permit overwriting a published name/version pair. Rerunning a
 partially completed publication therefore checks each exact package version:
 matching existing packages are verified and skipped, missing packages are
 published, and any mismatched provenance or digest fails closed. The root
-package remains last. The selected dist-tag moves only after the root package is
-verified. Consequently, a failed nightly leaves `nightly` pointing at the last
-complete release; the same rule applies to `beta` and `latest`.
+package remains last and its `npm publish --tag {channel}` operation atomically
+publishes the version and moves the selected channel tag. The workflow never
+uses `npm dist-tag add`, which is outside npm OIDC publishing authorization. If
+an existing root version has the wrong channel tag, automation fails with an
+interactive-maintainer recovery command rather than introducing a registry
+token. Consequently, a failure before root publication leaves `nightly`,
+`beta`, or `latest` pointing at the last complete release.
 
 Stable GitHub releases and version tags are immutable in this workflow: an
 existing release is verified, never overwritten. Beta releases are also not
