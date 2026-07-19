@@ -1,6 +1,7 @@
 #![cfg(feature = "test-fixtures")]
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -71,21 +72,17 @@ fn toml_path(path: &Path) -> String {
 fn install_fake_provider_config(config_path: &Path) -> Result<()> {
     let mut config = fs::read_to_string(config_path)?;
     let fake = toml_path(&fake_provider_binary());
-    for provider in ["gemini", "codex", "claude"] {
-        config = config.replace(
-            &format!("executable = \"{provider}\""),
-            &format!("executable = {fake}"),
-        );
-    }
-    config = config.replace(
-        "default_timeout_minutes = 30",
-        "default_timeout_minutes = 1",
-    );
-    config = config.replace("priority = 70", "priority = 0");
-    config = config.replace(
-        "codex_app_server_adapter = true",
-        "codex_app_server_adapter = false",
-    );
+    write!(
+        config,
+        "\n[orchestrator]\ndefault_timeout_minutes = 1\n\
+         \n[orchestrator.providers.gemini]\nexecutable = {fake}\npriority = 0\n\
+         \n[orchestrator.providers.codex]\nexecutable = {fake}\n\
+         \n[orchestrator.providers.claude]\nexecutable = {fake}\n\
+         \n[orchestrator.model_profiles.codex.economy]\nmodel = \"\"\neffort = \"low\"\n\
+         \n[orchestrator.model_profiles.claude.economy]\nmodel = \"configured-by-test\"\neffort = \"low\"\n\
+         \n[orchestrator.model_profiles.gemini.economy]\nmodel = \"configured-by-test\"\n\
+         \n[features]\ncodex_app_server_adapter = false\n"
+    )?;
     fs::write(config_path, config)?;
     ensure_private_file(config_path)?;
     Ok(())
