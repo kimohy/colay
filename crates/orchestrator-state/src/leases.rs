@@ -851,7 +851,8 @@ mod tests {
 
     #[test]
     fn concurrent_coordinator_acquisition_has_one_winner() {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let directory = crate::CanonicalTempDir::new("tempdir")
+            .unwrap_or_else(|error| panic!("tempdir: {error}"));
         let path = directory.path().join("coordinator-race.db");
         let task_id = TaskId::new();
         {

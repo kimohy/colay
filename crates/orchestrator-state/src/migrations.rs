@@ -166,8 +166,7 @@ impl MigrationManager {
     /// Executes all pending migrations against an online-backup copy and verifies `SQLite`
     /// integrity. The live database is not changed.
     pub fn dry_run(connection: &Connection) -> StateResult<MigrationStatus> {
-        let temporary =
-            tempfile::tempdir().map_err(|error| StateError::io("migration-dry-run", error))?;
+        let temporary = crate::CanonicalTempDir::new("migration-dry-run")?;
         let path = temporary.path().join("dry-run.db");
         connection.backup(MAIN_DB, &path, None)?;
         let mut copy = Connection::open(&path)?;
@@ -835,7 +834,7 @@ mod tests {
 
     #[test]
     fn rollback_plan_seals_backup_and_rejects_changed_or_future_metadata() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let live = migrated_database(&temporary.path().join("live.db"))?;
         install_marker(&live, "before")?;
         let backup_path = temporary.path().join("prior.db");
@@ -868,7 +867,7 @@ mod tests {
 
     #[test]
     fn rollback_validation_rejects_backup_content_changes() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let live = migrated_database(&temporary.path().join("live.db"))?;
         install_marker(&live, "before")?;
         let backup_path = temporary.path().join("prior.db");
@@ -890,7 +889,7 @@ mod tests {
 
     #[test]
     fn rollback_plan_rejects_backup_behind_append_only_event_log() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let live = migrated_database(&temporary.path().join("live.db"))?;
         let backup_path = temporary.path().join("prior.db");
         MigrationManager::backup(&live, &backup_path)?;
@@ -911,7 +910,7 @@ mod tests {
 
     #[test]
     fn rollback_validation_rejects_active_tasks_and_advanced_events() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let live = migrated_database(&temporary.path().join("live.db"))?;
         let backup_path = temporary.path().join("prior.db");
         MigrationManager::backup(&live, &backup_path)?;
@@ -948,7 +947,7 @@ mod tests {
 
     #[test]
     fn rollback_apply_requires_exact_hash_and_explicit_approval() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let mut live = migrated_database(&temporary.path().join("live.db"))?;
         let backup_path = temporary.path().join("prior.db");
         MigrationManager::backup(&live, &backup_path)?;
@@ -985,7 +984,7 @@ mod tests {
 
     #[test]
     fn rollback_apply_restores_prior_image_and_preserves_live_recovery_backup() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let mut live = migrated_database(&temporary.path().join("live.db"))?;
         install_marker(&live, "before")?;
         let backup_path = temporary.path().join("prior.db");
@@ -1017,7 +1016,7 @@ mod tests {
 
     #[test]
     fn failed_post_restore_verification_automatically_recovers_live_database() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let mut live = migrated_database(&temporary.path().join("live.db"))?;
         install_marker(&live, "before")?;
         let backup_path = temporary.path().join("prior.db");

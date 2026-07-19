@@ -781,7 +781,7 @@ mod tests {
     fn unix_private_permissions_remain_owner_only() -> StateResult<()> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let directory = temporary.path().join("state");
         ensure_private_directory(&directory)?;
         let file = directory.join("state.json");
@@ -809,7 +809,7 @@ mod tests {
     fn windows_private_file_removes_untrusted_temp_file_grants() -> StateResult<()> {
         use std::ffi::OsString;
 
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let directory = temporary.path().join("state");
         ensure_private_directory(&directory)?;
         let file = directory.join("state.json");
@@ -841,7 +841,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_private_temp_directory_is_idempotent() -> StateResult<()> {
-        let temporary = tempfile::tempdir().map_err(|error| StateError::io("tempdir", error))?;
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
         let directory = temporary.path().join("state");
         ensure_private_directory(&directory)?;
         ensure_private_directory(&directory)?;

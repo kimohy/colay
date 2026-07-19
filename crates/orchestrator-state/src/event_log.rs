@@ -205,7 +205,8 @@ mod tests {
 
     #[test]
     fn reconciles_missing_outbox_events_idempotently() {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let directory = crate::CanonicalTempDir::new("tempdir")
+            .unwrap_or_else(|error| panic!("tempdir: {error}"));
         let database = Database::open(directory.path().join("state.db"))
             .unwrap_or_else(|error| panic!("db: {error}"));
         database

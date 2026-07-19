@@ -320,3 +320,32 @@ Expected: all local tests pass; Windows CI run `29667820725` remains RED evidenc
 Run the required format, Clippy, and workspace test commands; commit only the planned files; push the branch; and monitor all three CI jobs to completion.
 
 Expected: Ubuntu, macOS, and Windows jobs all succeed.
+
+### Task 10: Canonical state tempdirs
+
+**Files:**
+- Modify and test: `crates/orchestrator-state/src/lib.rs`
+- Modify and test: state unit-test modules and `MigrationManager::dry_run`
+- Modify and test: `crates/orchestrator-state/tests/config_migration.rs`
+- Modify and test: `crates/orchestrator-state/tests/migration_contract.rs`
+
+**Interfaces:**
+- Produces: internal `CanonicalTempDir` that retains `tempfile::TempDir` and exposes its canonical path.
+
+- [x] **Step 1: Add the state canonical tempdir wrapper**
+
+Map creation and canonicalization failures into `StateError::Io`, retain the original tempdir handle for cleanup, and expose `path() -> &Path`.
+
+- [x] **Step 2: Adopt it in production dry-run and all state unit tests**
+
+Replace direct default tempdir creation in `MigrationManager::dry_run` and state unit tests. Update the checkpoint fixture return type to the wrapper.
+
+- [x] **Step 3: Canonicalize state integration-test roots**
+
+Keep each integration test's `TempDir` handle alive, canonicalize `path()` immediately, and derive all security-sensitive paths from that root.
+
+- [ ] **Step 4: Verify and publish**
+
+Run focused state tests, then required workspace format/Clippy/tests; commit, push, and monitor the complete CI matrix.
+
+Expected: macOS advances through all state and integration tests, and every CI job succeeds.

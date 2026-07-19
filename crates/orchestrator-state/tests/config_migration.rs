@@ -164,7 +164,8 @@ fn rejects_future_and_invalid_versions_without_guessing() {
 #[test]
 fn file_apply_requires_and_verifies_a_sibling_backup() -> TestResult {
     let temporary = tempfile::tempdir()?;
-    let path = temporary.path().join("config.toml");
+    let root = fs::canonicalize(temporary.path())?;
+    let path = root.join("config.toml");
     fs::write(&path, LEGACY_V1)?;
     let migration = MigratableConfigDocument::load(&path)?;
     let timestamp = Utc
@@ -192,7 +193,8 @@ fn file_apply_requires_and_verifies_a_sibling_backup() -> TestResult {
 #[test]
 fn file_apply_refuses_a_source_changed_after_planning() -> TestResult {
     let temporary = tempfile::tempdir()?;
-    let path = temporary.path().join("config.toml");
+    let root = fs::canonicalize(temporary.path())?;
+    let path = root.join("config.toml");
     fs::write(&path, LEGACY_V1)?;
     let migration = MigratableConfigDocument::load(&path)?;
     fs::write(
@@ -202,7 +204,7 @@ fn file_apply_refuses_a_source_changed_after_planning() -> TestResult {
 
     let result = migration.apply_to_file(&path, Utc::now());
     assert!(matches!(result, Err(StateError::InvalidConfig(_))));
-    let backups = fs::read_dir(temporary.path())?
+    let backups = fs::read_dir(&root)?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".backup."))
         .count();

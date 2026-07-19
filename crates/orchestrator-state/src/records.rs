@@ -2284,8 +2284,9 @@ mod tests {
     }
 
     fn file_checkpoint_fixture()
-    -> Result<(tempfile::TempDir, Database, TaskId, Checkpoint), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
+    -> Result<(crate::CanonicalTempDir, Database, TaskId, Checkpoint), Box<dyn std::error::Error>>
+    {
+        let directory = crate::CanonicalTempDir::new("tempdir")?;
         let database = Database::open(directory.path().join("orchestrator.db"))?;
         database.migrate_with_backup(&directory.path().join("backups"))?;
         let task_id = create_task_in_state(&database, TaskState::Checkpointed)?;
