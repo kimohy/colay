@@ -83,6 +83,16 @@ pub struct RootConfig {
     pub features: FeatureConfig,
 }
 
+impl Default for RootConfig {
+    fn default() -> Self {
+        Self {
+            config_version: CONFIG_SCHEMA_VERSION,
+            orchestrator: OrchestratorConfig::default(),
+            features: FeatureConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OrchestratorConfig {
     #[serde(default = "default_true")]
@@ -126,13 +136,39 @@ pub struct OrchestratorConfig {
     pub redaction: RedactionSettings,
 }
 
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            automatic_routing: true,
+            state_dir: PathBuf::from(".colay"),
+            timezone: "UTC".to_owned(),
+            max_parallel_workers: 1,
+            default_timeout_minutes: 30,
+            max_retries: 1,
+            warning_threshold_percent: 30.0,
+            handover_threshold_percent: 15.0,
+            critical_reserve_percent: 15.0,
+            require_review_from_difficulty: 7,
+            minimum_progress: 0.05,
+            daily_grace_minutes: 60,
+            monthly_grace_minutes: 1_440,
+            forecast_alpha: 0.3,
+            minimum_forecast_observations: 3,
+            providers: ProviderConfigs::default(),
+            model_profiles: BTreeMap::new(),
+            redaction: RedactionSettings::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RedactionSettings {
     #[serde(default)]
     pub patterns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfigs {
     #[serde(default)]
     pub gemini: Option<ProviderConfig>,
@@ -140,6 +176,16 @@ pub struct ProviderConfigs {
     pub codex: Option<ProviderConfig>,
     #[serde(default)]
     pub claude: Option<ProviderConfig>,
+}
+
+impl Default for ProviderConfigs {
+    fn default() -> Self {
+        Self {
+            gemini: Some(default_gemini_provider()),
+            codex: Some(default_codex_provider()),
+            claude: Some(default_claude_provider()),
+        }
+    }
 }
 
 impl ProviderConfigs {
@@ -151,6 +197,45 @@ impl ProviderConfigs {
         ]
         .into_iter()
         .filter_map(|(name, value)| value.map(|config| (name, config)))
+    }
+}
+
+fn default_gemini_provider() -> ProviderConfig {
+    default_provider("gemini", "calendar_day", None, 70)
+}
+
+fn default_codex_provider() -> ProviderConfig {
+    default_provider("codex", "calendar_month", Some(1), 100)
+}
+
+fn default_claude_provider() -> ProviderConfig {
+    default_provider("claude", "calendar_month", Some(1), 90)
+}
+
+fn default_provider(
+    executable: &str,
+    quota_period: &str,
+    reset_day: Option<u8>,
+    priority: i32,
+) -> ProviderConfig {
+    ProviderConfig {
+        enabled: true,
+        executable: executable.to_owned(),
+        quota_period: quota_period.to_owned(),
+        quota_limit: None,
+        quota_unit: default_usage_unit(),
+        quota_scope: None,
+        quota_units_per_work_unit: None,
+        ledger_units_per_execution: None,
+        reset_day,
+        reset_timezone: "UTC".to_owned(),
+        rolling_anchor: None,
+        rolling_period_seconds: None,
+        custom_started_at: None,
+        custom_resets_at: None,
+        priority,
+        effort_flag_enabled: false,
+        usage_probe: UsageProbeConfig::ManualOrLedger,
     }
 }
 
