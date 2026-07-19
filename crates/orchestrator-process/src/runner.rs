@@ -149,6 +149,14 @@ impl Default for EnvironmentPolicy {
             "PATHEXT",
             "SystemRoot",
             "WINDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "VSCMD_ARG_TGT_ARCH",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
             "HOME",
             "USERPROFILE",
             "TMP",
@@ -531,7 +539,11 @@ async fn monitor(
     let input_result = input_task.await?;
     let stdout = join_capture(stdout_task).await?;
     let stderr = join_capture(stderr_task).await?;
-    input_result?;
+    if let Err(error) = input_result
+        && (termination == TerminationReason::Exited || error.kind() != io::ErrorKind::BrokenPipe)
+    {
+        return Err(error.into());
+    }
     let result = ProcessResult {
         exit_code: exit_status.code(),
         termination,
@@ -988,6 +1000,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_ignores_stdin_broken_pipe_from_terminated_child() {
+        let mut spec = fixture("sleep");
+        spec.stdin = vec![b'x'; 16 * 1024 * 1024];
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+
+        let result = ProcessRunner
+            .run(spec, token)
+            .await
+            .unwrap_or_else(|error| panic!("process: {error}"));
+
+        assert_eq!(result.termination, TerminationReason::Cancelled);
+    }
+
+    #[tokio::test]
     async fn supervisor_streams_redacted_frames_and_waits() {
         let mut session = ProcessSupervisor
             .start(fixture("output"))
@@ -1057,6 +1088,24 @@ mod tests {
         let mut environment = EnvironmentPolicy::empty();
         assert!(environment.set("OPENAI_API_KEY", "secret").is_err());
         assert!(environment.allow_inherit("ACCESS_TOKEN").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_environment_preserves_msvc_tool_discovery() {
+        let environment = EnvironmentPolicy::default();
+        for name in [
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "VCINSTALLDIR",
+            "VSINSTALLDIR",
+            "VSCMD_ARG_TGT_ARCH",
+            "WindowsSdkDir",
+            "WindowsSDKVersion",
+        ] {
+            assert!(environment.inherited.contains(name), "missing {name}");
+        }
     }
 
     #[cfg(windows)]

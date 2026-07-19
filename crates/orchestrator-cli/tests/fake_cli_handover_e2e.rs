@@ -224,7 +224,7 @@ fn verification_stderr_reports_redacted_command_logs() -> Result<()> {
 #[allow(clippy::too_many_lines)]
 fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> Result<()> {
     let temporary = tempfile::tempdir()?;
-    let repository = temporary.path().join("repository");
+    let repository = fs::canonicalize(temporary.path())?.join("repository");
     fs::create_dir_all(&repository)?;
     let config = initialize_repository(&repository)?;
     let task_file = write_task_file(&repository)?;
@@ -377,7 +377,7 @@ fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> R
 #[test]
 fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<()> {
     let temporary = tempfile::tempdir()?;
-    let repository = temporary.path().join("repository");
+    let repository = fs::canonicalize(temporary.path())?.join("repository");
     fs::create_dir_all(&repository)?;
     let config = initialize_repository(&repository)?;
     let state_root = repository.join(".colay");

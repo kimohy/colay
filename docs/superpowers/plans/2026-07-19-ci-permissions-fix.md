@@ -200,3 +200,87 @@ Expected: no whitespace errors and no unrelated files in the commit.
 Push `codex/fix-ci-permissions` to `origin`, find the new workflow run for the pushed SHA, and wait for all matrix jobs to complete.
 
 Expected: Ubuntu, macOS, and Windows jobs all succeed. If Windows recurs, its assertion includes the nested redacted `cargo test` stderr required for a root-cause fix.
+
+### Task 7: Cross-platform latent test failures exposed by CI diagnostics
+
+**Files:**
+- Modify and test: `crates/orchestrator-cli/tests/fake_cli_handover_e2e.rs`
+- Modify and test: `crates/orchestrator-process/src/runner.rs`
+
+**Interfaces:**
+- Produces: canonical repository roots for both fake CLI E2E tests.
+- Produces: `EnvironmentPolicy::default()` entries required for Rust/MSVC tool discovery on hosted Windows runners.
+- Produces: cancellation semantics that ignore only the expected stdin `BrokenPipe` caused by terminating the child process tree.
+
+- [x] **Step 1: Canonicalize both fake CLI E2E repository roots**
+
+In each E2E test, replace `temporary.path().join("repository")` with:
+
+```rust
+let repository = fs::canonicalize(temporary.path())?.join("repository");
+```
+
+Use macOS CI run `29667425877` as RED evidence: both tests fail during `colay init` with `symbolic-link traversal is forbidden: /var`.
+
+- [x] **Step 2: Add a Windows MSVC environment regression test**
+
+Add a Windows-only unit test that constructs `EnvironmentPolicy::default()` and asserts its private `inherited` set contains `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432`, `VCINSTALLDIR`, `VSINSTALLDIR`, `VSCMD_ARG_TGT_ARCH`, `WindowsSdkDir`, and `WindowsSDKVersion`.
+
+- [x] **Step 3: Verify the Windows environment test is red**
+
+Run: `cargo test -p orchestrator-process --all-features default_environment_preserves_msvc_tool_discovery -- --nocapture`
+
+Expected: the assertion fails because the existing allowlist omits the MSVC discovery variables. Windows CI run `29667425877` additionally proves the user-visible failure: Rust resolves GNU `link.exe`, which reports `missing operand` while linking the fixture test.
+
+- [x] **Step 4: Add the minimal MSVC discovery allowlist**
+
+Add only the eight named installation/discovery variables to `EnvironmentPolicy::default()`. Keep credential-name rejection and `env_clear()` unchanged.
+
+- [x] **Step 5: Add a deterministic cancellation/input race regression test**
+
+Start the existing sleeping fixture with a multi-megabyte initial stdin payload, cancel after 100 milliseconds, and require `ProcessRunner::run` to return a `ProcessResult` whose termination is `Cancelled` rather than a `ProcessError::Io(BrokenPipe)`.
+
+- [x] **Step 6: Verify the cancellation test is red**
+
+Run: `cargo test -p orchestrator-process --all-features cancellation_ignores_stdin_broken_pipe_from_terminated_child -- --nocapture`
+
+Expected: the current monitor returns `subprocess I/O failed: Broken pipe` after killing the child, matching Ubuntu CI run `29667425877`.
+
+- [x] **Step 7: Preserve cancellation while keeping unrelated stdin errors fail-closed**
+
+After joining the input task, suppress `io::ErrorKind::BrokenPipe` only when termination is `Cancelled` or `TimedOut`. Continue propagating every stdin error when the child exited normally and every non-`BrokenPipe` error for all termination reasons.
+
+- [x] **Step 8: Run focused cross-platform regression tests**
+
+Run: `cargo test -p orchestrator-process --all-features -- --nocapture`
+
+Run: `cargo test -p colay --test fake_cli_handover_e2e --all-features -- --nocapture`
+
+Expected: all focused tests pass locally; pushed CI supplies macOS and hosted Windows GREEN evidence.
+
+### Task 8: Reverify, commit, push, and monitor CI
+
+**Files:**
+- Review all changed files from Task 7 and this plan.
+
+- [x] **Step 1: Run required verification**
+
+Run: `cargo fmt --all -- --check`
+
+Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Run: `cargo test --workspace --all-features`
+
+Expected: every command exits successfully.
+
+- [ ] **Step 2: Commit and push**
+
+Commit only the planned files, push `codex/fix-ci-permissions`, and identify the workflow run for the new SHA.
+
+Expected: the branch is clean and synchronized with `origin`.
+
+- [ ] **Step 3: Monitor the complete CI matrix**
+
+Wait for Ubuntu, macOS, and Windows jobs to finish.
+
+Expected: all jobs succeed; do not report completion while any job is pending or failed.
