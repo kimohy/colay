@@ -10,6 +10,7 @@ import test from "node:test";
 import {
   allowedPackageFiles,
   loadNativeDescriptors,
+  parseNpmPackRecord,
   sha256File,
   stageRelease,
 } from "../stage.mjs";
@@ -212,7 +213,49 @@ test("rejects fail-closed staging inputs with specific diagnostics", async (t) =
     await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
     await assert.rejects(
       stageRelease({ ...values, channel: "nightly", version, sourceCommit, binaries: values.binaries, archives: values.archives }),
-      /root package must not declare runtime dependencies/,
+      /root package must not declare dependencies/,
+    );
+  });
+  await t.test("root lifecycle script", async () => {
+    const values = await fixture();
+    const manifestPath = join(values.repoRoot, "npm/colay/package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.scripts = { postinstall: "unsafe" };
+    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+    await assert.rejects(
+      stageRelease({ ...values, channel: "nightly", version, sourceCommit, binaries: values.binaries, archives: values.archives }),
+      /package @kimohy\/colay must not declare lifecycle script postinstall/,
+    );
+  });
+  await t.test("native optional dependency", async () => {
+    const values = await fixture();
+    const manifestPath = join(values.repoRoot, "npm/colay-linux-x64/package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.optionalDependencies = { surprise: "1.0.0" };
+    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+    await assert.rejects(
+      stageRelease({ ...values, channel: "nightly", version, sourceCommit, binaries: values.binaries, archives: values.archives }),
+      /native package @kimohy\/colay-linux-x64 must not declare optionalDependencies/,
+    );
+  });
+  await t.test("native platform contract", async () => {
+    const values = await fixture();
+    const manifestPath = join(values.repoRoot, "npm/colay-linux-x64/package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.cpu = ["arm64"];
+    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+    await assert.rejects(
+      stageRelease({ ...values, channel: "nightly", version, sourceCommit, binaries: values.binaries, archives: values.archives }),
+      /native package @kimohy\/colay-linux-x64 cpu must be \["x64"\]/,
+    );
+  });
+  await t.test("Codex authority field relocation", async () => {
+    const values = await fixture();
+    const authorityPath = join(values.repoRoot, "compatibility/codex-version.toml");
+    await writeFile(authorityPath, `${await readFile(authorityPath, "utf8")}\n[shadow]\nrecommended = "9.9.9"\n`);
+    await assert.rejects(
+      stageRelease({ ...values, channel: "nightly", version, sourceCommit, binaries: values.binaries, archives: values.archives }),
+      /Codex authority fields must appear exactly once before the first TOML table/,
     );
   });
   await t.test("unexpected npm pack file", async () => {
@@ -240,4 +283,39 @@ test("native descriptors reject referenced paths outside their directory", async
     archive_sha256: "0".repeat(64),
   }));
   await assert.rejects(loadNativeDescriptors([descriptor]), /binary_path must stay beneath descriptor directory/);
+});
+
+test("native descriptors require the deterministic archive basename", async () => {
+  const root = await mkdtemp(join(tmpdir(), "colay-descriptor-name-"));
+  const descriptorRoot = join(root, "descriptor");
+  await mkdir(descriptorRoot);
+  await writeFile(join(descriptorRoot, "colay.exe"), "binary");
+  await writeFile(join(descriptorRoot, "renamed.zip"), "archive");
+  const descriptor = join(descriptorRoot, "native-descriptor.json");
+  await writeFile(descriptor, JSON.stringify({
+    package_name: "@kimohy/colay-win32-x64",
+    target: "x86_64-pc-windows-msvc",
+    binary_path: "colay.exe",
+    archive_path: "renamed.zip",
+    archive_sha256: "0".repeat(64),
+  }));
+  await assert.rejects(
+    loadNativeDescriptors([descriptor], { version }),
+    /archive_path basename for x86_64-pc-windows-msvc must be colay-v.*-x86_64-pc-windows-msvc\.zip/,
+  );
+});
+
+test("npm pack JSON must describe one exact safe package record", () => {
+  assert.throws(
+    () => parseNpmPackRecord(JSON.stringify([{ name: "@kimohy/colay", version, filename: "one.tgz" }, { name: "@kimohy/colay", version, filename: "two.tgz" }]), "@kimohy/colay", version),
+    /npm pack must return exactly one record for @kimohy\/colay/,
+  );
+  assert.throws(
+    () => parseNpmPackRecord(JSON.stringify([{ name: "@kimohy/colay", version: "0.0.0", filename: "root.tgz" }]), "@kimohy/colay", version),
+    /npm pack returned wrong version for @kimohy\/colay/,
+  );
+  assert.throws(
+    () => parseNpmPackRecord(JSON.stringify([{ name: "@kimohy/colay", version, filename: "." }]), "@kimohy/colay", version),
+    /npm pack returned unsafe filename for @kimohy\/colay/,
+  );
 });

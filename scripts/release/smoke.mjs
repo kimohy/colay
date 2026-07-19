@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -45,15 +45,23 @@ async function loadTarball(tarballsDir, packageName, version) {
   if (matches.length === 0) fail(`missing tarball metadata for ${packageName}@${version}`);
   if (matches.length > 1) fail(`duplicate tarball metadata for ${packageName}@${version}`);
   const filename = matches[0].filename;
-  if (typeof filename !== "string" || filename === "" || filename !== filename.split(/[\\/]/).pop()) {
+  if (typeof filename !== "string" || filename === "" || filename === "." || filename === ".." || /[\\/]/.test(filename) || filename !== basename(filename)) {
     fail(`unsafe tarball filename for ${packageName}@${version}`);
   }
-  const path = resolve(tarballsDir, filename);
+  const resolvedDirectory = resolve(tarballsDir);
+  const path = resolve(resolvedDirectory, filename);
+  const lexicalRelative = relative(resolvedDirectory, path);
+  if (lexicalRelative === "" || lexicalRelative.startsWith("..") || isAbsolute(lexicalRelative)) fail(`unsafe tarball filename for ${packageName}@${version}`);
+  let stat;
   try {
-    await access(path);
+    stat = await lstat(path);
   } catch {
     fail(`tarball is missing for ${packageName}@${version}`);
   }
+  if (!stat.isFile()) fail(`tarball must be a regular file for ${packageName}@${version}`);
+  const [realDirectory, realTarball] = await Promise.all([realpath(resolvedDirectory), realpath(path)]);
+  const physicalRelative = relative(realDirectory, realTarball);
+  if (physicalRelative === "" || physicalRelative.startsWith("..") || isAbsolute(physicalRelative)) fail(`tarball must stay beneath tarballsDir for ${packageName}@${version}`);
   return path;
 }
 

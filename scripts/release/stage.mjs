@@ -12,7 +12,7 @@ import {
   realpath,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -26,9 +26,9 @@ const NIGHTLY = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.\d{8}\.[0-9a
 
 const PACKAGES = Object.freeze([
   Object.freeze({ name: "@kimohy/colay", directory: "colay", binary: null, target: null }),
-  Object.freeze({ name: "@kimohy/colay-win32-x64", directory: "colay-win32-x64", binary: "bin/colay.exe", target: "x86_64-pc-windows-msvc" }),
-  Object.freeze({ name: "@kimohy/colay-darwin-arm64", directory: "colay-darwin-arm64", binary: "bin/colay", target: "aarch64-apple-darwin" }),
-  Object.freeze({ name: "@kimohy/colay-linux-x64", directory: "colay-linux-x64", binary: "bin/colay", target: "x86_64-unknown-linux-musl" }),
+  Object.freeze({ name: "@kimohy/colay-win32-x64", directory: "colay-win32-x64", binary: "bin/colay.exe", target: "x86_64-pc-windows-msvc", os: ["win32"], cpu: ["x64"], libc: null }),
+  Object.freeze({ name: "@kimohy/colay-darwin-arm64", directory: "colay-darwin-arm64", binary: "bin/colay", target: "aarch64-apple-darwin", os: ["darwin"], cpu: ["arm64"], libc: null }),
+  Object.freeze({ name: "@kimohy/colay-linux-x64", directory: "colay-linux-x64", binary: "bin/colay", target: "x86_64-unknown-linux-musl", os: ["linux"], cpu: ["x64"], libc: ["musl"] }),
 ]);
 const NATIVE_PACKAGES = PACKAGES.filter(({ target }) => target !== null);
 const PACKAGE_BY_NAME = new Map(PACKAGES.map((item) => [item.name, item]));
@@ -49,6 +49,22 @@ function npmInvocation(args) {
 
 function fail(message) {
   throw new Error(`Invalid release staging: ${message}`);
+}
+
+function codeUnitCompare(left, right) {
+  return left < right ? -1 : Number(left > right);
+}
+
+function equalArrays(actual, expected) {
+  return Array.isArray(actual) && actual.length === expected.length && actual.every((value, index) => value === expected[index]);
+}
+
+function expectedArchiveName(version, target) {
+  return `colay-v${version}-${target}${target === "x86_64-pc-windows-msvc" ? ".zip" : ".tar.gz"}`;
+}
+
+function safeBasename(filename) {
+  return typeof filename === "string" && filename !== "" && filename !== "." && filename !== ".." && !/[\\/]/.test(filename) && filename === basename(filename);
 }
 
 function matchesChannelVersion(channel, version) {
@@ -87,7 +103,7 @@ function packageForName(name) {
 export function allowedPackageFiles(packageName) {
   const files = ALLOWLISTS[packageName];
   if (!files) fail(`unsupported package ${JSON.stringify(packageName)}`);
-  return [...files].sort();
+  return [...files].sort(codeUnitCompare);
 }
 
 export async function sha256File(path) {
@@ -108,13 +124,20 @@ async function readSchemaVersions(repoRoot) {
 
 async function readCodexAuthority(repoRoot) {
   const text = (await readFile(join(repoRoot, "compatibility/codex-version.toml"), "utf8")).replaceAll("\r\n", "\n");
-  const supportedMin = /^supported_min = "([0-9]+\.[0-9]+\.[0-9]+)"$/m.exec(text)?.[1];
-  const tested = /^tested_versions = \[([^\]]*)\]$/m.exec(text)?.[1];
-  const recommended = /^recommended = "([0-9]+\.[0-9]+\.[0-9]+)"$/m.exec(text)?.[1];
-  const pinnedRevision = /^pinned_revision = "([0-9a-f]{40})"$/m.exec(text)?.[1];
-  if (!supportedMin || tested === undefined || !recommended || !pinnedRevision) {
-    fail("could not read Codex compatibility authority");
-  }
+  const lines = text.split("\n");
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const topLevel = lines.slice(0, firstTable === -1 ? lines.length : firstTable);
+  const tableLines = firstTable === -1 ? [] : lines.slice(firstTable);
+  const authority = (name, expression) => {
+    const matches = topLevel.map((line) => expression.exec(line)).filter(Boolean);
+    const relocated = tableLines.some((line) => new RegExp(`^\\s*${name}\\s*=`).test(line));
+    if (matches.length !== 1 || relocated) fail("Codex authority fields must appear exactly once before the first TOML table");
+    return matches[0][1];
+  };
+  const supportedMin = authority("supported_min", /^supported_min = "([0-9]+\.[0-9]+\.[0-9]+)"$/);
+  const tested = authority("tested_versions", /^tested_versions = \[([^\]]*)\]$/);
+  const recommended = authority("recommended", /^recommended = "([0-9]+\.[0-9]+\.[0-9]+)"$/);
+  const pinnedRevision = authority("pinned_revision", /^pinned_revision = "([0-9a-f]{40})"$/);
   const testedVersions = [...tested.matchAll(/"([0-9]+\.[0-9]+\.[0-9]+)"/g)].map((match) => match[1]);
   if (testedVersions.length === 0 || tested.replace(/"[0-9]+\.[0-9]+\.[0-9]+"|,|\s/g, "") !== "") {
     fail("Codex tested_versions must be a non-empty strict version list");
@@ -174,7 +197,7 @@ async function validateArchives(version, archives) {
   for (const [target, packageDescriptor] of TARGET_BY_NAME) {
     const archive = byTarget.get(target);
     if (!archive) fail(`missing archive target ${target}`);
-    const expectedName = `colay-v${version}-${target}${target === "x86_64-pc-windows-msvc" ? ".zip" : ".tar.gz"}`;
+    const expectedName = expectedArchiveName(version, target);
     if (archive.name !== expectedName) fail(`archive name for ${target} must be ${expectedName}`);
     if (typeof archive.path !== "string") fail(`archive path for ${target} is required`);
     if (typeof archive.sha256 !== "string" || !SHA256.test(archive.sha256)) fail(`archive SHA-256 for ${target} must be lowercase hexadecimal`);
@@ -182,7 +205,51 @@ async function validateArchives(version, archives) {
     if ((await sha256File(archive.path)) !== archive.sha256) fail(`archive digest mismatch for ${target}`);
     validated.push({ target, name: archive.name, path: archive.path, sha256: archive.sha256, packageName: packageDescriptor.name });
   }
-  return validated.sort((left, right) => left.target.localeCompare(right.target));
+  return validated.sort((left, right) => codeUnitCompare(left.target, right.target));
+}
+
+function rejectRuntimeDependencies(manifest, packageName, allowedOptionalDependencies) {
+  for (const field of ["dependencies", "peerDependencies", "bundledDependencies", "bundleDependencies"]) {
+    if (Object.hasOwn(manifest, field)) fail(`${packageName === "@kimohy/colay" ? "root package" : `native package ${packageName}`} must not declare ${field}`);
+  }
+  if (allowedOptionalDependencies) {
+    if (!manifest.optionalDependencies || typeof manifest.optionalDependencies !== "object" || Array.isArray(manifest.optionalDependencies)) {
+      fail("root package must declare exact optionalDependencies");
+    }
+    const names = Object.keys(manifest.optionalDependencies).sort(codeUnitCompare);
+    const expected = NATIVE_PACKAGES.map((item) => item.name).sort(codeUnitCompare);
+    if (!equalArrays(names, expected) || names.some((name) => typeof manifest.optionalDependencies[name] !== "string" || manifest.optionalDependencies[name] === "")) {
+      fail("root package optionalDependencies must exactly name the native packages");
+    }
+  } else if (Object.hasOwn(manifest, "optionalDependencies")) {
+    fail(`native package ${packageName} must not declare optionalDependencies`);
+  }
+}
+
+function validateManifestContract(manifest, descriptor) {
+  if (manifest.name !== descriptor.name) fail(`template metadata does not match ${descriptor.name}`);
+  if (manifest.license !== "Apache-2.0") fail(`template license must be Apache-2.0 for ${descriptor.name}`);
+  for (const lifecycle of ["preinstall", "install", "postinstall", "prepublish", "prepublishOnly", "prepare", "prepack", "postpack", "preversion", "version", "postversion"]) {
+    if (manifest.scripts && Object.hasOwn(manifest.scripts, lifecycle)) fail(`package ${descriptor.name} must not declare lifecycle script ${lifecycle}`);
+  }
+  if (descriptor.binary === null) {
+    if (manifest.type !== "commonjs" || JSON.stringify(manifest.bin) !== JSON.stringify({ colay: "bin/colay.js" }) || manifest.engines?.node !== ">=22") {
+      fail("root package metadata does not match the launcher contract");
+    }
+    if (Object.hasOwn(manifest, "os") || Object.hasOwn(manifest, "cpu") || Object.hasOwn(manifest, "libc")) fail("root package must not declare native platform metadata");
+    rejectRuntimeDependencies(manifest, descriptor.name, true);
+    return;
+  }
+  if (manifest.binary !== descriptor.binary) fail(`template metadata does not match ${descriptor.name}`);
+  for (const field of ["os", "cpu", "libc"]) {
+    const expected = descriptor[field];
+    if (expected === null) {
+      if (Object.hasOwn(manifest, field)) fail(`native package ${descriptor.name} must not declare ${field}`);
+    } else if (!equalArrays(manifest[field], expected)) {
+      fail(`native package ${descriptor.name} ${field} must be ${JSON.stringify(expected)}`);
+    }
+  }
+  rejectRuntimeDependencies(manifest, descriptor.name, false);
 }
 
 async function copyAndRewritePackage({ repoRoot, npmRoot, rootLicense, descriptor, version, binaries }) {
@@ -191,16 +258,7 @@ async function copyAndRewritePackage({ repoRoot, npmRoot, rootLicense, descripto
   await cp(source, destination, { recursive: true, force: false, errorOnExist: true });
   const manifestPath = join(destination, "package.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  if (manifest.name !== descriptor.name || (descriptor.binary !== null && manifest.binary !== descriptor.binary)) {
-    fail(`template metadata does not match ${descriptor.name}`);
-  }
-  if (manifest.license !== "Apache-2.0") fail(`template license must be Apache-2.0 for ${descriptor.name}`);
-  if (manifest.dependencies && Object.keys(manifest.dependencies).length !== 0) {
-    fail(`${descriptor.name === "@kimohy/colay" ? "root package" : `native package ${descriptor.name}`} must not declare runtime dependencies`);
-  }
-  if (descriptor.binary !== null && manifest.optionalDependencies && Object.keys(manifest.optionalDependencies).length !== 0) {
-    fail(`native package ${descriptor.name} must not declare optional dependencies`);
-  }
+  validateManifestContract(manifest, descriptor);
   manifest.version = version;
   if (descriptor.name === "@kimohy/colay") {
     manifest.optionalDependencies = Object.fromEntries(NATIVE_PACKAGES.map((item) => [item.name, version]));
@@ -216,35 +274,41 @@ async function copyAndRewritePackage({ repoRoot, npmRoot, rootLicense, descripto
   return destination;
 }
 
-async function packAndVerify(packageName, packageDir, tarballsDir) {
-  const dryRunInvocation = npmInvocation(["pack", "--json", "--dry-run"]);
-  const dryRun = await execFilePromise(dryRunInvocation.command, dryRunInvocation.args, { cwd: packageDir, shell: false });
-  let record;
+export function parseNpmPackRecord(output, packageName, version) {
+  let records;
   try {
-    [record] = JSON.parse(dryRun.stdout);
+    records = JSON.parse(output);
   } catch {
     fail(`npm pack did not return JSON for ${packageName}`);
   }
-  const actual = (record?.files ?? []).map(({ path }) => path).sort();
+  if (!Array.isArray(records) || records.length !== 1) fail(`npm pack must return exactly one record for ${packageName}`);
+  const [record] = records;
+  if (!record || typeof record !== "object" || record.name !== packageName) fail(`npm pack returned wrong package name for ${packageName}`);
+  if (record.version !== version) fail(`npm pack returned wrong version for ${packageName}`);
+  if (!safeBasename(record.filename)) fail(`npm pack returned unsafe filename for ${packageName}`);
+  return record;
+}
+
+function assertPackFiles(record, packageName) {
+  const actual = Array.isArray(record.files) ? record.files.map(({ path }) => path).sort(codeUnitCompare) : [];
   const expected = allowedPackageFiles(packageName);
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     const unexpected = actual.filter((file) => !expected.includes(file));
     const missing = expected.filter((file) => !actual.includes(file));
     fail(`unexpected package files for ${packageName}: ${[...unexpected, ...missing.map((file) => `missing ${file}`)].join(", ")}`);
   }
+}
+
+async function packAndVerify(packageName, version, packageDir, tarballsDir) {
+  const dryRunInvocation = npmInvocation(["pack", "--json", "--dry-run"]);
+  const dryRun = await execFilePromise(dryRunInvocation.command, dryRunInvocation.args, { cwd: packageDir, shell: false });
+  const record = parseNpmPackRecord(dryRun.stdout, packageName, version);
+  assertPackFiles(record, packageName);
   const packedInvocation = npmInvocation(["pack", "--json", "--pack-destination", tarballsDir]);
   const packed = await execFilePromise(packedInvocation.command, packedInvocation.args, { cwd: packageDir, shell: false });
-  let packedRecord;
-  try {
-    [packedRecord] = JSON.parse(packed.stdout);
-  } catch {
-    fail(`npm pack did not return package metadata for ${packageName}`);
-  }
-  if (!packedRecord || packedRecord.name !== packageName || typeof packedRecord.filename !== "string") {
-    fail(`npm pack returned invalid metadata for ${packageName}`);
-  }
+  const packedRecord = parseNpmPackRecord(packed.stdout, packageName, version);
+  assertPackFiles(packedRecord, packageName);
   const filename = packedRecord.filename;
-  if (filename !== filename.split(/[\\/]/).pop()) fail(`npm pack returned unsafe filename for ${packageName}`);
   await requireRegularFile(join(tarballsDir, filename), `tarball for ${packageName}`);
   return packedRecord;
 }
@@ -267,13 +331,13 @@ export async function stageRelease({ repoRoot, outputRoot, channel, version, sou
     packageDirs.set(descriptor.name, await copyAndRewritePackage({ repoRoot, npmRoot, rootLicense, descriptor, version, binaries }));
   }
   const records = [];
-  for (const descriptor of PACKAGES) records.push(await packAndVerify(descriptor.name, packageDirs.get(descriptor.name), tarballsDir));
+  for (const descriptor of PACKAGES) records.push(await packAndVerify(descriptor.name, version, packageDirs.get(descriptor.name), tarballsDir));
   await writeFile(join(tarballsDir, "npm-pack.json"), `${JSON.stringify(records, null, 2)}\n`, "utf8");
 
   for (const archive of validatedArchives) await copyFile(archive.path, join(releaseDir, archive.name));
   const checksumLines = validatedArchives
     .map(({ name, sha256 }) => `${sha256}  ${name}`)
-    .sort((left, right) => left.localeCompare(right));
+    .sort(codeUnitCompare);
   await writeFile(join(releaseDir, "SHA256SUMS"), `${checksumLines.join("\n")}\n`, "utf8");
   const manifest = {
     channel,
@@ -289,7 +353,7 @@ export async function stageRelease({ repoRoot, outputRoot, channel, version, sou
   return { manifest, packages: records, npmRoot, tarballsDir, releaseDir };
 }
 
-export async function loadNativeDescriptors(descriptorPaths) {
+export async function loadNativeDescriptors(descriptorPaths, { version } = {}) {
   if (!Array.isArray(descriptorPaths)) fail("native descriptors must be an array");
   const binaries = new Map();
   const archives = [];
@@ -316,6 +380,9 @@ export async function loadNativeDescriptors(descriptorPaths) {
     }
     const binaryPath = requireContained(descriptorDirectory, descriptor.binary_path, "binary_path");
     const archivePath = requireContained(descriptorDirectory, descriptor.archive_path, "archive_path");
+    if (version !== undefined && basename(descriptor.archive_path) !== expectedArchiveName(version, descriptor.target)) {
+      fail(`archive_path basename for ${descriptor.target} must be ${expectedArchiveName(version, descriptor.target)}`);
+    }
     await Promise.all([requireRegularFile(binaryPath, "descriptor binary"), requireRegularFile(archivePath, "descriptor archive")]);
     const realDirectory = await realpath(descriptorDirectory);
     const [realBinary, realArchive] = await Promise.all([realpath(binaryPath), realpath(archivePath)]);
@@ -350,12 +417,12 @@ function parseCliArguments(args) {
 
 export async function main(args = process.argv.slice(2), { log = console.log } = {}) {
   const options = parseCliArguments(args);
-  const descriptors = await loadNativeDescriptors(options.descriptors);
+  const descriptors = await loadNativeDescriptors(options.descriptors, { version: options["--version"] });
   const archives = descriptors.archives.map((archive) => {
     const targetDescriptor = TARGET_BY_NAME.get(archive.target);
     return {
       ...archive,
-      name: `colay-v${options["--version"]}-${archive.target}${archive.target === "x86_64-pc-windows-msvc" ? ".zip" : ".tar.gz"}`,
+      name: expectedArchiveName(options["--version"], archive.target),
       packageName: targetDescriptor.name,
     };
   });

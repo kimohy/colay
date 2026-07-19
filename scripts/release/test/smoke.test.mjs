@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { smokeInstall } from "../smoke.mjs";
 
 const version = "0.1.1-nightly.20260719.a1b2c3d";
 
-async function fixture({ records } = {}) {
+async function fixture({ records, writeTarballs = true } = {}) {
   const root = await mkdtemp(join(tmpdir(), "colay-smoke-"));
   const tarballsDir = join(root, "tarballs");
   const prefix = join(root, "prefix");
@@ -18,8 +18,10 @@ async function fixture({ records } = {}) {
     { name: "@kimohy/colay-linux-x64", version, filename: "kimohy-colay-linux-x64.tgz", integrity: "sha512-native" },
   ];
   await writeFile(join(tarballsDir, "npm-pack.json"), `${JSON.stringify(packageRecords, null, 2)}\n`);
-  for (const { filename } of packageRecords) {
-    await writeFile(join(tarballsDir, filename), filename);
+  if (writeTarballs) {
+    for (const { filename } of packageRecords) {
+      await writeFile(join(tarballsDir, filename), filename);
+    }
   }
   return { tarballsDir, prefix };
 }
@@ -93,6 +95,74 @@ test("fails specifically for invalid packages, metadata, commands, and versions"
     await assert.rejects(
       smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
       /duplicate tarball metadata for @kimohy\/colay@/,
+    );
+  });
+  await t.test("unsafe dot tarball filename", async () => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "." },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /unsafe tarball filename for @kimohy\/colay@/,
+    );
+  });
+  await t.test("tarball path traversal", async () => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "../outside.tgz" },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /unsafe tarball filename for @kimohy\/colay@/,
+    );
+  });
+  await t.test("tarball metadata cannot name a directory", async () => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "directory.tgz" },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    await mkdir(join(values.tarballsDir, "directory.tgz"));
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /tarball must be a regular file for @kimohy\/colay@/,
+    );
+  });
+  await t.test("tarball metadata cannot follow an escaping symlink", async (t) => {
+    const values = await fixture({
+      writeTarballs: false,
+      records: [
+        { name: "@kimohy/colay", version, filename: "root.tgz" },
+        { name: "@kimohy/colay-linux-x64", version, filename: "native.tgz" },
+      ],
+    });
+    const outside = join(values.tarballsDir, "..", "outside.tgz");
+    await writeFile(outside, "outside");
+    try {
+      await symlink(outside, join(values.tarballsDir, "root.tgz"));
+    } catch (error) {
+      if (error?.code === "EPERM") {
+        t.skip("symlink creation is unavailable on this Windows host");
+        return;
+      }
+      throw error;
+    }
+    await writeFile(join(values.tarballsDir, "native.tgz"), "native");
+    await assert.rejects(
+      smokeInstall({ ...values, packageName: "@kimohy/colay-linux-x64", version, run: async () => ({ code: 0 }) }),
+      /tarball must be a regular file for @kimohy\/colay@/,
     );
   });
   await t.test("npm install failure", async () => {
