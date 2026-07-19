@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use rusqlite::Connection;
 use serde_json::Value;
 
 struct CliFixture {
@@ -141,5 +142,46 @@ fn compatibility_and_status_do_not_create_repository_state() -> Result<()> {
         String::from_utf8_lossy(&status.stderr)
     );
     assert!(!fixture.repository.join(".colay").exists());
+    Ok(())
+}
+
+#[test]
+fn failed_event_reconciliation_blocks_retries_before_task_mutation() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    let state = fixture.repository.join(".colay");
+    fs::create_dir_all(&state)?;
+    fs::write(state.join("events.jsonl"), "not valid jsonl\n")?;
+
+    for attempt in 1..=2 {
+        let output = fixture.colay(["run", "inspect repository", "--plan-only"])?;
+        assert!(
+            !output.status.success(),
+            "attempt {attempt} unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let status = fixture.colay(["--json", "status"])?;
+    assert!(
+        status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["data"]["tasks"], Value::Array(Vec::new()));
+    assert_eq!(status["data"]["database"]["last_event_sequence"], 0);
+
+    let database = Connection::open(state.join("orchestrator.db"))?;
+    let tasks: i64 = database.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
+    let events: i64 =
+        database.query_row("SELECT count(*) FROM task_events", [], |row| row.get(0))?;
+    let exported: i64 = database.query_row(
+        "SELECT last_exported_sequence FROM event_log_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(tasks, 0);
+    assert_eq!(events, 0);
+    assert_eq!(exported, 0);
     Ok(())
 }

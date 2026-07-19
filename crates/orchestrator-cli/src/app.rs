@@ -614,6 +614,7 @@ async fn run_task(
     } else {
         initialize_repository_state(&state)?
     };
+    reconcile_events(&state, &database)?;
     let input = load_task_input(&arguments)?;
     let redactor = Redactor::new(&process_redaction(&document.config().orchestrator))?;
     let runtime_prompt = input.original_request.clone();
