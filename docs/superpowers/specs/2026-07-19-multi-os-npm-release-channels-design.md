@@ -22,10 +22,14 @@ manager integrations other than npm, auto-update behavior, code signing, a
 container image, external telemetry, or any provider credential handling.
 
 The public npm package is `@kimohy/colay`; the installed executable command
-remains `colay`. The repository's licensing policy is not changed by this
-work. Package metadata must reflect the repository's actual license state
-rather than inventing a license grant. Until the repository contains a license
-file, every npm manifest uses `"license": "UNLICENSED"`.
+remains `colay`. Colay is distributed under the Apache License 2.0. The
+repository root contains the unmodified Apache License 2.0 text in `LICENSE` so
+GitHub can detect and display the repository license. `Cargo.toml` declares the
+SPDX identifier `Apache-2.0` in `[workspace.package]`, every Rust crate inherits
+that value with `license.workspace = true`, and all four npm manifests declare
+`"license": "Apache-2.0"`. A `NOTICE` file is added only if Colay later gains
+attributions that require one; this release work does not create an empty
+placeholder notice.
 
 ## Considered delivery approaches
 
@@ -50,15 +54,19 @@ The repository gains a private npm workspace root and four publishable packages:
 npm/
 |-- colay/
 |   |-- package.json
+|   |-- LICENSE
 |   `-- bin/colay.js
 |-- colay-win32-x64/
 |   |-- package.json
+|   |-- LICENSE
 |   `-- bin/colay.exe
 |-- colay-darwin-arm64/
 |   |-- package.json
+|   |-- LICENSE
 |   `-- bin/colay
 `-- colay-linux-x64/
     |-- package.json
+    |-- LICENSE
     `-- bin/colay
 ```
 
@@ -170,9 +178,14 @@ colay-v<version>-aarch64-apple-darwin.tar.gz
 colay-v<version>-x86_64-unknown-linux-musl.tar.gz
 ```
 
+Every direct-download archive includes the matching binary and a byte-for-byte
+copy of the repository root `LICENSE`. Every npm package includes the same
+license text next to its manifest.
+
 `release-manifest.json` records the channel, version, source commit, Rust target,
 archive name, SHA-256 digest, state/config schema versions, and supported and
-recommended Codex versions. It contains no credentials or local paths.
+recommended Codex versions, plus the `Apache-2.0` license identifier. It contains
+no credentials or local paths.
 
 The workflow uses GitHub-hosted actions pinned to immutable commit SHAs. Build
 jobs have `contents: read`. npm OIDC, GitHub attestation, and GitHub release
@@ -229,7 +242,11 @@ inference:
 - `npm pack --json --dry-run` output is parsed and compared with an exact
   per-package allowlist. Each native package may contain only its manifest,
   npm-required documentation, and one expected binary; the root package contains
-  no native binary.
+  no native binary. Every package must contain `LICENSE`, whose SHA-256 digest
+  must match the repository root license file.
+- Cargo metadata validation proves that the workspace and every member crate
+  resolve to the `Apache-2.0` SPDX identifier, and npm manifest validation proves
+  the same identifier is present in all four packages.
 - Each native runner installs the locally packed root and platform package in an
   isolated prefix and runs `colay --version`, proving npm's command shim and the
   Rust binary agree on the generated version.
@@ -252,11 +269,12 @@ invoke Codex, Claude, or Gemini.
 
 ## Documentation and operator experience
 
-The README leads with stable npm installation and shows beta, nightly, and
-direct-download alternatives. The release guide documents channel semantics,
-tag preparation, required GitHub environments, initial npm Trusted Publishing
-setup, retry behavior, checksum and attestation verification, and the fact that
-nightly artifacts expire after 14 days.
+The README displays an Apache-2.0 license badge linked to the root `LICENSE`,
+leads with stable npm installation, and shows beta, nightly, and direct-download
+alternatives. The release guide documents channel semantics, tag preparation,
+required GitHub environments, initial npm Trusted Publishing setup, retry
+behavior, checksum and attestation verification, Apache-2.0 licensing, and the
+fact that nightly artifacts expire after 14 days.
 
 Every beta and stable GitHub release satisfies the existing release-note
 obligations: supported and recommended Codex versions, state/config migration
