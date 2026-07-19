@@ -24,12 +24,13 @@ mod tests {
     impl LayerFixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let repository = temp.path().join("repository");
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let repository = root.join("repository");
             fs::create_dir_all(&repository).unwrap();
             Self {
-                global_home: temp.path().join("home/.colay"),
-                environment: temp.path().join("environment.toml"),
-                cli: temp.path().join("cli.toml"),
+                global_home: root.join("home/.colay"),
+                environment: root.join("environment.toml"),
+                cli: root.join("cli.toml"),
                 _temp: temp,
                 repository,
             }
@@ -72,7 +73,8 @@ mod tests {
     #[test]
     fn empty_layers_use_complete_safe_defaults() {
         let repository = tempfile::tempdir().unwrap();
-        let request = ConfigRequest::new(repository.path(), ConfigEnvironment::isolated());
+        let repository_root = fs::canonicalize(repository.path()).unwrap();
+        let request = ConfigRequest::new(&repository_root, ConfigEnvironment::isolated());
         let effective = load_effective_config(&request).unwrap();
 
         assert_eq!(effective.config().config_version, CONFIG_SCHEMA_VERSION);
@@ -126,9 +128,10 @@ mod tests {
     #[test]
     fn explicit_missing_config_is_an_error() {
         let repository = tempfile::tempdir().unwrap();
-        let missing = repository.path().join("missing.toml");
+        let repository_root = fs::canonicalize(repository.path()).unwrap();
+        let missing = repository_root.join("missing.toml");
         let request = ConfigRequest {
-            repository: repository.path(),
+            repository: &repository_root,
             cli_config: Some(&missing),
             environment: ConfigEnvironment::isolated(),
         };
