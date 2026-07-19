@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { publishRelease } from "../publish.mjs";
+import { main, publishRelease } from "../publish.mjs";
 
 const version = "0.1.1-nightly.20260719.a1b2c3d";
 const nativeNames = [
@@ -226,4 +226,30 @@ test("requires manual recovery when an existing root remains absent from its pub
   );
   assert.equal(client.calls.filter(([kind]) => kind === "channel").length, 7);
   assert.equal(waits, 6);
+});
+
+test("CLI forwards validated workflow arguments to the publication operation", async () => {
+  const calls = [];
+  const logged = [];
+  const result = await main([
+    "--tarballs-dir", "/safe/tarballs",
+    "--version", version,
+    "--dist-tag", "nightly",
+  ], {
+    publish: async (options) => {
+      calls.push(options);
+      return { version: options.version, distTag: options.distTag, packages: [] };
+    },
+    log: (message) => logged.push(message),
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].tarballsDir, "/safe/tarballs");
+  assert.equal(calls[0].version, version);
+  assert.equal(calls[0].distTag, "nightly");
+  assert.equal(typeof calls[0].npmClient.viewIntegrity, "function");
+  assert.equal(typeof calls[0].npmClient.publish, "function");
+  assert.equal(typeof calls[0].npmClient.viewChannelVersion, "function");
+  assert.deepEqual(result, { version, distTag: "nightly", packages: [] });
+  assert.deepEqual(logged, [JSON.stringify(result)]);
 });

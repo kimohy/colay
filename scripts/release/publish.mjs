@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFilePromise = promisify(execFile);
@@ -222,4 +223,45 @@ export async function publishRelease({ tarballsDir, version, distTag, npmClient,
   results.push({ name: ROOT_PACKAGE, state: rootState });
   await requireRootChannel({ npmClient, version, distTag, rootState, retryDelay });
   return { version, distTag, packages: results };
+}
+
+function parseCliArguments(args) {
+  const options = {};
+  for (let index = 0; index < args.length; index += 1) {
+    const option = args[index];
+    if (!['--tarballs-dir', '--version', '--dist-tag'].includes(option)) {
+      fail(`unsupported CLI option ${JSON.stringify(option)}`);
+    }
+    if (Object.hasOwn(options, option)) fail(`duplicate CLI option ${JSON.stringify(option)}`);
+    const value = args[index + 1];
+    if (value === undefined || value === '' || value.startsWith('--')) {
+      fail(`missing value for ${option}`);
+    }
+    options[option] = value;
+    index += 1;
+  }
+  for (const option of ['--tarballs-dir', '--version', '--dist-tag']) {
+    if (!Object.hasOwn(options, option)) fail(`missing required CLI option ${option}`);
+  }
+  return options;
+}
+
+export async function main(args = process.argv.slice(2), { publish = publishRelease, log = console.log } = {}) {
+  if (typeof publish !== 'function') fail('publish must be a function');
+  const options = parseCliArguments(args);
+  const result = await publish({
+    tarballsDir: options['--tarballs-dir'],
+    version: options['--version'],
+    distTag: options['--dist-tag'],
+    npmClient: createNpmClient(),
+  });
+  log(JSON.stringify(result));
+  return result;
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error.message);
+    process.exitCode = 1;
+  });
 }
