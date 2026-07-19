@@ -1,0 +1,15 @@
+{
+  "name": "@kimohy/colay-linux-x64",
+  "version": "0.1.0",
+  "description": "Local-first multi-provider coding-agent orchestrator",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/kimohy/colay.git" },
+  "homepage": "https://github.com/kimohy/colay#readme",
+  "bugs": { "url": "https://github.com/kimohy/colay/issues" },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["musl"],
+  "binary": "bin/colay",
+  "files": ["bin", "LICENSE"],
+  "publishConfig": { "access": "public" }
+}

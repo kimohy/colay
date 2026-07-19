@@ -1,4 +1,5 @@
 /target/
+/dist/
 /.colay/
 /.codex/orchestrator/
 /.codex-orchestrator-worktrees/
