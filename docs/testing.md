@@ -11,6 +11,7 @@ CI clears common provider API-key variables and sets `COLAY_TEST_FAKE_PROVIDERS_
 ```text
 npm test
 node --test scripts/release/test/workflow-contract.test.mjs
+python scripts/generate_codex_matrix.py --check
 git diff --check
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings

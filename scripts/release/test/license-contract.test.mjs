@@ -108,5 +108,6 @@ test("installation and release documentation describe the supported distribution
   assert.match(releaseGuide, /Trusted Publishing[\s\S]*automatically.*provenance/i);
   assert.match(testingGuide, /npm test/);
   assert.match(testingGuide, /scripts\/release\/test\/workflow-contract\.test\.mjs/);
+  assert.match(testingGuide, /python scripts\/generate_codex_matrix\.py --check/);
   assert.match(testingGuide, /git diff --check/);
 });
