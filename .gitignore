@@ -3,6 +3,7 @@
 /.colay/
 /.codex/orchestrator/
 /.codex-orchestrator-worktrees/
+/.worktrees/
 *.db-shm
 *.db-wal
 *.backup.*
