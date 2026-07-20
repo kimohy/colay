@@ -1464,7 +1464,7 @@ fn register_checkpoint_artifact(
     Ok(stored.0)
 }
 
-fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
+pub(crate) fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     Ok(StoredTask {
         task_id: parse_id(row.get::<_, String>(0)?, 0)?,
         schema_version: row.get(1)?,
@@ -1487,7 +1487,7 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     })
 }
 
-fn validate_stored_task(task: StoredTask) -> StateResult<StoredTask> {
+pub(crate) fn validate_stored_task(task: StoredTask) -> StateResult<StoredTask> {
     ensure_supported_schema(
         "task envelope",
         &task.schema_version,
@@ -1508,7 +1508,7 @@ fn validate_stored_task(task: StoredTask) -> StateResult<StoredTask> {
     Ok(task)
 }
 
-fn map_task_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTaskAttempt> {
+pub(crate) fn map_task_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTaskAttempt> {
     let attempt_id = parse_id(row.get(0)?, 0)?;
     let task_id = parse_id(row.get(1)?, 1)?;
     let worker_result: Option<serde_json::Value> = row
@@ -1552,7 +1552,7 @@ fn map_task_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTaskAttem
     })
 }
 
-fn map_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredWorktree> {
+pub(crate) fn map_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredWorktree> {
     Ok(StoredWorktree {
         worktree_id: parse_id(row.get(0)?, 0)?,
         task_id: parse_id(row.get(1)?, 1)?,

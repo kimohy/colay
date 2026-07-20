@@ -19,6 +19,7 @@ mod paths;
 mod permissions;
 mod records;
 mod sessions;
+mod workspace;
 
 pub use artifacts::{ArtifactStore, StoredArtifact};
 pub use client_commands::ClientCommandRecoveryDisposition;
@@ -54,6 +55,10 @@ pub use records::{
     StoredTaskAttempt, StoredWorktree, TaskListFilter,
 };
 pub use sessions::{NewSessionRecord, SessionListFilter, StoredSession};
+pub use workspace::{
+    WorkspaceAttention, WorkspaceAttentionKind, WorkspaceInspector, WorkspaceProjection,
+    WorkspaceReadRequest, WorkspaceTask, WorkspaceVerification,
+};
 
 pub(crate) struct CanonicalTempDir {
     _directory: tempfile::TempDir,

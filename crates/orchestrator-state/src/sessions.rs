@@ -357,7 +357,7 @@ fn session_by_id(
         .map_err(StateError::from)
 }
 
-fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> {
+pub(crate) fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> {
     Ok(StoredSession {
         session_id: parse_id(&row.get::<_, String>(0)?, 0)?,
         schema_version: row.get(1)?,
@@ -390,7 +390,7 @@ fn message_by_id(
         .map_err(StateError::from)
 }
 
-fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, ConversationMessage)> {
+pub(crate) fn map_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<(u64, ConversationMessage)> {
     Ok((
         row.get(0)?,
         ConversationMessage {
