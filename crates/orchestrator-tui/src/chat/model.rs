@@ -210,6 +210,14 @@ impl ActionFeedback {
             message: format!("{feature} becomes available in a later orchestration phase"),
         }
     }
+
+    #[must_use]
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            level: FeedbackLevel::Error,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

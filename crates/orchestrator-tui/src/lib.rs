@@ -180,6 +180,8 @@ pub enum TuiError {
     Io(#[from] io::Error),
     #[error("control input is incomplete or invalid: {0}")]
     InvalidControlInput(String),
+    #[error("workspace driver failed: {0}")]
+    Driver(String),
 }
 
 trait TerminalControl {

@@ -227,17 +227,19 @@ fn render_composer(
         state.composer()
     };
     let lines = vec![
-        Line::from(format!("to: {}", state.composer_target().label())),
+        Line::from(format!(
+            "{}to: {}",
+            if state.focus() == FocusPane::Composer {
+                "> "
+            } else {
+                "  "
+            },
+            state.composer_target().label()
+        )),
         Line::from(input),
         Line::from(feedback),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).block(panel(focused_title(
-            "COMPOSER",
-            state.focus() == FocusPane::Composer,
-        ))),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_compact(frame: &mut Frame<'_>, area: Rect, snapshot: &WorkspaceSnapshot) {
