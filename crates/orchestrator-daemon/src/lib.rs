@@ -1,0 +1,211 @@
+//! Repository-local daemon heartbeat and shutdown loop.
+#![allow(clippy::missing_errors_doc)]
+#![cfg_attr(test, allow(clippy::panic))]
+
+use std::time::Duration;
+
+use chrono::{TimeDelta, Utc};
+use orchestrator_domain::DaemonInstanceId;
+use orchestrator_state::{DaemonLeaseRequest, Database, StateError};
+use thiserror::Error;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug)]
+pub struct DaemonSettings {
+    pub heartbeat_interval: Duration,
+    pub lease_ttl: TimeDelta,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_secs(1),
+            lease_ttl: TimeDelta::seconds(5),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonExit {
+    StopRequested,
+    Cancelled,
+}
+
+#[derive(Debug, Error)]
+pub enum DaemonError {
+    #[error("invalid daemon settings: {0}")]
+    InvalidSettings(String),
+    #[error(transparent)]
+    State(#[from] StateError),
+}
+
+pub async fn serve(
+    database: &Database,
+    instance_id: DaemonInstanceId,
+    pid: u32,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+) -> Result<DaemonExit, DaemonError> {
+    validate_settings(settings)?;
+    let started_at = Utc::now();
+    database.acquire_daemon_lease(&DaemonLeaseRequest {
+        instance_id,
+        pid,
+        started_at,
+        ttl: settings.lease_ttl,
+    })?;
+
+    let mut interval = tokio::time::interval(settings.heartbeat_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let exit = loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break DaemonExit::Cancelled,
+            _ = interval.tick() => {
+                if database.daemon_stop_requested(instance_id)? {
+                    break DaemonExit::StopRequested;
+                }
+                database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
+            }
+        }
+    };
+    database.release_daemon(instance_id, Utc::now())?;
+    Ok(exit)
+}
+
+fn validate_settings(settings: DaemonSettings) -> Result<(), DaemonError> {
+    if settings.heartbeat_interval.is_zero() {
+        return Err(DaemonError::InvalidSettings(
+            "heartbeat interval must be positive".to_owned(),
+        ));
+    }
+    if settings.lease_ttl <= TimeDelta::zero() {
+        return Err(DaemonError::InvalidSettings(
+            "lease TTL must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use chrono::{TimeDelta, Utc};
+    use orchestrator_domain::DaemonInstanceId;
+    use orchestrator_state::{DaemonStatus, Database, StateResult};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{DaemonError, DaemonExit, DaemonSettings, serve};
+
+    fn database() -> StateResult<Arc<Database>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        Ok(Arc::new(database))
+    }
+
+    fn settings() -> DaemonSettings {
+        DaemonSettings {
+            heartbeat_interval: Duration::from_millis(10),
+            lease_ttl: TimeDelta::milliseconds(100),
+        }
+    }
+
+    async fn wait_until_online(database: &Database) -> DaemonStatus {
+        for _ in 0..50 {
+            let status = database
+                .daemon_status(Utc::now())
+                .unwrap_or(DaemonStatus::Stopped);
+            if matches!(status, DaemonStatus::Online(_)) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        DaemonStatus::Stopped
+    }
+
+    #[tokio::test]
+    async fn heartbeat_runs_until_cancellation_and_releases_lease() -> Result<(), DaemonError> {
+        let database = database()?;
+        let instance_id = DaemonInstanceId::new();
+        let cancellation = CancellationToken::new();
+        let service_database = Arc::clone(&database);
+        let service_cancellation = cancellation.clone();
+        let service = tokio::spawn(async move {
+            serve(
+                &service_database,
+                instance_id,
+                42,
+                service_cancellation,
+                settings(),
+            )
+            .await
+        });
+        let initial = wait_until_online(&database).await;
+        let DaemonStatus::Online(initial) = initial else {
+            return Err(DaemonError::InvalidSettings(
+                "daemon did not become online".to_owned(),
+            ));
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let current = database.daemon_status(Utc::now())?;
+        let DaemonStatus::Online(current) = current else {
+            return Err(DaemonError::InvalidSettings(
+                "daemon did not remain online".to_owned(),
+            ));
+        };
+        assert!(current.heartbeat_at >= initial.heartbeat_at);
+        cancellation.cancel();
+        assert_eq!(
+            service.await.map_err(|error| {
+                DaemonError::InvalidSettings(format!("daemon task failed: {error}"))
+            })??,
+            DaemonExit::Cancelled
+        );
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_request_exits_and_second_runtime_is_rejected() -> Result<(), DaemonError> {
+        let database = database()?;
+        let instance_id = DaemonInstanceId::new();
+        let cancellation = CancellationToken::new();
+        let service_database = Arc::clone(&database);
+        let service_cancellation = cancellation.clone();
+        let service = tokio::spawn(async move {
+            serve(
+                &service_database,
+                instance_id,
+                42,
+                service_cancellation,
+                settings(),
+            )
+            .await
+        });
+        assert!(matches!(
+            wait_until_online(&database).await,
+            DaemonStatus::Online(_)
+        ));
+
+        let conflict = serve(
+            &database,
+            DaemonInstanceId::new(),
+            43,
+            CancellationToken::new(),
+            settings(),
+        )
+        .await;
+        assert!(matches!(conflict, Err(DaemonError::State(_))));
+
+        database.request_daemon_stop(instance_id, Utc::now())?;
+        assert_eq!(
+            service.await.map_err(|error| {
+                DaemonError::InvalidSettings(format!("daemon task failed: {error}"))
+            })??,
+            DaemonExit::StopRequested
+        );
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+}

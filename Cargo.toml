@@ -3,6 +3,7 @@ members = [
     "crates/orchestrator-domain",
     "crates/orchestrator-policy",
     "crates/orchestrator-state",
+    "crates/orchestrator-daemon",
     "crates/orchestrator-process",
     "crates/codex-compat",
     "crates/orchestrator-providers",
