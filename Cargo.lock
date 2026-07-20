@@ -820,8 +820,11 @@ name = "orchestrator-daemon"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "orchestrator-domain",
  "orchestrator-state",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

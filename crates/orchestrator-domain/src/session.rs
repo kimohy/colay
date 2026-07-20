@@ -197,6 +197,48 @@ impl ConversationMessage {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSessionCommandPayload {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+impl CreateSessionCommandPayload {
+    /// Validates a durable create-session command payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionValidationError::BlankTitle`] for a blank session title.
+    pub fn validate(&self) -> Result<(), SessionValidationError> {
+        if self.title.trim().is_empty() {
+            Err(SessionValidationError::BlankTitle)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendMessageCommandPayload {
+    pub message_id: MessageId,
+    pub content: String,
+}
+
+impl AppendMessageCommandPayload {
+    /// Validates a durable user-message command payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionValidationError::BlankFinalMessage`] for blank content.
+    pub fn validate(&self) -> Result<(), SessionValidationError> {
+        if self.content.trim().is_empty() {
+            Err(SessionValidationError::BlankFinalMessage)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientCommandAction {
@@ -297,8 +339,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ClientCommand, ClientCommandAction, ClientCommandState, ConversationMessage, MessageKind,
-        MessageRole, MessageState, Session, SessionState,
+        AppendMessageCommandPayload, ClientCommand, ClientCommandAction, ClientCommandState,
+        ConversationMessage, CreateSessionCommandPayload, MessageKind, MessageRole, MessageState,
+        Session, SessionState,
     };
     use crate::{ClientCommandId, MessageId, SessionId};
 
@@ -406,5 +449,49 @@ mod tests {
         assert_eq!(command.validate(), Ok(()));
         command.requested_by.clear();
         assert!(command.validate().is_err());
+    }
+
+    #[test]
+    fn typed_session_command_payloads_validate_and_round_trip() -> Result<(), serde_json::Error> {
+        let create = CreateSessionCommandPayload {
+            session_id: SessionId::new(),
+            title: "auth refactor".to_owned(),
+        };
+        assert_eq!(create.validate(), Ok(()));
+        assert_eq!(
+            serde_json::from_value::<CreateSessionCommandPayload>(serde_json::to_value(&create)?)?,
+            create
+        );
+
+        let append = AppendMessageCommandPayload {
+            message_id: MessageId::new(),
+            content: "continue task-03".to_owned(),
+        };
+        assert_eq!(append.validate(), Ok(()));
+        assert_eq!(
+            serde_json::from_value::<AppendMessageCommandPayload>(serde_json::to_value(&append)?)?,
+            append
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_session_command_payloads_reject_blank_user_text() {
+        assert!(
+            CreateSessionCommandPayload {
+                session_id: SessionId::new(),
+                title: " ".to_owned(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppendMessageCommandPayload {
+                message_id: MessageId::new(),
+                content: String::new(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

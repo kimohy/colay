@@ -16,6 +16,25 @@ pub enum ClientCommandRecoveryDisposition {
 }
 
 impl Database {
+    pub fn load_client_command(
+        &self,
+        command_id: ClientCommandId,
+    ) -> StateResult<Option<ClientCommand>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT command_id, session_id, task_id, action, payload_json,
+                            idempotency_key, state, requested_by, requested_at, claimed_at,
+                            completed_at, outcome
+                     FROM client_commands WHERE command_id = ?1",
+                    [command_id.to_string()],
+                    map_client_command,
+                )
+                .optional()
+                .map_err(StateError::from)
+        })
+    }
+
     pub fn submit_client_command(&self, command: &ClientCommand) -> StateResult<ClientCommand> {
         command
             .validate()
@@ -58,15 +77,37 @@ impl Database {
         &self,
         claimed_at: DateTime<Utc>,
     ) -> StateResult<Option<ClientCommand>> {
+        self.claim_client_command(claimed_at, false)
+    }
+
+    pub fn claim_next_session_client_command(
+        &self,
+        claimed_at: DateTime<Utc>,
+    ) -> StateResult<Option<ClientCommand>> {
+        self.claim_client_command(claimed_at, true)
+    }
+
+    fn claim_client_command(
+        &self,
+        claimed_at: DateTime<Utc>,
+        session_actions_only: bool,
+    ) -> StateResult<Option<ClientCommand>> {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let command = {
-            let mut statement = transaction.prepare(
+            let sql = if session_actions_only {
                 "SELECT command_id, session_id, task_id, action, payload_json, idempotency_key,
                         state, requested_by, requested_at, claimed_at, completed_at, outcome
                  FROM client_commands WHERE state = 'pending'
-                 ORDER BY requested_at, command_id LIMIT 1",
-            )?;
+                   AND action IN ('create_session', 'append_message')
+                 ORDER BY requested_at, command_id LIMIT 1"
+            } else {
+                "SELECT command_id, session_id, task_id, action, payload_json, idempotency_key,
+                        state, requested_by, requested_at, claimed_at, completed_at, outcome
+                 FROM client_commands WHERE state = 'pending'
+                 ORDER BY requested_at, command_id LIMIT 1"
+            };
+            let mut statement = transaction.prepare(sql)?;
             statement.query_row([], map_client_command).optional()?
         };
         let Some(mut command) = command else {
@@ -476,6 +517,19 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn client_command_can_be_loaded_by_stable_id() -> StateResult<()> {
+        let database = migrated_database();
+        let command = command(ClientCommandAction::AppendMessage, "load-command");
+        database.submit_client_command(&command)?;
+        assert_eq!(
+            database.load_client_command(command.command_id)?,
+            Some(command)
+        );
+        assert_eq!(database.load_client_command(ClientCommandId::new())?, None);
         Ok(())
     }
 }

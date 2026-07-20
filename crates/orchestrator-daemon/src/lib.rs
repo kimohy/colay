@@ -11,9 +11,14 @@ use thiserror::Error;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
+mod commands;
+
+pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
+
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonSettings {
     pub heartbeat_interval: Duration,
+    pub command_poll_interval: Duration,
     pub lease_ttl: TimeDelta,
 }
 
@@ -21,6 +26,7 @@ impl Default for DaemonSettings {
     fn default() -> Self {
         Self {
             heartbeat_interval: Duration::from_secs(1),
+            command_poll_interval: Duration::from_millis(100),
             lease_ttl: TimeDelta::seconds(5),
         }
     }
@@ -47,6 +53,33 @@ pub async fn serve(
     cancellation: CancellationToken,
     settings: DaemonSettings,
 ) -> Result<DaemonExit, DaemonError> {
+    serve_with_commands(
+        database,
+        instance_id,
+        pid,
+        cancellation,
+        settings,
+        &IdentityRedactor,
+    )
+    .await
+}
+
+struct IdentityRedactor;
+
+impl MessageRedactor for IdentityRedactor {
+    fn redact(&self, value: &str) -> String {
+        value.to_owned()
+    }
+}
+
+pub async fn serve_with_commands(
+    database: &Database,
+    instance_id: DaemonInstanceId,
+    pid: u32,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: &dyn MessageRedactor,
+) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
     let started_at = Utc::now();
     database.acquire_daemon_lease(&DaemonLeaseRequest {
@@ -56,16 +89,21 @@ pub async fn serve(
         ttl: settings.lease_ttl,
     })?;
 
-    let mut interval = tokio::time::interval(settings.heartbeat_interval);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
+    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut command_interval = tokio::time::interval(settings.command_poll_interval);
+    command_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let exit = loop {
         tokio::select! {
             () = cancellation.cancelled() => break DaemonExit::Cancelled,
-            _ = interval.tick() => {
+            _ = heartbeat_interval.tick() => {
                 if database.daemon_stop_requested(instance_id)? {
                     break DaemonExit::StopRequested;
                 }
                 database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
+            }
+            _ = command_interval.tick() => {
+                process_next_client_command(database, redactor, Utc::now())?;
             }
         }
     };
@@ -77,6 +115,11 @@ fn validate_settings(settings: DaemonSettings) -> Result<(), DaemonError> {
     if settings.heartbeat_interval.is_zero() {
         return Err(DaemonError::InvalidSettings(
             "heartbeat interval must be positive".to_owned(),
+        ));
+    }
+    if settings.command_poll_interval.is_zero() {
+        return Err(DaemonError::InvalidSettings(
+            "command poll interval must be positive".to_owned(),
         ));
     }
     if settings.lease_ttl <= TimeDelta::zero() {
@@ -92,11 +135,24 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use chrono::{TimeDelta, Utc};
-    use orchestrator_domain::DaemonInstanceId;
+    use orchestrator_domain::{
+        ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState, DaemonInstanceId,
+        SessionId,
+    };
     use orchestrator_state::{DaemonStatus, Database, StateResult};
     use tokio_util::sync::CancellationToken;
 
-    use super::{DaemonError, DaemonExit, DaemonSettings, serve};
+    use super::{
+        DaemonError, DaemonExit, DaemonSettings, MessageRedactor, serve, serve_with_commands,
+    };
+
+    struct IdentityRedactor;
+
+    impl MessageRedactor for IdentityRedactor {
+        fn redact(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
 
     fn database() -> StateResult<Arc<Database>> {
         let database = Database::open_in_memory()?;
@@ -107,6 +163,7 @@ mod tests {
     fn settings() -> DaemonSettings {
         DaemonSettings {
             heartbeat_interval: Duration::from_millis(10),
+            command_poll_interval: Duration::from_millis(5),
             lease_ttl: TimeDelta::milliseconds(100),
         }
     }
@@ -206,6 +263,65 @@ mod tests {
             DaemonExit::StopRequested
         );
         assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_loop_processes_pending_session_commands() -> Result<(), DaemonError> {
+        let database = database()?;
+        let session_id = SessionId::new();
+        let command = ClientCommand {
+            command_id: ClientCommandId::new(),
+            session_id: None,
+            task_id: None,
+            action: ClientCommandAction::CreateSession,
+            payload: serde_json::json!({
+                "session_id": session_id,
+                "title": "chat session",
+            }),
+            idempotency_key: "runtime-create-session".to_owned(),
+            state: ClientCommandState::Pending,
+            requested_by: "test".to_owned(),
+            requested_at: Utc::now(),
+            claimed_at: None,
+            completed_at: None,
+            outcome: None,
+        };
+        database.submit_client_command(&command)?;
+        let cancellation = CancellationToken::new();
+        let service_database = Arc::clone(&database);
+        let service_cancellation = cancellation.clone();
+        let service = tokio::spawn(async move {
+            serve_with_commands(
+                &service_database,
+                DaemonInstanceId::new(),
+                42,
+                service_cancellation,
+                settings(),
+                &IdentityRedactor,
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if database.load_session(session_id)?.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(database.load_session(session_id)?.is_some());
+        assert_eq!(
+            database
+                .load_client_command(command.command_id)?
+                .map(|value| value.state),
+            Some(ClientCommandState::Completed)
+        );
+        cancellation.cancel();
+        assert_eq!(
+            service.await.map_err(|error| {
+                DaemonError::InvalidSettings(format!("daemon task failed: {error}"))
+            })??,
+            DaemonExit::Cancelled
+        );
         Ok(())
     }
 }

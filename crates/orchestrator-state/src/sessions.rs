@@ -88,6 +88,22 @@ impl Database {
         })
     }
 
+    pub fn load_message(&self, message_id: MessageId) -> StateResult<Option<ConversationMessage>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT ordinal, message_id, session_id, task_id, role, kind, state,
+                            content_redacted, created_at, finalized_at
+                     FROM conversation_messages WHERE message_id = ?1",
+                    [message_id.to_string()],
+                    map_message,
+                )
+                .optional()
+                .map(|value| value.map(|(_, message)| message))
+                .map_err(StateError::from)
+        })
+    }
+
     pub fn list_sessions(&self, filter: &SessionListFilter) -> StateResult<Vec<StoredSession>> {
         let limit = i64::try_from(filter.limit).unwrap_or(i64::MAX);
         self.with_connection(|connection| {
@@ -156,33 +172,29 @@ impl Database {
         message
             .validate()
             .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        self.with_transaction(|transaction| append_message_in_transaction(transaction, message))
+    }
+
+    pub fn append_message_with_event(
+        &self,
+        message: &ConversationMessage,
+        mut event: TaskEvent,
+    ) -> StateResult<u64> {
+        message
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        if event.session_id != Some(message.session_id)
+            || event.task_id != message.task_id
+            || event.event_type != EventType::MessageAppended
+        {
+            return Err(StateError::InvalidRecord(
+                "message event target or type does not match its projection".to_owned(),
+            ));
+        }
         self.with_transaction(|transaction| {
-            let next: i64 = transaction.query_row(
-                "SELECT coalesce(max(ordinal), 0) + 1 FROM conversation_messages
-                 WHERE session_id = ?1",
-                [message.session_id.to_string()],
-                |row| row.get(0),
-            )?;
-            transaction.execute(
-                "INSERT INTO conversation_messages(
-                    message_id, session_id, task_id, ordinal, role, kind, state,
-                    content_redacted, created_at, finalized_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    message.message_id.to_string(),
-                    message.session_id.to_string(),
-                    message.task_id.map(|id| id.to_string()),
-                    next,
-                    enum_text(&message.role)?,
-                    enum_text(&message.kind)?,
-                    enum_text(&message.state)?,
-                    message.content_redacted,
-                    message.created_at.to_rfc3339(),
-                    message.finalized_at.map(|value| value.to_rfc3339()),
-                ],
-            )?;
-            u64::try_from(next)
-                .map_err(|_| StateError::InvalidRecord("message ordinal is negative".to_owned()))
+            let ordinal = append_message_in_transaction(transaction, message)?;
+            append_event_in_transaction(transaction, &mut event)?;
+            Ok(ordinal)
         })
     }
 
@@ -257,6 +269,38 @@ impl Database {
                 .map_err(StateError::from)
         })
     }
+}
+
+fn append_message_in_transaction(
+    transaction: &Transaction<'_>,
+    message: &ConversationMessage,
+) -> StateResult<u64> {
+    let next: i64 = transaction.query_row(
+        "SELECT coalesce(max(ordinal), 0) + 1 FROM conversation_messages
+         WHERE session_id = ?1",
+        [message.session_id.to_string()],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO conversation_messages(
+            message_id, session_id, task_id, ordinal, role, kind, state,
+            content_redacted, created_at, finalized_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            message.message_id.to_string(),
+            message.session_id.to_string(),
+            message.task_id.map(|id| id.to_string()),
+            next,
+            enum_text(&message.role)?,
+            enum_text(&message.kind)?,
+            enum_text(&message.state)?,
+            message.content_redacted,
+            message.created_at.to_rfc3339(),
+            message.finalized_at.map(|value| value.to_rfc3339()),
+        ],
+    )?;
+    u64::try_from(next)
+        .map_err(|_| StateError::InvalidRecord("message ordinal is negative".to_owned()))
 }
 
 fn validate_new_session(session: &NewSessionRecord) -> StateResult<()> {
@@ -673,6 +717,31 @@ mod tests {
                 )
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn message_can_be_loaded_for_crash_reconciliation() -> StateResult<()> {
+        let database = migrated_database();
+        let session = new_session("reconcile");
+        database.create_session_with_event(
+            &session,
+            session_event(session.session_id, EventType::SessionCreated),
+        )?;
+        let message = ConversationMessage {
+            message_id: MessageId::new(),
+            session_id: session.session_id,
+            task_id: None,
+            role: MessageRole::User,
+            kind: MessageKind::UserMessage,
+            state: MessageState::Final,
+            content_redacted: "continue".to_owned(),
+            created_at: timestamp(),
+            finalized_at: Some(timestamp()),
+        };
+        database.append_message(&message)?;
+        assert_eq!(database.load_message(message.message_id)?, Some(message));
+        assert_eq!(database.load_message(MessageId::new())?, None);
         Ok(())
     }
 }
