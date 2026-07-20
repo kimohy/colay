@@ -67,7 +67,7 @@ pub enum Command {
     Migrate(MigrationArgs),
     /// Plan or explicitly approve recovery from versioned backups.
     Rollback(RollbackArgs),
-    /// Open the local five-panel terminal dashboard.
+    /// Open the durable chat workspace (Ctrl+T targets, /tasks, /admin dashboard).
     Tui(TaskSelector),
 }
 

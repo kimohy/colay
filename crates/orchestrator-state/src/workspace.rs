@@ -82,6 +82,52 @@ pub struct WorkspaceProjection {
 }
 
 impl Database {
+    pub fn load_workspace_selected_task(
+        &self,
+        session_id: SessionId,
+    ) -> StateResult<Option<TaskId>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT selected_task_id FROM session_workspace_state WHERE session_id = ?1",
+                    [session_id.to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .map(|value| {
+                    TaskId::from_str(&value).map_err(|error| {
+                        StateError::InvalidRecord(format!(
+                            "stored workspace task ID is invalid: {error}"
+                        ))
+                    })
+                })
+                .transpose()
+        })
+    }
+
+    pub fn save_workspace_selected_task(
+        &self,
+        session_id: SessionId,
+        selected_task_id: Option<TaskId>,
+        updated_at: DateTime<Utc>,
+    ) -> StateResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO session_workspace_state(session_id, selected_task_id, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET selected_task_id = excluded.selected_task_id,
+                 updated_at = excluded.updated_at",
+                params![
+                    session_id.to_string(),
+                    selected_task_id.map(|task_id| task_id.to_string()),
+                    updated_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn read_workspace_projection(
         &self,
         request: WorkspaceReadRequest,
@@ -580,5 +626,36 @@ mod tests {
             .unwrap_or_else(|error| panic!("clamped: {error}"));
         assert_eq!(clamped.messages.len(), 200);
         assert_eq!(clamped.recent_tasks.len(), 1);
+    }
+
+    #[test]
+    fn selected_task_round_trips_per_session() {
+        let database = database();
+        let (session_id, other_session, running) =
+            seed(&database).unwrap_or_else(|error| panic!("seed: {error}"));
+        database
+            .save_workspace_selected_task(session_id, Some(running), timestamp())
+            .unwrap_or_else(|error| panic!("save: {error}"));
+        assert_eq!(
+            database
+                .load_workspace_selected_task(session_id)
+                .unwrap_or_else(|error| panic!("load: {error}")),
+            Some(running)
+        );
+        assert_eq!(
+            database
+                .load_workspace_selected_task(other_session)
+                .unwrap_or_else(|error| panic!("other load: {error}")),
+            None
+        );
+        database
+            .save_workspace_selected_task(session_id, None, timestamp())
+            .unwrap_or_else(|error| panic!("clear: {error}"));
+        assert_eq!(
+            database
+                .load_workspace_selected_task(session_id)
+                .unwrap_or_else(|error| panic!("load cleared: {error}")),
+            None
+        );
     }
 }

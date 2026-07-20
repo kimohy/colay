@@ -126,6 +126,11 @@ impl WorkspaceState {
     }
 
     pub fn reconcile_snapshot(&mut self, snapshot: &WorkspaceSnapshot) {
+        if self.selected_task.is_none()
+            && let Some(inspector) = snapshot.inspector.as_ref()
+        {
+            self.selected_task = Some(inspector.task_id.clone());
+        }
         if let Some(selected) = self.selected_task.as_deref() {
             self.selected_task_index = snapshot
                 .tasks
@@ -293,10 +298,24 @@ impl WorkspaceState {
                 }
                 _ => UiEffect::None,
             },
-            Some(Overlay::CommandPalette) => {
-                self.overlay = None;
-                self.submit_composer(snapshot)
-            }
+            Some(Overlay::CommandPalette) => match key.code {
+                KeyCode::Enter => {
+                    self.overlay = None;
+                    self.submit_composer(snapshot)
+                }
+                KeyCode::Backspace => {
+                    self.composer.pop();
+                    UiEffect::Redraw
+                }
+                KeyCode::Char(character)
+                    if !character.is_control()
+                        && self.composer.len() + character.len_utf8() <= 4_096 =>
+                {
+                    self.composer.push(character);
+                    UiEffect::Redraw
+                }
+                _ => UiEffect::None,
+            },
             Some(Overlay::Overview | Overlay::FullLog | Overlay::Help | Overlay::Inspector) => {
                 UiEffect::None
             }
@@ -368,7 +387,7 @@ impl WorkspaceState {
             PaletteCommand::Pause => self.task_control(snapshot, TaskControlIntent::Pause),
             PaletteCommand::Resume => self.task_control(snapshot, TaskControlIntent::Resume),
             PaletteCommand::Cancel => self.task_control(snapshot, TaskControlIntent::Cancel),
-            PaletteCommand::Handover | PaletteCommand::Provider => {
+            PaletteCommand::Handover | PaletteCommand::Provider | PaletteCommand::Admin => {
                 UiEffect::Dispatch(WorkspaceAction::OpenAdministration)
             }
             PaletteCommand::Retry => self.task_control(snapshot, TaskControlIntent::Retry),
@@ -480,6 +499,27 @@ mod tests {
             })
         );
         assert_eq!(state.composer_target(), &ComposerTarget::Orchestrator);
+    }
+
+    #[test]
+    fn command_palette_accepts_text_until_enter() {
+        let mut state = WorkspaceState::default();
+        let snapshot = snapshot();
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('/')), &snapshot, LayoutMode::Wide),
+            UiEffect::Redraw
+        );
+        for character in "admin".chars() {
+            assert_eq!(
+                state.handle_key(key(KeyCode::Char(character)), &snapshot, LayoutMode::Wide),
+                UiEffect::Redraw
+            );
+        }
+        assert_eq!(state.composer(), "/admin");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Dispatch(WorkspaceAction::OpenAdministration)
+        );
     }
 
     #[test]

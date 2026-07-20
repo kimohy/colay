@@ -4974,8 +4974,45 @@ fn validate_sealed_rollback_destinations(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn tui(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+    runtime: &ConfigRuntime,
+    selector: &TaskSelector,
+    json_output: bool,
+) -> Result<()> {
+    if !runtime.effective.config().features.orchestrator_tui {
+        bail!("orchestrator TUI is disabled by configuration");
+    }
+    let mut driver = crate::chat_tui::SqliteWorkspaceDriver::connect(
+        repository,
+        runtime.effective.config(),
+        cli_config,
+        selector.task_id.as_deref(),
+    )
+    .await?;
+    let mut workspace_state = orchestrator_tui::chat::WorkspaceState::default();
+    loop {
+        match orchestrator_tui::chat::run_workspace_session(&mut driver, &mut workspace_state)? {
+            orchestrator_tui::chat::WorkspaceExit::Quit => return Ok(()),
+            orchestrator_tui::chat::WorkspaceExit::Administration => {
+                Box::pin(legacy_tui(
+                    repository,
+                    cli_config,
+                    environment.clone(),
+                    runtime,
+                    selector,
+                    json_output,
+                ))
+                .await?;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn legacy_tui(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,

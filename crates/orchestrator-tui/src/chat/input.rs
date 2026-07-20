@@ -12,6 +12,7 @@ pub enum PaletteCommand {
     Retry,
     Checkpoint,
     Provider,
+    Admin,
 }
 
 #[must_use]
@@ -27,6 +28,7 @@ pub fn parse_palette_command(value: &str) -> Option<PaletteCommand> {
         "/retry" => Some(PaletteCommand::Retry),
         "/checkpoint" => Some(PaletteCommand::Checkpoint),
         "/provider" => Some(PaletteCommand::Provider),
+        "/admin" => Some(PaletteCommand::Admin),
         _ => None,
     }
 }
@@ -94,6 +96,7 @@ mod tests {
             ("/retry", PaletteCommand::Retry),
             ("/checkpoint", PaletteCommand::Checkpoint),
             ("/provider", PaletteCommand::Provider),
+            ("/admin", PaletteCommand::Admin),
         ] {
             assert_eq!(parse_palette_command(value), Some(expected));
         }

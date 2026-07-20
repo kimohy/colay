@@ -117,7 +117,8 @@ impl WorkspaceSnapshot {
     /// # Errors
     ///
     /// Returns [`WorkspaceModelError`] when required strings are blank, task IDs repeat,
-    /// or inspector/message task references do not exist in the task list.
+    /// or the selected inspector references a task outside the task list. Historical
+    /// messages may reference tasks outside the bounded recent-task window.
     pub fn validate(&self) -> Result<(), WorkspaceModelError> {
         require_non_blank(&self.repository, "repository")?;
         require_non_blank(&self.session_id, "session ID")?;
@@ -144,11 +145,6 @@ impl WorkspaceSnapshot {
             require_non_blank(&message.message_id, "message ID")?;
             if message.state != "streaming" {
                 require_non_blank(&message.content, "message content")?;
-            }
-            if let Some(task_id) = &message.task_id
-                && !task_ids.contains(task_id.as_str())
-            {
-                return Err(WorkspaceModelError::UnknownTaskReference(task_id.clone()));
             }
         }
         Ok(())

@@ -28,7 +28,7 @@ fn seed_v1(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn v1_to_v4_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
+fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let root = std::fs::canonicalize(directory.path())?;
@@ -39,7 +39,7 @@ fn v1_to_v4_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 
     let initial = database.migration_status()?;
     assert_eq!(initial.current_version, 1);
-    assert_eq!(initial.pending_versions, vec![2, 3, 4]);
+    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5]);
 
     let dry_run = database.dry_run_migrations()?;
     assert_eq!(dry_run.current_version, STATE_SCHEMA_VERSION);
@@ -57,6 +57,7 @@ fn v1_to_v4_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
             "conversation_messages",
             "client_commands",
             "daemon_instances",
+            "session_workspace_state",
         ] {
             let count: i64 = connection.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -82,7 +83,7 @@ fn v1_to_v4_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     let backup = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let backup_status = MigrationManager::status(&backup)?;
     assert_eq!(backup_status.current_version, 1);
-    assert_eq!(backup_status.pending_versions, vec![2, 3, 4]);
+    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5]);
     Ok(())
 }
 
@@ -109,7 +110,8 @@ fn seed_v3(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn v3_event_hash_remains_verifiable_after_v4_migration() -> Result<(), Box<dyn std::error::Error>> {
+fn v3_event_hash_remains_verifiable_after_current_migration()
+-> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let root = std::fs::canonicalize(directory.path())?;
     let database_path = root.join("orchestrator.db");
@@ -138,7 +140,7 @@ fn v3_event_hash_remains_verifiable_after_v4_migration() -> Result<(), Box<dyn s
     assert!(historical.verify_hash()?);
 
     let migrated = database.migrate_with_backup(&root.join("backups-v4"))?;
-    assert_eq!(migrated.current_version, 4);
+    assert_eq!(migrated.current_version, STATE_SCHEMA_VERSION);
     let reloaded = database.event_at(1)?.ok_or("historical event missing")?;
     assert_eq!(reloaded, historical);
     assert!(reloaded.verify_hash()?);
@@ -172,19 +174,20 @@ fn checksum_tampering_and_future_schemas_fail_closed() -> Result<(), Box<dyn std
     let second_database = Database::open(&second_path)?;
     second_database.migrate_with_backup(&second_root.join("backups"))?;
     second_database.with_connection(|connection| {
+        let future = STATE_SCHEMA_VERSION + 1;
         connection.execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
-             VALUES (5, 'future', ?1, ?2)",
-            params!["f".repeat(64), Utc::now().to_rfc3339()],
+             VALUES (?1, 'future', ?2, ?3)",
+            params![future, "f".repeat(64), Utc::now().to_rfc3339()],
         )?;
         Ok(())
     })?;
     assert!(matches!(
         second_database.migration_status(),
         Err(StateError::FutureSchema {
-            found: 5,
+            found,
             supported: STATE_SCHEMA_VERSION
-        })
+        }) if found == STATE_SCHEMA_VERSION + 1
     ));
     Ok(())
 }

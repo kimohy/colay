@@ -35,6 +35,25 @@ impl Database {
         })
     }
 
+    pub fn load_client_command_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> StateResult<Option<ClientCommand>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT command_id, session_id, task_id, action, payload_json,
+                            idempotency_key, state, requested_by, requested_at, claimed_at,
+                            completed_at, outcome
+                     FROM client_commands WHERE idempotency_key = ?1",
+                    [idempotency_key],
+                    map_client_command,
+                )
+                .optional()
+                .map_err(StateError::from)
+        })
+    }
+
     pub fn submit_client_command(&self, command: &ClientCommand) -> StateResult<ClientCommand> {
         command
             .validate()

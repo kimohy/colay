@@ -42,6 +42,21 @@ pub trait WorkspaceDriver {
     ///
     /// Returns [`DriverError`] when the action cannot be durably accepted.
     fn dispatch(&mut self, action: WorkspaceAction) -> Result<ActionFeedback, DriverError>;
+
+    /// Persists navigation state without changing the composer target.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError`] when the selected task cannot be stored safely.
+    fn selection_changed(&mut self, _task_id: Option<&str>) -> Result<(), DriverError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceExit {
+    Quit,
+    Administration,
 }
 
 trait EventSource {
@@ -67,19 +82,47 @@ impl EventSource for CrosstermEvents {
 ///
 /// Returns [`TuiError`] when terminal setup/input fails or the initial durable
 /// workspace snapshot cannot be loaded or validated.
-pub fn run_workspace<D: WorkspaceDriver>(driver: &mut D) -> Result<(), TuiError> {
+pub fn run_workspace<D: WorkspaceDriver>(driver: &mut D) -> Result<WorkspaceExit, TuiError> {
+    run_workspace_session(driver, &mut WorkspaceState::default())
+}
+
+/// Runs the chat workspace while retaining navigation and composer state across
+/// temporary exits to the administration dashboard.
+///
+/// # Errors
+///
+/// Returns [`TuiError`] under the same conditions as [`run_workspace`].
+pub fn run_workspace_session<D: WorkspaceDriver>(
+    driver: &mut D,
+    state: &mut WorkspaceState,
+) -> Result<WorkspaceExit, TuiError> {
     let _guard = TerminalGuard::enter(CrosstermTerminalControl)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    run_loop(driver, &mut terminal, &mut CrosstermEvents)
+    run_loop_with_state(driver, &mut terminal, &mut CrosstermEvents, state)
 }
 
+#[cfg(test)]
 fn run_loop<D, B, E>(
     driver: &mut D,
     terminal: &mut Terminal<B>,
     events: &mut E,
-) -> Result<(), TuiError>
+) -> Result<WorkspaceExit, TuiError>
+where
+    D: WorkspaceDriver,
+    B: Backend,
+    E: EventSource,
+{
+    run_loop_with_state(driver, terminal, events, &mut WorkspaceState::default())
+}
+
+fn run_loop_with_state<D, B, E>(
+    driver: &mut D,
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    state: &mut WorkspaceState,
+) -> Result<WorkspaceExit, TuiError>
 where
     D: WorkspaceDriver,
     B: Backend,
@@ -91,12 +134,11 @@ where
     snapshot
         .validate()
         .map_err(|error| TuiError::InvalidControlInput(error.to_string()))?;
-    let mut state = WorkspaceState::default();
     state.reconcile_snapshot(&snapshot);
     let mut last_refresh = Instant::now();
 
     loop {
-        terminal.draw(|frame| render_workspace(frame, &snapshot, &state))?;
+        terminal.draw(|frame| render_workspace(frame, &snapshot, state))?;
         if last_refresh.elapsed() >= SNAPSHOT_REFRESH_INTERVAL {
             match driver.refresh(&snapshot.cursor) {
                 Ok(refreshed) => match refreshed.validate() {
@@ -125,10 +167,20 @@ where
             state.primary_view(),
         )
         .mode;
-        match state.handle_key(key, &snapshot, layout_mode) {
+        let previous_selection = state.selected_task().map(str::to_owned);
+        let effect = state.handle_key(key, &snapshot, layout_mode);
+        if previous_selection.as_deref() != state.selected_task()
+            && let Err(error) = driver.selection_changed(state.selected_task())
+        {
+            state.set_feedback(ActionFeedback::error(error.to_string()));
+        }
+        match effect {
             UiEffect::None | UiEffect::Redraw => {}
             UiEffect::Feedback(feedback) => state.set_feedback(feedback),
-            UiEffect::Dispatch(WorkspaceAction::Quit) => break,
+            UiEffect::Dispatch(WorkspaceAction::Quit) => return Ok(WorkspaceExit::Quit),
+            UiEffect::Dispatch(WorkspaceAction::OpenAdministration) => {
+                return Ok(WorkspaceExit::Administration);
+            }
             UiEffect::Dispatch(action) => match driver.dispatch(action) {
                 Ok(feedback) => {
                     state.set_feedback(feedback);
@@ -150,7 +202,6 @@ where
             },
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -160,10 +211,12 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Cell};
 
-    use super::{DriverError, EventSource, WorkspaceDriver, run_loop};
+    use super::{
+        DriverError, EventSource, WorkspaceDriver, WorkspaceExit, run_loop, run_loop_with_state,
+    };
     use crate::chat::{
         ActionFeedback, ComposerTarget, DaemonConnectivity, WorkspaceAction, WorkspaceCursor,
-        WorkspaceSnapshot,
+        WorkspaceSnapshot, WorkspaceState,
     };
 
     struct FakeDriver {
@@ -259,7 +312,10 @@ mod tests {
             .collect(),
             initial_delay: None,
         };
-        run_loop(&mut driver, &mut terminal, &mut events)?;
+        assert_eq!(
+            run_loop(&mut driver, &mut terminal, &mut events)?,
+            WorkspaceExit::Quit
+        );
         assert_eq!(
             driver.actions,
             vec![WorkspaceAction::SubmitMessage {
@@ -287,7 +343,10 @@ mod tests {
                 .collect(),
             initial_delay: Some(Duration::from_millis(210)),
         };
-        run_loop(&mut driver, &mut terminal, &mut events)?;
+        assert_eq!(
+            run_loop(&mut driver, &mut terminal, &mut events)?,
+            WorkspaceExit::Quit
+        );
         assert!(driver.refreshes >= 2);
         Ok(())
     }
@@ -316,7 +375,10 @@ mod tests {
             .collect(),
             initial_delay: None,
         };
-        run_loop(&mut driver, &mut terminal, &mut events)?;
+        assert_eq!(
+            run_loop(&mut driver, &mut terminal, &mut events)?,
+            WorkspaceExit::Quit
+        );
         assert!(driver.actions.is_empty());
         assert!(rendered(&terminal).contains("daemon offline"));
         Ok(())
@@ -348,6 +410,57 @@ mod tests {
         run_loop(&mut driver, &mut terminal, &mut events)?;
         assert!(driver.actions.is_empty());
         assert!(rendered(&terminal).contains("scripted dispatch failure"));
+        Ok(())
+    }
+
+    #[test]
+    fn administration_exit_preserves_explicit_composer_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut driver = FakeDriver {
+            snapshot: valid_snapshot(),
+            refreshes: 0,
+            actions: Vec::new(),
+            fail_dispatch: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(110, 30))?;
+        let mut state = WorkspaceState::default();
+        let mut administration = ScriptedEvents {
+            events: [
+                key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                key(KeyCode::Char('/'), KeyModifiers::NONE),
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                key(KeyCode::Char('d'), KeyModifiers::NONE),
+                key(KeyCode::Char('m'), KeyModifiers::NONE),
+                key(KeyCode::Char('i'), KeyModifiers::NONE),
+                key(KeyCode::Char('n'), KeyModifiers::NONE),
+                key(KeyCode::Enter, KeyModifiers::NONE),
+            ]
+            .into_iter()
+            .collect(),
+            initial_delay: None,
+        };
+        assert_eq!(
+            run_loop_with_state(&mut driver, &mut terminal, &mut administration, &mut state)?,
+            WorkspaceExit::Administration
+        );
+        assert_eq!(state.composer_target(), &ComposerTarget::AllRunning);
+        assert!(driver.actions.is_empty());
+
+        let mut quit = ScriptedEvents {
+            events: [
+                key(KeyCode::Tab, KeyModifiers::NONE),
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+            ]
+            .into_iter()
+            .collect(),
+            initial_delay: None,
+        };
+        assert_eq!(
+            run_loop_with_state(&mut driver, &mut terminal, &mut quit, &mut state)?,
+            WorkspaceExit::Quit
+        );
+        assert_eq!(state.composer_target(), &ComposerTarget::AllRunning);
         Ok(())
     }
 }

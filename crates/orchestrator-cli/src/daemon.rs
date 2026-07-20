@@ -6,8 +6,9 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
-use orchestrator_daemon::{DaemonSettings, serve};
+use orchestrator_daemon::{DaemonSettings, MessageRedactor, serve_with_commands};
 use orchestrator_domain::DaemonInstanceId;
+use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{DaemonStatus, Database, EventLog, RepositoryStatePaths, RootConfig};
 use serde::Serialize;
 use serde_json::json;
@@ -28,7 +29,7 @@ pub async fn run(
 ) -> Result<()> {
     match action {
         DaemonAction::Start => {
-            let status = start(repository, config, explicit_config).await?;
+            let status = ensure_started(repository, config, explicit_config).await?;
             emit(json_output, "daemon_start", &json!({"status": status}))
         }
         DaemonAction::Serve => serve_foreground(repository, config).await,
@@ -42,13 +43,13 @@ pub async fn run(
         }
         DaemonAction::Restart => {
             stop(repository, config).await?;
-            let status = start(repository, config, explicit_config).await?;
+            let status = ensure_started(repository, config, explicit_config).await?;
             emit(json_output, "daemon_restart", &json!({"status": status}))
         }
     }
 }
 
-async fn start(
+pub(crate) async fn ensure_started(
     repository: &Path,
     config: &RootConfig,
     explicit_config: Option<&Path>,
@@ -86,12 +87,17 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             signal_cancellation.cancel();
         }
     });
-    let result = serve(
+    let redactor = ProcessMessageRedactor(Redactor::new(&RedactionConfig {
+        literals: Vec::new(),
+        patterns: config.orchestrator.redaction.patterns.clone(),
+    })?);
+    let result = serve_with_commands(
         &database,
         DaemonInstanceId::new(),
         std::process::id(),
         cancellation,
         DaemonSettings::default(),
+        &redactor,
     )
     .await;
     signal_task.abort();
@@ -99,7 +105,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     Ok(())
 }
 
-fn status(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
+pub(crate) fn status(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
     let paths = RepositoryStatePaths::from_config(repository, config)?;
     if !paths.database.exists() {
         return Ok(DaemonStatus::Stopped);
@@ -143,14 +149,14 @@ async fn stop(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
     }
 }
 
-fn initialize_database(paths: &RepositoryStatePaths) -> Result<Database> {
+pub(crate) fn initialize_database(paths: &RepositoryStatePaths) -> Result<Database> {
     let database = Database::open(&paths.database)?;
     database.migrate_with_backup(&paths.backups)?;
     EventLog::open(&paths.events)?.reconcile(&database)?;
     Ok(database)
 }
 
-fn open_ready_database(paths: &RepositoryStatePaths) -> Result<Database> {
+pub(crate) fn open_ready_database(paths: &RepositoryStatePaths) -> Result<Database> {
     if !paths.database.exists() {
         bail!(
             "state database does not exist at {}; run `colay init` or `colay daemon start`",
@@ -195,6 +201,14 @@ fn configure_background_process(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn configure_background_process(_command: &mut Command) {}
+
+struct ProcessMessageRedactor(Redactor);
+
+impl MessageRedactor for ProcessMessageRedactor {
+    fn redact(&self, value: &str) -> String {
+        self.0.redact(value)
+    }
+}
 
 fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> {
     let envelope = json!({

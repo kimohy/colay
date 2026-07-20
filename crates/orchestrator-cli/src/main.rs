@@ -1,5 +1,6 @@
 mod app;
 mod args;
+mod chat_tui;
 mod daemon;
 mod profile_config;
 
