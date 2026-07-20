@@ -9,6 +9,9 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
+    SessionCreated,
+    SessionStateTransitioned,
+    MessageAppended,
     TaskCreated,
     AssessmentCompleted,
     UsageCollected,

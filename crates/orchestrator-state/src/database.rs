@@ -260,23 +260,50 @@ pub(crate) fn append_event_in_transaction(
         })?;
     let event_json = serde_json::to_string(&event)?;
     let event_type = serde_string(&event.event_type)?;
-    transaction.execute(
-        "INSERT INTO task_events( \
-            sequence, event_id, task_id, event_type, schema_version, occurred_at, event_json, \
-            previous_hash, event_hash, exported_at \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
-        params![
-            sequence,
-            event.event_id.to_string(),
-            event.task_id.map(|id| id.to_string()),
-            event_type,
-            event.schema_version.as_str(),
-            event.occurred_at.to_rfc3339(),
-            event_json,
-            event.previous_hash,
-            event.event_hash,
-        ],
-    )?;
+    let state_version: u32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if state_version >= 4 {
+        transaction.execute(
+            "INSERT INTO task_events( \
+                sequence, event_id, task_id, event_type, schema_version, occurred_at, event_json, \
+                previous_hash, event_hash, exported_at, session_id \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+            params![
+                sequence,
+                event.event_id.to_string(),
+                event.task_id.map(|id| id.to_string()),
+                event_type,
+                event.schema_version.as_str(),
+                event.occurred_at.to_rfc3339(),
+                event_json,
+                event.previous_hash,
+                event.event_hash,
+                event.session_id.map(|id| id.to_string()),
+            ],
+        )?;
+    } else {
+        if event.session_id.is_some() {
+            return Err(StateError::InvalidRecord(
+                "session events require state schema version 4".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO task_events( \
+                sequence, event_id, task_id, event_type, schema_version, occurred_at, event_json, \
+                previous_hash, event_hash, exported_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            params![
+                sequence,
+                event.event_id.to_string(),
+                event.task_id.map(|id| id.to_string()),
+                event_type,
+                event.schema_version.as_str(),
+                event.occurred_at.to_rfc3339(),
+                event_json,
+                event.previous_hash,
+                event.event_hash,
+            ],
+        )?;
+    }
     Ok(())
 }
 

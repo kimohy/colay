@@ -16,6 +16,7 @@ mod migrations;
 mod paths;
 mod permissions;
 mod records;
+mod sessions;
 
 pub use artifacts::{ArtifactStore, StoredArtifact};
 pub use config::{
@@ -48,6 +49,7 @@ pub use records::{
     NewTaskRecord, RecoveredControl, RoutingAuditRecord, StoredHandover, StoredTask,
     StoredTaskAttempt, StoredWorktree, TaskListFilter,
 };
+pub use sessions::{NewSessionRecord, SessionListFilter, StoredSession};
 
 pub(crate) struct CanonicalTempDir {
     _directory: tempfile::TempDir,
