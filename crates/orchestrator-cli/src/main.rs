@@ -1,5 +1,6 @@
 mod app;
 mod args;
+mod profile_config;
 
 use clap::Parser as _;
 
