@@ -67,6 +67,8 @@ idempotent while that service has a healthy lease. Use `daemon status`,
 `daemon stop`, or `daemon restart` to manage it; `--json` emits the same stable
 command envelope used by the rest of the CLI. The daemon stores control state
 only in the repository SQLite database and does not open a network listener.
+This durable-session phase does not yet schedule task graphs or replace the
+current TUI; those capabilities build on this lifecycle foundation.
 
 ## Model profiles
 

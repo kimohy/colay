@@ -9,7 +9,7 @@ Codex integration follows its public automation surfaces: [`codex exec`](https:/
 The dependency direction is intentionally one-way:
 
 ```text
-domain <- policy/state/process/codex-compat <- providers <- engine <- cli/tui
+domain <- policy/state/process/codex-compat <- providers <- engine/daemon <- cli/tui
 ```
 
 The domain crate contains no filesystem, database, process, or provider wire types. `codex-compat` converts versioned Codex wire events into domain `WorkerEvent` values. Provider-specific session identifiers may be persisted for same-provider resume, but are never treated as portable state.
@@ -41,3 +41,13 @@ Quota values are comparable only within the same provider, quota scope, period, 
 ## Local-only control plane
 
 SQLite is the state projection and event outbox. `events.jsonl` is an append-only, hash-chained audit replica. CLI and TUI controls use an idempotent SQLite command queue; the project exposes no orchestration HTTP service and requires no MCP server.
+
+One repository-local daemon owns a renewable SQLite lease. CLI clients reconnect
+through persisted sessions, conversation messages, and idempotent client
+commands rather than an in-memory process channel. The daemon opens no socket or
+network listener; its only control plane is the repository-confined database.
+PID is diagnostic metadata, not ownership authority—the UUID lease and its
+unexpired database predicates decide ownership.
+
+Phase 1 establishes durable sessions and daemon lifecycle only. It does not yet
+schedule task DAGs, run parallel agents, or replace the existing five-panel TUI.

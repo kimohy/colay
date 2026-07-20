@@ -41,6 +41,21 @@ Use `run --plan-only` to persist an assessment and routing decision without crea
 
 `status`, `usage`, `providers`, `explain-routing`, and `compatibility` support global `--json`. `tui` renders the persisted five-panel snapshot and sends provider enable/disable, routing, handover, pause/resume/cancel, and usage-override actions through the same config/state APIs as the CLI.
 
+## Repository daemon
+
+Use `colay daemon start` to initialize missing repository state and launch the
+single local background service. A repeated start returns the existing healthy
+instance. `colay daemon status` is read-only and reports `stopped`, `online`, or
+`stale`; it does not create state when the database is absent. `stop` requests a
+graceful release and is idempotent when no daemon exists. `restart` waits for the
+previous lease to be released or expire before starting a replacement.
+
+The hidden `daemon serve` action is an internal child-process entry point. The
+service heartbeats once per second with a five-second lease and responds to both
+persisted stop requests and Ctrl-C cancellation. A crashed daemon leaves a
+stale row; a replacement may take ownership only at or after lease expiry.
+There is no network endpoint and no provider invocation in this service loop.
+
 ## Control requests and recovery
 
 `pause`, `cancel`, and `handover --to` append idempotent control records. A concurrently running orchestrator consumes them and reaches a safe checkpoint before acting.
@@ -48,6 +63,11 @@ Use `run --plan-only` to persist an assessment and routing decision without crea
 `resume <task-id>` is the restart path for a paused, blocked, or interrupted non-terminal task. It validates the persisted worktree, sealed checkpoint/handover, task revision, and schema; converts an interrupted running/checkpoint/handover transition to an authoritative Git checkpoint when necessary; performs the persistence secret preflight; reroutes with current usage/health; and resumes through a vendor-neutral bundle. Inconsistent projections, missing worktrees, failed integrity, or unsafe persistence scans fail closed for administrator review.
 
 SQLite and the hash-chained JSONL log retain tasks, attempts, checkpoints, handovers, leases, and worktree metadata across process restarts. Stale claimed pause/resume/cancel controls can be requeued safely; ambiguous handover/usage-override controls require manual reconciliation.
+
+Client commands use unique idempotency keys. Stale claimed session creation and
+message append commands are replay-safe and requeued on recovery. A stale
+`stop_daemon` command remains claimed for manual reconciliation because blind
+replay could stop a replacement instance.
 
 ## Usage evidence
 
