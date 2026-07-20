@@ -514,7 +514,7 @@ fn profile_reset_confirmation_action(
     state: &mut InteractionState,
 ) -> Option<ControlAction> {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y' | 'Y') => {
             let target = state.profile_reset_confirmation.take()?;
             state.profile_list = None;
             state.feedback = None;
@@ -523,7 +523,7 @@ fn profile_reset_confirmation_action(
                 profile: target.profile,
             })
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+        KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter => {
             state.profile_reset_confirmation = None;
             state.feedback = Some("profile reset cancelled".to_owned());
             None
@@ -534,9 +534,7 @@ fn profile_reset_confirmation_action(
 
 fn profile_editor_action(code: KeyCode, state: &mut InteractionState) -> Option<ControlAction> {
     let mut submitted = None;
-    let Some(editor) = state.profile_editor.as_mut() else {
-        return None;
-    };
+    let editor = state.profile_editor.as_mut()?;
     match code {
         KeyCode::Esc => {
             state.profile_editor = None;
@@ -613,7 +611,6 @@ const fn next_profile_field(field: ProfileEditorField, forward: bool) -> Profile
 
 fn cycle_effort(current: &str, forward: bool) -> &'static str {
     match (current, forward) {
-        ("low", true) | ("high", false) => "medium",
         ("medium", true) | ("low", false) => "high",
         ("high", true) | ("medium", false) => "low",
         (_, _) => "medium",

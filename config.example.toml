@@ -7,3 +7,12 @@ config_version = 4
 
 # [orchestrator.providers.codex]
 # executable = "C:\\path\\to\\codex.exe"
+
+# Colay supplies complete built-in profiles. Override only organization-specific values.
+# [orchestrator.model_profiles.claude.premium]
+# model = "claude-fable-5"
+# effort = "high"
+#
+# [orchestrator.model_profiles.gemini.standard]
+# model = "gemini-3.5-flash"
+# effort = "medium"

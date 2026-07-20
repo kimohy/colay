@@ -6985,6 +6985,25 @@ mod tests {
     }
 
     #[test]
+    fn shipped_docs_describe_profile_management_and_current_presets() {
+        let readme = include_str!("../../../README.md");
+        let example = include_str!("../../../config.example.toml");
+        for required in [
+            "colay profiles",
+            "colay profiles set",
+            "colay profiles reset",
+            "claude-fable-5",
+            "gemini-3.5-flash",
+            "gpt-5.6-sol",
+            "f:profiles",
+        ] {
+            assert!(readme.contains(required), "README is missing {required}");
+        }
+        assert!(example.contains("orchestrator.model_profiles.claude.premium"));
+        assert!(example.contains("claude-fable-5"));
+    }
+
+    #[test]
     fn provider_enable_adds_only_the_requested_boolean() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();

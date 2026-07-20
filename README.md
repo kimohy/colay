@@ -39,6 +39,9 @@ colay run --plan-only "<task>"
 colay status [--json]
 colay providers [--json]
 colay providers {enable|disable} <provider>
+colay profiles [--json]
+colay profiles set <provider> <profile> --model <id> [--effort low|medium|high]
+colay profiles reset <provider> <profile>
 colay usage [--json]
 colay usage override <provider> --entered-by <audit-identity> [--used N] [--limit N] [--remaining N]
 colay handover <task-id> --to <provider>
@@ -57,6 +60,20 @@ colay rollback plan --to <version>
 colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity>
 colay tui [task-id]
 ```
+
+## Model profiles
+
+Colay analyzes each task and automatically selects `economy`, `standard`, or `premium`; users do not choose a model per run. The built-in mappings below are current as of 2026-07-20:
+
+| Provider | Economy (`low`) | Standard (`medium`) | Premium (`high`) |
+| --- | --- | --- | --- |
+| Codex | `gpt-5.6-luna` | `gpt-5.6-terra` | `gpt-5.6-sol` |
+| Claude | `claude-haiku-4-5` | `claude-sonnet-5` | `claude-fable-5` |
+| Gemini | `gemini-3.1-flash-lite` | `gemini-3.5-flash` | `gemini-3.1-pro-preview` |
+
+Inspect effective settings with `colay profiles` or `colay profiles --json`. Administrators can override one entry with `colay profiles set <provider> <profile> --model <id> [--effort low|medium|high]`, and remove the writable-layer override with `colay profiles reset <provider> <profile>`. Reset reveals the compiled or lower-precedence value; it does not delete it. The TUI exposes the same matrix and editor under `f:profiles`.
+
+Layered TOML remains supported for managed deployments. A configured model must also be available to the installed official provider CLI and the authenticated account; a preset does not grant model access.
 
 ## Configuration
 
