@@ -1,5 +1,7 @@
 //! Terminal dashboard for orchestrator status.
 
+pub mod chat;
+
 use std::io;
 use std::time::Duration;
 
