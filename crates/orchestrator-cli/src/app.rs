@@ -55,8 +55,12 @@ use toml_edit::{DocumentMut, Item, Table, TableLike};
 use uuid::Uuid;
 
 use crate::args::{
-    Cli, Command, HandoverArgs, MigrationAction, MigrationRollbackAction, ProviderAction,
-    RequiredTask, RollbackAction, RunArgs, TaskSelector, UsageAction, UsageOverrideArgs,
+    Cli, Command, EffortName, HandoverArgs, MigrationAction, MigrationRollbackAction,
+    ProfileAction, ProfileName, ProviderAction, ProviderName, RequiredTask, RollbackAction,
+    RunArgs, TaskSelector, UsageAction, UsageOverrideArgs,
+};
+use crate::profile_config::{
+    ProfileReportRow, effective_profile_rows, reset_profile_override, set_profile_override,
 };
 
 const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
@@ -132,7 +136,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             ),
             None => providers(&runtime.effective, cli.json).await,
         },
-        Command::Profiles(_) => bail!("profile management is not implemented"),
+        Command::Profiles(arguments) => match arguments.action {
+            Some(ProfileAction::Set(arguments)) => set_model_profile(
+                &repository,
+                cli.config.as_deref(),
+                environment,
+                &runtime,
+                arguments.provider,
+                arguments.profile,
+                &arguments.model,
+                arguments.effort,
+                cli.json,
+            ),
+            Some(ProfileAction::Reset(arguments)) => reset_model_profile(
+                &repository,
+                cli.config.as_deref(),
+                environment,
+                &runtime,
+                arguments.provider,
+                arguments.profile,
+                cli.json,
+            ),
+            None => profiles(&runtime.effective, cli.json),
+        },
         Command::Usage(arguments) => match arguments.action {
             Some(UsageAction::Override(arguments)) => {
                 usage_override(&repository, &runtime.effective, arguments, cli.json)
@@ -552,6 +578,77 @@ fn set_provider_enabled(
         "provider_updated",
         &json!({"provider": provider, "enabled": enabled}),
     )
+}
+
+fn profiles(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    let defaults = RootConfig::default();
+    let rows = effective_profile_rows(effective.config(), &defaults)?;
+    emit(json_output, "profiles", &rows)
+}
+
+fn selected_profile_row(
+    config: &RootConfig,
+    provider: ProviderName,
+    profile: ProfileName,
+) -> Result<ProfileReportRow> {
+    let provider_id = ProviderId::from(provider);
+    effective_profile_rows(config, &RootConfig::default())?
+        .into_iter()
+        .find(|row| row.provider == provider_id.as_str() && row.profile == profile.as_str())
+        .ok_or_else(|| anyhow!("effective profile disappeared after configuration reload"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_model_profile(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+    runtime: &ConfigRuntime,
+    provider: ProviderName,
+    profile: ProfileName,
+    model: &str,
+    effort: Option<EffortName>,
+    json_output: bool,
+) -> Result<()> {
+    let mut document = load_edit_document(&runtime.explicit_edit_path)?;
+    let provider_id = ProviderId::from(provider);
+    set_profile_override(
+        &mut document,
+        provider_id.as_str(),
+        profile.as_str(),
+        model,
+        effort.map(EffortName::as_str),
+    )?;
+    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    let reloaded = load_config_runtime(repository, cli_config, environment)?;
+    let row = selected_profile_row(reloaded.effective.config(), provider, profile)?;
+    if row.model != model.trim() {
+        bail!("model profile override did not survive effective configuration reload");
+    }
+    if effort.is_some_and(|value| row.effort.as_deref() != Some(value.as_str())) {
+        bail!("model profile effort did not survive effective configuration reload");
+    }
+    emit(json_output, "profile_updated", &row)
+}
+
+fn reset_model_profile(
+    repository: &Path,
+    cli_config: Option<&Path>,
+    environment: ConfigEnvironment,
+    runtime: &ConfigRuntime,
+    provider: ProviderName,
+    profile: ProfileName,
+    json_output: bool,
+) -> Result<()> {
+    let mut document = load_edit_document(&runtime.explicit_edit_path)?;
+    let provider_id = ProviderId::from(provider);
+    if !reset_profile_override(&mut document, provider_id.as_str(), profile.as_str())? {
+        bail!("selected writable layer has no override for this model profile");
+    }
+    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    let reloaded = load_config_runtime(repository, cli_config, environment)?;
+    let row = selected_profile_row(reloaded.effective.config(), provider, profile)?;
+    emit(json_output, "profile_reset", &row)
 }
 
 fn load_edit_document(path: &Path) -> Result<DocumentMut> {
@@ -6632,7 +6729,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use crate::args::MigrationAction;
+    use crate::args::{EffortName, MigrationAction, ProfileName, ProviderName};
     use anyhow::Result;
     use chrono::Utc;
     use orchestrator_domain::{
@@ -6647,8 +6744,9 @@ mod tests {
 
     use super::{
         ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
-        block_for_unconfirmed_termination, initialize, load_config_runtime,
-        rollback_resolution_context, set_provider_enabled, trusted_rollback_steps,
+        block_for_unconfirmed_termination, initialize, load_config_runtime, reset_model_profile,
+        rollback_resolution_context, set_model_profile, set_provider_enabled,
+        trusted_rollback_steps,
     };
 
     fn test_state(root: PathBuf) -> StatePaths {
@@ -6732,6 +6830,66 @@ mod tests {
         assert!(!persisted.to_ascii_lowercase().contains("credential"));
         assert!(!persisted.to_ascii_lowercase().contains("api_key"));
         assert!(!persisted.to_ascii_lowercase().contains("token"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_set_persists_one_override_and_reloads_effective_config() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let environment = ConfigEnvironment::isolated();
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
+
+        set_model_profile(
+            &root,
+            None,
+            environment,
+            &runtime,
+            ProviderName::Claude,
+            ProfileName::Premium,
+            "company-fable",
+            Some(EffortName::High),
+            true,
+        )?;
+
+        let reloaded = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
+        let profiles = &reloaded.effective.config().orchestrator.model_profiles;
+        assert_eq!(profiles["claude"]["premium"].model, "company-fable");
+        assert_eq!(profiles["codex"]["standard"].model, "gpt-5.6-terra");
+        Ok(())
+    }
+
+    #[test]
+    fn profile_reset_reveals_the_compiled_preset() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let environment = ConfigEnvironment::isolated();
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
+        set_model_profile(
+            &root,
+            None,
+            environment.clone(),
+            &runtime,
+            ProviderName::Gemini,
+            ProfileName::Standard,
+            "company-gemini",
+            None,
+            true,
+        )?;
+        let runtime = load_config_runtime(&root, None, environment.clone())?;
+        reset_model_profile(
+            &root,
+            None,
+            environment,
+            &runtime,
+            ProviderName::Gemini,
+            ProfileName::Standard,
+            true,
+        )?;
+
+        let reloaded = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
+        assert_eq!(
+            reloaded.effective.config().orchestrator.model_profiles["gemini"]["standard"].model,
+            "gemini-3.5-flash"
+        );
         Ok(())
     }
 
