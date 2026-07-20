@@ -9,6 +9,7 @@ mod artifacts;
 mod client_commands;
 mod config;
 mod config_layers;
+mod daemon_instances;
 mod database;
 mod error;
 mod event_log;
@@ -31,6 +32,7 @@ pub use config_layers::{
     ConfigEnvironment, ConfigLayerKind, ConfigRequest, ConfigSource, EffectiveConfig,
     load_effective_config,
 };
+pub use daemon_instances::{DaemonInstance, DaemonLeaseRequest, DaemonStatus};
 pub use database::{Database, DatabaseHealth, OutboxRecord};
 pub use error::{StateError, StateResult};
 pub use event_log::{EventLog, ReconciliationReport};
