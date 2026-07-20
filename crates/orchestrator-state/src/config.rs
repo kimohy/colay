@@ -156,7 +156,7 @@ impl Default for OrchestratorConfig {
             forecast_alpha: 0.3,
             minimum_forecast_observations: 3,
             providers: ProviderConfigs::default(),
-            model_profiles: BTreeMap::new(),
+            model_profiles: default_model_profiles(),
             redaction: RedactionSettings::default(),
         }
     }
@@ -209,7 +209,9 @@ fn default_codex_provider() -> ProviderConfig {
 }
 
 fn default_claude_provider() -> ProviderConfig {
-    default_provider("claude", "calendar_month", Some(1), 90)
+    let mut provider = default_provider("claude", "calendar_month", Some(1), 90);
+    provider.effort_flag_enabled = true;
+    provider
 }
 
 fn default_provider(
@@ -294,12 +296,56 @@ pub enum UsageProbeConfig {
     ManualOrLedger,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ModelProfileConfig {
     #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub effort: Option<String>,
+}
+
+fn model_profile(model: &str, effort: &str) -> ModelProfileConfig {
+    ModelProfileConfig {
+        model: model.to_owned(),
+        effort: Some(effort.to_owned()),
+    }
+}
+
+fn provider_profiles(
+    economy: &str,
+    standard: &str,
+    premium: &str,
+) -> BTreeMap<String, ModelProfileConfig> {
+    [
+        ("economy".to_owned(), model_profile(economy, "low")),
+        ("standard".to_owned(), model_profile(standard, "medium")),
+        ("premium".to_owned(), model_profile(premium, "high")),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn default_model_profiles() -> BTreeMap<String, BTreeMap<String, ModelProfileConfig>> {
+    [
+        (
+            "codex".to_owned(),
+            provider_profiles("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"),
+        ),
+        (
+            "claude".to_owned(),
+            provider_profiles("claude-haiku-4-5", "claude-sonnet-5", "claude-fable-5"),
+        ),
+        (
+            "gemini".to_owned(),
+            provider_profiles(
+                "gemini-3.1-flash-lite",
+                "gemini-3.5-flash",
+                "gemini-3.1-pro-preview",
+            ),
+        ),
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1052,6 +1098,41 @@ fn default_json() -> String {
 mod tests {
     use super::{ConfigDocument, RootConfig, UsageProbeConfig};
 
+    fn assert_profile(
+        config: &RootConfig,
+        provider: &str,
+        profile: &str,
+        model: &str,
+        effort: &str,
+    ) {
+        let value = &config.orchestrator.model_profiles[provider][profile];
+        assert_eq!(value.model, model, "{provider}.{profile} model");
+        assert_eq!(
+            value.effort.as_deref(),
+            Some(effort),
+            "{provider}.{profile} effort"
+        );
+    }
+
+    #[test]
+    fn compiled_model_profile_defaults_are_complete_and_current() {
+        let config = RootConfig::default();
+        for (provider, profile, model, effort) in [
+            ("codex", "economy", "gpt-5.6-luna", "low"),
+            ("codex", "standard", "gpt-5.6-terra", "medium"),
+            ("codex", "premium", "gpt-5.6-sol", "high"),
+            ("claude", "economy", "claude-haiku-4-5", "low"),
+            ("claude", "standard", "claude-sonnet-5", "medium"),
+            ("claude", "premium", "claude-fable-5", "high"),
+            ("gemini", "economy", "gemini-3.1-flash-lite", "low"),
+            ("gemini", "standard", "gemini-3.5-flash", "medium"),
+            ("gemini", "premium", "gemini-3.1-pro-preview", "high"),
+        ] {
+            assert_profile(&config, provider, profile, model, effort);
+        }
+        assert_eq!(config.orchestrator.model_profiles.len(), 3);
+    }
+
     #[test]
     fn compiled_provider_defaults_are_safe_and_complete() {
         let config = RootConfig::default();
@@ -1108,6 +1189,16 @@ mod tests {
                 UsageProbeConfig::ManualOrLedger
             ));
         }
+
+        assert_eq!(
+            config
+                .orchestrator
+                .providers
+                .claude
+                .as_ref()
+                .map(|provider| provider.effort_flag_enabled),
+            Some(true)
+        );
     }
 
     const VALID: &str = r#"

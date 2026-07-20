@@ -126,6 +126,30 @@ mod tests {
     }
 
     #[test]
+    fn one_profile_override_preserves_the_compiled_matrix() {
+        let fixture = LayerFixture::new();
+        fixture.write_repository(
+            "config_version = 4\n[orchestrator.model_profiles.claude.premium]\nmodel = \"company-fable\"\n",
+        );
+        fixture.write_environment("config_version = 4\n");
+        fixture.write_cli("config_version = 4\n");
+
+        let effective = load_effective_config(&fixture.request()).unwrap();
+        let profiles = &effective.config().orchestrator.model_profiles;
+        assert_eq!(profiles["claude"]["premium"].model, "company-fable");
+        assert_eq!(
+            profiles["claude"]["premium"].effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(profiles["claude"]["economy"].model, "claude-haiku-4-5");
+        assert_eq!(profiles["codex"]["standard"].model, "gpt-5.6-terra");
+        assert_eq!(
+            profiles["gemini"]["premium"].model,
+            "gemini-3.1-pro-preview"
+        );
+    }
+
+    #[test]
     fn explicit_missing_config_is_an_error() {
         let repository = tempfile::tempdir().unwrap();
         let repository_root = fs::canonicalize(repository.path()).unwrap();
