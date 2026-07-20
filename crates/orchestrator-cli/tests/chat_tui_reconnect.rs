@@ -16,6 +16,8 @@ use orchestrator_domain::{
 };
 use orchestrator_state::Database;
 
+const README: &str = include_str!("../../../README.md");
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -201,4 +203,18 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
 
     assert!(fixture.output(&["daemon", "stop"])?.status.success());
     Ok(())
+}
+
+#[test]
+fn chat_tui_readme_documents_navigation_reconnect_and_phase_boundary() {
+    for expected in [
+        "colay tui",
+        "Ctrl+T",
+        "/tasks",
+        "daemon reconnect",
+        "Phase 3",
+        "parallel execution",
+    ] {
+        assert!(README.contains(expected), "README is missing `{expected}`");
+    }
 }

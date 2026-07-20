@@ -39,7 +39,35 @@ When `.colay/config.toml` is absent, Colay can continue using a legacy `.codex/o
 
 Use `run --plan-only` to persist an assessment and routing decision without creating a worktree or invoking a provider. A normal writable run creates a task branch/worktree, runs a bounded worker, checkpoints Git evidence, and independently verifies the result before completion.
 
-`status`, `usage`, `providers`, `explain-routing`, and `compatibility` support global `--json`. `tui` renders the persisted five-panel snapshot and sends provider enable/disable, routing, handover, pause/resume/cancel, and usage-override actions through the same config/state APIs as the CLI.
+`status`, `usage`, `providers`, `explain-routing`, and `compatibility` support
+global `--json`. `colay tui [task-id]` opens the durable chat workspace and
+starts the daemon when needed. The header reports `online`, `stale`, or
+`offline`; stale/offline workspaces remain readable but messages and task
+controls are rejected. Run `colay daemon restart` from another terminal, then
+the open workspace reconnects on its 200ms refresh cycle.
+
+The text layout and bindings are:
+
+```text
+wide (>=110):  tasks | conversation | inspector
+medium (80-109): tasks | conversation, inspector overlay
+narrow (60-79): one primary view selected by focus/overview
+compact (<60): status and resize guidance, no mutation
+
+Tab / Shift+Tab   traverse panes
+Ctrl+P, /tasks    task switcher
+Ctrl+O            overview
+Ctrl+L            full log
+Ctrl+T            explicit composer target
+?                 help
+/admin            five-panel administration compatibility view
+```
+
+Task selection never changes the composer target. `@task-<id>` and `@all` are
+one-message overrides; broadcast execution is unavailable until the parallel
+phase. The chat view currently shows recent repository tasks rather than graph
+members because session DAG membership starts in Phase 3. `/plan`, `/approve`,
+`/retry`, and later integration actions fail visibly as unavailable.
 
 ## Repository daemon
 
@@ -51,10 +79,11 @@ graceful release and is idempotent when no daemon exists. `restart` waits for th
 previous lease to be released or expire before starting a replacement.
 
 The hidden `daemon serve` action is an internal child-process entry point. The
-service heartbeats once per second with a five-second lease and responds to both
-persisted stop requests and Ctrl-C cancellation. A crashed daemon leaves a
-stale row; a replacement may take ownership only at or after lease expiry.
-There is no network endpoint and no provider invocation in this service loop.
+service heartbeats once per second with a five-second lease, processes
+session/message commands every 100ms, and responds to persisted stop requests
+and Ctrl-C cancellation. A crashed daemon leaves a stale row; a replacement may
+take ownership only at or after lease expiry. There is no network endpoint and
+no provider invocation in this service loop.
 
 ## Control requests and recovery
 
@@ -68,6 +97,12 @@ Client commands use unique idempotency keys. Stale claimed session creation and
 message append commands are replay-safe and requeued on recovery. A stale
 `stop_daemon` command remains claimed for manual reconciliation because blind
 replay could stop a replacement instance.
+
+The TUI redacts message text before it enters `client_commands`; the daemon
+redacts again before writing `conversation_messages`. Exact projection matching
+allows a crash after insertion to finish on replay without duplicating a
+message. A mismatched projection fails closed. Closing the TUI does not stop the
+daemon; use the explicit daemon command for lifecycle changes.
 
 ## Usage evidence
 

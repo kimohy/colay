@@ -49,5 +49,22 @@ network listener; its only control plane is the repository-confined database.
 PID is diagnostic metadata, not ownership authority—the UUID lease and its
 unexpired database predicates decide ownership.
 
-Phase 1 establishes durable sessions and daemon lifecycle only. It does not yet
-schedule task DAGs, run parallel agents, or replace the existing five-panel TUI.
+The Phase 2 TUI reads one bounded projection under a single database lock:
+session identity, at most 200 newest messages, at most 100 recent repository
+tasks, attention state, and the selected task inspector. The newest-message SQL
+query runs in descending order and is reversed before presentation, so long
+histories remain bounded while the timeline stays chronological. A v5
+`session_workspace_state` row restores the selected task without coupling the
+domain model to presentation state.
+
+The chat reducer keeps navigation selection and composer target as separate
+state. Only `Ctrl+T`, its target picker, or an explicit one-message mention can
+change a target. Returning from the legacy administration dashboard reuses the
+same UI session state. A stale/offline daemon produces a readable snapshot with
+an explicit mutation guard rather than an optimistic local queue.
+
+Phase 2 does not infer a session DAG from recent tasks and does not invoke a
+provider from the daemon. Phase 3 adds approved graph planning and membership;
+parallel agents and integration/recovery follow in later phases. The existing
+five-panel dashboard remains available only through `/admin` as a compatibility
+adapter.

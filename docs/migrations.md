@@ -4,7 +4,7 @@ State, config, handover, worker result, checkpoint, routing decision, and usage 
 
 ## SQLite
 
-SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
+SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4 -> v5`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
 
 State schema v4 adds `sessions`, ordered `conversation_messages`, idempotent
 `client_commands`, and repository `daemon_instances`. It also adds nullable
@@ -13,9 +13,15 @@ hashes are not rewritten: absent `session_id` remains omitted during
 serialization, and migration audit events use the pre-v4 insert shape until the
 new column exists.
 
+State schema v5 adds `session_workspace_state`, containing only the optional
+selected task and update timestamp for each durable session. It restores task
+navigation after a TUI reconnect without mixing presentation fields into the
+provider-neutral task/session contracts. The foreign keys prevent a selection
+from naming a missing session or task.
+
 For an existing nonzero schema, `migrate apply` creates an online SQLite backup under `.colay/backups/orchestrator.db.backup.<timestamp>` before applying pending versions. A legacy config keeps using its explicitly selected state root. A brand-new empty database has no prior state to back up. After migration, `doctor` reports SQLite integrity and foreign-key health.
 
-`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas.
+`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas.
 
 ## Configuration
 
@@ -43,3 +49,5 @@ Restoring a pre-v4 backup removes durable sessions and daemon lease history alon
 with every other post-backup record. The normal rollback guards therefore still
 require task/lease quiescence, exact event sequence, an approved sealed plan, and
 a verified recovery backup; daemon lifecycle does not bypass those controls.
+Restoring a v4 backup also removes v5 task-selection preferences; chat content
+and task records remain governed by the selected backup image.

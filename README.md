@@ -62,13 +62,32 @@ colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity
 colay tui [task-id]
 ```
 
-`colay daemon start` launches one repository-local background service and is
-idempotent while that service has a healthy lease. Use `daemon status`,
-`daemon stop`, or `daemon restart` to manage it; `--json` emits the same stable
-command envelope used by the rest of the CLI. The daemon stores control state
-only in the repository SQLite database and does not open a network listener.
-This durable-session phase does not yet schedule task graphs or replace the
-current TUI; those capabilities build on this lifecycle foundation.
+`colay tui` is the primary durable chat workspace. It starts or reconnects to
+the repository daemon, restores the latest session and selected task, and shows
+a text-only task list, conversation timeline, inspector, attention queue, and
+explicit composer target. The daemon continues after the TUI closes.
+
+The wide layout has three panes; medium terminals hide the inspector, narrow
+terminals show one selected primary view, and terminals below 60 columns become
+read-only until resized. Use `Tab`/`Shift+Tab` to traverse panes, `Ctrl+P` or
+`/tasks` to switch tasks, `Ctrl+O` for the overview, `Ctrl+L` for the full log,
+and `Ctrl+T` to change the composer target. Selecting a task never silently
+retargets the composer. `/admin` opens the preserved five-panel administration
+dashboard and returns to chat without losing the explicit target. `?` shows
+keyboard help; `q` exits when the composer is not focused.
+
+`colay daemon start` is idempotent while its repository-local lease is healthy.
+The TUI performs daemon reconnect on startup. A stopped or stale daemon leaves
+the timeline readable but disables messages and task controls until
+`colay daemon restart`; it never opens a network listener. Messages are
+redacted before durable command submission and again before conversation
+projection.
+
+Phase 2 intentionally lists recent repository tasks. Phase 3 adds approved DAG
+planning and session graph membership; parallel execution and integration
+approval arrive in later phases. `/plan`, `/approve`, `/retry`, and broadcast
+execution therefore report that they are unavailable instead of implying work
+was scheduled.
 
 ## Model profiles
 
