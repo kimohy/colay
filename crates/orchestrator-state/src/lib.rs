@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::panic))]
 
 mod artifacts;
+mod client_commands;
 mod config;
 mod config_layers;
 mod database;
@@ -19,6 +20,7 @@ mod records;
 mod sessions;
 
 pub use artifacts::{ArtifactStore, StoredArtifact};
+pub use client_commands::ClientCommandRecoveryDisposition;
 pub use config::{
     CONFIG_SCHEMA_VERSION, ConfigDocument, ConfigMigrationApplyResult, ConfigMigrationPlan,
     ConfigMigrationPreview, ConfigMigrationResult, ConfigMigrationStep, ConfigValidationError,
