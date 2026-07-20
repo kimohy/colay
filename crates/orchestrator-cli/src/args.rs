@@ -41,6 +41,8 @@ pub enum Command {
     Status(TaskSelector),
     /// Show enabled providers and detected safe interfaces.
     Providers(ProviderArgs),
+    /// Inspect or administratively override provider model profiles.
+    Profiles(ProfileArgs),
     /// Inspect or administratively override usage evidence.
     Usage(UsageArgs),
     /// Request a safe checkpoint and provider handover.
@@ -288,5 +290,115 @@ mod tests {
             }) if plan_hash.len() == 64 && approved_by == "enterprise-admin"
         ));
         Ok(())
+    }
+
+    #[test]
+    fn parses_profile_set_with_versioned_model_and_effort() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "colay",
+            "profiles",
+            "set",
+            "claude",
+            "premium",
+            "--model",
+            "claude-fable-5",
+            "--effort",
+            "high",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Command::Profiles(ProfileArgs {
+                action: Some(ProfileAction::Set(ProfileSetArgs {
+                    provider: ProviderName::Claude,
+                    profile: ProfileName::Premium,
+                    model,
+                    effort: Some(EffortName::High),
+                }))
+            }) if model == "claude-fable-5"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_profile_reset_target() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["colay", "profiles", "reset", "gemini", "standard"])?;
+        assert!(matches!(
+            cli.command,
+            Command::Profiles(ProfileArgs {
+                action: Some(ProfileAction::Reset(ProfileTargetArgs {
+                    provider: ProviderName::Gemini,
+                    profile: ProfileName::Standard,
+                }))
+            })
+        ));
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct ProfileArgs {
+    #[command(subcommand)]
+    pub action: Option<ProfileAction>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ProfileAction {
+    /// Override one effective provider profile in the selected writable config layer.
+    Set(ProfileSetArgs),
+    /// Remove one override and reveal the next lower-precedence value.
+    Reset(ProfileTargetArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProfileSetArgs {
+    #[arg(value_enum)]
+    pub provider: ProviderName,
+    #[arg(value_enum)]
+    pub profile: ProfileName,
+    #[arg(long)]
+    pub model: String,
+    #[arg(long, value_enum)]
+    pub effort: Option<EffortName>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProfileTargetArgs {
+    #[arg(value_enum)]
+    pub provider: ProviderName,
+    #[arg(value_enum)]
+    pub profile: ProfileName,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProfileName {
+    Economy,
+    Standard,
+    Premium,
+}
+
+impl ProfileName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Economy => "economy",
+            Self::Standard => "standard",
+            Self::Premium => "premium",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EffortName {
+    Low,
+    Medium,
+    High,
+}
+
+impl EffortName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
     }
 }

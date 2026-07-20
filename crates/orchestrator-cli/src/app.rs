@@ -132,6 +132,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             ),
             None => providers(&runtime.effective, cli.json).await,
         },
+        Command::Profiles(_) => bail!("profile management is not implemented"),
         Command::Usage(arguments) => match arguments.action {
             Some(UsageAction::Override(arguments)) => {
                 usage_override(&repository, &runtime.effective, arguments, cli.json)
