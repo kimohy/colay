@@ -242,6 +242,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "codex-compat",
+ "orchestrator-daemon",
  "orchestrator-domain",
  "orchestrator-engine",
  "orchestrator-policy",

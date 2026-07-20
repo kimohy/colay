@@ -33,6 +33,7 @@ The orchestrator never rotates identities, bypasses quotas, scrapes usage pages,
 
 ```text
 colay init
+colay daemon {start|status|stop|restart}
 colay run "<task>"
 colay run --task-file task.json
 colay run --plan-only "<task>"
@@ -60,6 +61,12 @@ colay rollback plan --to <version>
 colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity>
 colay tui [task-id]
 ```
+
+`colay daemon start` launches one repository-local background service and is
+idempotent while that service has a healthy lease. Use `daemon status`,
+`daemon stop`, or `daemon restart` to manage it; `--json` emits the same stable
+command envelope used by the rest of the CLI. The daemon stores control state
+only in the repository SQLite database and does not open a network listener.
 
 ## Model profiles
 

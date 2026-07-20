@@ -113,6 +113,16 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
     match cli.command {
         Command::Init(_) => initialize(&repository, &runtime, cli.json),
+        Command::Daemon(arguments) => {
+            crate::daemon::run(
+                &repository,
+                runtime.effective.config(),
+                cli.config.as_deref(),
+                arguments.action,
+                cli.json,
+            )
+            .await
+        }
         Command::Run(arguments) => {
             run_task(&repository, &runtime.effective, arguments, cli.json).await
         }

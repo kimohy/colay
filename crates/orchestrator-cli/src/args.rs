@@ -35,6 +35,8 @@ pub struct Cli {
 pub enum Command {
     /// Create local state and an editable configuration without invoking providers.
     Init(InitArgs),
+    /// Manage the repository-local background orchestration service.
+    Daemon(DaemonArgs),
     /// Analyze, route, and run one development task.
     Run(RunArgs),
     /// Show task state, or all recent task states.
@@ -67,6 +69,22 @@ pub enum Command {
     Rollback(RollbackArgs),
     /// Open the local five-panel terminal dashboard.
     Tui(TaskSelector),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub action: DaemonAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+pub enum DaemonAction {
+    Start,
+    #[command(hide = true)]
+    Serve,
+    Status,
+    Stop,
+    Restart,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -331,6 +349,24 @@ mod tests {
                 }))
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_every_daemon_lifecycle_action() -> Result<(), clap::Error> {
+        for (name, expected) in [
+            ("start", DaemonAction::Start),
+            ("serve", DaemonAction::Serve),
+            ("status", DaemonAction::Status),
+            ("stop", DaemonAction::Stop),
+            ("restart", DaemonAction::Restart),
+        ] {
+            let cli = Cli::try_parse_from(["colay", "daemon", name])?;
+            assert!(matches!(
+                cli.command,
+                Command::Daemon(DaemonArgs { action }) if action == expected
+            ));
+        }
         Ok(())
     }
 }

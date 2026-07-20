@@ -26,6 +26,7 @@ chrono-tz.workspace = true
 clap.workspace = true
 codex-compat = { path = "../codex-compat" }
 orchestrator-domain = { path = "../orchestrator-domain" }
+orchestrator-daemon = { path = "../orchestrator-daemon" }
 orchestrator-engine = { path = "../orchestrator-engine" }
 orchestrator-policy = { path = "../orchestrator-policy" }
 orchestrator-process = { path = "../orchestrator-process" }
