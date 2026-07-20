@@ -544,6 +544,30 @@ mod tests {
     }
 
     #[test]
+    fn quality_tiers_select_matching_profiles_and_efforts() {
+        for (quality, profile, effort) in [
+            (
+                QualityTier::Economy,
+                ModelProfile::Economy,
+                ReasoningEffort::Low,
+            ),
+            (
+                QualityTier::Standard,
+                ModelProfile::Standard,
+                ReasoningEffort::Medium,
+            ),
+            (
+                QualityTier::Premium,
+                ModelProfile::Premium,
+                ReasoningEffort::High,
+            ),
+        ] {
+            assert_eq!(profile_for_quality(quality), profile);
+            assert_eq!(effort_for_profile(profile), effort);
+        }
+    }
+
+    #[test]
     fn critical_work_with_unknown_budget_is_blocked() -> Result<(), Box<dyn std::error::Error>> {
         let context = RoutingContext {
             task_id: TaskId::new(),

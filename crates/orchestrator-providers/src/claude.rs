@@ -49,25 +49,13 @@ impl ClaudeAdapter {
             String::from_utf8_lossy(&help.stdout),
             String::from_utf8_lossy(&help.stderr)
         );
-        let mut result = ProviderCapabilities::unsupported(ProviderId::Claude);
-        result.version = (version.exit_code == Some(0))
-            .then(|| String::from_utf8_lossy(&version.stdout).trim().to_owned());
-        result.non_interactive = advertised(help.exit_code == Some(0) && text.contains("--print"));
-        result.structured_output = advertised(
-            text.contains("--output-format")
-                && (text.contains("stream-json") || text.contains("stream_json")),
-        );
-        result.read_only = verified(
-            help.exit_code == Some(0)
-                && text.contains("--permission-mode")
-                && text.contains("plan"),
-        );
-        result.writable = advertised(text.contains("acceptEdits"));
-        result.session_resume = advertised(text.contains("--resume"));
-        result.reasoning_effort =
-            advertised(self.config.effort_flag_enabled && text.contains("--effort"));
-        result.evidence = vec!["claude --version".to_owned(), "claude --help".to_owned()];
-        Ok(result)
+        Ok(capabilities_from_probe(
+            version.exit_code == Some(0),
+            &String::from_utf8_lossy(&version.stdout),
+            help.exit_code == Some(0),
+            &text,
+            self.config.effort_flag_enabled,
+        ))
     }
 
     fn prepare_with(
@@ -261,5 +249,68 @@ const fn verified(value: bool) -> CapabilitySupport {
         CapabilitySupport::Verified
     } else {
         CapabilitySupport::Unsupported
+    }
+}
+
+fn capabilities_from_probe(
+    version_succeeded: bool,
+    version_text: &str,
+    help_succeeded: bool,
+    help_text: &str,
+    effort_flag_enabled: bool,
+) -> ProviderCapabilities {
+    let mut result = ProviderCapabilities::unsupported(ProviderId::Claude);
+    result.version = version_succeeded.then(|| version_text.trim().to_owned());
+    result.non_interactive = advertised(help_succeeded && help_text.contains("--print"));
+    result.structured_output = advertised(
+        help_text.contains("--output-format")
+            && (help_text.contains("stream-json") || help_text.contains("stream_json")),
+    );
+    result.read_only = verified(
+        help_succeeded && help_text.contains("--permission-mode") && help_text.contains("plan"),
+    );
+    result.writable = advertised(help_text.contains("acceptEdits"));
+    result.session_resume = advertised(help_text.contains("--resume"));
+    result.reasoning_effort =
+        advertised(effort_flag_enabled && help_succeeded && help_text.contains("--effort"));
+    result.evidence = vec!["claude --version".to_owned(), "claude --help".to_owned()];
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REQUIRED_HELP: &str =
+        "--print --output-format stream-json --permission-mode plan acceptEdits --resume";
+
+    #[test]
+    fn effort_requires_both_admin_enablement_and_cli_advertisement() {
+        let enabled_and_advertised = capabilities_from_probe(
+            true,
+            "Claude Code 5",
+            true,
+            &format!("{REQUIRED_HELP} --effort"),
+            true,
+        );
+        let disabled = capabilities_from_probe(
+            true,
+            "Claude Code 5",
+            true,
+            &format!("{REQUIRED_HELP} --effort"),
+            false,
+        );
+        let not_advertised =
+            capabilities_from_probe(true, "Claude Code 5", true, REQUIRED_HELP, true);
+
+        assert_eq!(
+            enabled_and_advertised.reasoning_effort,
+            CapabilitySupport::Advertised
+        );
+        assert_eq!(disabled.reasoning_effort, CapabilitySupport::Unsupported);
+        assert_eq!(
+            not_advertised.reasoning_effort,
+            CapabilitySupport::Unsupported
+        );
     }
 }

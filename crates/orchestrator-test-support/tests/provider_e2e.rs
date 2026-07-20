@@ -277,6 +277,49 @@ async fn prepared_argv_omits_empty_models_and_uses_safe_permissions()
     Ok(())
 }
 
+#[test]
+fn prepared_argv_passes_provider_model_ids_as_separate_arguments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shared = runtime();
+    let claude = ClaudeAdapter::new(
+        ClaudeAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Claude),
+            effort_flag_enabled: true,
+        },
+        shared.clone(),
+    );
+    let gemini = GeminiAdapter::new(
+        GeminiAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Gemini),
+        },
+        shared,
+    );
+    let mut claude_request = request(ProviderId::Claude, "secret task")?;
+    claude_request.model = Some("claude-sonnet-5".to_owned());
+    let mut gemini_request = request(ProviderId::Gemini, "secret task")?;
+    gemini_request.model = Some("gemini-3.5-flash".to_owned());
+
+    assert!(
+        claude
+            .prepare(&claude_request)?
+            .args_lossy()
+            .windows(2)
+            .any(|pair| pair == ["--model", "claude-sonnet-5"])
+    );
+    assert!(
+        gemini
+            .prepare(&gemini_request)?
+            .args_lossy()
+            .windows(2)
+            .any(|pair| pair == ["--model", "gemini-3.5-flash"])
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn fake_silent_worker_cancels_as_a_process_tree() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = GeminiAdapter::new(

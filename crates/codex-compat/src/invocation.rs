@@ -240,6 +240,40 @@ mod tests {
     }
 
     #[test]
+    fn exec_passes_selected_model_and_verified_effort() -> Result<(), CompatibilityError> {
+        let request = CodexRequest {
+            working_directory: PathBuf::from("repo"),
+            prompt: "do the task".to_owned(),
+            model: Some("gpt-5.6-terra".to_owned()),
+            effort: Some(ReasoningEffort::Medium),
+            sandbox: CodexSandbox::ReadOnly,
+            resume_session: None,
+            output_schema: None,
+        };
+        let capabilities = CodexCapabilities {
+            exec: CapabilitySupport::Verified,
+            jsonl_output: CapabilitySupport::Verified,
+            read_only_sandbox: CapabilitySupport::Verified,
+            exec_reasoning_effort: CapabilitySupport::Verified,
+            ..CodexCapabilities::default()
+        };
+        let invocation = CodexInvocation::exec("codex", &request, &capabilities)?;
+        assert!(
+            invocation
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--model", "gpt-5.6-terra"])
+        );
+        assert!(
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg.contains("model_reasoning_effort=\"medium\""))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exec_refuses_unverified_requested_sandbox_mode() {
         let request = CodexRequest {
             working_directory: PathBuf::from("repo"),

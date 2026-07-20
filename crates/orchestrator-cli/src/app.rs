@@ -2123,13 +2123,7 @@ async fn run_worker(
         None,
         EventActor::Provider(request.provider),
         correlation_id,
-        json!({
-            "attempt_id": request.attempt_id,
-            "provider": request.provider,
-            "sandbox": request.sandbox,
-            "profile": request.profile,
-            "session_resume_requested": request.resume_session_id.is_some(),
-        }),
+        worker_started_payload(&request),
     )?;
 
     let redactor = Redactor::new(redaction_config)?;
@@ -2700,6 +2694,18 @@ fn persist_attempt_started(
         Ok(())
     })?;
     Ok(())
+}
+
+fn worker_started_payload(request: &WorkerRequest) -> Value {
+    json!({
+        "attempt_id": request.attempt_id,
+        "provider": request.provider,
+        "sandbox": request.sandbox,
+        "profile": request.profile,
+        "model": request.model.as_deref(),
+        "reasoning_effort": request.reasoning_effort,
+        "session_resume_requested": request.resume_session_id.is_some(),
+    })
 }
 
 fn persist_attempt_start_failure(
@@ -6790,9 +6796,9 @@ mod tests {
     use anyhow::Result;
     use chrono::Utc;
     use orchestrator_domain::{
-        AttemptId, ModelProfile, ProviderId, SandboxMode, SchemaVersion, TaskEnvelope, TaskEvent,
-        TaskState, TestEvidence, TestStatus, VerificationStatus, WorkerOutcome, WorkerRequest,
-        WorkerResult,
+        AttemptId, ModelProfile, ProviderId, ReasoningEffort, SandboxMode, SchemaVersion,
+        TaskEnvelope, TaskEvent, TaskId, TaskState, TestEvidence, TestStatus, VerificationStatus,
+        WorkerOutcome, WorkerRequest, WorkerResult,
     };
     use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
     use orchestrator_state::{ConfigEnvironment, Database, NewTaskRecord, RootConfig};
@@ -6803,7 +6809,7 @@ mod tests {
         ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
         block_for_unconfirmed_termination, initialize, load_config_runtime, reset_model_profile,
         rollback_resolution_context, set_model_profile, set_provider_enabled,
-        trusted_rollback_steps,
+        trusted_rollback_steps, worker_started_payload,
     };
 
     fn test_state(root: PathBuf) -> StatePaths {
@@ -6947,6 +6953,34 @@ mod tests {
             reloaded.effective.config().orchestrator.model_profiles["gemini"]["standard"].model,
             "gemini-3.5-flash"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_started_audit_records_effective_model_profile_and_effort() -> Result<()> {
+        let request = WorkerRequest {
+            schema_version: SchemaVersion::v1(),
+            task_id: TaskId::new(),
+            attempt_id: AttemptId::new(),
+            provider: ProviderId::Claude,
+            objective: "audit selection".to_owned(),
+            prompt: "do work".to_owned(),
+            constraints: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            workspace_root: std::env::current_dir()?,
+            sandbox: SandboxMode::WorkspaceWrite,
+            profile: ModelProfile::Premium,
+            model: Some("claude-fable-5".to_owned()),
+            reasoning_effort: Some(ReasoningEffort::High),
+            timeout_seconds: 60,
+            max_output_bytes: 1024,
+            resume_session_id: None,
+            handover_payload: None,
+        };
+        let payload = worker_started_payload(&request);
+        assert_eq!(payload["model"], "claude-fable-5");
+        assert_eq!(payload["profile"], "premium");
+        assert_eq!(payload["reasoning_effort"], "high");
         Ok(())
     }
 
