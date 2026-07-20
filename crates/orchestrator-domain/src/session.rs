@@ -305,14 +305,17 @@ mod tests {
     fn timestamp() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 9, 0, 0)
             .single()
-            .unwrap_or_else(|| panic!("fixed timestamp must be valid"))
+            .unwrap_or_default()
     }
 
     #[test]
     fn session_title_must_not_be_blank() {
         assert!(Session::new("   ", timestamp()).is_err());
-        let session = Session::new(" auth refactor ", timestamp())
-            .unwrap_or_else(|error| panic!("session: {error}"));
+        let result = Session::new(" auth refactor ", timestamp());
+        assert!(result.is_ok());
+        let Ok(session) = result else {
+            return;
+        };
         assert_eq!(session.title, "auth refactor");
         assert_eq!(session.state, SessionState::Drafting);
     }
