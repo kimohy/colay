@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::Write as _,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     str::FromStr as _,
     sync::Arc,
     time::Duration,
@@ -43,8 +43,9 @@ use orchestrator_providers::{
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
     ControlAction, CoordinatorLease, CoordinatorLeaseRequest, Database, EffectiveConfig, EventLog,
-    MigratableConfigDocument, OrchestratorConfig, ProviderConfig, RootConfig, WorkerLease,
-    WorkerLeaseMode, WorkerLeaseRequest, load_effective_config,
+    MigratableConfigDocument, OrchestratorConfig, ProviderConfig,
+    RepositoryStatePaths as StatePaths, RootConfig, WorkerLease, WorkerLeaseMode,
+    WorkerLeaseRequest, load_effective_config,
 };
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -6570,90 +6571,6 @@ fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> 
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     }
     Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct StatePaths {
-    root: PathBuf,
-    database: PathBuf,
-    events: PathBuf,
-    backups: PathBuf,
-    tasks: PathBuf,
-    checkpoints: PathBuf,
-    handovers: PathBuf,
-    worktrees: PathBuf,
-}
-
-impl StatePaths {
-    fn from_config(repository: &Path, config: &RootConfig) -> Result<Self> {
-        let repository = fs::canonicalize(repository).with_context(|| {
-            format!(
-                "cannot canonicalize repository root: {}",
-                repository.display()
-            )
-        })?;
-        let root = confined_local_path(&repository, &config.orchestrator.state_dir)?;
-        Ok(Self {
-            database: root.join("orchestrator.db"),
-            events: root.join("events.jsonl"),
-            backups: root.join("backups"),
-            tasks: root.join("tasks"),
-            checkpoints: root.join("checkpoints"),
-            handovers: root.join("handovers"),
-            worktrees: root.join("worktrees"),
-            root,
-        })
-    }
-}
-
-fn confined_local_path(repository: &Path, configured: &Path) -> Result<PathBuf> {
-    let candidate = resolve_from(repository, configured);
-    let normalized = normalize_lexically(&candidate)?;
-    if !normalized.starts_with(repository) {
-        bail!(
-            "configured path escapes the repository: {}",
-            configured.display()
-        );
-    }
-
-    // Canonicalize the nearest existing ancestor so a symlink below the repository
-    // cannot redirect state, logs, worktrees, or SQLite files outside the trust boundary.
-    let mut ancestor = normalized.as_path();
-    while !ancestor.exists() {
-        ancestor = ancestor.parent().ok_or_else(|| {
-            anyhow!(
-                "configured path has no existing ancestor: {}",
-                normalized.display()
-            )
-        })?;
-    }
-    let canonical_ancestor = fs::canonicalize(ancestor)
-        .with_context(|| format!("cannot canonicalize path ancestor: {}", ancestor.display()))?;
-    if !canonical_ancestor.starts_with(repository) {
-        bail!("configured path traverses a symlink outside the repository");
-    }
-    Ok(normalized)
-}
-
-fn normalize_lexically(path: &Path) -> Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    bail!(
-                        "path contains an invalid parent traversal: {}",
-                        path.display()
-                    );
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-        }
-    }
-    Ok(normalized)
 }
 
 #[derive(Clone, Debug, Deserialize)]

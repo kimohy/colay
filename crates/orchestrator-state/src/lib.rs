@@ -13,6 +13,7 @@ mod error;
 mod event_log;
 mod leases;
 mod migrations;
+mod paths;
 mod permissions;
 mod records;
 
@@ -38,6 +39,7 @@ pub use migrations::{
     AppliedMigration, MigrationManager, MigrationPlan, MigrationStatus,
     ROLLBACK_PLAN_SCHEMA_VERSION, RollbackApplyResult, RollbackPlan, STATE_SCHEMA_VERSION,
 };
+pub use paths::RepositoryStatePaths;
 pub use permissions::{
     ensure_private_directory, ensure_private_file, reject_symlink_components, verify_private_file,
 };
