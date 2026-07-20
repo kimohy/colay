@@ -181,7 +181,6 @@ impl ConversationMessage {
             MessageState::Streaming if self.finalized_at.is_some() => {
                 Err(SessionValidationError::StreamingMessageFinalized)
             }
-            MessageState::Streaming => Ok(()),
             MessageState::Final if self.content_redacted.trim().is_empty() => {
                 Err(SessionValidationError::BlankFinalMessage)
             }
@@ -190,7 +189,10 @@ impl ConversationMessage {
             {
                 Err(SessionValidationError::MissingMessageFinalizedAt)
             }
-            MessageState::Final | MessageState::Interrupted | MessageState::Rejected => Ok(()),
+            MessageState::Streaming
+            | MessageState::Final
+            | MessageState::Interrupted
+            | MessageState::Rejected => Ok(()),
         }
     }
 }

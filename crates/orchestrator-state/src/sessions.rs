@@ -212,7 +212,7 @@ impl Database {
                 });
             }
             message.state = state;
-            message.content_redacted = content_redacted.to_owned();
+            content_redacted.clone_into(&mut message.content_redacted);
             message.finalized_at = Some(finalized_at);
             message
                 .validate()

@@ -134,7 +134,8 @@ mod tests {
         config.orchestrator.state_dir = "../outside".into();
 
         let error = RepositoryStatePaths::from_config(&repository, &config)
-            .expect_err("relative escape must fail");
+            .err()
+            .unwrap_or_else(|| panic!("relative escape must fail"));
 
         assert!(error.to_string().contains("escapes the repository"));
         Ok(())
@@ -153,7 +154,8 @@ mod tests {
         config.orchestrator.state_dir = outside;
 
         let error = RepositoryStatePaths::from_config(&repository, &config)
-            .expect_err("absolute escape must fail");
+            .err()
+            .unwrap_or_else(|| panic!("absolute escape must fail"));
 
         assert!(error.to_string().contains("escapes the repository"));
         Ok(())
