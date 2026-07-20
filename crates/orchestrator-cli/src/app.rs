@@ -60,7 +60,8 @@ use crate::args::{
     RunArgs, TaskSelector, UsageAction, UsageOverrideArgs,
 };
 use crate::profile_config::{
-    ProfileReportRow, effective_profile_rows, reset_profile_override, set_profile_override,
+    ProfileReportRow, ProfileSource, effective_profile_rows, reset_profile_override,
+    set_profile_override,
 };
 
 const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
@@ -5118,6 +5119,17 @@ async fn tui(
         },
         provider_controls,
         usage_override_drafts,
+        model_profiles: effective_profile_rows(config, &RootConfig::default())?
+            .into_iter()
+            .map(|row| orchestrator_tui::ModelProfileRow {
+                provider: row.provider,
+                profile: row.profile,
+                model: row.model,
+                effort: row.effort.unwrap_or_default(),
+                description: row.description,
+                customized: row.source == ProfileSource::Customized,
+            })
+            .collect(),
     };
     let action = orchestrator_tui::run(&snapshot)?;
     match action {
@@ -5199,6 +5211,33 @@ async fn tui(
             },
             json_output,
         ),
+        orchestrator_tui::ControlAction::SetModelProfile {
+            provider,
+            profile,
+            model,
+            effort,
+        } => set_model_profile(
+            repository,
+            cli_config,
+            environment,
+            runtime,
+            parse_provider_name(&provider)?,
+            parse_profile_name(&profile)?,
+            &model,
+            Some(parse_effort_name(&effort)?),
+            json_output,
+        ),
+        orchestrator_tui::ControlAction::ResetModelProfile { provider, profile } => {
+            reset_model_profile(
+                repository,
+                cli_config,
+                environment,
+                runtime,
+                parse_provider_name(&provider)?,
+                parse_profile_name(&profile)?,
+                json_output,
+            )
+        }
         orchestrator_tui::ControlAction::Quit => Ok(()),
     }
 }
@@ -5213,6 +5252,24 @@ fn parse_provider_name(value: &str) -> Result<crate::args::ProviderName> {
         "codex" => Ok(crate::args::ProviderName::Codex),
         "claude" => Ok(crate::args::ProviderName::Claude),
         _ => bail!("unknown approved provider `{value}`"),
+    }
+}
+
+fn parse_profile_name(value: &str) -> Result<ProfileName> {
+    match value {
+        "economy" => Ok(ProfileName::Economy),
+        "standard" => Ok(ProfileName::Standard),
+        "premium" => Ok(ProfileName::Premium),
+        _ => bail!("unknown model profile `{value}`"),
+    }
+}
+
+fn parse_effort_name(value: &str) -> Result<EffortName> {
+    match value {
+        "low" => Ok(EffortName::Low),
+        "medium" => Ok(EffortName::Medium),
+        "high" => Ok(EffortName::High),
+        _ => bail!("unsupported reasoning effort `{value}`"),
     }
 }
 

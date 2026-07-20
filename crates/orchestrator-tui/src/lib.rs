@@ -36,6 +36,19 @@ pub struct DashboardSnapshot {
     /// reused for a different provider.
     #[serde(default)]
     pub usage_override_drafts: Vec<UsageOverrideDraft>,
+    /// Effective provider/profile mappings with preset/customized classification.
+    #[serde(default)]
+    pub model_profiles: Vec<ModelProfileRow>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModelProfileRow {
+    pub provider: String,
+    pub profile: String,
+    pub model: String,
+    pub effort: String,
+    pub description: String,
+    pub customized: bool,
 }
 
 /// A configured provider and its current administrative enablement state.
@@ -146,6 +159,16 @@ pub enum ControlAction {
         remaining: Option<f64>,
         entered_by: String,
     },
+    SetModelProfile {
+        provider: String,
+        profile: String,
+        model: String,
+        effort: String,
+    },
+    ResetModelProfile {
+        provider: String,
+        profile: String,
+    },
     Quit,
 }
 
@@ -246,6 +269,15 @@ fn action_for_key(
     snapshot: &DashboardSnapshot,
     state: &mut InteractionState,
 ) -> Result<Option<ControlAction>, TuiError> {
+    if state.profile_reset_confirmation.is_some() {
+        return Ok(profile_reset_confirmation_action(code, state));
+    }
+    if state.profile_editor.is_some() {
+        return Ok(profile_editor_action(code, state));
+    }
+    if state.profile_list.is_some() {
+        return profile_list_action(code, snapshot, state);
+    }
     if state.usage_editor.is_some() {
         return Ok(usage_editor_action(code, state));
     }
@@ -279,6 +311,15 @@ fn action_for_key(
         }
         KeyCode::Char('u') => {
             open_picker(state, PickerPurpose::UsageOverride, snapshot);
+            None
+        }
+        KeyCode::Char('f') => {
+            if snapshot.model_profiles.is_empty() {
+                state.feedback = Some("no configured model profiles".to_owned());
+            } else {
+                state.profile_list = Some(ProfileListState::default());
+                state.feedback = Some("select a provider profile explicitly".to_owned());
+            }
             None
         }
         KeyCode::Char('q') | KeyCode::Esc => Some(ControlAction::Quit),
@@ -320,6 +361,34 @@ struct UsageEditorState {
     field: UsageEditorField,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProfileListState {
+    selected: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProfileEditorField {
+    #[default]
+    Model,
+    Effort,
+    Confirm,
+}
+
+#[derive(Clone, Debug)]
+struct ProfileEditorState {
+    provider: String,
+    profile: String,
+    model: String,
+    effort: String,
+    field: ProfileEditorField,
+}
+
+#[derive(Clone, Debug)]
+struct ProfileResetConfirmation {
+    provider: String,
+    profile: String,
+}
+
 impl UsageEditorState {
     fn from_draft(draft: &UsageOverrideDraft) -> Self {
         Self {
@@ -356,7 +425,199 @@ impl UsageEditorState {
 struct InteractionState {
     picker: Option<PickerState>,
     usage_editor: Option<UsageEditorState>,
+    profile_list: Option<ProfileListState>,
+    profile_editor: Option<ProfileEditorState>,
+    profile_reset_confirmation: Option<ProfileResetConfirmation>,
     feedback: Option<String>,
+}
+
+fn profile_list_action(
+    code: KeyCode,
+    snapshot: &DashboardSnapshot,
+    state: &mut InteractionState,
+) -> Result<Option<ControlAction>, TuiError> {
+    let Some(list) = state.profile_list.as_mut() else {
+        return Ok(None);
+    };
+    match code {
+        KeyCode::Esc => {
+            state.profile_list = None;
+            state.feedback = None;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            list.selected = Some(next_index(
+                list.selected,
+                snapshot.model_profiles.len(),
+                true,
+            ));
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            list.selected = Some(next_index(
+                list.selected,
+                snapshot.model_profiles.len(),
+                false,
+            ));
+        }
+        KeyCode::Char(digit) if digit.is_ascii_digit() && digit != '0' => {
+            let index = usize::try_from(digit.to_digit(10).unwrap_or_default())
+                .unwrap_or_default()
+                .saturating_sub(1);
+            if index < snapshot.model_profiles.len() {
+                list.selected = Some(index);
+            }
+        }
+        KeyCode::Enter => {
+            let Some(index) = list.selected else {
+                state.feedback = Some("choose a profile before editing".to_owned());
+                return Ok(None);
+            };
+            let row = snapshot
+                .model_profiles
+                .get(index)
+                .ok_or_else(|| invalid_control("selected model profile is no longer available"))?;
+            state.profile_editor = Some(ProfileEditorState {
+                provider: row.provider.clone(),
+                profile: row.profile.clone(),
+                model: row.model.clone(),
+                effort: row.effort.clone(),
+                field: ProfileEditorField::default(),
+            });
+            state.feedback = Some("edit Model/Effort, then confirm".to_owned());
+        }
+        KeyCode::Delete => {
+            let Some(index) = list.selected else {
+                state.feedback = Some("choose a profile before resetting".to_owned());
+                return Ok(None);
+            };
+            let row = snapshot
+                .model_profiles
+                .get(index)
+                .ok_or_else(|| invalid_control("selected model profile is no longer available"))?;
+            if row.customized {
+                state.profile_reset_confirmation = Some(ProfileResetConfirmation {
+                    provider: row.provider.clone(),
+                    profile: row.profile.clone(),
+                });
+                state.feedback = Some("Reset override? y/N".to_owned());
+            } else {
+                state.feedback =
+                    Some("selected profile already uses the built-in preset".to_owned());
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+fn profile_reset_confirmation_action(
+    code: KeyCode,
+    state: &mut InteractionState,
+) -> Option<ControlAction> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let target = state.profile_reset_confirmation.take()?;
+            state.profile_list = None;
+            state.feedback = None;
+            Some(ControlAction::ResetModelProfile {
+                provider: target.provider,
+                profile: target.profile,
+            })
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+            state.profile_reset_confirmation = None;
+            state.feedback = Some("profile reset cancelled".to_owned());
+            None
+        }
+        _ => None,
+    }
+}
+
+fn profile_editor_action(code: KeyCode, state: &mut InteractionState) -> Option<ControlAction> {
+    let mut submitted = None;
+    let Some(editor) = state.profile_editor.as_mut() else {
+        return None;
+    };
+    match code {
+        KeyCode::Esc => {
+            state.profile_editor = None;
+            state.feedback = Some("profile edit cancelled".to_owned());
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+            editor.field = next_profile_field(editor.field, true);
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+            editor.field = next_profile_field(editor.field, false);
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.field == ProfileEditorField::Effort =>
+        {
+            editor.effort = cycle_effort(&editor.effort, code != KeyCode::Left).to_owned();
+        }
+        KeyCode::Backspace if editor.field == ProfileEditorField::Model => {
+            editor.model.pop();
+        }
+        KeyCode::Delete if editor.field == ProfileEditorField::Model => {
+            editor.model.clear();
+        }
+        KeyCode::Home | KeyCode::End if editor.field == ProfileEditorField::Model => {}
+        KeyCode::Char(character)
+            if editor.field == ProfileEditorField::Model
+                && !character.is_control()
+                && editor.model.len() + character.len_utf8() <= 256 =>
+        {
+            editor.model.push(character);
+        }
+        KeyCode::Enter if editor.field == ProfileEditorField::Confirm => {
+            let model = editor.model.trim();
+            if model.is_empty() {
+                state.feedback = Some("model must not be blank".to_owned());
+                return None;
+            }
+            if !matches!(editor.effort.as_str(), "low" | "medium" | "high") {
+                state.feedback = Some("effort must be low, medium, or high".to_owned());
+                return None;
+            }
+            submitted = Some(ControlAction::SetModelProfile {
+                provider: editor.provider.clone(),
+                profile: editor.profile.clone(),
+                model: model.to_owned(),
+                effort: editor.effort.clone(),
+            });
+        }
+        KeyCode::Enter => {
+            editor.field = next_profile_field(editor.field, true);
+        }
+        _ => {}
+    }
+    if submitted.is_some() {
+        state.profile_editor = None;
+        state.profile_list = None;
+        state.feedback = None;
+    }
+    submitted
+}
+
+const fn next_profile_field(field: ProfileEditorField, forward: bool) -> ProfileEditorField {
+    match (field, forward) {
+        (ProfileEditorField::Model, true) | (ProfileEditorField::Confirm, false) => {
+            ProfileEditorField::Effort
+        }
+        (ProfileEditorField::Effort, true) | (ProfileEditorField::Model, false) => {
+            ProfileEditorField::Confirm
+        }
+        (ProfileEditorField::Confirm, true) | (ProfileEditorField::Effort, false) => {
+            ProfileEditorField::Model
+        }
+    }
+}
+
+fn cycle_effort(current: &str, forward: bool) -> &'static str {
+    match (current, forward) {
+        ("low", true) | ("high", false) => "medium",
+        ("medium", true) | ("low", false) => "high",
+        ("high", true) | ("medium", false) => "low",
+        (_, _) => "medium",
+    }
 }
 
 fn open_picker(state: &mut InteractionState, purpose: PickerPurpose, snapshot: &DashboardSnapshot) {
@@ -691,6 +952,8 @@ pub fn render(frame: &mut Frame<'_>, snapshot: &DashboardSnapshot) {
         Span::raw(":handover  "),
         Span::styled("u", Style::default().fg(Color::Cyan)),
         Span::raw(":usage override  "),
+        Span::styled("f", Style::default().fg(Color::Cyan)),
+        Span::raw(":profiles  "),
         Span::styled("c/q", Style::default().fg(Color::Cyan)),
         Span::raw(":cancel/quit"),
     ]);
@@ -703,7 +966,13 @@ fn render_interactive(
     state: &InteractionState,
 ) {
     render(frame, snapshot);
-    if let Some(editor) = &state.usage_editor {
+    if let Some(confirmation) = &state.profile_reset_confirmation {
+        render_profile_reset_confirmation(frame, confirmation, state.feedback.as_deref());
+    } else if let Some(editor) = &state.profile_editor {
+        render_profile_editor(frame, editor, state.feedback.as_deref());
+    } else if let Some(list) = &state.profile_list {
+        render_profile_list(frame, snapshot, list, state.feedback.as_deref());
+    } else if let Some(editor) = &state.usage_editor {
         render_usage_editor(frame, editor, state.feedback.as_deref());
     } else if let Some(picker) = &state.picker {
         render_picker(frame, snapshot, picker, state.feedback.as_deref());
@@ -716,6 +985,123 @@ fn render_interactive(
             area,
         );
     }
+}
+
+fn render_profile_list(
+    frame: &mut Frame<'_>,
+    snapshot: &DashboardSnapshot,
+    list: &ProfileListState,
+    feedback: Option<&str>,
+) {
+    let width = frame.area().width.min(68);
+    let height = u16::try_from(snapshot.model_profiles.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(9)
+        .min(frame.area().height);
+    let area = centered_rect(width, height, frame.area());
+    let mut lines = vec![Line::from(
+        "  Provider Profile  Model                        Effort Source",
+    )];
+    lines.extend(
+        snapshot
+            .model_profiles
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let marker = if list.selected == Some(index) {
+                    ">"
+                } else {
+                    " "
+                };
+                let source = if row.customized { "custom" } else { "preset" };
+                Line::from(format!(
+                    "{marker} {:<7} {:<8} {:<28} {:<6} [{source}]",
+                    row.provider, row.profile, row.model, row.effort,
+                ))
+            }),
+    );
+    lines.push(Line::from("economy: fast and cost-efficient simple work"));
+    lines.push(Line::from("standard: everyday development work"));
+    lines.push(Line::from(
+        "premium: complex work requiring the highest quality",
+    ));
+    lines.push(Line::from(feedback.unwrap_or(
+        "Up/Down or number: select  Enter: edit  Delete: reset  Esc: close",
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel(" Model profiles "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_profile_editor(
+    frame: &mut Frame<'_>,
+    editor: &ProfileEditorState,
+    feedback: Option<&str>,
+) {
+    let area = centered_rect(frame.area().width.min(68), 9, frame.area());
+    let lines = vec![
+        Line::from(format!("{}.{}", editor.provider, editor.profile)),
+        Line::from(format!(
+            "{} Model: {}",
+            if editor.field == ProfileEditorField::Model {
+                ">"
+            } else {
+                " "
+            },
+            editor.model,
+        )),
+        Line::from(format!(
+            "{} Effort: {}",
+            if editor.field == ProfileEditorField::Effort {
+                ">"
+            } else {
+                " "
+            },
+            editor.effort,
+        )),
+        Line::from(format!(
+            "{} Confirm override",
+            if editor.field == ProfileEditorField::Confirm {
+                ">"
+            } else {
+                " "
+            },
+        )),
+        Line::from("Up/Down: field  Left/Right/Space: effort"),
+        Line::from(feedback.unwrap_or("Type model; Enter advances/submits; Esc cancels")),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(panel(" Model profile editor "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_profile_reset_confirmation(
+    frame: &mut Frame<'_>,
+    confirmation: &ProfileResetConfirmation,
+    feedback: Option<&str>,
+) {
+    let area = centered_rect(frame.area().width.min(52), 6, frame.area());
+    let lines = vec![
+        Line::from(format!(
+            "{}.{}",
+            confirmation.provider, confirmation.profile
+        )),
+        Line::from(feedback.unwrap_or("Reset override? y/N")),
+        Line::from("y: reset  n/Esc: cancel"),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(panel(" Confirm profile reset ")),
+        area,
+    );
 }
 
 fn render_usage_editor(frame: &mut Frame<'_>, editor: &UsageEditorState, feedback: Option<&str>) {
@@ -1272,6 +1658,70 @@ mod tests {
             Some(ControlAction::SetProviderEnabled {
                 provider: "claude".to_owned(),
                 enabled: true,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_editor_emits_validated_model_and_effort() -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = DashboardSnapshot {
+            model_profiles: vec![ModelProfileRow {
+                provider: "claude".to_owned(),
+                profile: "premium".to_owned(),
+                model: "claude-fable-5".to_owned(),
+                effort: "high".to_owned(),
+                description: "complex work requiring the highest quality".to_owned(),
+                customized: false,
+            }],
+            ..DashboardSnapshot::default()
+        };
+        let mut state = InteractionState::default();
+        action_for_key(KeyCode::Char('f'), &snapshot, &mut state)?;
+        action_for_key(KeyCode::Down, &snapshot, &mut state)?;
+        action_for_key(KeyCode::Enter, &snapshot, &mut state)?;
+        action_for_key(KeyCode::End, &snapshot, &mut state)?;
+        action_for_key(KeyCode::Char('x'), &snapshot, &mut state)?;
+        action_for_key(KeyCode::Down, &snapshot, &mut state)?;
+        action_for_key(KeyCode::Down, &snapshot, &mut state)?;
+        assert_eq!(
+            action_for_key(KeyCode::Enter, &snapshot, &mut state)?,
+            Some(ControlAction::SetModelProfile {
+                provider: "claude".to_owned(),
+                profile: "premium".to_owned(),
+                model: "claude-fable-5x".to_owned(),
+                effort: "high".to_owned(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_reset_requires_explicit_confirmation() -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = DashboardSnapshot {
+            model_profiles: vec![ModelProfileRow {
+                provider: "gemini".to_owned(),
+                profile: "standard".to_owned(),
+                model: "company-gemini".to_owned(),
+                effort: "medium".to_owned(),
+                description: "everyday development work".to_owned(),
+                customized: true,
+            }],
+            ..DashboardSnapshot::default()
+        };
+        let mut state = InteractionState::default();
+        action_for_key(KeyCode::Char('f'), &snapshot, &mut state)?;
+        action_for_key(KeyCode::Down, &snapshot, &mut state)?;
+        assert_eq!(
+            action_for_key(KeyCode::Delete, &snapshot, &mut state)?,
+            None
+        );
+        assert!(state.profile_reset_confirmation.is_some());
+        assert_eq!(
+            action_for_key(KeyCode::Char('y'), &snapshot, &mut state)?,
+            Some(ControlAction::ResetModelProfile {
+                provider: "gemini".to_owned(),
+                profile: "standard".to_owned(),
             })
         );
         Ok(())
