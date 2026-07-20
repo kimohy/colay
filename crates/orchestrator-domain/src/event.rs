@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CorrelationId, EventId, IntegrityError, ProviderId, SchemaVersion, TaskId, TaskState,
-    canonical_sha256,
+    CorrelationId, EventId, IntegrityError, ProviderId, SchemaVersion, SessionId, TaskId,
+    TaskState, canonical_sha256,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -48,6 +48,8 @@ pub struct TaskEvent {
     pub schema_version: SchemaVersion,
     pub sequence: u64,
     pub event_id: EventId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub task_id: Option<TaskId>,
     pub occurred_at: DateTime<Utc>,
     pub event_type: EventType,
@@ -108,6 +110,7 @@ mod tests {
             schema_version: SchemaVersion::state_current(),
             sequence: 1,
             event_id: EventId::new(),
+            session_id: None,
             task_id: Some(TaskId::new()),
             occurred_at: Utc::now(),
             event_type: EventType::TaskCreated,
@@ -125,6 +128,31 @@ mod tests {
         assert!(event.verify_hash()?);
         event.payload = json!({"objective": "tampered"});
         assert!(!event.verify_hash()?);
+        Ok(())
+    }
+
+    #[test]
+    fn absent_session_id_is_omitted_for_historical_event_hash_compatibility()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = TaskEvent {
+            schema_version: SchemaVersion::new(SchemaVersion::V3),
+            sequence: 1,
+            event_id: EventId::new(),
+            session_id: None,
+            task_id: None,
+            occurred_at: Utc::now(),
+            event_type: EventType::CompatibilityWarning,
+            from_state: None,
+            to_state: None,
+            reason: None,
+            actor: EventActor::System,
+            correlation_id: CorrelationId::new(),
+            causation_id: None,
+            payload: json!({}),
+            previous_hash: None,
+            event_hash: String::new(),
+        };
+        assert!(serde_json::to_value(event)?.get("session_id").is_none());
         Ok(())
     }
 }

@@ -84,6 +84,10 @@ uuid_id!(RoutingDecisionId);
 uuid_id!(VerificationId);
 uuid_id!(CorrelationId);
 uuid_id!(CommandEvidenceId);
+uuid_id!(SessionId);
+uuid_id!(MessageId);
+uuid_id!(ClientCommandId);
+uuid_id!(DaemonInstanceId);
 
 #[cfg(test)]
 mod tests {

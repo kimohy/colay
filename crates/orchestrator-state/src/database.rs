@@ -313,6 +313,7 @@ mod tests {
             schema_version: SchemaVersion::state_current(),
             sequence: 0,
             event_id: EventId::new(),
+            session_id: None,
             task_id: None,
             occurred_at: Utc::now(),
             event_type: EventType::CompatibilityWarning,

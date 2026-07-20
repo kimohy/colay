@@ -10,6 +10,7 @@ pub struct SchemaVersion(String);
 impl SchemaVersion {
     pub const V1: &'static str = "1";
     pub const V3: &'static str = "3";
+    pub const V4: &'static str = "4";
 
     #[must_use]
     pub fn new(version: impl Into<String>) -> Self {
@@ -23,7 +24,7 @@ impl SchemaVersion {
 
     #[must_use]
     pub fn state_current() -> Self {
-        Self::new(Self::V3)
+        Self::new(Self::V4)
     }
 
     #[must_use]
