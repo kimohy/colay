@@ -68,6 +68,12 @@ impl RepoPath {
     }
 }
 
+/// Returns whether two normalized repository-relative paths reserve intersecting trees.
+#[must_use]
+pub fn repo_paths_overlap(left: &RepoPath, right: &RepoPath) -> bool {
+    left.as_path().starts_with(right.as_path()) || right.as_path().starts_with(left.as_path())
+}
+
 impl fmt::Display for RepoPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0.to_string_lossy())

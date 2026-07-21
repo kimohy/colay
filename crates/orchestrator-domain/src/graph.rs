@@ -371,9 +371,7 @@ fn overlapping_scope(left: &TaskGraphNode, right: &TaskGraphNode) -> Option<(Str
     }
     for left_scope in &left.write_scopes {
         for right_scope in &right.write_scopes {
-            if left_scope.as_path().starts_with(right_scope.as_path())
-                || right_scope.as_path().starts_with(left_scope.as_path())
-            {
+            if crate::repo_paths_overlap(left_scope, right_scope) {
                 return Some((left_scope.to_string(), right_scope.to_string()));
             }
         }

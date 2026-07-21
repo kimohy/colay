@@ -90,6 +90,9 @@ uuid_id!(ClientCommandId);
 uuid_id!(DaemonInstanceId);
 uuid_id!(GraphRevisionId);
 uuid_id!(PlanningAttemptId);
+uuid_id!(InstructionId);
+uuid_id!(ResourceClaimId);
+uuid_id!(ScheduleClaimId);
 
 #[cfg(test)]
 mod tests {
