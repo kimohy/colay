@@ -436,13 +436,24 @@ fn planning_prompt(stdin: &str) -> Option<serde_json::Value> {
 
 fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_json::Value) {
     let cwd = std::env::current_dir().unwrap_or_default();
+    let log_path = cwd.join(".colay/fake-planner-invocation.json");
+    let invocation_count = std::fs::read(&log_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("invocation_count")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or_default()
+        .saturating_add(1);
     let log = serde_json::json!({
         "args": args,
         "cwd": cwd,
         "timeout_seconds": prompt.get("timeout_seconds"),
         "stdout_limit": prompt.get("stdout_limit"),
+        "invocation_count": invocation_count,
     });
-    let log_path = cwd.join(".colay/fake-planner-invocation.json");
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
