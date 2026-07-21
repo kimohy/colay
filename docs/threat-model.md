@@ -18,7 +18,9 @@ Provider output, task text, repository files, Git metadata, usage-probe output, 
 | Shell/argument injection | Executable and argv arrays only; no command strings |
 | Credential disclosure | No token/key reads; environment allowlist; output redaction; state-directory access control |
 | Workspace escape | Validated repository-relative paths, symlink checks, provider sandbox |
-| Partial or conflicting edits | Unique durable writable lease, changed-file ownership, task worktree, safe checkpoint boundary |
+| Partial or conflicting edits | Per-task worktree, atomic schedule/resource claims, component-aware overlap detection, safe checkpoint boundary |
+| Duplicate parallel execution | Current approved-graph check, `BEGIN IMMEDIATE`, unique active-task constraint, daemon-bound renewable claim, idempotent release/restart reconciliation |
+| Cross-task chat injection | Relational task/session membership check, atomic message/instruction insert, ordered one-way instruction lifecycle; display labels carry no identity |
 | Daemon spoofing or split ownership | Repository-confined SQLite file, protected local permissions, UUID lease, `BEGIN IMMEDIATE`, expiry predicates; PID is never authority |
 | Malicious local command replay | Unique idempotency keys, canonical payload/target comparison, atomic single-consumer claim, conservative stale recovery |
 | Silent chat retargeting | Navigation and composer target are separate reducer fields; target changes require an explicit picker or one-message mention |
@@ -58,5 +60,13 @@ text. The approval transaction recomputes the canonical proposal seal and
 rejects superseded, invalid, malformed, or wrong-hash revisions. Planning errors
 are redacted before persistence, and cancellation terminates the owned process
 tree while leaving a reconcilable durable attempt.
+
+Parallel capacity is enforced in SQLite rather than trusted to an in-process
+semaphore. Provider success is insufficient: dependency readiness uses only a
+completed task whose latest verification passed. Declared scopes are never
+widened after dispatch, and an overlap or out-of-scope change blocks progress.
+Schedule/resource claims and instruction transitions remain auditable after a
+daemon crash. None of those records authorizes integration into the user's
+branch.
 
 The design does not attempt to defend against a host administrator who can replace binaries, read process memory, or rewrite all state and hashes. Enterprise endpoint security and code-signing policy remain required.

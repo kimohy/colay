@@ -87,20 +87,27 @@ Use `/plan` after sending a session-level goal. The daemon invokes one eligible
 official CLI in an explicitly read-only sandbox, requires exactly one bounded
 JSON task-graph proposal, validates its DAG, providers, profiles, concurrency,
 and write-scope isolation, and persists the revision without creating a task or
-worktree. `/approve` opens a text confirmation containing the exact proposal
-hash, nodes, dependencies, scopes, providers/profiles, risks, and proposed
+worktree. `/approve` opens a text confirmation containing the exact proposal hash,
+nodes, dependencies, scopes, providers/profiles, risks, and proposed
 parallelism. Only `y` submits typed approval for that exact revision/hash;
 `n`/`Esc`, an offline daemon, an invalid plan, or a changed hash fails closed.
 Chat text such as "yes" has no approval authority.
 
-Phase 3 implements this exact proposal hash approval boundary; parallel execution
-is deliberately deferred to Phase 4.
-
 No writable task before approval is a hard boundary. Exact approval atomically
-materializes the graph as queued session tasks; it still starts no worker and
-creates no worktree. Phase 4 adds dependency-aware execution, while integration,
-merge, push, and cleanup remain separately gated in Phase 5. `/retry` and
-broadcast execution are not yet available.
+materializes the graph as queued session tasks. The daemon then claims only
+dependency-ready tasks, enforcing exact global/provider limits and normalized
+write-scope ownership in SQLite. Independent tasks run concurrently through
+official CLI adapters in separate Git worktrees and reach `completed` only
+after sealed checkpoint evidence and independent verification.
+
+Phase 3 established the exact proposal-hash approval boundary; Phase 4 adds
+the bounded parallel execution described above without weakening that approval.
+
+Send `@task-<id> ...` to create an ordered durable instruction for one current
+graph task, or `@all ...` to fan out separately auditable instructions. Task
+selection still never changes the composer target. Results and worktrees remain
+isolated after execution; integration, merge, push, publication, cleanup, and
+`/retry` remain separately gated in Phase 5.
 
 ## Model profiles
 

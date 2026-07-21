@@ -4,7 +4,7 @@ State, config, handover, worker result, checkpoint, routing decision, and usage 
 
 ## SQLite
 
-SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4 -> v5 -> v6`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
+SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
 
 State schema v4 adds `sessions`, ordered `conversation_messages`, idempotent
 `client_commands`, and repository `daemon_instances`. It also adds nullable
@@ -28,13 +28,28 @@ triggers allow only the intended planning-to-valid/invalid and
 awaiting-approval-to-approved/superseded transitions. Existing databases are
 backed up before the rebuild, and historical event JSON/hashes are not rewritten.
 
+State schema v7 adds `task_schedule_claims`, `resource_claims`, and
+`task_instructions`. Schedule claims bind one daemon, approved graph revision,
+task, provider, lease window, and explicit release reason. Partial unique
+indexes prevent two active claims for one task. Resource rows store normalized
+path components or repository-wide ownership and are released with the parent
+claim. Instructions retain per-task order and the
+`queued -> applying -> applied|rejected|interrupted` lifecycle across restarts.
+
 For an existing nonzero schema, `migrate apply` creates an online SQLite backup under `.colay/backups/orchestrator.db.backup.<timestamp>` before applying pending versions. A legacy config keeps using its explicitly selected state root. A brand-new empty database has no prior state to back up. After migration, `doctor` reports SQLite integrity and foreign-key health.
 
-`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5/v6 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. A separate v5 fixture proves the v6 rebuild preserves completed command rows and creates a verified pre-apply backup.
+`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5/v6/v7 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. Separate v5 and v6 fixtures prove the later migrations preserve completed command rows and create a verified pre-apply backup.
 
 ## Configuration
 
-The current config schema is v4. Config migration uses a separate raw-document reader so normal startup remains strict: `ConfigDocument` accepts only v4, while `MigratableConfigDocument` accepts the supported v1-v4 range and rejects future or pre-v1 versions without guessing.
+The current config schema is v4. The optional
+`orchestrator.provider_parallel_limits` map is an additive v4 field: an absent
+map means every provider inherits `max_parallel_workers`, while present values
+must be positive and name known providers. No persisted document rewrite is
+required. Config migration uses a separate raw-document reader so normal
+startup remains strict: `ConfigDocument` accepts only v4, while
+`MigratableConfigDocument` accepts the supported v1-v4 range and rejects future
+or pre-v1 versions without guessing.
 
 The migration catalog is explicit and sequential:
 

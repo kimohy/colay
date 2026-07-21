@@ -24,7 +24,15 @@ On Unix, state directories/files are set to `0700`/`0600`. On Windows, state cre
 
 `--task-file` is read only when it is a non-symlink regular file inside the current repository, no larger than 1 MiB, and already has the same private Unix mode or verified Windows DACL. The orchestrator checks this policy without changing the input file.
 
-Artifact writes use create-new temporary files, flush, content hashes, and rename. Task events form an append-only hash chain replicated from the SQLite outbox. Writable attempts acquire a durable task/worktree lease, and changed-file ownership is recorded before that lease is released. Artifact hashes and event hashes detect accidental/torn changes; they are not signatures against a privileged host attacker.
+Artifact writes use create-new temporary files, flush, content hashes, and
+rename. Task events form an append-only hash chain replicated from the SQLite
+outbox. Writable attempts acquire a durable task/worktree lease plus an atomic
+schedule claim and normalized resource claims. Global and per-provider limits,
+current-graph membership, verified dependency readiness, and scope conflicts
+are evaluated inside one immediate SQLite transaction. Changed-file ownership
+is recorded before leases are released. Artifact hashes and event hashes detect
+accidental/torn changes; they are not signatures against a privileged host
+attacker.
 
 ## Redaction and secret scanning
 
@@ -34,7 +42,16 @@ Before checkpoint persistence, restart recovery, handover, or reviewer sharing, 
 
 ## Approval boundaries
 
-Completion is blocked by failed verification, out-of-scope files, secret findings, inconclusive large-file scans, or a missing required independent review. Worktree deletion is not automated. Release and database-migration rollback both require an explicit `--approved-by` identity and an exact plan-bound integrity hash. Quality-floor downgrade approval records exist in the state schema; this release does not silently lower critical-task quality.
+Completion is blocked by failed verification, out-of-scope files, secret
+findings, inconclusive large-file scans, or a missing required independent
+review. Task instructions have no integration authority: they are accepted only
+for relationally valid current-graph targets and move through an auditable
+one-way lifecycle at provider safe boundaries. Worktree deletion, integration,
+merge, push, and publication are not automated in Phase 4. Release and
+database-migration rollback both require an explicit `--approved-by` identity
+and an exact plan-bound integrity hash. Quality-floor downgrade approval records
+exist in the state schema; this release does not silently lower critical-task
+quality.
 
 A release rollback that replaces the Codex executable also requires validated, persisted evidence from the latest completed writable Codex attempt. The stored attempt/task/provider identity, actual resolved executable, and trusted worktree must agree; missing, malformed, or mismatched execution evidence fails closed. Current configuration or `PATH` resolution is not substituted for that persisted identity.
 

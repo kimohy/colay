@@ -65,9 +65,11 @@ Ctrl+T            explicit composer target
 /admin            five-panel administration compatibility view
 ```
 
-Task selection never changes the composer target. `@task-<id>` and `@all` are
-one-message overrides; broadcast execution is unavailable until the parallel
-phase. `/plan` selects only the newest final, session-level user message and
+Task selection never changes the composer target. `@task-<id>` is a one-message
+override that atomically records an ordered instruction for that graph task.
+`@all` fans the same redacted instruction out into separate durable rows for
+every current non-terminal graph task, preserving per-task audit identity.
+`/plan` selects only the newest final, session-level user message and
 submits a durable read-only planning request. The resulting plan card shows its
 revision, SHA-256 proposal hash, ordered nodes, dependencies, scopes,
 providers/profiles, risks, and parallelism. `/approve` is enabled only for a
@@ -76,11 +78,15 @@ validated current revision while the daemon is online. Only `y` confirms;
 Typing "yes" in chat remains an ordinary message.
 
 Before approval there are no writable tasks, worktrees, or worker leases. Exact
-approval materializes queued tasks and dependency rows once, but Phase 3 does
-not dispatch them. An invalid plan is retained with a redacted attention error
-and no approvable hash. Re-run `/plan` after correcting the goal to create a new
-revision; earlier revisions remain historical. `/retry` and later integration
-actions still fail visibly as unavailable.
+approval materializes queued tasks and dependency rows once. The daemon claims
+dependency-ready tasks subject to `max_parallel_workers`, optional
+`provider_parallel_limits`, and non-overlapping normalized write scopes. Each
+claim creates one isolated worktree and one provider attempt. A task completes
+only after checkpoint sealing and verification; failure releases its claim and
+does not cancel an independent sibling. An invalid plan is retained with a
+redacted attention error and no approvable hash. Re-run `/plan` after correcting
+the goal to create a new revision; earlier revisions remain historical.
+`/retry` and integration actions still fail visibly as unavailable.
 
 ## Repository daemon
 
@@ -93,12 +99,13 @@ previous lease to be released or expire before starting a replacement.
 
 The hidden `daemon serve` action is an internal child-process entry point. The
 service heartbeats once per second with a five-second lease, processes durable
-session/message/planning/approval commands every 100ms, and responds to
-persisted stop requests and Ctrl-C cancellation. Read-only planning runs in an
-owned cancellable child while heartbeat and stop handling continue. A crashed
-daemon leaves a stale row and reconciles replay-safe planning commands on
-restart; a replacement may take ownership only at or after lease expiry. There
-is no network endpoint.
+session/message/planning/approval commands every 100ms, and schedules approved
+tasks without blocking heartbeat or stop handling. Read-only planning and task
+execution run in owned cancellable children. Task claims renew while an attempt
+is active; a crashed daemon leaves expiring claims and restart reconciliation
+does not create a second attempt for already completed work. A replacement may
+take daemon ownership only at or after lease expiry. There is no network
+endpoint.
 
 ## Control requests and recovery
 
@@ -127,7 +134,11 @@ The current manual command accepts `provider`, optional `--used`, `--limit`, and
 
 ## Worktree retention
 
-Worktrees and task branches are retained after completion, failure, cancellation, and rollback. The engine can produce a cleanup plan containing exact paths, but this release has no automatic worktree removal, merge, or push path.
+Worktrees and task branches are retained after completion, failure,
+cancellation, daemon restart, and rollback. Phase 4 never applies a task result
+to the user's branch and has no automatic worktree removal, merge, push, or
+publication path. These retained verified results are the only inputs eligible
+for a later exact-hash integration preview.
 
 ## Provider prerequisites
 
