@@ -7,9 +7,10 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use orchestrator_domain::{
-    AppendMessageCommandPayload, ClientCommand, ClientCommandAction, ClientCommandId,
-    ClientCommandState, CreateSessionCommandPayload, GraphValidationSummary, MessageId,
-    MessageKind, ProviderId, SessionId, TaskId, TaskState,
+    AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand, ClientCommandAction,
+    ClientCommandId, ClientCommandState, CreateSessionCommandPayload, GraphRevisionId,
+    GraphValidationSummary, MessageId, MessageKind, ProviderId, RequestPlanCommandPayload,
+    SessionId, TaskId, TaskState,
 };
 use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{
@@ -176,6 +177,80 @@ impl SqliteWorkspaceDriver {
             .map_err(driver_error)?;
         Ok(ActionFeedback::info("task control accepted"))
     }
+
+    fn request_plan(&self, goal_message_id: &str) -> Result<ActionFeedback, DriverError> {
+        if !self.online()? {
+            return Err(DriverError::new(
+                "daemon is offline or stale; planning is read-only",
+            ));
+        }
+        let goal_message_id = MessageId::from_str(goal_message_id)
+            .map_err(|error| DriverError::new(format!("invalid goal message ID: {error}")))?;
+        let command_id = ClientCommandId::new();
+        let command = ClientCommand {
+            command_id,
+            session_id: Some(self.session_id),
+            task_id: None,
+            action: ClientCommandAction::RequestPlan,
+            payload: serde_json::to_value(RequestPlanCommandPayload { goal_message_id })
+                .map_err(driver_error)?,
+            idempotency_key: format!("chat-plan-{command_id}"),
+            state: ClientCommandState::Pending,
+            requested_by: "local-tui".to_owned(),
+            requested_at: Utc::now(),
+            claimed_at: None,
+            completed_at: None,
+            outcome: None,
+        };
+        self.database
+            .submit_client_command(&command)
+            .map_err(driver_error)?;
+        Ok(ActionFeedback::info("task graph planning requested"))
+    }
+
+    fn approve_graph(
+        &self,
+        revision_id: &str,
+        proposal_hash: &str,
+        approved_by: &str,
+    ) -> Result<ActionFeedback, DriverError> {
+        if !self.online()? {
+            return Err(DriverError::new(
+                "daemon is offline or stale; graph approval is read-only",
+            ));
+        }
+        let payload = ApproveGraphCommandPayload {
+            revision_id: GraphRevisionId::from_str(revision_id)
+                .map_err(|error| DriverError::new(format!("invalid graph revision ID: {error}")))?,
+            proposal_hash: proposal_hash.to_owned(),
+            approved_by: approved_by.to_owned(),
+        };
+        payload
+            .validate()
+            .map_err(|error| DriverError::new(error.to_string()))?;
+        let command_id = ClientCommandId::new();
+        let command = ClientCommand {
+            command_id,
+            session_id: Some(self.session_id),
+            task_id: None,
+            action: ClientCommandAction::ApproveGraph,
+            payload: serde_json::to_value(&payload).map_err(driver_error)?,
+            idempotency_key: format!(
+                "chat-approve-{}-{}",
+                payload.revision_id, payload.proposal_hash
+            ),
+            state: ClientCommandState::Pending,
+            requested_by: approved_by.to_owned(),
+            requested_at: Utc::now(),
+            claimed_at: None,
+            completed_at: None,
+            outcome: None,
+        };
+        self.database
+            .submit_client_command(&command)
+            .map_err(driver_error)?;
+        Ok(ActionFeedback::info("exact task graph approval accepted"))
+    }
 }
 
 impl WorkspaceDriver for SqliteWorkspaceDriver {
@@ -205,6 +280,12 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             WorkspaceAction::RequestTaskControl { task_id, intent } => {
                 self.request_control(&task_id, intent)
             }
+            WorkspaceAction::RequestPlan { goal_message_id } => self.request_plan(&goal_message_id),
+            WorkspaceAction::ApproveGraph {
+                revision_id,
+                proposal_hash,
+                approved_by,
+            } => self.approve_graph(&revision_id, &proposal_hash, &approved_by),
             WorkspaceAction::OpenAdministration => {
                 Ok(ActionFeedback::info("opening administration dashboard"))
             }
@@ -566,10 +647,11 @@ mod tests {
     use chrono::TimeDelta;
     use orchestrator_daemon::{MessageRedactor, process_next_client_command};
     use orchestrator_domain::{
-        ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState,
-        CreateSessionCommandPayload, DaemonInstanceId, GraphRevisionId, GraphValidationPolicy,
-        ModelProfile, PlanningAttemptId, ProviderId, RepoPath, RiskTag, SchemaVersion, SessionId,
-        TaskGraphNode, TaskGraphProposal, validate_task_graph,
+        ApproveGraphCommandPayload, ClientCommand, ClientCommandAction, ClientCommandId,
+        ClientCommandState, CreateSessionCommandPayload, DaemonInstanceId, GraphRevisionId,
+        GraphValidationPolicy, ModelProfile, PlanningAttemptId, ProviderId, RepoPath,
+        RequestPlanCommandPayload, RiskTag, SchemaVersion, SessionId, TaskGraphNode,
+        TaskGraphProposal, validate_task_graph,
     };
     use orchestrator_process::{RedactionConfig, Redactor};
     use orchestrator_state::{
@@ -787,6 +869,77 @@ mod tests {
         );
         assert_eq!(approved.tasks[1].dependency_status, "after domain");
         approved.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn chat_tui_submits_typed_plan_and_exact_approval_commands() -> anyhow::Result<()> {
+        let database = database()?;
+        let redactor = Redactor::new(&RedactionConfig::default())?;
+        let adapter = Adapter(redactor.clone());
+        let session_id = create_session(&database, &adapter)?;
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id: DaemonInstanceId::new(),
+            pid: 42,
+            started_at: chrono::Utc::now(),
+            ttl: TimeDelta::seconds(30),
+        })?;
+        let mut driver = SqliteWorkspaceDriver::from_database(
+            PathBuf::from("C:/repo"),
+            database,
+            session_id,
+            None,
+            redactor,
+        );
+        let goal_message_id = orchestrator_domain::MessageId::new();
+        driver.dispatch(WorkspaceAction::RequestPlan {
+            goal_message_id: goal_message_id.to_string(),
+        })?;
+        let revision_id = GraphRevisionId::new();
+        let proposal_hash = "a".repeat(64);
+        driver.dispatch(WorkspaceAction::ApproveGraph {
+            revision_id: revision_id.to_string(),
+            proposal_hash: proposal_hash.clone(),
+            approved_by: "operator".to_owned(),
+        })?;
+
+        driver.database.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT action, payload_json, requested_by FROM client_commands
+                 WHERE action IN ('request_plan', 'approve_graph') ORDER BY requested_at, rowid",
+            )?;
+            let commands = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(commands.len(), 2);
+            assert_eq!(commands[0].0, "request_plan");
+            assert_eq!(
+                serde_json::from_str::<RequestPlanCommandPayload>(&commands[0].1)?.goal_message_id,
+                goal_message_id
+            );
+            let approval = serde_json::from_str::<ApproveGraphCommandPayload>(&commands[1].1)?;
+            assert_eq!(commands[1].0, "approve_graph");
+            assert_eq!(approval.revision_id, revision_id);
+            assert_eq!(approval.proposal_hash, proposal_hash);
+            assert_eq!(approval.approved_by, "operator");
+            assert_eq!(commands[1].2, "operator");
+            Ok(())
+        })?;
+        assert!(
+            driver
+                .dispatch(WorkspaceAction::ApproveGraph {
+                    revision_id: revision_id.to_string(),
+                    proposal_hash: "not-a-hash".to_owned(),
+                    approved_by: "operator".to_owned(),
+                })
+                .is_err()
+        );
         Ok(())
     }
 }

@@ -349,6 +349,13 @@ fn render_overlay(
             );
             (" INSPECTOR ", lines)
         }
+        Overlay::ApprovalConfirmation {
+            revision_id,
+            proposal_hash,
+        } => (
+            " APPROVE EXACT TASK GRAPH? ",
+            approval_confirmation_lines(snapshot, revision_id, proposal_hash),
+        ),
     };
     let overlay_area = centered_rect(area, 72, 70);
     frame.render_widget(Clear, overlay_area);
@@ -359,6 +366,76 @@ fn render_overlay(
         overlay_area,
     );
     let _ = state;
+}
+
+fn approval_confirmation_lines(
+    snapshot: &WorkspaceSnapshot,
+    revision_id: &str,
+    proposal_hash: &str,
+) -> Vec<Line<'static>> {
+    let Some(plan) = snapshot
+        .plan_approval
+        .as_ref()
+        .filter(|plan| plan.revision_id == revision_id && plan.proposal_hash == proposal_hash)
+    else {
+        return vec![Line::from(
+            "Plan revision changed. Close and reopen /approve.",
+        )];
+    };
+    let mut lines = vec![
+        Line::from(format!("revision    {}", plan.revision_id)),
+        Line::from(format!("SHA-256     {}", plan.proposal_hash)),
+        Line::from(format!("parallelism {}", plan.proposed_parallelism)),
+        Line::from(format!("all risks    {}", list_or_none(&plan.risks))),
+        Line::default(),
+    ];
+    for node in &plan.nodes {
+        lines.extend([
+            Line::from(Span::styled(
+                format!("{} — {}", node.key, node.title),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  objective    {}", node.objective)),
+            Line::from(format!(
+                "  dependencies {}",
+                list_or_none(&node.dependencies)
+            )),
+            Line::from(format!("  provider     {}/{}", node.provider, node.profile)),
+            Line::from(format!(
+                "  write scopes {}{}",
+                list_or_none(&node.write_scopes),
+                if node.repository_wide_write_scope {
+                    " (repository-wide)"
+                } else {
+                    ""
+                }
+            )),
+            Line::from(format!(
+                "  constraints  {}",
+                list_or_none(&node.constraints)
+            )),
+            Line::from(format!(
+                "  acceptance   {}",
+                list_or_none(&node.acceptance_criteria)
+            )),
+            Line::from(format!("  risks        {}", list_or_none(&node.risks))),
+            Line::from(format!("  parallel     {}", node.parallel_safety)),
+            Line::default(),
+        ]);
+    }
+    lines.push(Line::from(Span::styled(
+        "y: approve exact revision | n/Esc: cancel",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines
+}
+
+fn list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn centered_rect(area: Rect, horizontal_percent: u16, vertical_percent: u16) -> Rect {
@@ -395,8 +472,9 @@ mod tests {
 
     use super::render_workspace;
     use crate::chat::{
-        AttentionItem, AttentionSeverity, DaemonConnectivity, LayoutMode, TaskInspector,
-        TaskSummary, TimelineEntry, WorkspaceSnapshot, WorkspaceState,
+        AttentionItem, AttentionSeverity, DaemonConnectivity, FocusPane, LayoutMode,
+        PlanApprovalCard, PlanNodeSummary, TaskInspector, TaskSummary, TimelineEntry,
+        WorkspaceSnapshot, WorkspaceState,
     };
 
     fn snapshot() -> WorkspaceSnapshot {
@@ -535,6 +613,59 @@ mod tests {
         assert!(text.contains("more messages"));
         assert!(text.contains("message content 1000"));
         assert!(!text.contains("message content 1 "));
+        Ok(())
+    }
+
+    #[test]
+    fn approval_overlay_renders_all_authoritative_plan_fields() -> Result<(), io::Error> {
+        let mut snapshot = snapshot();
+        snapshot.plan_approval = Some(PlanApprovalCard {
+            revision_id: "revision-01".to_owned(),
+            proposal_hash: "a".repeat(64),
+            nodes: vec![PlanNodeSummary {
+                key: "ui".to_owned(),
+                title: "Chat UI".to_owned(),
+                objective: "Implement approval overlay".to_owned(),
+                dependencies: vec!["domain".to_owned()],
+                constraints: vec!["local only".to_owned()],
+                acceptance_criteria: vec!["tests pass".to_owned()],
+                provider: "codex".to_owned(),
+                profile: "standard".to_owned(),
+                write_scopes: vec!["crates/orchestrator-tui".to_owned()],
+                repository_wide_write_scope: false,
+                risks: vec!["concurrency".to_owned()],
+                parallel_safety: "after domain".to_owned(),
+            }],
+            proposed_parallelism: 2,
+            risks: vec!["concurrency".to_owned()],
+        });
+        let mut state = WorkspaceState::default();
+        state.set_focus(FocusPane::Composer);
+        state.set_composer("/approve");
+        state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            LayoutMode::Wide,
+        );
+        let text = rendered_text(160, 50, &snapshot, &state)?;
+        let proposal_hash = "a".repeat(64);
+        for expected in [
+            "APPROVE EXACT TASK GRAPH",
+            "revision-01",
+            proposal_hash.as_str(),
+            "parallelism 2",
+            "ui — Chat UI",
+            "dependencies domain",
+            "provider     codex/standard",
+            "crates/orchestrator-tui",
+            "local only",
+            "tests pass",
+            "concurrency",
+            "after domain",
+            "y: approve exact revision",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`");
+        }
         Ok(())
     }
 }

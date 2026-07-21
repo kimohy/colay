@@ -232,6 +232,14 @@ pub enum WorkspaceAction {
         task_id: String,
         intent: TaskControlIntent,
     },
+    RequestPlan {
+        goal_message_id: String,
+    },
+    ApproveGraph {
+        revision_id: String,
+        proposal_hash: String,
+        approved_by: String,
+    },
     OpenAdministration,
     Quit,
 }
@@ -263,6 +271,14 @@ impl ActionFeedback {
         Self {
             level: FeedbackLevel::Warning,
             message: format!("{feature} becomes available in a later orchestration phase"),
+        }
+    }
+
+    #[must_use]
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            level: FeedbackLevel::Warning,
+            message: message.into(),
         }
     }
 

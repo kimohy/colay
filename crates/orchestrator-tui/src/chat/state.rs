@@ -24,6 +24,10 @@ pub enum Overlay {
     CommandPalette,
     Help,
     Inspector,
+    ApprovalConfirmation {
+        revision_id: String,
+        proposal_hash: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +130,19 @@ impl WorkspaceState {
     }
 
     pub fn reconcile_snapshot(&mut self, snapshot: &WorkspaceSnapshot) {
+        if let Some(Overlay::ApprovalConfirmation {
+            revision_id,
+            proposal_hash,
+        }) = self.overlay.as_ref()
+            && !snapshot.plan_approval.as_ref().is_some_and(|plan| {
+                plan.revision_id == *revision_id && plan.proposal_hash == *proposal_hash
+            })
+        {
+            self.overlay = None;
+            self.feedback = Some(ActionFeedback::warning(
+                "plan changed; reopen /approve to review the current revision",
+            ));
+        }
         if self.selected_task.is_none()
             && let Some(inspector) = snapshot.inspector.as_ref()
         {
@@ -316,6 +333,25 @@ impl WorkspaceState {
                 }
                 _ => UiEffect::None,
             },
+            Some(Overlay::ApprovalConfirmation {
+                ref revision_id,
+                ref proposal_hash,
+            }) => match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    let action = WorkspaceAction::ApproveGraph {
+                        revision_id: revision_id.clone(),
+                        proposal_hash: proposal_hash.clone(),
+                        approved_by: "local-tui".to_owned(),
+                    };
+                    self.overlay = None;
+                    UiEffect::Dispatch(action)
+                }
+                KeyCode::Char('n' | 'N') => {
+                    self.overlay = None;
+                    UiEffect::Redraw
+                }
+                _ => UiEffect::None,
+            },
             Some(Overlay::Overview | Overlay::FullLog | Overlay::Help | Overlay::Inspector) => {
                 UiEffect::None
             }
@@ -380,10 +416,8 @@ impl WorkspaceState {
                 self.overlay = Some(Overlay::TaskSwitcher);
                 UiEffect::Redraw
             }
-            PaletteCommand::Plan => UiEffect::Feedback(ActionFeedback::unavailable("planning")),
-            PaletteCommand::Approve => {
-                UiEffect::Feedback(ActionFeedback::unavailable("graph approval"))
-            }
+            PaletteCommand::Plan => Self::request_plan(snapshot),
+            PaletteCommand::Approve => self.request_approval(snapshot),
             PaletteCommand::Pause => self.task_control(snapshot, TaskControlIntent::Pause),
             PaletteCommand::Resume => self.task_control(snapshot, TaskControlIntent::Resume),
             PaletteCommand::Cancel => self.task_control(snapshot, TaskControlIntent::Cancel),
@@ -395,6 +429,50 @@ impl WorkspaceState {
                 self.task_control(snapshot, TaskControlIntent::Checkpoint)
             }
         }
+    }
+
+    fn request_plan(snapshot: &WorkspaceSnapshot) -> UiEffect {
+        if let Some(reason) = snapshot.read_only_reason.as_deref() {
+            return UiEffect::Feedback(ActionFeedback::info(reason));
+        }
+        snapshot
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == "user"
+                    && message.kind == "user_message"
+                    && message.state == "final"
+                    && message.task_id.is_none()
+            })
+            .map_or_else(
+                || {
+                    UiEffect::Feedback(ActionFeedback::info(
+                        "send a session-level user goal before requesting a plan",
+                    ))
+                },
+                |message| {
+                    UiEffect::Dispatch(WorkspaceAction::RequestPlan {
+                        goal_message_id: message.message_id.clone(),
+                    })
+                },
+            )
+    }
+
+    fn request_approval(&mut self, snapshot: &WorkspaceSnapshot) -> UiEffect {
+        if let Some(reason) = snapshot.read_only_reason.as_deref() {
+            return UiEffect::Feedback(ActionFeedback::info(reason));
+        }
+        let Some(plan) = snapshot.plan_approval.as_ref() else {
+            return UiEffect::Feedback(ActionFeedback::info(
+                "no validated task graph is awaiting approval",
+            ));
+        };
+        self.overlay = Some(Overlay::ApprovalConfirmation {
+            revision_id: plan.revision_id.clone(),
+            proposal_hash: plan.proposal_hash.clone(),
+        });
+        UiEffect::Redraw
     }
 
     fn task_control(&self, snapshot: &WorkspaceSnapshot, intent: TaskControlIntent) -> UiEffect {
@@ -428,8 +506,8 @@ mod tests {
 
     use super::{FocusPane, Overlay, UiEffect, WorkspaceState};
     use crate::chat::{
-        ComposerTarget, LayoutMode, TaskControlIntent, TaskSummary, WorkspaceAction,
-        WorkspaceSnapshot,
+        ComposerTarget, DaemonConnectivity, LayoutMode, PlanApprovalCard, PlanNodeSummary,
+        TaskControlIntent, TaskSummary, TimelineEntry, WorkspaceAction, WorkspaceSnapshot,
     };
 
     fn snapshot() -> WorkspaceSnapshot {
@@ -455,6 +533,58 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn planning_snapshot() -> WorkspaceSnapshot {
+        let mut snapshot = snapshot();
+        snapshot.daemon = DaemonConnectivity::Online;
+        snapshot.messages = vec![
+            TimelineEntry {
+                ordinal: 1,
+                message_id: "old-goal".to_owned(),
+                role: "user".to_owned(),
+                kind: "user_message".to_owned(),
+                state: "final".to_owned(),
+                content: "old".to_owned(),
+                ..TimelineEntry::default()
+            },
+            TimelineEntry {
+                ordinal: 2,
+                message_id: "task-message".to_owned(),
+                task_id: Some("task-01".to_owned()),
+                role: "user".to_owned(),
+                kind: "user_message".to_owned(),
+                state: "final".to_owned(),
+                content: "task instruction".to_owned(),
+                ..TimelineEntry::default()
+            },
+            TimelineEntry {
+                ordinal: 3,
+                message_id: "new-goal".to_owned(),
+                role: "user".to_owned(),
+                kind: "user_message".to_owned(),
+                state: "final".to_owned(),
+                content: "new".to_owned(),
+                ..TimelineEntry::default()
+            },
+        ];
+        snapshot.plan_approval = Some(PlanApprovalCard {
+            revision_id: "revision-01".to_owned(),
+            proposal_hash: "a".repeat(64),
+            nodes: vec![PlanNodeSummary {
+                key: "domain".to_owned(),
+                title: "Domain".to_owned(),
+                objective: "Implement domain".to_owned(),
+                provider: "codex".to_owned(),
+                profile: "standard".to_owned(),
+                write_scopes: vec!["src/domain".to_owned()],
+                parallel_safety: "isolated".to_owned(),
+                ..PlanNodeSummary::default()
+            }],
+            proposed_parallelism: 1,
+            risks: vec!["concurrency".to_owned()],
+        });
+        snapshot
     }
 
     #[test]
@@ -539,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn command_palette_maps_current_controls_and_marks_later_phases_unavailable() {
+    fn command_palette_maps_current_controls_and_planning() {
         let mut state = WorkspaceState::default();
         let snapshot = snapshot();
         state.select_task(Some("task-02".to_owned()));
@@ -553,8 +683,93 @@ mod tests {
             })
         );
         state.set_composer("/plan");
-        assert!(matches!(
+        assert_eq!(
             state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Feedback(crate::chat::ActionFeedback::info(
+                "send a session-level user goal before requesting a plan"
+            ))
+        );
+    }
+
+    #[test]
+    fn plan_uses_newest_session_goal_and_approval_requires_exact_yes() {
+        let snapshot = planning_snapshot();
+        let mut state = WorkspaceState::default();
+        state.set_focus(FocusPane::Composer);
+        state.set_composer("/plan");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Dispatch(WorkspaceAction::RequestPlan {
+                goal_message_id: "new-goal".to_owned(),
+            })
+        );
+
+        state.set_composer("/approve");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Redraw
+        );
+        assert_eq!(
+            state.overlay(),
+            Some(&Overlay::ApprovalConfirmation {
+                revision_id: "revision-01".to_owned(),
+                proposal_hash: "a".repeat(64),
+            })
+        );
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('x')), &snapshot, LayoutMode::Wide),
+            UiEffect::None
+        );
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('y')), &snapshot, LayoutMode::Wide),
+            UiEffect::Dispatch(WorkspaceAction::ApproveGraph {
+                revision_id: "revision-01".to_owned(),
+                proposal_hash: "a".repeat(64),
+                approved_by: "local-tui".to_owned(),
+            })
+        );
+        assert_eq!(state.overlay(), None);
+    }
+
+    #[test]
+    fn approval_cancels_and_stale_or_read_only_cards_fail_closed() {
+        let snapshot = planning_snapshot();
+        let mut state = WorkspaceState::default();
+        state.set_focus(FocusPane::Composer);
+        state.set_composer("/approve");
+        state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('n')), &snapshot, LayoutMode::Wide),
+            UiEffect::Redraw
+        );
+        assert_eq!(state.overlay(), None);
+
+        state.set_composer("/approve");
+        state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide);
+        let mut changed = snapshot.clone();
+        if let Some(plan) = changed.plan_approval.as_mut() {
+            plan.proposal_hash = "b".repeat(64);
+        }
+        state.reconcile_snapshot(&changed);
+        assert_eq!(state.overlay(), None);
+        assert!(
+            state
+                .feedback()
+                .is_some_and(|feedback| feedback.message.contains("plan changed"))
+        );
+
+        let mut offline = snapshot.clone();
+        offline.read_only_reason = Some("daemon offline".to_owned());
+        state.set_composer("/approve");
+        assert!(matches!(
+            state.handle_key(key(KeyCode::Enter), &offline, LayoutMode::Wide),
+            UiEffect::Feedback(_)
+        ));
+        let mut invalid = snapshot;
+        invalid.plan_approval = None;
+        state.set_composer("/approve");
+        assert!(matches!(
+            state.handle_key(key(KeyCode::Enter), &invalid, LayoutMode::Wide),
             UiEffect::Feedback(_)
         ));
     }
