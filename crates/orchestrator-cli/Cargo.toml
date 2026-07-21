@@ -21,6 +21,7 @@ required-features = ["test-fixtures"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 clap.workspace = true

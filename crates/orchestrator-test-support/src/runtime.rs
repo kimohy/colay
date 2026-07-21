@@ -257,7 +257,7 @@ fn fake_probe_output(args: &[String]) -> String {
     if args == ["--version"] {
         "codex-cli 0.144.5\n".to_owned()
     } else if args == ["exec", "--help"] {
-        "--json --output-schema --sandbox read-only workspace-write\n".to_owned()
+        "--json --output-schema --sandbox read-only workspace-write -c model_reasoning_effort=[low|medium|high]\n".to_owned()
     } else if args == ["exec", "resume", "--help"] {
         "Usage: codex exec resume [SESSION_ID]\n".to_owned()
     } else if args == ["app-server", "--help"] {
@@ -360,6 +360,11 @@ where
         ProviderId::Gemini
     };
 
+    if let Some(prompt) = planning_prompt(&stdin) {
+        emit_planner_fixture(provider, &args, &prompt);
+        return;
+    }
+
     if stdin.contains("scenario:codex-quota") {
         if provider == ProviderId::Codex {
             write_partial_handover_fixture();
@@ -419,6 +424,108 @@ where
     for line in scenario_lines(provider, scenario) {
         println!("{}", String::from_utf8_lossy(&line));
     }
+}
+
+fn planning_prompt(stdin: &str) -> Option<serde_json::Value> {
+    let bridge: serde_json::Value = serde_json::from_str(stdin).ok()?;
+    if bridge.get("objective")?.as_str()? != "Propose a read-only task graph" {
+        return None;
+    }
+    serde_json::from_str(bridge.get("task")?.as_str()?).ok()
+}
+
+fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_json::Value) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let log = serde_json::json!({
+        "args": args,
+        "cwd": cwd,
+        "timeout_seconds": prompt.get("timeout_seconds"),
+        "stdout_limit": prompt.get("stdout_limit"),
+    });
+    let log_path = cwd.join(".colay/fake-planner-invocation.json");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &log_path,
+        serde_json::to_vec_pretty(&log).unwrap_or_default(),
+    );
+
+    let goal = prompt
+        .get("goal_redacted")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let text = if goal.contains("scenario:malformed") {
+        "not-json".to_owned()
+    } else {
+        serde_json::json!({
+            "schema_version": "1",
+            "revision_id": prompt.get("revision_id"),
+            "session_id": prompt.get("session_id"),
+            "goal_message_id": prompt.get("goal_message_id"),
+            "planner_provider": prompt.get("planner_provider"),
+            "proposed_at": Utc::now(),
+            "nodes": [
+                {
+                    "key": "domain",
+                    "title": "Domain contract",
+                    "objective": "Implement domain contract",
+                    "dependencies": [],
+                    "constraints": ["local only"],
+                    "acceptance_criteria": ["domain tests pass"],
+                    "provider": prompt.get("planner_provider"),
+                    "profile": "standard",
+                    "write_scopes": ["crates/orchestrator-domain"],
+                    "repository_wide_write_scope": false,
+                    "risks": ["concurrency"],
+                    "parallel_safety": "isolated domain scope"
+                },
+                {
+                    "key": "tui",
+                    "title": "TUI integration",
+                    "objective": "Render the approved plan",
+                    "dependencies": ["domain"],
+                    "constraints": ["text only"],
+                    "acceptance_criteria": ["TUI tests pass"],
+                    "provider": prompt.get("planner_provider"),
+                    "profile": "standard",
+                    "write_scopes": ["crates/orchestrator-tui"],
+                    "repository_wide_write_scope": false,
+                    "risks": [],
+                    "parallel_safety": "runs after domain"
+                }
+            ]
+        })
+        .to_string()
+    };
+    for line in planner_lines(provider, &text) {
+        println!("{}", String::from_utf8_lossy(&line));
+    }
+}
+
+fn planner_lines(provider: ProviderId, text: &str) -> Vec<Vec<u8>> {
+    let values = match provider {
+        ProviderId::Codex => vec![
+            serde_json::json!({"type":"thread.started","thread_id":"fake-planner"}),
+            serde_json::json!({"type":"turn.started"}),
+            serde_json::json!({"type":"item.completed","item":{"id":"plan","type":"agent_message","text":text}}),
+            serde_json::json!({"type":"turn.completed","usage":{}}),
+        ],
+        ProviderId::Claude => vec![
+            serde_json::json!({"type":"system","subtype":"init","session_id":"fake-planner"}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
+            serde_json::json!({"type":"result","is_error":false,"result":text}),
+        ],
+        ProviderId::Gemini => vec![
+            serde_json::json!({"type":"init","session_id":"fake-planner"}),
+            serde_json::json!({"type":"message","role":"assistant","content":text}),
+            serde_json::json!({"type":"result","result":text}),
+        ],
+    };
+    values
+        .into_iter()
+        .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+        .collect()
 }
 
 fn is_handover_acknowledgement(stdin: &str) -> bool {

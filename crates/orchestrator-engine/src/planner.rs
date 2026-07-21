@@ -44,6 +44,11 @@ pub struct PlannerResponse {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PlannerFailure {
+    #[error("planner invocation failed: {reason}")]
+    Invocation {
+        reason: String,
+        evidence_redacted: String,
+    },
     #[error("planner invocation was not read-only")]
     NotReadOnly,
     #[error("unsupported {contract} schema version `{found}`")]
