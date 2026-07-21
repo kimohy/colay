@@ -24,6 +24,7 @@ pub struct OfficialCliTaskExecutor {
     config: RootConfig,
     repository_root: PathBuf,
     runtime: Arc<dyn AdapterRuntime>,
+    worktree_creation: tokio::sync::Mutex<()>,
 }
 
 impl OfficialCliTaskExecutor {
@@ -50,6 +51,7 @@ impl OfficialCliTaskExecutor {
             config: config.clone(),
             repository_root,
             runtime,
+            worktree_creation: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -116,7 +118,10 @@ impl TaskExecutor for OfficialCliTaskExecutor {
         }
         let worktrees_root = request.state_root.join("worktrees");
         let manager = GitWorktreeManager::open(&self.repository_root, &worktrees_root)?;
-        let worktree = manager.create(request.claim.task_id, "HEAD").await?;
+        let worktree = {
+            let _creation_guard = self.worktree_creation.lock().await;
+            manager.create(request.claim.task_id, "HEAD").await?
+        };
         let attempt_id = AttemptId::new();
         let worker_request = self.worker_request(&request, worktree.path.clone(), attempt_id)?;
         let adapter: Arc<dyn WorkerAdapter> = Arc::from(
