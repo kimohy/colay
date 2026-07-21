@@ -784,7 +784,7 @@ fn graph_revision_by_id(
     .transpose()
 }
 
-fn graph_projection(
+pub(crate) fn graph_projection(
     connection: &rusqlite::Connection,
     revision_id: GraphRevisionId,
 ) -> StateResult<GraphProjection> {

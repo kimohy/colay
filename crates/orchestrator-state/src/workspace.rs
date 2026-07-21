@@ -2,7 +2,7 @@ use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ConversationMessage, ProviderId, SessionId, SessionState, TaskId, TaskState,
+    ConversationMessage, GraphRevisionId, ProviderId, SessionId, SessionState, TaskId, TaskState,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Database, StateError, StateResult, StoredSession, StoredTask, StoredTaskAttempt,
     StoredWorktree,
+    graphs::graph_projection,
     records::{map_task, map_task_attempt, map_worktree, validate_stored_task},
     sessions::{map_message, map_session},
 };
@@ -34,6 +35,15 @@ pub struct WorkspaceTask {
     pub latest_provider: Option<ProviderId>,
     pub latest_model_profile: Option<String>,
     pub latest_effort: Option<String>,
+    pub graph_node_key: Option<String>,
+    pub graph_display_order: Option<u64>,
+    pub dependency_task_ids: Vec<TaskId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceGraph {
+    pub graph: crate::GraphProjection,
+    pub error_redacted: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +82,10 @@ pub struct WorkspaceAttention {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceProjection {
     pub session: StoredSession,
-    /// Phase 2 shows bounded recent repository tasks. Session graph membership arrives in Phase 3.
+    /// Current graph tasks in graph display order. Falls back to bounded recent repository tasks
+    /// only when this session has never produced a graph revision.
     pub recent_tasks: Vec<WorkspaceTask>,
+    pub current_graph: Option<WorkspaceGraph>,
     pub messages: Vec<(u64, ConversationMessage)>,
     pub has_older_messages: bool,
     pub attention: Vec<WorkspaceAttention>,
@@ -159,13 +171,23 @@ impl Database {
                 request.before_ordinal,
                 message_limit,
             )?;
-            let recent_tasks = read_recent_tasks(connection, task_limit)?;
+            let current_graph = read_current_graph(connection, request.session_id)?;
+            let recent_tasks = match current_graph.as_ref() {
+                Some(graph) => read_graph_tasks(connection, graph, task_limit)?,
+                None => read_recent_tasks(connection, task_limit)?,
+            };
             let inspector = request
                 .selected_task_id
+                .filter(|task_id| {
+                    current_graph.is_none()
+                        || recent_tasks
+                            .iter()
+                            .any(|task| task.task.task_id == *task_id)
+                })
                 .map(|task_id| read_inspector(connection, task_id, &recent_tasks))
                 .transpose()?
                 .flatten();
-            let attention = derive_attention(&session, &recent_tasks);
+            let attention = derive_attention(&session, &recent_tasks, current_graph.as_ref());
             let last_event_sequence = connection.query_row(
                 "SELECT coalesce(max(sequence), 0) FROM task_events",
                 [],
@@ -174,6 +196,7 @@ impl Database {
             Ok(WorkspaceProjection {
                 session,
                 recent_tasks,
+                current_graph,
                 messages,
                 has_older_messages,
                 attention,
@@ -248,6 +271,74 @@ fn read_recent_tasks(connection: &Connection, limit: usize) -> StateResult<Vec<W
         .collect()
 }
 
+fn read_current_graph(
+    connection: &Connection,
+    session_id: SessionId,
+) -> StateResult<Option<WorkspaceGraph>> {
+    let revision_id = connection
+        .query_row(
+            "SELECT revision_id FROM session_graph_heads WHERE session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| {
+            GraphRevisionId::from_str(&value).map_err(|error| {
+                StateError::InvalidRecord(format!("stored graph revision ID is invalid: {error}"))
+            })
+        })
+        .transpose()?;
+    let Some(revision_id) = revision_id else {
+        return Ok(None);
+    };
+    let graph = graph_projection(connection, revision_id)?;
+    let error_redacted = connection
+        .query_row(
+            "SELECT error_redacted FROM planning_attempts WHERE revision_id = ?1
+             ORDER BY started_at DESC, attempt_id DESC LIMIT 1",
+            [revision_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(Some(WorkspaceGraph {
+        graph,
+        error_redacted,
+    }))
+}
+
+fn read_graph_tasks(
+    connection: &Connection,
+    workspace_graph: &WorkspaceGraph,
+    limit: usize,
+) -> StateResult<Vec<WorkspaceTask>> {
+    workspace_graph
+        .graph
+        .tasks
+        .iter()
+        .take(limit)
+        .map(|graph_task| {
+            let mut task =
+                read_workspace_task(connection, graph_task.task_id)?.ok_or_else(|| {
+                    StateError::InvalidRecord(format!(
+                        "graph task {} is missing",
+                        graph_task.task_id
+                    ))
+                })?;
+            task.graph_node_key = Some(graph_task.node_key.clone());
+            task.graph_display_order = Some(graph_task.display_order);
+            task.dependency_task_ids = workspace_graph
+                .graph
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.task_id == graph_task.task_id)
+                .map(|dependency| dependency.depends_on_task_id)
+                .collect();
+            Ok(task)
+        })
+        .collect()
+}
+
 fn read_workspace_task(
     connection: &Connection,
     task_id: TaskId,
@@ -278,6 +369,9 @@ fn map_workspace_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTask
         latest_provider: provider,
         latest_model_profile: row.get(13)?,
         latest_effort: row.get(14)?,
+        graph_node_key: None,
+        graph_display_order: None,
+        dependency_task_ids: Vec::new(),
     })
 }
 
@@ -380,13 +474,37 @@ fn map_verification(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceVerifi
     })
 }
 
-fn derive_attention(session: &StoredSession, tasks: &[WorkspaceTask]) -> Vec<WorkspaceAttention> {
+fn derive_attention(
+    session: &StoredSession,
+    tasks: &[WorkspaceTask],
+    current_graph: Option<&WorkspaceGraph>,
+) -> Vec<WorkspaceAttention> {
     let mut attention = Vec::new();
-    if session.state == SessionState::AwaitingApproval {
+    if current_graph.is_some_and(|graph| {
+        graph.graph.revision.status == crate::GraphRevisionStatus::AwaitingApproval
+            && graph.graph.revision.proposal_hash.is_some()
+    }) {
         attention.push(WorkspaceAttention {
             task_id: None,
             kind: WorkspaceAttentionKind::ApprovalRequired,
             summary: "session plan requires approval".to_owned(),
+        });
+    } else if let Some(graph) = current_graph
+        && graph.graph.revision.status == crate::GraphRevisionStatus::Invalid
+    {
+        attention.push(WorkspaceAttention {
+            task_id: None,
+            kind: WorkspaceAttentionKind::Failed,
+            summary: graph
+                .error_redacted
+                .clone()
+                .unwrap_or_else(|| "task graph planning failed validation".to_owned()),
+        });
+    } else if current_graph.is_none() && session.state == SessionState::AwaitingApproval {
+        attention.push(WorkspaceAttention {
+            task_id: None,
+            kind: WorkspaceAttentionKind::ApprovalRequired,
+            summary: "session requires approval but has no graph revision".to_owned(),
         });
     }
     for task in tasks {
@@ -410,15 +528,24 @@ fn derive_attention(session: &StoredSession, tasks: &[WorkspaceTask]) -> Vec<Wor
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        str::FromStr as _,
+    };
+
     use chrono::{Duration, TimeZone as _, Utc};
     use orchestrator_domain::{
-        AttemptId, MessageId, SchemaVersion, SessionId, TaskEnvelope, TaskId,
+        AttemptId, GraphRevisionId, GraphValidationPolicy, MessageId, ModelProfile,
+        PlanningAttemptId, ProviderId, RepoPath, RiskTag, SchemaVersion, SessionId, TaskEnvelope,
+        TaskGraphNode, TaskGraphProposal, TaskId, validate_task_graph,
     };
     use rusqlite::params;
     use uuid::Uuid;
 
     use super::{WorkspaceAttentionKind, WorkspaceReadRequest};
-    use crate::{Database, StateResult};
+    use crate::{
+        Database, GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt, StateResult,
+    };
 
     fn timestamp() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0)
@@ -532,6 +659,63 @@ mod tests {
             Ok(())
         })?;
         Ok((session, other_session, running))
+    }
+
+    fn record_graph(
+        database: &Database,
+        session_id: SessionId,
+        goal_message_id: MessageId,
+    ) -> orchestrator_domain::ValidatedTaskGraph {
+        let node =
+            |key: &str, dependencies: &[&str], scope: &str, risk: Vec<RiskTag>| TaskGraphNode {
+                key: key.to_owned(),
+                title: format!("{key} title"),
+                objective: format!("implement {key}"),
+                dependencies: dependencies
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                constraints: vec!["local only".to_owned()],
+                acceptance_criteria: vec!["tests pass".to_owned()],
+                provider: Some(ProviderId::Codex),
+                profile: ModelProfile::Standard,
+                write_scopes: vec![
+                    RepoPath::try_from(scope).unwrap_or_else(|error| panic!("scope: {error}")),
+                ],
+                repository_wide_write_scope: false,
+                risks: risk,
+                parallel_safety: "dependency ordered".to_owned(),
+            };
+        let graph = validate_task_graph(
+            TaskGraphProposal {
+                schema_version: SchemaVersion::v1(),
+                revision_id: GraphRevisionId::new(),
+                session_id,
+                goal_message_id,
+                planner_provider: ProviderId::Codex,
+                proposed_at: timestamp(),
+                nodes: vec![
+                    node("domain", &[], "src/domain", vec![RiskTag::Concurrency]),
+                    node("ui", &["domain"], "src/ui", Vec::new()),
+                ],
+            },
+            &GraphValidationPolicy {
+                eligible_providers: BTreeSet::from([ProviderId::Codex]),
+                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                max_parallel_workers: 2,
+                per_provider_limits: BTreeMap::from([(ProviderId::Codex, 2)]),
+            },
+        )
+        .unwrap_or_else(|error| panic!("validate graph: {error}"));
+        database
+            .record_graph_attempt(&NewGraphAttempt::from_validated(
+                PlanningAttemptId::new(),
+                graph.clone(),
+                timestamp(),
+                timestamp(),
+            ))
+            .unwrap_or_else(|error| panic!("record graph: {error}"));
+        graph
     }
 
     #[test]
@@ -657,5 +841,128 @@ mod tests {
                 .unwrap_or_else(|error| panic!("load cleared: {error}")),
             None
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn workspace_graph_is_session_isolated_ordered_and_relational() {
+        let database = database();
+        let (session_id, other_session, _) =
+            seed(&database).unwrap_or_else(|error| panic!("seed: {error}"));
+        let goal_id = database
+            .with_connection(|connection| {
+                Ok(connection.query_row(
+                    "SELECT message_id FROM conversation_messages WHERE session_id = ?1 AND ordinal = 1000",
+                    [session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .and_then(|value| {
+                MessageId::from_str(&value)
+                    .map_err(|error| crate::StateError::InvalidRecord(error.to_string()))
+            })
+            .unwrap_or_else(|error| panic!("goal: {error}"));
+        let graph = record_graph(&database, session_id, goal_id);
+
+        let awaiting = database
+            .read_workspace_projection(WorkspaceReadRequest {
+                session_id,
+                selected_task_id: None,
+                before_ordinal: None,
+                message_limit: 1,
+                task_limit: 100,
+            })
+            .unwrap_or_else(|error| panic!("awaiting projection: {error}"));
+        assert!(awaiting.recent_tasks.is_empty());
+        let current = awaiting
+            .current_graph
+            .as_ref()
+            .unwrap_or_else(|| panic!("current graph"));
+        assert_eq!(
+            current.graph.revision.proposal_hash,
+            Some(graph.proposal_hash.clone())
+        );
+        assert_eq!(
+            current.graph.revision.status,
+            GraphRevisionStatus::AwaitingApproval
+        );
+
+        let approved = database
+            .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
+                revision_id: graph.proposal.revision_id,
+                expected_proposal_hash: graph.proposal_hash,
+                approved_by: "workspace-test".to_owned(),
+                approved_at: timestamp(),
+            })
+            .unwrap_or_else(|error| panic!("approve: {error}"));
+        let projected = database
+            .read_workspace_projection(WorkspaceReadRequest {
+                session_id,
+                selected_task_id: Some(approved.task_ids[1]),
+                before_ordinal: None,
+                message_limit: 1,
+                task_limit: 100,
+            })
+            .unwrap_or_else(|error| panic!("approved projection: {error}"));
+        assert_eq!(
+            projected
+                .recent_tasks
+                .iter()
+                .filter_map(|task| task.graph_node_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["domain", "ui"]
+        );
+        assert_eq!(
+            projected.recent_tasks[1].dependency_task_ids,
+            vec![approved.task_ids[0]]
+        );
+
+        let other = database
+            .read_workspace_projection(WorkspaceReadRequest {
+                session_id: other_session,
+                selected_task_id: Some(approved.task_ids[0]),
+                before_ordinal: None,
+                message_limit: 1,
+                task_limit: 1,
+            })
+            .unwrap_or_else(|error| panic!("other projection: {error}"));
+        assert!(other.current_graph.is_none());
+        assert_eq!(other.recent_tasks.len(), 1);
+
+        let invalid_revision = GraphRevisionId::new();
+        database
+            .record_graph_attempt(&NewGraphAttempt::invalid(
+                PlanningAttemptId::new(),
+                invalid_revision,
+                session_id,
+                goal_id,
+                ProviderId::Codex,
+                serde_json::json!({"errors": ["cycle"]}),
+                "redacted cycle error",
+                timestamp(),
+                timestamp(),
+            ))
+            .unwrap_or_else(|error| panic!("invalid graph: {error}"));
+        let invalid = database
+            .read_workspace_projection(WorkspaceReadRequest {
+                session_id,
+                selected_task_id: None,
+                before_ordinal: None,
+                message_limit: 1,
+                task_limit: 100,
+            })
+            .unwrap_or_else(|error| panic!("invalid projection: {error}"));
+        let invalid_graph = invalid
+            .current_graph
+            .as_ref()
+            .unwrap_or_else(|| panic!("invalid graph head"));
+        assert_eq!(invalid_graph.graph.revision.proposal_hash, None);
+        assert_eq!(
+            invalid_graph.error_redacted.as_deref(),
+            Some("redacted cycle error")
+        );
+        assert!(invalid.attention.iter().any(|item| {
+            item.kind == WorkspaceAttentionKind::Failed && item.summary == "redacted cycle error"
+        }));
     }
 }

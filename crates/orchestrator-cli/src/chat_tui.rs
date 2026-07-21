@@ -8,8 +8,8 @@ use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use orchestrator_domain::{
     AppendMessageCommandPayload, ClientCommand, ClientCommandAction, ClientCommandId,
-    ClientCommandState, CreateSessionCommandPayload, MessageId, MessageKind, ProviderId, SessionId,
-    TaskId, TaskState,
+    ClientCommandState, CreateSessionCommandPayload, GraphValidationSummary, MessageId,
+    MessageKind, ProviderId, SessionId, TaskId, TaskState,
 };
 use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{
@@ -18,8 +18,8 @@ use orchestrator_state::{
 };
 use orchestrator_tui::chat::{
     ActionFeedback, AttentionItem, AttentionSeverity, ComposerTarget, DaemonConnectivity,
-    DriverError, TaskControlIntent, TaskInspector, TaskSummary, TimelineEntry, WorkspaceAction,
-    WorkspaceCursor, WorkspaceDriver, WorkspaceSnapshot,
+    DriverError, PlanApprovalCard, PlanNodeSummary, TaskControlIntent, TaskInspector, TaskSummary,
+    TimelineEntry, WorkspaceAction, WorkspaceCursor, WorkspaceDriver, WorkspaceSnapshot,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -302,6 +302,18 @@ fn projection_to_snapshot(
         .iter()
         .filter_map(|item| item.task_id)
         .collect::<Vec<_>>();
+    let graph_node_labels = projection
+        .recent_tasks
+        .iter()
+        .map(|task| {
+            (
+                task.task.task_id,
+                task.graph_node_key
+                    .clone()
+                    .unwrap_or_else(|| task.task.objective.clone()),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let tasks = projection
         .recent_tasks
         .iter()
@@ -310,10 +322,81 @@ fn projection_to_snapshot(
             title: task.task.objective.clone(),
             state: enum_name(&task.task.state).unwrap_or_else(|_| "unknown".to_owned()),
             state_symbol: task_state_symbol(task.task.state).to_owned(),
-            dependency_status: "repository task".to_owned(),
+            dependency_status: if task.graph_node_key.is_some() {
+                if task.dependency_task_ids.is_empty() {
+                    "ready (no dependencies)".to_owned()
+                } else {
+                    format!(
+                        "after {}",
+                        task.dependency_task_ids
+                            .iter()
+                            .map(|task_id| graph_node_labels
+                                .get(task_id)
+                                .cloned()
+                                .unwrap_or_else(|| task_id.to_string()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            } else {
+                "repository task".to_owned()
+            },
             needs_attention: attention_task_ids.contains(&task.task.task_id),
         })
         .collect::<Vec<_>>();
+    let plan_approval = projection
+        .current_graph
+        .as_ref()
+        .and_then(|workspace_graph| {
+            let revision = &workspace_graph.graph.revision;
+            if revision.status != orchestrator_state::GraphRevisionStatus::AwaitingApproval {
+                return None;
+            }
+            let proposal = revision.proposal.as_ref()?;
+            let proposal_hash = revision.proposal_hash.clone()?;
+            let validation =
+                serde_json::from_value::<GraphValidationSummary>(revision.validation.clone())
+                    .ok()?;
+            let mut risks = proposal
+                .nodes
+                .iter()
+                .flat_map(|node| node.risks.iter())
+                .filter_map(|risk| enum_name(risk).ok())
+                .collect::<Vec<_>>();
+            risks.sort();
+            risks.dedup();
+            Some(PlanApprovalCard {
+                revision_id: revision.revision_id.to_string(),
+                proposal_hash,
+                nodes: proposal
+                    .nodes
+                    .iter()
+                    .map(|node| PlanNodeSummary {
+                        key: node.key.clone(),
+                        title: node.title.clone(),
+                        objective: node.objective.clone(),
+                        dependencies: node.dependencies.clone(),
+                        constraints: node.constraints.clone(),
+                        acceptance_criteria: node.acceptance_criteria.clone(),
+                        provider: node
+                            .provider
+                            .unwrap_or(proposal.planner_provider)
+                            .to_string(),
+                        profile: enum_name(&node.profile).unwrap_or_else(|_| "unknown".to_owned()),
+                        write_scopes: node.write_scopes.iter().map(ToString::to_string).collect(),
+                        repository_wide_write_scope: node.repository_wide_write_scope,
+                        risks: node
+                            .risks
+                            .iter()
+                            .filter_map(|risk| enum_name(risk).ok())
+                            .collect(),
+                        parallel_safety: node.parallel_safety.clone(),
+                    })
+                    .collect(),
+                proposed_parallelism: validation.maximum_parallel_width,
+                risks,
+            })
+        });
     let messages = projection
         .messages
         .iter()
@@ -379,7 +462,17 @@ fn projection_to_snapshot(
                 .and_then(|attempt| attempt.outcome.clone())
                 .unwrap_or_else(|| "pending".to_owned()),
             elapsed,
-            dependencies: vec!["dependency graph arrives in Phase 3".to_owned()],
+            dependencies: inspector
+                .task
+                .dependency_task_ids
+                .iter()
+                .map(|task_id| {
+                    graph_node_labels
+                        .get(task_id)
+                        .cloned()
+                        .unwrap_or_else(|| task_id.to_string())
+                })
+                .collect(),
             worktree: inspector.active_worktree.as_ref().map_or_else(
                 || "not allocated".to_owned(),
                 |worktree| worktree.worktree_path.display().to_string(),
@@ -424,6 +517,7 @@ fn projection_to_snapshot(
             .filter(|task| task.task.state == TaskState::Blocked)
             .count(),
         tasks,
+        plan_approval,
         messages,
         has_older_messages: projection.has_older_messages,
         attention,
@@ -463,16 +557,24 @@ fn driver_error(error: impl std::fmt::Display) -> DriverError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+    };
 
+    use anyhow::anyhow;
     use chrono::TimeDelta;
     use orchestrator_daemon::{MessageRedactor, process_next_client_command};
     use orchestrator_domain::{
         ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState,
-        CreateSessionCommandPayload, DaemonInstanceId, SessionId,
+        CreateSessionCommandPayload, DaemonInstanceId, GraphRevisionId, GraphValidationPolicy,
+        ModelProfile, PlanningAttemptId, ProviderId, RepoPath, RiskTag, SchemaVersion, SessionId,
+        TaskGraphNode, TaskGraphProposal, validate_task_graph,
     };
     use orchestrator_process::{RedactionConfig, Redactor};
-    use orchestrator_state::{DaemonLeaseRequest, Database};
+    use orchestrator_state::{
+        DaemonLeaseRequest, Database, GraphApprovalRequest, NewGraphAttempt, WorkspaceReadRequest,
+    };
     use orchestrator_tui::chat::{
         ComposerTarget, DaemonConnectivity, WorkspaceAction, WorkspaceCursor, WorkspaceDriver,
     };
@@ -562,6 +664,129 @@ mod tests {
                 })
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn chat_tui_projects_full_plan_card_and_dependency_labels() -> anyhow::Result<()> {
+        let database = database()?;
+        let redactor = Redactor::new(&RedactionConfig::default())?;
+        let adapter = Adapter(redactor.clone());
+        let session_id = create_session(&database, &adapter)?;
+        let instance = DaemonInstanceId::new();
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id: instance,
+            pid: 42,
+            started_at: chrono::Utc::now(),
+            ttl: TimeDelta::seconds(30),
+        })?;
+        let mut driver = SqliteWorkspaceDriver::from_database(
+            PathBuf::from("C:/repo"),
+            database,
+            session_id,
+            None,
+            redactor,
+        );
+        driver.dispatch(WorkspaceAction::SubmitMessage {
+            target: ComposerTarget::Orchestrator,
+            content: "build graph".to_owned(),
+        })?;
+        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        let goal_id = driver
+            .database
+            .read_workspace_projection(WorkspaceReadRequest {
+                session_id,
+                selected_task_id: None,
+                before_ordinal: None,
+                message_limit: 10,
+                task_limit: 10,
+            })?
+            .messages
+            .last()
+            .map(|(_, message)| message.message_id)
+            .ok_or_else(|| anyhow!("goal message missing"))?;
+        let node =
+            |key: &str, dependencies: &[&str], scope: &str, risks: Vec<RiskTag>| TaskGraphNode {
+                key: key.to_owned(),
+                title: format!("{key} title"),
+                objective: format!("implement {key}"),
+                dependencies: dependencies
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect(),
+                constraints: vec!["local only".to_owned()],
+                acceptance_criteria: vec!["tests pass".to_owned()],
+                provider: Some(ProviderId::Codex),
+                profile: ModelProfile::Standard,
+                write_scopes: RepoPath::try_from(scope).ok().into_iter().collect(),
+                repository_wide_write_scope: false,
+                risks,
+                parallel_safety: "dependency ordered".to_owned(),
+            };
+        let graph = validate_task_graph(
+            TaskGraphProposal {
+                schema_version: SchemaVersion::v1(),
+                revision_id: GraphRevisionId::new(),
+                session_id,
+                goal_message_id: goal_id,
+                planner_provider: ProviderId::Codex,
+                proposed_at: chrono::Utc::now(),
+                nodes: vec![
+                    node("domain", &[], "src/domain", vec![RiskTag::Concurrency]),
+                    node("ui", &["domain"], "src/ui", Vec::new()),
+                ],
+            },
+            &GraphValidationPolicy {
+                eligible_providers: BTreeSet::from([ProviderId::Codex]),
+                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                max_parallel_workers: 2,
+                per_provider_limits: BTreeMap::from([(ProviderId::Codex, 2)]),
+            },
+        )?;
+        driver
+            .database
+            .record_graph_attempt(&NewGraphAttempt::from_validated(
+                PlanningAttemptId::new(),
+                graph.clone(),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+            ))?;
+
+        let proposed = driver.refresh(&WorkspaceCursor::default())?;
+        let card = proposed
+            .plan_approval
+            .as_ref()
+            .ok_or_else(|| anyhow!("plan approval card missing"))?;
+        assert_eq!(card.revision_id, graph.proposal.revision_id.to_string());
+        assert_eq!(card.proposal_hash, graph.proposal_hash);
+        assert_eq!(card.nodes[1].dependencies, vec!["domain"]);
+        assert_eq!(card.nodes[0].constraints, vec!["local only"]);
+        assert_eq!(card.nodes[0].acceptance_criteria, vec!["tests pass"]);
+        assert_eq!(card.nodes[0].write_scopes, vec!["src/domain"]);
+        assert_eq!(card.nodes[0].provider, "codex");
+        assert_eq!(card.nodes[0].profile, "standard");
+        assert_eq!(card.risks, vec!["concurrency"]);
+        assert_eq!(card.proposed_parallelism, 1);
+        proposed.validate()?;
+
+        driver
+            .database
+            .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
+                revision_id: graph.proposal.revision_id,
+                expected_proposal_hash: graph.proposal_hash,
+                approved_by: "test".to_owned(),
+                approved_at: chrono::Utc::now(),
+            })?;
+        let approved = driver.refresh(&WorkspaceCursor::default())?;
+        assert!(approved.plan_approval.is_none());
+        assert_eq!(approved.tasks.len(), 2);
+        assert_eq!(
+            approved.tasks[0].dependency_status,
+            "ready (no dependencies)"
+        );
+        assert_eq!(approved.tasks[1].dependency_status, "after domain");
+        approved.validate()?;
         Ok(())
     }
 }

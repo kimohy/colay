@@ -49,6 +49,31 @@ pub struct TaskSummary {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanNodeSummary {
+    pub key: String,
+    pub title: String,
+    pub objective: String,
+    pub dependencies: Vec<String>,
+    pub constraints: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub provider: String,
+    pub profile: String,
+    pub write_scopes: Vec<String>,
+    pub repository_wide_write_scope: bool,
+    pub risks: Vec<String>,
+    pub parallel_safety: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanApprovalCard {
+    pub revision_id: String,
+    pub proposal_hash: String,
+    pub nodes: Vec<PlanNodeSummary>,
+    pub proposed_parallelism: usize,
+    pub risks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimelineEntry {
     pub ordinal: i64,
     pub message_id: String,
@@ -103,6 +128,7 @@ pub struct WorkspaceSnapshot {
     pub running_count: usize,
     pub blocked_count: usize,
     pub tasks: Vec<TaskSummary>,
+    pub plan_approval: Option<PlanApprovalCard>,
     pub messages: Vec<TimelineEntry>,
     pub has_older_messages: bool,
     pub attention: Vec<AttentionItem>,
@@ -132,6 +158,39 @@ impl WorkspaceSnapshot {
             require_non_blank(&task.state, "task state")?;
             if !task_ids.insert(task.task_id.as_str()) {
                 return Err(WorkspaceModelError::DuplicateTask(task.task_id.clone()));
+            }
+        }
+        if let Some(plan) = &self.plan_approval {
+            require_non_blank(&plan.revision_id, "plan revision ID")?;
+            if plan.proposal_hash.len() != 64
+                || !plan
+                    .proposal_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(WorkspaceModelError::InvalidProposalHash);
+            }
+            if plan.nodes.is_empty() {
+                return Err(WorkspaceModelError::EmptyPlan);
+            }
+            let mut node_keys = HashSet::with_capacity(plan.nodes.len());
+            for node in &plan.nodes {
+                require_non_blank(&node.key, "plan node key")?;
+                require_non_blank(&node.title, "plan node title")?;
+                require_non_blank(&node.objective, "plan node objective")?;
+                require_non_blank(&node.provider, "plan node provider")?;
+                require_non_blank(&node.profile, "plan node profile")?;
+                if !node_keys.insert(node.key.as_str()) {
+                    return Err(WorkspaceModelError::DuplicatePlanNode(node.key.clone()));
+                }
+            }
+            if plan
+                .nodes
+                .iter()
+                .flat_map(|node| &node.dependencies)
+                .any(|dependency| !node_keys.contains(dependency.as_str()))
+            {
+                return Err(WorkspaceModelError::UnknownPlanDependency);
             }
         }
         if let Some(inspector) = &self.inspector
@@ -224,6 +283,14 @@ pub enum WorkspaceModelError {
     DuplicateTask(String),
     #[error("task reference `{0}` is absent from the workspace task list")]
     UnknownTaskReference(String),
+    #[error("plan proposal hash is not a SHA-256 hexadecimal value")]
+    InvalidProposalHash,
+    #[error("approvable plan has no nodes")]
+    EmptyPlan,
+    #[error("duplicate plan node `{0}`")]
+    DuplicatePlanNode(String),
+    #[error("plan dependency references an unknown node")]
+    UnknownPlanDependency,
 }
 
 fn require_non_blank(value: &str, field: &'static str) -> Result<(), WorkspaceModelError> {
