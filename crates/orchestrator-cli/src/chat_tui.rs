@@ -856,6 +856,13 @@ fn integration_to_card(
             }))
             .collect(),
         approvable: batch.status == IntegrationBatchStatus::Preview && preview.is_approvable(),
+        resolution_available: batch.status == IntegrationBatchStatus::NeedsAttention
+            || preview.blockers.iter().any(|blocker| {
+                matches!(
+                    blocker,
+                    IntegrationBlocker::PathOverlap { .. } | IntegrationBlocker::PatchFailed { .. }
+                )
+            }),
     })
 }
 

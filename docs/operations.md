@@ -63,7 +63,7 @@ Ctrl+T            explicit composer target
 /plan             plan the newest session-level user goal (read-only)
 /integrate        build a read-only sealed result preview
 /approve          confirm the exact current graph or integration hash
-/resolve          create one task for the current blocked integration batch
+/resolve          create one task for a resolvable integration conflict
 /admin            five-panel administration compatibility view
 ```
 
@@ -96,9 +96,11 @@ the base, exact hash, ordered sources and changed files, blockers, and retained
 destination. Previewing never creates that destination. Only `y` in the
 integration approval overlay submits typed authority for the displayed hash.
 Any source or base change invalidates it. Missing evidence, failed verification,
-overlap, stale base, or patch failure stops closed. `/resolve` materializes one
-idempotent task bound to the blocked batch; completing it grants no authority,
-and `/integrate` plus `/approve` must run again.
+overlap, stale base, or patch failure stops closed. Evidence and verification
+failures require remediation in the source task. For a path overlap or failed
+application, `/resolve` materializes one idempotent task bound to the batch;
+completing it grants no authority, and `/integrate` plus `/approve` must run
+again.
 
 ## Repository daemon
 

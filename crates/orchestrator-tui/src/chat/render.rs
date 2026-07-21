@@ -754,6 +754,7 @@ mod tests {
             }],
             blockers: Vec::new(),
             approvable: true,
+            resolution_available: false,
         });
         let mut state = WorkspaceState::default();
         state.set_focus(FocusPane::Composer);

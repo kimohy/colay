@@ -540,14 +540,14 @@ impl WorkspaceState {
         snapshot.integration_approval.as_ref().map_or_else(
             || UiEffect::Feedback(ActionFeedback::info("no integration preview is available")),
             |card| {
-                if card.blockers.is_empty() {
-                    UiEffect::Feedback(ActionFeedback::info(
-                        "the current integration preview has no blockers",
-                    ))
-                } else {
+                if card.resolution_available {
                     UiEffect::Dispatch(WorkspaceAction::CreateResolutionTask {
                         batch_id: card.batch_id.clone(),
                     })
+                } else {
+                    UiEffect::Feedback(ActionFeedback::info(
+                        "the current blocker requires source remediation, not a resolution task",
+                    ))
                 }
             },
         )
@@ -871,6 +871,7 @@ mod tests {
             }],
             blockers: Vec::new(),
             approvable: true,
+            resolution_available: false,
         });
         let mut state = WorkspaceState::default();
         state.set_focus(FocusPane::Composer);
@@ -904,6 +905,7 @@ mod tests {
         if let Some(card) = snapshot.integration_approval.as_mut() {
             card.blockers = vec!["path overlap: src/lib.rs".to_owned()];
             card.approvable = false;
+            card.resolution_available = true;
         }
         state.set_composer("/resolve");
         assert_eq!(

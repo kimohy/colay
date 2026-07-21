@@ -91,6 +91,7 @@ pub struct IntegrationApprovalCard {
     pub sources: Vec<IntegrationSourceSummary>,
     pub blockers: Vec<String>,
     pub approvable: bool,
+    pub resolution_available: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +229,9 @@ impl WorkspaceSnapshot {
             if integration.approvable
                 && (integration.sources.is_empty() || !integration.blockers.is_empty())
             {
+                return Err(WorkspaceModelError::InvalidIntegrationApprovalState);
+            }
+            if integration.resolution_available && integration.blockers.is_empty() {
                 return Err(WorkspaceModelError::InvalidIntegrationApprovalState);
             }
             for source in &integration.sources {
@@ -496,6 +500,7 @@ mod tests {
             }],
             blockers: Vec::new(),
             approvable: true,
+            resolution_available: false,
         });
         assert_eq!(snapshot.validate(), Ok(()));
 

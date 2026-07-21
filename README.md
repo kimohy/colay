@@ -111,8 +111,9 @@ completed and verified, `/integrate` creates a read-only sealed preview. Its
 card displays the exact SHA-256 hash, base, ordered evidence, changed paths,
 blockers, and dedicated destination. `/approve` requires `y` for that exact
 preview; every source is revalidated before application only to the retained
-`.colay/integration/<batch-id>` worktree. `/resolve` turns a blocked batch into
-one auditable task whose result requires a new preview and approval. Merge to
+`.colay/integration/<batch-id>` worktree. `/resolve` turns a resolvable overlap
+or application failure into one auditable task whose result requires a new
+preview and approval. Merge to
 the user's branch, push, publication, automatic cleanup, and `/retry` remain
 unavailable.
 

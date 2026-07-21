@@ -324,9 +324,16 @@ impl Database {
             ));
         }
         let preview: IntegrationPreview = serde_json::from_str(&preview_json)?;
-        if preview.blockers.is_empty() && status != IntegrationBatchStatus::NeedsAttention {
+        let resolution_available = status == IntegrationBatchStatus::NeedsAttention
+            || preview.blockers.iter().any(|blocker| {
+                matches!(
+                    blocker,
+                    IntegrationBlocker::PathOverlap { .. } | IntegrationBlocker::PatchFailed { .. }
+                )
+            });
+        if !resolution_available {
             return Err(StateError::InvalidRecord(
-                "integration resolution task requires at least one blocker".to_owned(),
+                "integration blocker requires source remediation, not a resolution task".to_owned(),
             ));
         }
         let session_id = SessionId::from_str(&session_id)
@@ -758,7 +765,7 @@ mod tests {
     use chrono::Utc;
     use orchestrator_domain::{
         GraphRevisionId, IntegrationApplicationId, IntegrationBatchId, IntegrationBlocker,
-        IntegrationPreview, MessageId, SchemaVersion, SessionId, TaskEnvelope, TaskId,
+        IntegrationPreview, MessageId, RepoPath, SchemaVersion, SessionId, TaskEnvelope, TaskId,
     };
     use rusqlite::params;
 
@@ -775,8 +782,11 @@ mod tests {
         let message_id = MessageId::new();
         let revision_id = GraphRevisionId::new();
         let source_task_id = TaskId::new();
+        let second_source_task_id = TaskId::new();
         let mut source = TaskEnvelope::new("source", "source", now);
         source.task_id = source_task_id;
+        let mut second_source = TaskEnvelope::new("second source", "second source", now);
+        second_source.task_id = second_source_task_id;
         database.with_connection(|connection| {
             connection.execute(
                 "INSERT INTO sessions(session_id, schema_version, revision, title, state,
@@ -819,28 +829,34 @@ mod tests {
                     now.to_rfc3339()
                 ],
             )?;
-            connection.execute(
-                "INSERT INTO tasks(task_id, schema_version, revision, state, resume_state,
-                    paused, objective, original_request_redacted, task_envelope_json, created_at,
-                    updated_at, archived_at)
-                 VALUES (?1, ?2, 0, 'completed', NULL, 0, 'source', 'source', ?3, ?4, ?4, NULL)",
-                params![
-                    source_task_id.to_string(),
-                    SchemaVersion::v1().as_str(),
-                    serde_json::to_string(&source)?,
-                    now.to_rfc3339()
-                ],
-            )?;
-            connection.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
-                    display_order, provider_id, model_profile)
-                 VALUES (?1, ?2, ?3, 'source', 1, 'codex', 'standard')",
-                params![
-                    session_id.to_string(),
-                    revision_id.to_string(),
-                    source_task_id.to_string()
-                ],
-            )?;
+            for (index, envelope) in [source.clone(), second_source.clone()].iter().enumerate() {
+                connection.execute(
+                    "INSERT INTO tasks(task_id, schema_version, revision, state, resume_state,
+                        paused, objective, original_request_redacted, task_envelope_json,
+                        created_at, updated_at, archived_at)
+                     VALUES (?1, ?2, 0, 'completed', NULL, 0, ?3, ?4, ?5, ?6, ?6, NULL)",
+                    params![
+                        envelope.task_id.to_string(),
+                        SchemaVersion::v1().as_str(),
+                        envelope.objective,
+                        envelope.original_request_redacted,
+                        serde_json::to_string(envelope)?,
+                        now.to_rfc3339()
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                        display_order, provider_id, model_profile)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
+                    params![
+                        session_id.to_string(),
+                        revision_id.to_string(),
+                        envelope.task_id.to_string(),
+                        format!("source-{index}"),
+                        i64::try_from(index + 1).unwrap_or(i64::MAX)
+                    ],
+                )?;
+            }
             Ok(())
         })?;
         let batch_id = IntegrationBatchId::new();
@@ -850,9 +866,10 @@ mod tests {
             revision_id,
             "a".repeat(40),
             Vec::new(),
-            vec![IntegrationBlocker::MissingEvidence {
-                task_id: source_task_id,
-                detail: "checkpoint missing".to_owned(),
+            vec![IntegrationBlocker::PathOverlap {
+                left: source_task_id,
+                right: second_source_task_id,
+                path: RepoPath::try_from("src/lib.rs")?,
             }],
             now,
         )?;
@@ -869,12 +886,12 @@ mod tests {
         assert!(envelope.objective.contains(&batch_id.to_string()));
         assert!(envelope.repository_wide_write_scope);
         database.with_connection(|connection| {
-            let dependency: String = connection.query_row(
-                "SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1",
+            let dependencies: i64 = connection.query_row(
+                "SELECT count(*) FROM task_dependencies WHERE task_id = ?1",
                 [resolution.to_string()],
                 |row| row.get(0),
             )?;
-            assert_eq!(dependency, source_task_id.to_string());
+            assert_eq!(dependencies, 2);
             connection.execute(
                 "UPDATE tasks SET state = 'completed' WHERE task_id = ?1",
                 [resolution.to_string()],
