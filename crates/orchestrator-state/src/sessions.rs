@@ -198,6 +198,47 @@ impl Database {
         })
     }
 
+    pub fn append_message_with_event_and_instruction(
+        &self,
+        message: &ConversationMessage,
+        mut event: TaskEvent,
+    ) -> StateResult<(u64, Option<crate::StoredTaskInstruction>)> {
+        message
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        if event.session_id != Some(message.session_id)
+            || event.task_id != message.task_id
+            || event.event_type != EventType::MessageAppended
+        {
+            return Err(StateError::InvalidRecord(
+                "message event target or type does not match its projection".to_owned(),
+            ));
+        }
+        self.with_transaction(|transaction| {
+            let ordinal = append_message_in_transaction(transaction, message)?;
+            let instruction = message
+                .task_id
+                .map(|task_id| {
+                    crate::instructions::queue_instruction_in_transaction(
+                        transaction,
+                        message.session_id,
+                        task_id,
+                        message.message_id,
+                        &message.content_redacted,
+                        message.created_at,
+                    )
+                })
+                .transpose()?;
+            if let Some(instruction) = instruction.as_ref() {
+                event.payload["instruction_id"] =
+                    serde_json::Value::String(instruction.instruction_id.to_string());
+                event.payload["instruction_ordinal"] = serde_json::json!(instruction.ordinal);
+            }
+            append_event_in_transaction(transaction, &mut event)?;
+            Ok((ordinal, instruction))
+        })
+    }
+
     pub fn finalize_message(
         &self,
         session_id: SessionId,

@@ -181,20 +181,29 @@ fn append_message(
         ));
     }
     let content_hash = hex::encode(Sha256::digest(expected.content_redacted.as_bytes()));
-    database.append_message_with_event(
-        &expected,
-        command_event(
-            command,
-            Some(session_id),
-            command.task_id,
-            EventType::MessageAppended,
-            serde_json::json!({
-                "command_id": command.command_id,
-                "message_id": payload.message_id,
-                "content_sha256": content_hash,
-            }),
-        ),
-    )?;
+    database
+        .append_message_with_event_and_instruction(
+            &expected,
+            command_event(
+                command,
+                Some(session_id),
+                command.task_id,
+                EventType::MessageAppended,
+                serde_json::json!({
+                    "command_id": command.command_id,
+                    "message_id": payload.message_id,
+                    "content_sha256": content_hash,
+                }),
+            ),
+        )
+        .map_err(|error| match error {
+            StateError::InvalidRecord(_) if command.task_id.is_some() => {
+                CommandExecutionError::Rejected(
+                    "append-message task target cannot accept instructions",
+                )
+            }
+            error => CommandExecutionError::State(error),
+        })?;
     Ok(format!("message:{}", payload.message_id))
 }
 

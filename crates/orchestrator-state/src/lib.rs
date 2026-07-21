@@ -14,6 +14,7 @@ mod database;
 mod error;
 mod event_log;
 mod graphs;
+mod instructions;
 mod leases;
 mod migrations;
 mod paths;
@@ -43,6 +44,7 @@ pub use graphs::{
     ApprovedGraph, GraphApprovalRequest, GraphProjection, GraphRevisionStatus, GraphTaskDependency,
     GraphTaskProjection, NewGraphAttempt, NewPlanningAttempt, StoredGraphRevision,
 };
+pub use instructions::StoredTaskInstruction;
 pub use leases::{
     CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, WorkerLease, WorkerLeaseMode,
     WorkerLeaseRequest,
