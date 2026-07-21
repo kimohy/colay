@@ -4,6 +4,7 @@
 mod checkpoint;
 mod coordinator;
 mod error;
+mod executor;
 mod handover;
 mod planner;
 mod rollback;
@@ -14,6 +15,7 @@ mod worktree;
 pub use checkpoint::{CheckpointInput, CheckpointManager, GitCheckpointEvidence};
 pub use coordinator::TaskLifecycle;
 pub use error::{EngineError, EngineResult};
+pub use executor::{TaskExecutionReport, TaskExecutionRequest, TaskExecutor};
 pub use handover::{HandoverInput, HandoverManager};
 pub use orchestrator_domain::TaskEnvelope;
 pub use planner::{

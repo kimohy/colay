@@ -393,7 +393,7 @@ fn invocation_failure(reason: &str) -> PlannerFailure {
     }
 }
 
-fn build_provider_adapter(
+pub(crate) fn build_provider_adapter(
     provider: ProviderId,
     config: &RootConfig,
     runtime: Arc<dyn AdapterRuntime>,
@@ -446,7 +446,7 @@ fn build_provider_adapter(
     }
 }
 
-fn profile_settings(
+pub(crate) fn profile_settings(
     config: &OrchestratorConfig,
     provider: ProviderId,
     profile: ModelProfile,
