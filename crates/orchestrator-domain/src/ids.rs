@@ -93,6 +93,8 @@ uuid_id!(PlanningAttemptId);
 uuid_id!(InstructionId);
 uuid_id!(ResourceClaimId);
 uuid_id!(ScheduleClaimId);
+uuid_id!(IntegrationBatchId);
+uuid_id!(IntegrationApplicationId);
 
 #[cfg(test)]
 mod tests {
