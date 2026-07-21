@@ -6,6 +6,7 @@ mod coordinator;
 mod error;
 mod executor;
 mod handover;
+mod integration;
 mod planner;
 mod rollback;
 mod startup;
@@ -17,6 +18,9 @@ pub use coordinator::TaskLifecycle;
 pub use error::{EngineError, EngineResult};
 pub use executor::{TaskExecutionReport, TaskExecutionRequest, TaskExecutor};
 pub use handover::{HandoverInput, HandoverManager};
+pub use integration::{
+    GitIntegrationManager, IntegrationCandidate, IntegrationPreviewRequest, IntegrationWorktree,
+};
 pub use orchestrator_domain::TaskEnvelope;
 pub use planner::{
     PLANNER_MAX_OUTPUT_BYTES, PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse,

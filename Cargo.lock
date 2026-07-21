@@ -855,6 +855,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "codex-compat",
+ "hex",
  "orchestrator-domain",
  "orchestrator-policy",
  "orchestrator-process",
