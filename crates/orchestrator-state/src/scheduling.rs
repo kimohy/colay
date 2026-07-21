@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn two_connections_never_claim_the_same_task_and_release_is_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (directory, database, daemon) = setup()?;
+        let (_directory, database, daemon) = setup()?;
         let (session, revision) = seed_graph(&database)?;
         let task = seed_task(
             &database,
@@ -675,7 +675,7 @@ mod tests {
             "src/a",
             &[],
         )?;
-        let other = Database::open(directory.path().join("orchestrator.db"))?;
+        let other = Database::open(database.path().to_path_buf())?;
 
         let claimed = database
             .claim_next_ready_task(&request(daemon))?
