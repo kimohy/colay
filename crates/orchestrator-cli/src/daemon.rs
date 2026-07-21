@@ -10,11 +10,13 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
 use orchestrator_daemon::{
-    DaemonSettings, ExecutionServices, MessageRedactor, PlanningServices,
+    DaemonSettings, ExecutionServices, IntegrationServices, MessageRedactor, PlanningServices,
     serve_with_full_orchestration,
 };
 use orchestrator_domain::{DaemonInstanceId, GraphValidationPolicy, ModelProfile, ProviderId};
-use orchestrator_engine::{PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner};
+use orchestrator_engine::{
+    GitIntegrationManager, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
+};
 use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{DaemonStatus, Database, EventLog, RepositoryStatePaths, RootConfig};
@@ -125,6 +127,11 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             ),
         };
     let executor = Arc::new(OfficialCliTaskExecutor::new(config, repository, runtime)?);
+    let integration = IntegrationServices {
+        manager: Arc::new(GitIntegrationManager::new(repository, &paths.root)?),
+        repository_root: std::fs::canonicalize(repository)?,
+        state_root: paths.root.clone(),
+    };
     let provider_limits = config
         .orchestrator
         .provider_parallel_limits
@@ -157,6 +164,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                     .max(1),
                 per_provider_limits: BTreeMap::new(),
             },
+            integration: Some(integration),
         },
         ExecutionServices {
             executor,

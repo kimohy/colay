@@ -1477,6 +1477,19 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn latest_verification(&self, task_id: TaskId) -> StateResult<Option<VerificationResult>> {
+        self.lock()?
+            .query_row(
+                "SELECT result_json FROM verification_results WHERE task_id = ?1
+                 ORDER BY completed_at DESC, verification_id DESC LIMIT 1",
+                [task_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(StateError::from))
+            .transpose()
+    }
 }
 
 fn checkpoint_select(suffix: &str) -> String {

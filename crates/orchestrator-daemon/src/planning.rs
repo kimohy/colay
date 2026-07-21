@@ -20,6 +20,7 @@ pub struct PlanningServices {
     pub planner: Arc<dyn TaskPlanner>,
     pub planner_provider: ProviderId,
     pub validation_policy: GraphValidationPolicy,
+    pub integration: Option<crate::IntegrationServices>,
 }
 
 pub async fn process_next_orchestration_command(
@@ -39,6 +40,31 @@ pub async fn process_next_orchestration_command(
         ClientCommandAction::ReviseGraph | ClientCommandAction::CancelPlan => Err(
             ExecutionError::Rejected("revise/cancel planning commands are not enabled".to_owned()),
         ),
+        ClientCommandAction::RequestIntegration => {
+            if let Some(integration) = services.integration.as_ref() {
+                crate::integration::request_integration(database, integration, &command, now)
+                    .await
+                    .map_err(map_integration_error)
+            } else {
+                Err(ExecutionError::Rejected(
+                    "integration services are unavailable".to_owned(),
+                ))
+            }
+        }
+        ClientCommandAction::ApproveIntegration => {
+            if let Some(integration) = services.integration.as_ref() {
+                crate::integration::approve_integration(database, integration, &command, now)
+                    .await
+                    .map_err(map_integration_error)
+            } else {
+                Err(ExecutionError::Rejected(
+                    "integration services are unavailable".to_owned(),
+                ))
+            }
+        }
+        ClientCommandAction::CreateResolutionTask => Err(ExecutionError::Rejected(
+            "integration resolution task requires a blocked preview".to_owned(),
+        )),
         ClientCommandAction::CreateSession
         | ClientCommandAction::AppendMessage
         | ClientCommandAction::StopDaemon => Err(ExecutionError::Rejected(
@@ -59,6 +85,15 @@ pub async fn process_next_orchestration_command(
             Ok(Some(CommandProcessingResult::Failed(command.command_id)))
         }
         Err(ExecutionError::State(error)) => Err(error.into()),
+    }
+}
+
+fn map_integration_error(error: crate::integration::IntegrationCommandError) -> ExecutionError {
+    match error {
+        crate::integration::IntegrationCommandError::Rejected(reason) => {
+            ExecutionError::Rejected(reason)
+        }
+        crate::integration::IntegrationCommandError::State(error) => ExecutionError::State(error),
     }
 }
 
@@ -610,6 +645,7 @@ mod tests {
                 max_parallel_workers: 2,
                 per_provider_limits: BTreeMap::new(),
             },
+            integration: None,
         };
         (service, planner)
     }

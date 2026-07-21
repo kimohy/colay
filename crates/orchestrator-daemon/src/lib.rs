@@ -13,10 +13,12 @@ use tokio_util::sync::CancellationToken;
 
 mod commands;
 mod execution;
+mod integration;
 mod planning;
 
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
 pub use execution::ExecutionServices;
+pub use integration::IntegrationServices;
 pub use planning::{PlanningServices, process_next_orchestration_command};
 
 #[derive(Clone, Copy, Debug)]

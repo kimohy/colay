@@ -72,7 +72,10 @@ fn execute_command(
         ClientCommandAction::RequestPlan
         | ClientCommandAction::ApproveGraph
         | ClientCommandAction::ReviseGraph
-        | ClientCommandAction::CancelPlan => Err(CommandExecutionError::Rejected(
+        | ClientCommandAction::CancelPlan
+        | ClientCommandAction::RequestIntegration
+        | ClientCommandAction::ApproveIntegration
+        | ClientCommandAction::CreateResolutionTask => Err(CommandExecutionError::Rejected(
             "orchestration command requires planning services",
         )),
     }

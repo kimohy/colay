@@ -308,6 +308,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
             max_parallel_workers: 2,
             per_provider_limits: BTreeMap::from([(ProviderId::Codex, 2)]),
         },
+        integration: None,
     };
     let execution = ExecutionServices {
         executor,
