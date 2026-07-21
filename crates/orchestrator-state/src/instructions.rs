@@ -229,7 +229,7 @@ pub(crate) fn queue_instruction_in_transaction(
     })
 }
 
-fn instruction_select(suffix: &str) -> String {
+pub(crate) fn instruction_select(suffix: &str) -> String {
     format!(
         "SELECT instruction_id, session_id, task_id, message_id, ordinal, state,
                 content_redacted, queued_at, claimed_at, completed_at, outcome_redacted
@@ -237,7 +237,7 @@ fn instruction_select(suffix: &str) -> String {
     )
 }
 
-fn map_instruction(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTaskInstruction> {
+pub(crate) fn map_instruction(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTaskInstruction> {
     let instruction_id = row.get::<_, String>(0)?;
     let session_id = row.get::<_, String>(1)?;
     let task_id = row.get::<_, String>(2)?;

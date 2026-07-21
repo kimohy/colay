@@ -110,9 +110,55 @@ impl SqliteWorkspaceDriver {
                     .map_err(|error| DriverError::new(format!("invalid task target: {error}")))?,
             ),
             ComposerTarget::AllRunning => {
-                return Ok(ActionFeedback::unavailable("broadcast messaging"));
+                let task_ids: Vec<TaskId> = self
+                    .database
+                    .with_connection(|connection| {
+                        let mut statement = connection.prepare(
+                            "SELECT st.task_id FROM session_tasks st
+                             JOIN session_graph_heads gh ON gh.session_id = st.session_id
+                                                        AND gh.revision_id = st.revision_id
+                             JOIN tasks t ON t.task_id = st.task_id
+                             WHERE st.session_id = ?1 AND t.state = 'running'
+                             ORDER BY st.display_order",
+                        )?;
+                        let values = statement
+                            .query_map([self.session_id.to_string()], |row| {
+                                row.get::<_, String>(0)
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        values
+                            .into_iter()
+                            .map(|value| {
+                                TaskId::from_str(&value).map_err(|error| {
+                                    orchestrator_state::StateError::InvalidRecord(format!(
+                                        "invalid running task ID: {error}"
+                                    ))
+                                })
+                            })
+                            .collect()
+                    })
+                    .map_err(driver_error)?;
+                if task_ids.is_empty() {
+                    return Ok(ActionFeedback::unavailable(
+                        "broadcast messaging: no running graph tasks",
+                    ));
+                }
+                for task_id in &task_ids {
+                    self.enqueue_message(Some(*task_id), content)?;
+                }
+                return Ok(ActionFeedback::info(format!(
+                    "instruction queued for {} running tasks",
+                    task_ids.len()
+                )));
             }
         };
+        self.enqueue_message(task_id, content)?;
+        Ok(ActionFeedback::info(
+            "message accepted by repository daemon",
+        ))
+    }
+
+    fn enqueue_message(&self, task_id: Option<TaskId>, content: &str) -> Result<(), DriverError> {
         let message_id = MessageId::new();
         let command_id = ClientCommandId::new();
         let content = self.redactor.redact(content);
@@ -137,9 +183,7 @@ impl SqliteWorkspaceDriver {
         self.database
             .submit_client_command(&command)
             .map_err(driver_error)?;
-        Ok(ActionFeedback::info(
-            "message accepted by repository daemon",
-        ))
+        Ok(())
     }
 
     fn request_control(
@@ -403,25 +447,30 @@ fn projection_to_snapshot(
             title: task.task.objective.clone(),
             state: enum_name(&task.task.state).unwrap_or_else(|_| "unknown".to_owned()),
             state_symbol: task_state_symbol(task.task.state).to_owned(),
-            dependency_status: if task.graph_node_key.is_some() {
-                if task.dependency_task_ids.is_empty() {
-                    "ready (no dependencies)".to_owned()
+            dependency_status: format!(
+                "{} | {} | {}",
+                if task.graph_node_key.is_some() {
+                    if task.dependency_task_ids.is_empty() {
+                        "ready (no dependencies)".to_owned()
+                    } else {
+                        format!(
+                            "after {}",
+                            task.dependency_task_ids
+                                .iter()
+                                .map(|task_id| graph_node_labels
+                                    .get(task_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| task_id.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
                 } else {
-                    format!(
-                        "after {}",
-                        task.dependency_task_ids
-                            .iter()
-                            .map(|task_id| graph_node_labels
-                                .get(task_id)
-                                .cloned()
-                                .unwrap_or_else(|| task_id.to_string()))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }
-            } else {
-                "repository task".to_owned()
-            },
+                    "repository task".to_owned()
+                },
+                task_execution_status(task),
+                task_instruction_status(task)
+            ),
             needs_attention: attention_task_ids.contains(&task.task.task_id),
         })
         .collect::<Vec<_>>();
@@ -554,6 +603,23 @@ fn projection_to_snapshot(
                         .unwrap_or_else(|| task_id.to_string())
                 })
                 .collect(),
+            schedule: task_execution_status(&inspector.task),
+            instructions: inspector
+                .instructions
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "#{} {}: {}",
+                        instruction.ordinal,
+                        enum_name(&instruction.state).unwrap_or_else(|_| "unknown".to_owned()),
+                        instruction
+                            .content_redacted
+                            .chars()
+                            .take(80)
+                            .collect::<String>()
+                    )
+                })
+                .collect(),
             worktree: inspector.active_worktree.as_ref().map_or_else(
                 || "not allocated".to_owned(),
                 |worktree| worktree.worktree_path.display().to_string(),
@@ -612,6 +678,48 @@ fn projection_to_snapshot(
         },
         read_only_reason,
     })
+}
+
+fn task_execution_status(task: &orchestrator_state::WorkspaceTask) -> String {
+    if task.active_schedule_claim_id.is_some() {
+        return format!(
+            "claimed by {}",
+            task.latest_provider
+                .map_or_else(|| "scheduler".to_owned(), |provider| provider.to_string())
+        );
+    }
+    match task.task.state {
+        TaskState::Queued => "awaiting scheduler".to_owned(),
+        TaskState::Analyzing | TaskState::Planned => "starting isolated worker".to_owned(),
+        TaskState::Running => format!(
+            "running on {}",
+            task.latest_provider
+                .map_or_else(|| "provider".to_owned(), |provider| provider.to_string())
+        ),
+        TaskState::Verifying => "verifying Git evidence".to_owned(),
+        TaskState::Completed => "verified complete".to_owned(),
+        TaskState::Failed => "execution failed".to_owned(),
+        TaskState::Blocked => "blocked".to_owned(),
+        state => enum_name(&state).unwrap_or_else(|_| "unknown".to_owned()),
+    }
+}
+
+fn task_instruction_status(task: &orchestrator_state::WorkspaceTask) -> String {
+    if task.queued_instruction_count == 0 && task.applying_instruction_count == 0 {
+        return task.latest_instruction_state.map_or_else(
+            || "no instructions".to_owned(),
+            |state| {
+                format!(
+                    "last instruction {}",
+                    enum_name(&state).unwrap_or_else(|_| "unknown".to_owned())
+                )
+            },
+        );
+    }
+    format!(
+        "{} queued / {} applying",
+        task.queued_instruction_count, task.applying_instruction_count
+    )
 }
 
 fn enum_name<T: Serialize>(value: &T) -> Result<String> {
@@ -865,10 +973,33 @@ mod tests {
         assert_eq!(approved.tasks.len(), 2);
         assert_eq!(
             approved.tasks[0].dependency_status,
-            "ready (no dependencies)"
+            "ready (no dependencies) | awaiting scheduler | no instructions"
         );
-        assert_eq!(approved.tasks[1].dependency_status, "after domain");
+        assert_eq!(
+            approved.tasks[1].dependency_status,
+            "after domain | awaiting scheduler | no instructions"
+        );
         approved.validate()?;
+
+        let target = approved.tasks[0].task_id.clone();
+        driver.dispatch(WorkspaceAction::SubmitMessage {
+            target: ComposerTarget::Task(target.clone()),
+            content: "also update the focused tests".to_owned(),
+        })?;
+        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        driver.selection_changed(Some(&target))?;
+        let instructed = driver.refresh(&WorkspaceCursor::default())?;
+        assert!(
+            instructed.tasks[0]
+                .dependency_status
+                .contains("1 queued / 0 applying")
+        );
+        let inspector = instructed
+            .inspector
+            .as_ref()
+            .ok_or_else(|| anyhow!("instruction inspector missing"))?;
+        assert_eq!(inspector.schedule, "awaiting scheduler");
+        assert!(inspector.instructions[0].contains("also update the focused tests"));
         Ok(())
     }
 

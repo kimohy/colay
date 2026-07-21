@@ -113,6 +113,8 @@ pub struct TaskInspector {
     pub progress: String,
     pub elapsed: String,
     pub dependencies: Vec<String>,
+    pub schedule: String,
+    pub instructions: Vec<String>,
     pub worktree: String,
     pub changed_files: Vec<String>,
     pub tests: Vec<String>,

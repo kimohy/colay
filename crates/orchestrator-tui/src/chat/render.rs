@@ -174,6 +174,7 @@ fn render_inspector(
                 )),
                 Line::from(format!("progress  {}", inspector.progress)),
                 Line::from(format!("elapsed   {}", inspector.elapsed)),
+                Line::from(format!("schedule  {}", inspector.schedule)),
                 Line::default(),
                 Line::from("DEPENDENCIES"),
             ];
@@ -183,6 +184,18 @@ fn render_inspector(
                     .iter()
                     .map(|value| Line::from(format!("- {value}"))),
             );
+            lines.push(Line::default());
+            lines.push(Line::from("INSTRUCTIONS"));
+            if inspector.instructions.is_empty() {
+                lines.push(Line::from("- none"));
+            } else {
+                lines.extend(
+                    inspector
+                        .instructions
+                        .iter()
+                        .map(|value| Line::from(format!("- {value}"))),
+                );
+            }
             lines.push(Line::default());
             lines.push(Line::from(format!("worktree {}", inspector.worktree)));
             lines.push(Line::from(format!(
@@ -520,6 +533,8 @@ mod tests {
                 progress: "60%".to_owned(),
                 elapsed: "4m".to_owned(),
                 dependencies: vec!["task-01 done".to_owned()],
+                schedule: "active claim".to_owned(),
+                instructions: vec!["#1 applied: update tests".to_owned()],
                 worktree: ".worktrees/task-03".to_owned(),
                 changed_files: vec!["tests/auth.rs".to_owned()],
                 tests: vec!["31 passed".to_owned()],
@@ -559,10 +574,13 @@ mod tests {
                 "to: orchestrator",
                 "* RUNNING",
                 "daemon online",
+                "schedule  active claim",
             ] {
                 assert!(text.contains(expected), "missing `{expected}` at {width}");
             }
         }
+        let tall = rendered_text(160, 50, &snapshot(), &WorkspaceState::default())?;
+        assert!(tall.contains("#1 applied: update tests"));
         Ok(())
     }
 

@@ -2,14 +2,15 @@ use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ConversationMessage, GraphRevisionId, ProviderId, SessionId, SessionState, TaskId, TaskState,
+    ConversationMessage, GraphRevisionId, ProviderId, SessionId, SessionState, TaskId,
+    TaskInstructionState, TaskState,
 };
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Database, StateError, StateResult, StoredSession, StoredTask, StoredTaskAttempt,
-    StoredWorktree,
+    StoredTaskInstruction, StoredWorktree,
     graphs::graph_projection,
     records::{map_task, map_task_attempt, map_worktree, validate_stored_task},
     sessions::{map_message, map_session},
@@ -38,6 +39,10 @@ pub struct WorkspaceTask {
     pub graph_node_key: Option<String>,
     pub graph_display_order: Option<u64>,
     pub dependency_task_ids: Vec<TaskId>,
+    pub active_schedule_claim_id: Option<String>,
+    pub queued_instruction_count: u64,
+    pub applying_instruction_count: u64,
+    pub latest_instruction_state: Option<TaskInstructionState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -60,6 +65,7 @@ pub struct WorkspaceInspector {
     pub active_worktree: Option<StoredWorktree>,
     pub changed_file_count: u64,
     pub latest_verification: Option<WorkspaceVerification>,
+    pub instructions: Vec<StoredTaskInstruction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,12 +253,24 @@ const TASK_SELECT: &str =
        (SELECT selected_provider FROM routing_decisions r WHERE r.task_id = tasks.task_id
         ORDER BY decided_at DESC, rowid DESC LIMIT 1),
        (SELECT provider_id FROM task_attempts a WHERE a.task_id = tasks.task_id
-        ORDER BY ordinal DESC LIMIT 1)
+        ORDER BY ordinal DESC LIMIT 1),
+       (SELECT provider_id FROM session_tasks st WHERE st.task_id = tasks.task_id LIMIT 1)
      ),
-     (SELECT model_profile FROM routing_decisions r WHERE r.task_id = tasks.task_id
-      ORDER BY decided_at DESC, rowid DESC LIMIT 1),
+     coalesce(
+       (SELECT model_profile FROM routing_decisions r WHERE r.task_id = tasks.task_id
+        ORDER BY decided_at DESC, rowid DESC LIMIT 1),
+       (SELECT model_profile FROM session_tasks st WHERE st.task_id = tasks.task_id LIMIT 1)
+     ),
      (SELECT effort FROM routing_decisions r WHERE r.task_id = tasks.task_id
       ORDER BY decided_at DESC, rowid DESC LIMIT 1)
+     ,(SELECT schedule_claim_id FROM task_schedule_claims sc WHERE sc.task_id = tasks.task_id
+       AND sc.released_at IS NULL ORDER BY acquired_at DESC LIMIT 1)
+     ,(SELECT count(*) FROM task_instructions i WHERE i.task_id = tasks.task_id
+       AND i.state IN ('queued', 'interrupted'))
+     ,(SELECT count(*) FROM task_instructions i WHERE i.task_id = tasks.task_id
+       AND i.state = 'applying')
+     ,(SELECT state FROM task_instructions i WHERE i.task_id = tasks.task_id
+       ORDER BY ordinal DESC LIMIT 1)
      FROM tasks";
 
 fn read_recent_tasks(connection: &Connection, limit: usize) -> StateResult<Vec<WorkspaceTask>> {
@@ -372,6 +390,31 @@ fn map_workspace_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTask
         graph_node_key: None,
         graph_display_order: None,
         dependency_task_ids: Vec::new(),
+        active_schedule_claim_id: row.get(15)?,
+        queued_instruction_count: parse_count(row, 16)?,
+        applying_instruction_count: parse_count(row, 17)?,
+        latest_instruction_state: row
+            .get::<_, Option<String>>(18)?
+            .map(|value| {
+                serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        18,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn parse_count(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(row.get::<_, i64>(column)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
     })
 }
 
@@ -436,12 +479,21 @@ fn read_inspector(
             map_verification,
         )
         .optional()?;
+    let instructions = {
+        let mut statement = connection.prepare(&crate::instructions::instruction_select(
+            "WHERE task_id = ?1 ORDER BY ordinal DESC LIMIT 20",
+        ))?;
+        statement
+            .query_map([task_id.to_string()], crate::instructions::map_instruction)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(Some(WorkspaceInspector {
         task,
         latest_attempt,
         active_worktree,
         changed_file_count,
         latest_verification,
+        instructions,
     }))
 }
 
