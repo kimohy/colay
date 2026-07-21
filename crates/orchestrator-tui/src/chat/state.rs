@@ -28,6 +28,10 @@ pub enum Overlay {
         revision_id: String,
         proposal_hash: String,
     },
+    IntegrationApprovalConfirmation {
+        batch_id: String,
+        preview_hash: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +145,19 @@ impl WorkspaceState {
             self.overlay = None;
             self.feedback = Some(ActionFeedback::warning(
                 "plan changed; reopen /approve to review the current revision",
+            ));
+        }
+        if let Some(Overlay::IntegrationApprovalConfirmation {
+            batch_id,
+            preview_hash,
+        }) = self.overlay.as_ref()
+            && !snapshot.integration_approval.as_ref().is_some_and(|card| {
+                card.approvable && card.batch_id == *batch_id && card.preview_hash == *preview_hash
+            })
+        {
+            self.overlay = None;
+            self.feedback = Some(ActionFeedback::warning(
+                "integration preview changed; reopen /approve to review the current preview",
             ));
         }
         if self.selected_task.is_none()
@@ -352,6 +369,25 @@ impl WorkspaceState {
                 }
                 _ => UiEffect::None,
             },
+            Some(Overlay::IntegrationApprovalConfirmation {
+                ref batch_id,
+                ref preview_hash,
+            }) => match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    let action = WorkspaceAction::ApproveIntegration {
+                        batch_id: batch_id.clone(),
+                        preview_hash: preview_hash.clone(),
+                        approved_by: "local-tui".to_owned(),
+                    };
+                    self.overlay = None;
+                    UiEffect::Dispatch(action)
+                }
+                KeyCode::Char('n' | 'N') => {
+                    self.overlay = None;
+                    UiEffect::Redraw
+                }
+                _ => UiEffect::None,
+            },
             Some(Overlay::Overview | Overlay::FullLog | Overlay::Help | Overlay::Inspector) => {
                 UiEffect::None
             }
@@ -417,7 +453,9 @@ impl WorkspaceState {
                 UiEffect::Redraw
             }
             PaletteCommand::Plan => Self::request_plan(snapshot),
+            PaletteCommand::Integrate => Self::request_integration(snapshot),
             PaletteCommand::Approve => self.request_approval(snapshot),
+            PaletteCommand::Resolve => Self::request_resolution(snapshot),
             PaletteCommand::Pause => self.task_control(snapshot, TaskControlIntent::Pause),
             PaletteCommand::Resume => self.task_control(snapshot, TaskControlIntent::Resume),
             PaletteCommand::Cancel => self.task_control(snapshot, TaskControlIntent::Cancel),
@@ -463,16 +501,55 @@ impl WorkspaceState {
         if let Some(reason) = snapshot.read_only_reason.as_deref() {
             return UiEffect::Feedback(ActionFeedback::info(reason));
         }
-        let Some(plan) = snapshot.plan_approval.as_ref() else {
-            return UiEffect::Feedback(ActionFeedback::info(
-                "no validated task graph is awaiting approval",
-            ));
-        };
-        self.overlay = Some(Overlay::ApprovalConfirmation {
-            revision_id: plan.revision_id.clone(),
-            proposal_hash: plan.proposal_hash.clone(),
-        });
-        UiEffect::Redraw
+        if let Some(plan) = snapshot.plan_approval.as_ref() {
+            self.overlay = Some(Overlay::ApprovalConfirmation {
+                revision_id: plan.revision_id.clone(),
+                proposal_hash: plan.proposal_hash.clone(),
+            });
+            return UiEffect::Redraw;
+        }
+        if let Some(card) = snapshot.integration_approval.as_ref() {
+            if !card.approvable {
+                return UiEffect::Feedback(ActionFeedback::info(
+                    "integration preview is blocked; use /resolve after reviewing blockers",
+                ));
+            }
+            self.overlay = Some(Overlay::IntegrationApprovalConfirmation {
+                batch_id: card.batch_id.clone(),
+                preview_hash: card.preview_hash.clone(),
+            });
+            return UiEffect::Redraw;
+        }
+        UiEffect::Feedback(ActionFeedback::info(
+            "no exact task graph or integration preview is awaiting approval",
+        ))
+    }
+
+    fn request_integration(snapshot: &WorkspaceSnapshot) -> UiEffect {
+        if let Some(reason) = snapshot.read_only_reason.as_deref() {
+            return UiEffect::Feedback(ActionFeedback::info(reason));
+        }
+        UiEffect::Dispatch(WorkspaceAction::RequestIntegration)
+    }
+
+    fn request_resolution(snapshot: &WorkspaceSnapshot) -> UiEffect {
+        if let Some(reason) = snapshot.read_only_reason.as_deref() {
+            return UiEffect::Feedback(ActionFeedback::info(reason));
+        }
+        snapshot.integration_approval.as_ref().map_or_else(
+            || UiEffect::Feedback(ActionFeedback::info("no integration preview is available")),
+            |card| {
+                if card.blockers.is_empty() {
+                    UiEffect::Feedback(ActionFeedback::info(
+                        "the current integration preview has no blockers",
+                    ))
+                } else {
+                    UiEffect::Dispatch(WorkspaceAction::CreateResolutionTask {
+                        batch_id: card.batch_id.clone(),
+                    })
+                }
+            },
+        )
     }
 
     fn task_control(&self, snapshot: &WorkspaceSnapshot, intent: TaskControlIntent) -> UiEffect {
@@ -506,8 +583,9 @@ mod tests {
 
     use super::{FocusPane, Overlay, UiEffect, WorkspaceState};
     use crate::chat::{
-        ComposerTarget, DaemonConnectivity, LayoutMode, PlanApprovalCard, PlanNodeSummary,
-        TaskControlIntent, TaskSummary, TimelineEntry, WorkspaceAction, WorkspaceSnapshot,
+        ComposerTarget, DaemonConnectivity, IntegrationApprovalCard, IntegrationSourceSummary,
+        LayoutMode, PlanApprovalCard, PlanNodeSummary, TaskControlIntent, TaskSummary,
+        TimelineEntry, WorkspaceAction, WorkspaceSnapshot,
     };
 
     fn snapshot() -> WorkspaceSnapshot {
@@ -772,6 +850,73 @@ mod tests {
             state.handle_key(key(KeyCode::Enter), &invalid, LayoutMode::Wide),
             UiEffect::Feedback(_)
         ));
+    }
+
+    #[test]
+    fn integration_preview_approval_and_resolution_are_explicit() {
+        let mut snapshot = snapshot();
+        snapshot.daemon = DaemonConnectivity::Online;
+        snapshot.integration_approval = Some(IntegrationApprovalCard {
+            batch_id: "batch-01".to_owned(),
+            preview_hash: "c".repeat(64),
+            base_revision: "d".repeat(40),
+            destination: ".colay/integration/batch-01".to_owned(),
+            sources: vec![IntegrationSourceSummary {
+                task_id: "task-01".to_owned(),
+                checkpoint_id: "checkpoint-01".to_owned(),
+                verification_id: "verification-01".to_owned(),
+                diff_sha256: "e".repeat(64),
+                changed_files: vec!["src/lib.rs".to_owned()],
+            }],
+            blockers: Vec::new(),
+            approvable: true,
+        });
+        let mut state = WorkspaceState::default();
+        state.set_focus(FocusPane::Composer);
+
+        state.set_composer("/integrate");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Dispatch(WorkspaceAction::RequestIntegration)
+        );
+        state.set_composer("/approve");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Redraw
+        );
+        assert_eq!(
+            state.overlay(),
+            Some(&Overlay::IntegrationApprovalConfirmation {
+                batch_id: "batch-01".to_owned(),
+                preview_hash: "c".repeat(64),
+            })
+        );
+        assert_eq!(
+            state.handle_key(key(KeyCode::Char('y')), &snapshot, LayoutMode::Wide),
+            UiEffect::Dispatch(WorkspaceAction::ApproveIntegration {
+                batch_id: "batch-01".to_owned(),
+                preview_hash: "c".repeat(64),
+                approved_by: "local-tui".to_owned(),
+            })
+        );
+
+        snapshot
+            .integration_approval
+            .as_mut()
+            .expect("card")
+            .blockers = vec!["path overlap: src/lib.rs".to_owned()];
+        snapshot
+            .integration_approval
+            .as_mut()
+            .expect("card")
+            .approvable = false;
+        state.set_composer("/resolve");
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),
+            UiEffect::Dispatch(WorkspaceAction::CreateResolutionTask {
+                batch_id: "batch-01".to_owned(),
+            })
+        );
     }
 
     #[test]

@@ -7,20 +7,23 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use orchestrator_domain::{
-    AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand, ClientCommandAction,
-    ClientCommandId, ClientCommandState, CreateSessionCommandPayload, GraphRevisionId,
-    GraphValidationSummary, MessageId, MessageKind, ProviderId, RequestPlanCommandPayload,
-    SessionId, TaskId, TaskState,
+    AppendMessageCommandPayload, ApproveGraphCommandPayload, ApproveIntegrationCommandPayload,
+    ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState,
+    CreateResolutionTaskCommandPayload, CreateSessionCommandPayload, GraphRevisionId,
+    GraphValidationSummary, IntegrationBatchId, IntegrationBlocker, MessageId, MessageKind,
+    ProviderId, RequestPlanCommandPayload, SessionId, TaskId, TaskState,
 };
 use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{
-    ControlAction as StateControlAction, DaemonStatus, Database, RepositoryStatePaths, RootConfig,
-    SessionListFilter, WorkspaceAttentionKind, WorkspaceProjection, WorkspaceReadRequest,
+    ControlAction as StateControlAction, DaemonStatus, Database, IntegrationBatchStatus,
+    RepositoryStatePaths, RootConfig, SessionListFilter, StoredIntegrationBatch,
+    WorkspaceAttentionKind, WorkspaceProjection, WorkspaceReadRequest,
 };
 use orchestrator_tui::chat::{
     ActionFeedback, AttentionItem, AttentionSeverity, ComposerTarget, DaemonConnectivity,
-    DriverError, PlanApprovalCard, PlanNodeSummary, TaskControlIntent, TaskInspector, TaskSummary,
-    TimelineEntry, WorkspaceAction, WorkspaceCursor, WorkspaceDriver, WorkspaceSnapshot,
+    DriverError, IntegrationApprovalCard, IntegrationSourceSummary, PlanApprovalCard,
+    PlanNodeSummary, TaskControlIntent, TaskInspector, TaskSummary, TimelineEntry, WorkspaceAction,
+    WorkspaceCursor, WorkspaceDriver, WorkspaceSnapshot,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -31,6 +34,7 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub(crate) struct SqliteWorkspaceDriver {
     repository: PathBuf,
+    state_root: PathBuf,
     database: Database,
     session_id: SessionId,
     selected_task_id: Option<TaskId>,
@@ -62,6 +66,7 @@ impl SqliteWorkspaceDriver {
         };
         Ok(Self {
             repository: repository.to_path_buf(),
+            state_root: paths.root,
             database,
             session_id,
             selected_task_id,
@@ -78,6 +83,7 @@ impl SqliteWorkspaceDriver {
         redactor: Redactor,
     ) -> Self {
         Self {
+            state_root: repository.join(".colay"),
             repository,
             database,
             session_id,
@@ -295,6 +301,105 @@ impl SqliteWorkspaceDriver {
             .map_err(driver_error)?;
         Ok(ActionFeedback::info("exact task graph approval accepted"))
     }
+
+    fn request_integration(&self) -> Result<ActionFeedback, DriverError> {
+        if !self.online()? {
+            return Err(DriverError::new(
+                "daemon is offline or stale; integration preview is read-only",
+            ));
+        }
+        self.submit_integration_command(
+            ClientCommandAction::RequestIntegration,
+            json!({}),
+            format!("chat-integration-preview-{}", ClientCommandId::new()),
+            "local-tui",
+        )?;
+        Ok(ActionFeedback::info("exact integration preview requested"))
+    }
+
+    fn approve_integration(
+        &self,
+        batch_id: &str,
+        preview_hash: &str,
+        approved_by: &str,
+    ) -> Result<ActionFeedback, DriverError> {
+        if !self.online()? {
+            return Err(DriverError::new(
+                "daemon is offline or stale; integration approval is read-only",
+            ));
+        }
+        let payload = ApproveIntegrationCommandPayload {
+            batch_id: IntegrationBatchId::from_str(batch_id).map_err(|error| {
+                DriverError::new(format!("invalid integration batch ID: {error}"))
+            })?,
+            preview_hash: preview_hash.to_owned(),
+            approved_by: approved_by.to_owned(),
+        };
+        payload
+            .validate()
+            .map_err(|error| DriverError::new(error.to_string()))?;
+        self.submit_integration_command(
+            ClientCommandAction::ApproveIntegration,
+            serde_json::to_value(&payload).map_err(driver_error)?,
+            format!(
+                "chat-integration-approve-{}-{}",
+                payload.batch_id, payload.preview_hash
+            ),
+            approved_by,
+        )?;
+        Ok(ActionFeedback::info(
+            "exact integration preview approval accepted",
+        ))
+    }
+
+    fn create_resolution_task(&self, batch_id: &str) -> Result<ActionFeedback, DriverError> {
+        if !self.online()? {
+            return Err(DriverError::new(
+                "daemon is offline or stale; resolution task creation is read-only",
+            ));
+        }
+        let payload = CreateResolutionTaskCommandPayload {
+            batch_id: IntegrationBatchId::from_str(batch_id).map_err(|error| {
+                DriverError::new(format!("invalid integration batch ID: {error}"))
+            })?,
+        };
+        self.submit_integration_command(
+            ClientCommandAction::CreateResolutionTask,
+            serde_json::to_value(&payload).map_err(driver_error)?,
+            format!("chat-integration-resolve-{}", payload.batch_id),
+            "local-tui",
+        )?;
+        Ok(ActionFeedback::info(
+            "integration resolution task requested",
+        ))
+    }
+
+    fn submit_integration_command(
+        &self,
+        action: ClientCommandAction,
+        payload: serde_json::Value,
+        idempotency_key: String,
+        requested_by: &str,
+    ) -> Result<(), DriverError> {
+        let command = ClientCommand {
+            command_id: ClientCommandId::new(),
+            session_id: Some(self.session_id),
+            task_id: None,
+            action,
+            payload,
+            idempotency_key,
+            state: ClientCommandState::Pending,
+            requested_by: requested_by.to_owned(),
+            requested_at: Utc::now(),
+            claimed_at: None,
+            completed_at: None,
+            outcome: None,
+        };
+        self.database
+            .submit_client_command(&command)
+            .map(|_| ())
+            .map_err(driver_error)
+    }
 }
 
 impl WorkspaceDriver for SqliteWorkspaceDriver {
@@ -313,7 +418,16 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             .database
             .daemon_status(Utc::now())
             .map_err(driver_error)?;
-        projection_to_snapshot(&self.repository, projection, &daemon).map_err(driver_error)
+        let mut snapshot =
+            projection_to_snapshot(&self.repository, projection, &daemon).map_err(driver_error)?;
+        snapshot.integration_approval = self
+            .database
+            .current_integration_batch(self.session_id)
+            .map_err(driver_error)?
+            .as_ref()
+            .and_then(|batch| integration_to_card(&self.state_root, batch));
+        snapshot.validate().map_err(driver_error)?;
+        Ok(snapshot)
     }
 
     fn dispatch(&mut self, action: WorkspaceAction) -> Result<ActionFeedback, DriverError> {
@@ -330,6 +444,15 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
                 proposal_hash,
                 approved_by,
             } => self.approve_graph(&revision_id, &proposal_hash, &approved_by),
+            WorkspaceAction::RequestIntegration => self.request_integration(),
+            WorkspaceAction::ApproveIntegration {
+                batch_id,
+                preview_hash,
+                approved_by,
+            } => self.approve_integration(&batch_id, &preview_hash, &approved_by),
+            WorkspaceAction::CreateResolutionTask { batch_id } => {
+                self.create_resolution_task(&batch_id)
+            }
             WorkspaceAction::OpenAdministration => {
                 Ok(ActionFeedback::info("opening administration dashboard"))
             }
@@ -665,6 +788,7 @@ fn projection_to_snapshot(
             .count(),
         tasks,
         plan_approval,
+        integration_approval: None,
         messages,
         has_older_messages: projection.has_older_messages,
         attention,
@@ -678,6 +802,84 @@ fn projection_to_snapshot(
         },
         read_only_reason,
     })
+}
+
+fn integration_to_card(
+    state_root: &Path,
+    batch: &StoredIntegrationBatch,
+) -> Option<IntegrationApprovalCard> {
+    if !matches!(
+        batch.status,
+        IntegrationBatchStatus::Preview
+            | IntegrationBatchStatus::Blocked
+            | IntegrationBatchStatus::NeedsAttention
+    ) {
+        return None;
+    }
+    let preview = &batch.preview;
+    Some(IntegrationApprovalCard {
+        batch_id: preview.batch_id.to_string(),
+        preview_hash: preview.preview_hash.clone(),
+        base_revision: preview.base_revision.clone(),
+        destination: batch.application.as_ref().map_or_else(
+            || {
+                state_root
+                    .join("integration")
+                    .join(preview.batch_id.to_string())
+                    .display()
+                    .to_string()
+            },
+            |application| application.integration_worktree.clone(),
+        ),
+        sources: preview
+            .sources
+            .iter()
+            .map(|source| IntegrationSourceSummary {
+                task_id: source.task_id.to_string(),
+                checkpoint_id: source.checkpoint_id.to_string(),
+                verification_id: source.verification_id.to_string(),
+                diff_sha256: source.diff_sha256.clone(),
+                changed_files: source
+                    .changed_files
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            })
+            .collect(),
+        blockers: preview
+            .blockers
+            .iter()
+            .map(integration_blocker_label)
+            .chain(batch.application.as_ref().and_then(|application| {
+                (!application.succeeded && !application.detail_redacted.trim().is_empty())
+                    .then(|| format!("application: {}", application.detail_redacted))
+            }))
+            .collect(),
+        approvable: batch.status == IntegrationBatchStatus::Preview && preview.is_approvable(),
+    })
+}
+
+fn integration_blocker_label(blocker: &IntegrationBlocker) -> String {
+    match blocker {
+        IntegrationBlocker::MissingEvidence { task_id, detail } => {
+            format!("{task_id}: missing evidence ({detail})")
+        }
+        IntegrationBlocker::VerificationFailed { task_id } => {
+            format!("{task_id}: verification failed")
+        }
+        IntegrationBlocker::StaleBase { task_id, found } => {
+            format!("{task_id}: stale base {found}")
+        }
+        IntegrationBlocker::SourceChanged { task_id } => {
+            format!("{task_id}: source changed after checkpoint")
+        }
+        IntegrationBlocker::PathOverlap { left, right, path } => {
+            format!("{left} and {right}: overlapping path {path}")
+        }
+        IntegrationBlocker::PatchFailed { task_id, detail } => {
+            format!("{task_id}: patch failed ({detail})")
+        }
+    }
 }
 
 fn task_execution_status(task: &orchestrator_state::WorkspaceTask) -> String {
@@ -755,21 +957,24 @@ mod tests {
     use chrono::TimeDelta;
     use orchestrator_daemon::{MessageRedactor, process_next_client_command};
     use orchestrator_domain::{
-        ApproveGraphCommandPayload, ClientCommand, ClientCommandAction, ClientCommandId,
-        ClientCommandState, CreateSessionCommandPayload, DaemonInstanceId, GraphRevisionId,
-        GraphValidationPolicy, ModelProfile, PlanningAttemptId, ProviderId, RepoPath,
+        ApproveGraphCommandPayload, ApproveIntegrationCommandPayload, CheckpointId, ClientCommand,
+        ClientCommandAction, ClientCommandId, ClientCommandState,
+        CreateResolutionTaskCommandPayload, CreateSessionCommandPayload, DaemonInstanceId,
+        GraphRevisionId, GraphValidationPolicy, IntegrationBatchId, IntegrationPreview,
+        IntegrationSource, ModelProfile, PlanningAttemptId, ProviderId, RepoPath,
         RequestPlanCommandPayload, RiskTag, SchemaVersion, SessionId, TaskGraphNode,
-        TaskGraphProposal, validate_task_graph,
+        TaskGraphProposal, TaskId, VerificationId, validate_task_graph,
     };
     use orchestrator_process::{RedactionConfig, Redactor};
     use orchestrator_state::{
-        DaemonLeaseRequest, Database, GraphApprovalRequest, NewGraphAttempt, WorkspaceReadRequest,
+        DaemonLeaseRequest, Database, GraphApprovalRequest, IntegrationBatchStatus,
+        NewGraphAttempt, StoredIntegrationBatch, WorkspaceReadRequest,
     };
     use orchestrator_tui::chat::{
         ComposerTarget, DaemonConnectivity, WorkspaceAction, WorkspaceCursor, WorkspaceDriver,
     };
 
-    use super::SqliteWorkspaceDriver;
+    use super::{SqliteWorkspaceDriver, integration_to_card};
 
     struct Adapter(Redactor);
 
@@ -1033,11 +1238,24 @@ mod tests {
             proposal_hash: proposal_hash.clone(),
             approved_by: "operator".to_owned(),
         })?;
+        driver.dispatch(WorkspaceAction::RequestIntegration)?;
+        let batch_id = IntegrationBatchId::new();
+        let preview_hash = "b".repeat(64);
+        driver.dispatch(WorkspaceAction::ApproveIntegration {
+            batch_id: batch_id.to_string(),
+            preview_hash: preview_hash.clone(),
+            approved_by: "operator".to_owned(),
+        })?;
+        driver.dispatch(WorkspaceAction::CreateResolutionTask {
+            batch_id: batch_id.to_string(),
+        })?;
 
         driver.database.with_connection(|connection| {
             let mut statement = connection.prepare(
                 "SELECT action, payload_json, requested_by FROM client_commands
-                 WHERE action IN ('request_plan', 'approve_graph') ORDER BY requested_at, rowid",
+                 WHERE action IN ('request_plan', 'approve_graph', 'request_integration',
+                                  'approve_integration', 'create_resolution_task')
+                 ORDER BY requested_at, rowid",
             )?;
             let commands = statement
                 .query_map([], |row| {
@@ -1048,7 +1266,7 @@ mod tests {
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            assert_eq!(commands.len(), 2);
+            assert_eq!(commands.len(), 5);
             assert_eq!(commands[0].0, "request_plan");
             assert_eq!(
                 serde_json::from_str::<RequestPlanCommandPayload>(&commands[0].1)?.goal_message_id,
@@ -1060,6 +1278,18 @@ mod tests {
             assert_eq!(approval.proposal_hash, proposal_hash);
             assert_eq!(approval.approved_by, "operator");
             assert_eq!(commands[1].2, "operator");
+            assert_eq!(commands[2].0, "request_integration");
+            assert_eq!(commands[2].1, "{}");
+            let integration =
+                serde_json::from_str::<ApproveIntegrationCommandPayload>(&commands[3].1)?;
+            assert_eq!(commands[3].0, "approve_integration");
+            assert_eq!(integration.batch_id, batch_id);
+            assert_eq!(integration.preview_hash, preview_hash);
+            assert_eq!(integration.approved_by, "operator");
+            let resolution =
+                serde_json::from_str::<CreateResolutionTaskCommandPayload>(&commands[4].1)?;
+            assert_eq!(commands[4].0, "create_resolution_task");
+            assert_eq!(resolution.batch_id, batch_id);
             Ok(())
         })?;
         assert!(
@@ -1071,6 +1301,45 @@ mod tests {
                 })
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn integration_preview_projects_exact_tui_authority_fields() -> anyhow::Result<()> {
+        let task_id = TaskId::new();
+        let preview = IntegrationPreview::seal(
+            IntegrationBatchId::new(),
+            SessionId::new(),
+            GraphRevisionId::new(),
+            "a".repeat(40),
+            vec![IntegrationSource {
+                task_id,
+                checkpoint_id: CheckpointId::new(),
+                verification_id: VerificationId::new(),
+                base_revision: "a".repeat(40),
+                diff_sha256: "b".repeat(64),
+                changed_files: vec![RepoPath::try_from("src/lib.rs")?],
+            }],
+            Vec::new(),
+            chrono::Utc::now(),
+        )?;
+        let card = integration_to_card(
+            std::path::Path::new("C:/repo/.colay"),
+            &StoredIntegrationBatch {
+                preview: preview.clone(),
+                status: IntegrationBatchStatus::Preview,
+                approval: None,
+                application: None,
+            },
+        )
+        .ok_or_else(|| anyhow!("integration card missing"))?;
+        assert_eq!(card.batch_id, preview.batch_id.to_string());
+        assert_eq!(card.preview_hash, preview.preview_hash);
+        assert_eq!(card.base_revision, "a".repeat(40));
+        assert_eq!(card.sources[0].task_id, task_id.to_string());
+        assert_eq!(card.sources[0].changed_files, vec!["src/lib.rs"]);
+        assert!(card.destination.contains(&preview.batch_id.to_string()));
+        assert!(card.approvable);
         Ok(())
     }
 }

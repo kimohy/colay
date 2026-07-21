@@ -4,7 +4,9 @@ use crate::chat::ComposerTarget;
 pub enum PaletteCommand {
     Tasks,
     Plan,
+    Integrate,
     Approve,
+    Resolve,
     Pause,
     Resume,
     Cancel,
@@ -20,7 +22,9 @@ pub fn parse_palette_command(value: &str) -> Option<PaletteCommand> {
     match value.trim() {
         "/tasks" => Some(PaletteCommand::Tasks),
         "/plan" => Some(PaletteCommand::Plan),
+        "/integrate" => Some(PaletteCommand::Integrate),
         "/approve" => Some(PaletteCommand::Approve),
+        "/resolve" => Some(PaletteCommand::Resolve),
         "/pause" => Some(PaletteCommand::Pause),
         "/resume" => Some(PaletteCommand::Resume),
         "/cancel" => Some(PaletteCommand::Cancel),
@@ -88,7 +92,9 @@ mod tests {
         for (value, expected) in [
             ("/tasks", PaletteCommand::Tasks),
             ("/plan", PaletteCommand::Plan),
+            ("/integrate", PaletteCommand::Integrate),
             ("/approve", PaletteCommand::Approve),
+            ("/resolve", PaletteCommand::Resolve),
             ("/pause", PaletteCommand::Pause),
             ("/resume", PaletteCommand::Resume),
             ("/cancel", PaletteCommand::Cancel),

@@ -337,7 +337,7 @@ fn render_overlay(
         Overlay::CommandPalette => (
             " COMMAND PALETTE ",
             vec![Line::from(
-                "/tasks /plan /approve /pause /resume /cancel /handover /retry /checkpoint /provider",
+                "/tasks /plan /integrate /approve /resolve /pause /resume /cancel /handover /retry /checkpoint /provider",
             )],
         ),
         Overlay::Help => (
@@ -369,6 +369,13 @@ fn render_overlay(
             " APPROVE EXACT TASK GRAPH? ",
             approval_confirmation_lines(snapshot, revision_id, proposal_hash),
         ),
+        Overlay::IntegrationApprovalConfirmation {
+            batch_id,
+            preview_hash,
+        } => (
+            " APPROVE EXACT INTEGRATION PREVIEW? ",
+            integration_approval_lines(snapshot, batch_id, preview_hash),
+        ),
     };
     let overlay_area = centered_rect(area, 72, 70);
     frame.render_widget(Clear, overlay_area);
@@ -379,6 +386,49 @@ fn render_overlay(
         overlay_area,
     );
     let _ = state;
+}
+
+fn integration_approval_lines(
+    snapshot: &WorkspaceSnapshot,
+    batch_id: &str,
+    preview_hash: &str,
+) -> Vec<Line<'static>> {
+    let Some(card) = snapshot.integration_approval.as_ref().filter(|card| {
+        card.approvable && card.batch_id == batch_id && card.preview_hash == preview_hash
+    }) else {
+        return vec![Line::from(
+            "Integration preview changed. Close and reopen /approve.",
+        )];
+    };
+    let mut lines = vec![
+        Line::from(format!("batch       {}", card.batch_id)),
+        Line::from(format!("SHA-256     {}", card.preview_hash)),
+        Line::from(format!("base        {}", card.base_revision)),
+        Line::from(format!("destination {}", card.destination)),
+        Line::from(format!("blockers    {}", list_or_none(&card.blockers))),
+        Line::default(),
+    ];
+    for source in &card.sources {
+        lines.extend([
+            Line::from(Span::styled(
+                format!("source {}", source.task_id),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!("  checkpoint   {}", source.checkpoint_id)),
+            Line::from(format!("  verification {}", source.verification_id)),
+            Line::from(format!("  diff SHA-256 {}", source.diff_sha256)),
+            Line::from(format!(
+                "  changed files {}",
+                list_or_none(&source.changed_files)
+            )),
+            Line::default(),
+        ]);
+    }
+    lines.push(Line::from(Span::styled(
+        "y: apply this exact preview in its integration worktree | n/Esc: cancel",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines
 }
 
 fn approval_confirmation_lines(
@@ -485,9 +535,9 @@ mod tests {
 
     use super::render_workspace;
     use crate::chat::{
-        AttentionItem, AttentionSeverity, DaemonConnectivity, FocusPane, LayoutMode,
-        PlanApprovalCard, PlanNodeSummary, TaskInspector, TaskSummary, TimelineEntry,
-        WorkspaceSnapshot, WorkspaceState,
+        AttentionItem, AttentionSeverity, DaemonConnectivity, FocusPane, IntegrationApprovalCard,
+        IntegrationSourceSummary, LayoutMode, PlanApprovalCard, PlanNodeSummary, TaskInspector,
+        TaskSummary, TimelineEntry, WorkspaceSnapshot, WorkspaceState,
     };
 
     fn snapshot() -> WorkspaceSnapshot {
@@ -681,6 +731,48 @@ mod tests {
             "concurrency",
             "after domain",
             "y: approve exact revision",
+        ] {
+            assert!(text.contains(expected), "missing `{expected}`");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn integration_overlay_renders_exact_sources_and_destination() -> Result<(), io::Error> {
+        let mut snapshot = snapshot();
+        snapshot.integration_approval = Some(IntegrationApprovalCard {
+            batch_id: "batch-01".to_owned(),
+            preview_hash: "c".repeat(64),
+            base_revision: "d".repeat(40),
+            destination: ".colay/integration/batch-01".to_owned(),
+            sources: vec![IntegrationSourceSummary {
+                task_id: "task-03".to_owned(),
+                checkpoint_id: "checkpoint-03".to_owned(),
+                verification_id: "verification-03".to_owned(),
+                diff_sha256: "e".repeat(64),
+                changed_files: vec!["src/auth.rs".to_owned()],
+            }],
+            blockers: Vec::new(),
+            approvable: true,
+        });
+        let mut state = WorkspaceState::default();
+        state.set_focus(FocusPane::Composer);
+        state.set_composer("/approve");
+        state.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &snapshot,
+            LayoutMode::Wide,
+        );
+        let text = rendered_text(160, 50, &snapshot, &state)?;
+        for expected in [
+            "APPROVE EXACT INTEGRATION PREVIEW",
+            "batch-01",
+            ".colay/integration/batch-01",
+            "checkpoint-03",
+            "verification-03",
+            "src/auth.rs",
+            &"c".repeat(64),
+            &"e".repeat(64),
         ] {
             assert!(text.contains(expected), "missing `{expected}`");
         }

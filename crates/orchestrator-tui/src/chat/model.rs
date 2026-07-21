@@ -74,6 +74,26 @@ pub struct PlanApprovalCard {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationSourceSummary {
+    pub task_id: String,
+    pub checkpoint_id: String,
+    pub verification_id: String,
+    pub diff_sha256: String,
+    pub changed_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationApprovalCard {
+    pub batch_id: String,
+    pub preview_hash: String,
+    pub base_revision: String,
+    pub destination: String,
+    pub sources: Vec<IntegrationSourceSummary>,
+    pub blockers: Vec<String>,
+    pub approvable: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimelineEntry {
     pub ordinal: i64,
     pub message_id: String,
@@ -131,6 +151,7 @@ pub struct WorkspaceSnapshot {
     pub blocked_count: usize,
     pub tasks: Vec<TaskSummary>,
     pub plan_approval: Option<PlanApprovalCard>,
+    pub integration_approval: Option<IntegrationApprovalCard>,
     pub messages: Vec<TimelineEntry>,
     pub has_older_messages: bool,
     pub attention: Vec<AttentionItem>,
@@ -195,6 +216,29 @@ impl WorkspaceSnapshot {
                 return Err(WorkspaceModelError::UnknownPlanDependency);
             }
         }
+        if let Some(integration) = &self.integration_approval {
+            require_non_blank(&integration.batch_id, "integration batch ID")?;
+            require_non_blank(&integration.destination, "integration destination")?;
+            if !valid_hex(&integration.preview_hash, 64, 64) {
+                return Err(WorkspaceModelError::InvalidIntegrationPreviewHash);
+            }
+            if !valid_hex(&integration.base_revision, 40, 64) {
+                return Err(WorkspaceModelError::InvalidIntegrationBaseRevision);
+            }
+            if integration.approvable
+                && (integration.sources.is_empty() || !integration.blockers.is_empty())
+            {
+                return Err(WorkspaceModelError::InvalidIntegrationApprovalState);
+            }
+            for source in &integration.sources {
+                require_non_blank(&source.task_id, "integration source task ID")?;
+                require_non_blank(&source.checkpoint_id, "integration checkpoint ID")?;
+                require_non_blank(&source.verification_id, "integration verification ID")?;
+                if !valid_hex(&source.diff_sha256, 64, 64) {
+                    return Err(WorkspaceModelError::InvalidIntegrationSourceHash);
+                }
+            }
+        }
         if let Some(inspector) = &self.inspector
             && !task_ids.contains(inspector.task_id.as_str())
         {
@@ -241,6 +285,15 @@ pub enum WorkspaceAction {
         revision_id: String,
         proposal_hash: String,
         approved_by: String,
+    },
+    RequestIntegration,
+    ApproveIntegration {
+        batch_id: String,
+        preview_hash: String,
+        approved_by: String,
+    },
+    CreateResolutionTask {
+        batch_id: String,
     },
     OpenAdministration,
     Quit,
@@ -309,6 +362,14 @@ pub enum WorkspaceModelError {
     DuplicatePlanNode(String),
     #[error("plan dependency references an unknown node")]
     UnknownPlanDependency,
+    #[error("integration preview hash is not a SHA-256 hexadecimal value")]
+    InvalidIntegrationPreviewHash,
+    #[error("integration base revision is not a hexadecimal Git object ID")]
+    InvalidIntegrationBaseRevision,
+    #[error("integration source hash is not a SHA-256 hexadecimal value")]
+    InvalidIntegrationSourceHash,
+    #[error("integration approval state contradicts its sources or blockers")]
+    InvalidIntegrationApprovalState,
 }
 
 fn require_non_blank(value: &str, field: &'static str) -> Result<(), WorkspaceModelError> {
@@ -319,11 +380,15 @@ fn require_non_blank(value: &str, field: &'static str) -> Result<(), WorkspaceMo
     }
 }
 
+fn valid_hex(value: &str, minimum: usize, maximum: usize) -> bool {
+    (minimum..=maximum).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerTarget, DaemonConnectivity, TaskInspector, TaskSummary, TimelineEntry,
-        WorkspaceSnapshot,
+        ComposerTarget, DaemonConnectivity, IntegrationApprovalCard, IntegrationSourceSummary,
+        TaskInspector, TaskSummary, TimelineEntry, WorkspaceModelError, WorkspaceSnapshot,
     };
 
     fn task(task_id: &str) -> TaskSummary {
@@ -412,5 +477,36 @@ mod tests {
         snapshot = sample_snapshot();
         snapshot.messages[0].content.clear();
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn integration_card_requires_exact_hash_and_sources() {
+        let mut snapshot = sample_snapshot();
+        snapshot.integration_approval = Some(IntegrationApprovalCard {
+            batch_id: "batch-01".to_owned(),
+            preview_hash: "c".repeat(64),
+            base_revision: "d".repeat(40),
+            destination: ".colay/integration/batch-01".to_owned(),
+            sources: vec![IntegrationSourceSummary {
+                task_id: "task-01".to_owned(),
+                checkpoint_id: "checkpoint-01".to_owned(),
+                verification_id: "verification-01".to_owned(),
+                diff_sha256: "e".repeat(64),
+                changed_files: vec!["src/lib.rs".to_owned()],
+            }],
+            blockers: Vec::new(),
+            approvable: true,
+        });
+        assert_eq!(snapshot.validate(), Ok(()));
+
+        snapshot
+            .integration_approval
+            .as_mut()
+            .expect("card")
+            .preview_hash = "not-a-hash".to_owned();
+        assert_eq!(
+            snapshot.validate(),
+            Err(WorkspaceModelError::InvalidIntegrationPreviewHash)
+        );
     }
 }
