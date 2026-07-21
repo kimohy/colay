@@ -83,11 +83,24 @@ the timeline readable but disables messages and task controls until
 redacted before durable command submission and again before conversation
 projection.
 
-Phase 2 intentionally lists recent repository tasks. Phase 3 adds approved DAG
-planning and session graph membership; parallel execution and integration
-approval arrive in later phases. `/plan`, `/approve`, `/retry`, and broadcast
-execution therefore report that they are unavailable instead of implying work
-was scheduled.
+Use `/plan` after sending a session-level goal. The daemon invokes one eligible
+official CLI in an explicitly read-only sandbox, requires exactly one bounded
+JSON task-graph proposal, validates its DAG, providers, profiles, concurrency,
+and write-scope isolation, and persists the revision without creating a task or
+worktree. `/approve` opens a text confirmation containing the exact proposal
+hash, nodes, dependencies, scopes, providers/profiles, risks, and proposed
+parallelism. Only `y` submits typed approval for that exact revision/hash;
+`n`/`Esc`, an offline daemon, an invalid plan, or a changed hash fails closed.
+Chat text such as "yes" has no approval authority.
+
+Phase 3 implements this exact proposal hash approval boundary; parallel execution
+is deliberately deferred to Phase 4.
+
+No writable task before approval is a hard boundary. Exact approval atomically
+materializes the graph as queued session tasks; it still starts no worker and
+creates no worktree. Phase 4 adds dependency-aware execution, while integration,
+merge, push, and cleanup remain separately gated in Phase 5. `/retry` and
+broadcast execution are not yet available.
 
 ## Model profiles
 

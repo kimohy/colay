@@ -213,6 +213,11 @@ fn chat_tui_readme_documents_navigation_reconnect_and_phase_boundary() {
         "/tasks",
         "daemon reconnect",
         "Phase 3",
+        "/plan",
+        "/approve",
+        "proposal hash",
+        "read-only sandbox",
+        "No writable task before approval",
         "parallel execution",
     ] {
         assert!(README.contains(expected), "README is missing `{expected}`");

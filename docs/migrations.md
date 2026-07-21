@@ -4,7 +4,7 @@ State, config, handover, worker result, checkpoint, routing decision, and usage 
 
 ## SQLite
 
-SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4 -> v5`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
+SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4 -> v5 -> v6`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
 
 State schema v4 adds `sessions`, ordered `conversation_messages`, idempotent
 `client_commands`, and repository `daemon_instances`. It also adds nullable
@@ -19,9 +19,18 @@ navigation after a TUI reconnect without mixing presentation fields into the
 provider-neutral task/session contracts. The foreign keys prevent a selection
 from naming a missing session or task.
 
+State schema v6 adds immutable graph revisions, planning attempts, session graph
+heads, exact approvals, ordered session-task membership, and relational task
+dependencies. It rebuilds the v5 client-command table so only typed graph
+actions are accepted while preserving existing rows and idempotency. Planning
+attempts support a durable in-flight state and one terminal completion; graph
+triggers allow only the intended planning-to-valid/invalid and
+awaiting-approval-to-approved/superseded transitions. Existing databases are
+backed up before the rebuild, and historical event JSON/hashes are not rewritten.
+
 For an existing nonzero schema, `migrate apply` creates an online SQLite backup under `.colay/backups/orchestrator.db.backup.<timestamp>` before applying pending versions. A legacy config keeps using its explicitly selected state root. A brand-new empty database has no prior state to back up. After migration, `doctor` reports SQLite integrity and foreign-key health.
 
-`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas.
+`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5/v6 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. A separate v5 fixture proves the v6 rebuild preserves completed command rows and creates a verified pre-apply backup.
 
 ## Configuration
 
@@ -51,3 +60,6 @@ require task/lease quiescence, exact event sequence, an approved sealed plan, an
 a verified recovery backup; daemon lifecycle does not bypass those controls.
 Restoring a v4 backup also removes v5 task-selection preferences; chat content
 and task records remain governed by the selected backup image.
+Restoring a pre-v6 backup also removes graph revisions, planning attempts,
+approvals, session graph membership, and dependency rows. The normal quiescence,
+sealed-plan, backup, and exact event-sequence guards still apply.

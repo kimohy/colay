@@ -23,6 +23,9 @@ Provider output, task text, repository files, Git metadata, usage-probe output, 
 | Malicious local command replay | Unique idempotency keys, canonical payload/target comparison, atomic single-consumer claim, conservative stale recovery |
 | Silent chat retargeting | Navigation and composer target are separate reducer fields; target changes require an explicit picker or one-message mention |
 | Secret persistence through chat | Client-side redaction before command persistence, daemon-side redaction before projection, redacted-only TUI mapping |
+| Forged or stale plan approval | Typed revision ID plus exact SHA-256 proposal hash, current-head check, seal recomputation, explicit `y`, stale-overlay closure; display text has no authority |
+| Planner-induced mutation | Official CLI capability probe, explicit read-only sandbox, bounded separated argv/process, no task/worktree materialization before approval |
+| Malicious task graph | Provider-neutral strict JSON, bounded collector, deterministic DAG/scope/provider/profile validation, invalid revision retention without approval hash |
 | Mutation during daemon loss | Heartbeat-derived online/stale/offline state; stale and offline snapshots are explicitly read-only |
 | Remote control-plane exposure | No listener, socket, HTTP service, or MCP server; CLI/daemon coordination is SQLite-only |
 | Quota misclassification | Source/confidence/unit/scope retained; unknown remains unknown |
@@ -47,5 +50,13 @@ only a session ID, optional task ID, and timestamp; it contains no message text,
 credential, provider session, or authority. `/admin` exits the chat terminal
 guard before entering the compatibility dashboard and restores a fresh guard on
 return.
+
+Planner output, node titles, dependency labels, risks, and chat content are
+untrusted display data. Approval authority is carried only in typed revision and
+hash fields preserved from SQLite; it is never recovered by parsing rendered
+text. The approval transaction recomputes the canonical proposal seal and
+rejects superseded, invalid, malformed, or wrong-hash revisions. Planning errors
+are redacted before persistence, and cancellation terminates the owned process
+tree while leaving a reconcilable durable attempt.
 
 The design does not attempt to defend against a host administrator who can replace binaries, read process memory, or rewrite all state and hashes. Enterprise endpoint security and code-signing policy remain required.

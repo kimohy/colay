@@ -49,9 +49,10 @@ network listener; its only control plane is the repository-confined database.
 PID is diagnostic metadata, not ownership authority—the UUID lease and its
 unexpired database predicates decide ownership.
 
-The Phase 2 TUI reads one bounded projection under a single database lock:
-session identity, at most 200 newest messages, at most 100 recent repository
-tasks, attention state, and the selected task inspector. The newest-message SQL
+The chat TUI reads one bounded projection under a single database lock:
+session identity, at most 200 newest messages, the current session graph (or at
+most 100 recent repository tasks only when no graph exists), attention state,
+and the selected task inspector. The newest-message SQL
 query runs in descending order and is reversed before presentation, so long
 histories remain bounded while the timeline stays chronological. A v5
 `session_workspace_state` row restores the selected task without coupling the
@@ -63,8 +64,20 @@ change a target. Returning from the legacy administration dashboard reuses the
 same UI session state. A stale/offline daemon produces a readable snapshot with
 an explicit mutation guard rather than an optimistic local queue.
 
-Phase 2 does not infer a session DAG from recent tasks and does not invoke a
-provider from the daemon. Phase 3 adds approved graph planning and membership;
-parallel agents and integration/recovery follow in later phases. The existing
-five-panel dashboard remains available only through `/admin` as a compatibility
-adapter.
+Phase 3 planning is a separate read-only provider boundary. A durable
+`request_plan` command binds the newest eligible goal message to a UUID-v7 graph
+revision and planning attempt. The official CLI receives separated argv, an
+explicit read-only sandbox, bounded output/time, redacted repository evidence,
+and a provider-neutral JSON schema. Domain validation deterministically checks
+identity, schemas, acyclicity, dependencies, provider/profile eligibility,
+parallel width, and independent write-scope overlap before sealing the proposal
+and validation summary with SHA-256.
+
+Invalid revisions and redacted errors remain inspectable but carry no approvable
+hash. Approval is not inferred from conversation text: a typed command must name
+the current revision and exact proposal hash. One short SQLite transaction
+recomputes the seal, records the approver, creates ordered session tasks and
+relational dependencies, and leaves every task `queued`. No worktree, worker
+lease, provider worker, merge, or push exists at this boundary. Parallel agents
+and integration/recovery follow in Phases 4 and 5. The existing five-panel
+dashboard remains available only through `/admin` as a compatibility adapter.

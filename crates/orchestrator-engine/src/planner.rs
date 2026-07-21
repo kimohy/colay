@@ -275,7 +275,7 @@ mod tests {
     fn valid_json(request: &PlannerRequest) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "schema_version": SchemaVersion::V1,
-            "revision_id": GraphRevisionId::new(),
+            "revision_id": request.revision_id,
             "session_id": request.session_id,
             "goal_message_id": request.goal_message_id,
             "planner_provider": "codex",

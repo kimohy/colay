@@ -7,7 +7,7 @@ This repository versions Colay and its persisted/public contracts independently.
 | Colay | `0.1.0` | workspace `Cargo.toml` |
 | Tested Codex | `0.144.5`, `0.144.6` | `compatibility/codex-version.toml` |
 | Recommended Codex | `0.144.6` | `compatibility/codex-version.toml` |
-| SQLite state schema | `5` | `STATE_SCHEMA_VERSION` and migrations |
+| SQLite state schema | `6` | `STATE_SCHEMA_VERSION` and migrations |
 | Config schema | `4` | `CONFIG_SCHEMA_VERSION` |
 | Checkpoint/handover schema | `1` | domain writers |
 
@@ -20,7 +20,7 @@ Current known limitations:
 - The CLI intentionally keeps `codex exec --json` as the default transport; selecting App Server first is an adapter policy rather than a user-facing CLI switch.
 - Authoritative checkpoint diffs remain sensitive local source artifacts even though persistence/handover preflight blocks known secret patterns and oversized unscanned files.
 - Routing policy can calculate a parallel count, but CLI dispatch currently forces one worker; concurrent read-only fan-out is not implemented.
-- The chat TUI shows recent repository tasks until Phase 3 adds approved session DAG membership; parallel execution and integration remain unavailable.
+- The chat TUI plans and approves exact session DAG revisions, but approved tasks remain queued; parallel execution and integration remain unavailable until Phases 4 and 5.
 
 See [`rollback.md`](rollback.md) for the release manifest, explicit approval, recovery journal, and restart procedure.
 

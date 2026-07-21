@@ -60,14 +60,27 @@ Ctrl+O            overview
 Ctrl+L            full log
 Ctrl+T            explicit composer target
 ?                 help
+/plan             plan the newest session-level user goal (read-only)
+/approve          review and confirm the exact current graph revision/hash
 /admin            five-panel administration compatibility view
 ```
 
 Task selection never changes the composer target. `@task-<id>` and `@all` are
 one-message overrides; broadcast execution is unavailable until the parallel
-phase. The chat view currently shows recent repository tasks rather than graph
-members because session DAG membership starts in Phase 3. `/plan`, `/approve`,
-`/retry`, and later integration actions fail visibly as unavailable.
+phase. `/plan` selects only the newest final, session-level user message and
+submits a durable read-only planning request. The resulting plan card shows its
+revision, SHA-256 proposal hash, ordered nodes, dependencies, scopes,
+providers/profiles, risks, and parallelism. `/approve` is enabled only for a
+validated current revision while the daemon is online. Only `y` confirms;
+`n`/`Esc` cancels, and a refresh with a different hash closes the overlay.
+Typing "yes" in chat remains an ordinary message.
+
+Before approval there are no writable tasks, worktrees, or worker leases. Exact
+approval materializes queued tasks and dependency rows once, but Phase 3 does
+not dispatch them. An invalid plan is retained with a redacted attention error
+and no approvable hash. Re-run `/plan` after correcting the goal to create a new
+revision; earlier revisions remain historical. `/retry` and later integration
+actions still fail visibly as unavailable.
 
 ## Repository daemon
 
@@ -79,11 +92,13 @@ graceful release and is idempotent when no daemon exists. `restart` waits for th
 previous lease to be released or expire before starting a replacement.
 
 The hidden `daemon serve` action is an internal child-process entry point. The
-service heartbeats once per second with a five-second lease, processes
-session/message commands every 100ms, and responds to persisted stop requests
-and Ctrl-C cancellation. A crashed daemon leaves a stale row; a replacement may
-take ownership only at or after lease expiry. There is no network endpoint and
-no provider invocation in this service loop.
+service heartbeats once per second with a five-second lease, processes durable
+session/message/planning/approval commands every 100ms, and responds to
+persisted stop requests and Ctrl-C cancellation. Read-only planning runs in an
+owned cancellable child while heartbeat and stop handling continue. A crashed
+daemon leaves a stale row and reconciles replay-safe planning commands on
+restart; a replacement may take ownership only at or after lease expiry. There
+is no network endpoint.
 
 ## Control requests and recovery
 
