@@ -160,7 +160,9 @@ impl Database {
                 "SELECT command_id, session_id, task_id, action, payload_json, idempotency_key,
                         state, requested_by, requested_at, claimed_at, completed_at, outcome
                  FROM client_commands WHERE state = 'pending'
-                   AND action IN ('request_plan', 'approve_graph', 'revise_graph', 'cancel_plan')
+                   AND action IN (
+                       'request_plan', 'approve_graph', 'revise_graph', 'cancel_plan',
+                       'request_integration', 'approve_integration', 'create_resolution_task')
                  ORDER BY requested_at, command_id LIMIT 1",
             )?;
             statement.query_row([], map_client_command).optional()?
@@ -246,6 +248,7 @@ impl Database {
                     | ClientCommandAction::AppendMessage
                     | ClientCommandAction::RequestPlan
                     | ClientCommandAction::ApproveGraph
+                    | ClientCommandAction::RequestIntegration
             ) {
                 let changed = transaction.execute(
                     "UPDATE client_commands SET state = 'pending', claimed_at = NULL
@@ -373,6 +376,9 @@ const fn action_name(action: ClientCommandAction) -> &'static str {
         ClientCommandAction::ApproveGraph => "approve_graph",
         ClientCommandAction::ReviseGraph => "revise_graph",
         ClientCommandAction::CancelPlan => "cancel_plan",
+        ClientCommandAction::RequestIntegration => "request_integration",
+        ClientCommandAction::ApproveIntegration => "approve_integration",
+        ClientCommandAction::CreateResolutionTask => "create_resolution_task",
     }
 }
 
@@ -385,6 +391,9 @@ fn parse_action(value: &str) -> Result<ClientCommandAction, std::io::Error> {
         "approve_graph" => Ok(ClientCommandAction::ApproveGraph),
         "revise_graph" => Ok(ClientCommandAction::ReviseGraph),
         "cancel_plan" => Ok(ClientCommandAction::CancelPlan),
+        "request_integration" => Ok(ClientCommandAction::RequestIntegration),
+        "approve_integration" => Ok(ClientCommandAction::ApproveIntegration),
+        "create_resolution_task" => Ok(ClientCommandAction::CreateResolutionTask),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown client command action `{value}`"),

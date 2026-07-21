@@ -236,6 +236,40 @@ pub struct ApproveGraphCommandPayload {
     pub approved_by: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveIntegrationCommandPayload {
+    pub batch_id: crate::IntegrationBatchId,
+    pub preview_hash: String,
+    pub approved_by: String,
+}
+
+impl ApproveIntegrationCommandPayload {
+    /// Validates exact integration approval authority fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for a malformed preview hash or blank approver.
+    pub fn validate(&self) -> Result<(), SessionValidationError> {
+        if self.preview_hash.len() != 64
+            || !self
+                .preview_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(SessionValidationError::InvalidIntegrationPreviewHash);
+        }
+        if self.approved_by.trim().is_empty() {
+            return Err(SessionValidationError::BlankApprover);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateResolutionTaskCommandPayload {
+    pub batch_id: crate::IntegrationBatchId,
+}
+
 impl ApproveGraphCommandPayload {
     /// Validates the typed authority fields for exact graph approval.
     ///
@@ -283,6 +317,9 @@ pub enum ClientCommandAction {
     ApproveGraph,
     ReviseGraph,
     CancelPlan,
+    RequestIntegration,
+    ApproveIntegration,
+    CreateResolutionTask,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +408,8 @@ pub enum SessionValidationError {
     InvalidProposalHash,
     #[error("graph approver identity must not be blank")]
     BlankApprover,
+    #[error("integration preview hash must be a hexadecimal SHA-256 value")]
+    InvalidIntegrationPreviewHash,
     #[error("client command state does not match its lifecycle timestamps")]
     InvalidCommandLifecycle,
 }

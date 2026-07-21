@@ -15,6 +15,7 @@ mod error;
 mod event_log;
 mod graphs;
 mod instructions;
+mod integrations;
 mod leases;
 mod migrations;
 mod paths;
@@ -45,6 +46,7 @@ pub use graphs::{
     GraphTaskProjection, NewGraphAttempt, NewPlanningAttempt, StoredGraphRevision,
 };
 pub use instructions::StoredTaskInstruction;
+pub use integrations::{IntegrationBatchStatus, StoredIntegrationBatch};
 pub use leases::{
     CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, WorkerLease, WorkerLeaseMode,
     WorkerLeaseRequest,

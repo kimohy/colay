@@ -41,7 +41,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 
     let initial = database.migration_status()?;
     assert_eq!(initial.current_version, 1);
-    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5, 6, 7]);
+    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5, 6, 7, 8]);
 
     let dry_run = database.dry_run_migrations()?;
     assert_eq!(dry_run.current_version, STATE_SCHEMA_VERSION);
@@ -69,6 +69,11 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
             "task_schedule_claims",
             "resource_claims",
             "task_instructions",
+            "integration_batches",
+            "integration_sources",
+            "integration_approvals",
+            "integration_applications",
+            "integration_resolution_tasks",
         ] {
             let count: i64 = connection.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -94,7 +99,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     let backup = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let backup_status = MigrationManager::status(&backup)?;
     assert_eq!(backup_status.current_version, 1);
-    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6, 7]);
+    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6, 7, 8]);
     Ok(())
 }
 
@@ -161,7 +166,7 @@ fn v5_to_current_dry_run_backup_and_command_rebuild_preserve_rows()
     let database = Database::open(&database_path)?;
     assert_eq!(database.migration_status()?.current_version, 5);
 
-    assert_eq!(database.dry_run_migrations()?.current_version, 7);
+    assert_eq!(database.dry_run_migrations()?.current_version, 8);
     assert_eq!(database.migration_status()?.current_version, 5);
     database.migrate_with_backup(&root.join("v5-backups"))?;
 
