@@ -5,6 +5,7 @@ mod checkpoint;
 mod coordinator;
 mod error;
 mod handover;
+mod planner;
 mod rollback;
 mod startup;
 mod verification;
@@ -15,6 +16,10 @@ pub use coordinator::TaskLifecycle;
 pub use error::{EngineError, EngineResult};
 pub use handover::{HandoverInput, HandoverManager};
 pub use orchestrator_domain::TaskEnvelope;
+pub use planner::{
+    PLANNER_MAX_OUTPUT_BYTES, PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse,
+    TaskPlanner, collect_planner_response,
+};
 pub use rollback::{
     RollbackApproval, RollbackExecutionReport, RollbackManager, RollbackRecoveryPlan, RollbackStep,
 };

@@ -848,6 +848,7 @@ dependencies = [
 name = "orchestrator-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "codex-compat",
  "orchestrator-domain",

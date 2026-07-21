@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 codex-compat = { path = "../codex-compat" }
 orchestrator-domain = { path = "../orchestrator-domain" }
