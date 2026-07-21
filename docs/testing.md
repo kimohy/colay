@@ -2,7 +2,7 @@
 
 ## Fake-only rule
 
-Tests and CI must never invoke real Codex, Claude, or Gemini inference. Provider integration tests use the compiled `fake-provider-cli` or `FakeAdapterRuntime`. The fake runtime canonicalizes its configured executable and rejects any basename other than `fake-provider-cli`, so accidentally passing `codex`, `claude`, or `gemini` is a test failure.
+Tests and CI must never invoke real Codex, Claude, Gemini, or Agy inference. Provider integration tests use the compiled `fake-provider-cli` or `FakeAdapterRuntime`. The fake runtime canonicalizes its configured executable and rejects any basename other than `fake-provider-cli`, so accidentally passing `codex`, `claude`, `gemini`, or `agy` is a test failure.
 
 CI clears common provider API-key variables and sets `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` at job scope. Compatibility workflows may build an exact official Codex source revision and run only the explicit version/help/schema probe allowlist; they never pass a prompt.
 
@@ -88,7 +88,7 @@ No provider credentials are needed. If an integration test asks for a provider l
 ## Contract coverage
 
 - `codex-compat/tests/contracts.rs` validates exact N/N-1 help/schema/event fixtures, unknown optional preservation, fail-closed lifecycle events, quota classification, resume events, and the committed compatibility matrix.
-- `orchestrator-test-support/tests/provider_e2e.rs` runs each adapter through fake structured streams, malformed/error/quota paths, cancellation, redaction, bounded process execution, and executable/argv usage probes.
+- `orchestrator-test-support/tests/provider_e2e.rs` runs each adapter through fake structured streams or Agy's bounded plain-text bridge, malformed/error/quota paths, cancellation, redaction, bounded process execution, and executable/argv usage probes.
 - `orchestrator-test-support/tests/multi_provider_handover_e2e.rs` drives the vendor-neutral lifecycle from a fake Gemini daily quota event through a sealed checkpoint, Codex implementation, a monthly-headroom warning carried into the Claude handover, Claude read-only review, and the independent completion gate.
 - `orchestrator-cli/tests/fake_cli_handover_e2e.rs` launches the compiled `colay` and gated `colay-e2e-fake-provider` binaries. It proves a Codex quota failure preserves a partial Git diff, Claude exactly acknowledges the sealed bundle before writing, local fmt/clippy/check/test evidence reaches `Completed`, the original branch remains untouched, and no merge/push/cleanup occurs. A second scenario exercises sealed, explicitly approved SQLite restore, recovery backup retention, and the post-restore JSONL hash chain.
 - `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential v2/v3/v4/v5/v6/v7/v8 plan and historical event hashes, rebuilds constrained command tables without losing rows, proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.

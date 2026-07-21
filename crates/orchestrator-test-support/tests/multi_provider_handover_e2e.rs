@@ -26,7 +26,7 @@ fn fake_binary() -> PathBuf {
 
 fn scope(provider: ProviderId) -> QuotaScope {
     match provider {
-        ProviderId::Gemini => {
+        ProviderId::Gemini | ProviderId::Agy => {
             QuotaScope::new("daily", QuotaPeriod::CalendarDay, UsageUnit::Requests)
         }
         ProviderId::Codex | ProviderId::Claude => {

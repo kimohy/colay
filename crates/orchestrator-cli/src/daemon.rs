@@ -138,6 +138,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         .iter()
         .filter_map(|(provider, limit)| {
             let provider = match provider.as_str() {
+                "agy" => ProviderId::Agy,
                 "codex" => ProviderId::Codex,
                 "claude" => ProviderId::Claude,
                 "gemini" => ProviderId::Gemini,

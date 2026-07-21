@@ -13,6 +13,7 @@ use crate::ProviderError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredOutput {
+    AgyText,
     CodexJsonl,
     CodexAppServerStdio,
     ClaudeStreamJson,
@@ -59,7 +60,8 @@ impl PreparedInvocation {
         match (self.output, self.codex_app_server.is_some()) {
             (StructuredOutput::CodexAppServerStdio, true)
             | (
-                StructuredOutput::CodexJsonl
+                StructuredOutput::AgyText
+                | StructuredOutput::CodexJsonl
                 | StructuredOutput::ClaudeStreamJson
                 | StructuredOutput::GeminiStreamJson
                 | StructuredOutput::UsageJson,

@@ -120,7 +120,7 @@ impl AdapterRuntime for FakeAdapterRuntime {
     ) -> Result<WorkerHandle, ProviderError> {
         self.ensure_fake(&invocation.executable)?;
         let lines = scenario_lines(provider, self.scenario);
-        let events = lines
+        let mut events = lines
             .into_iter()
             .enumerate()
             .map(|(index, bytes)| RawEvent {
@@ -130,6 +130,23 @@ impl AdapterRuntime for FakeAdapterRuntime {
                 received_at: Utc::now(),
             })
             .collect::<VecDeque<_>>();
+        if provider == ProviderId::Agy && self.scenario != FakeRuntimeScenario::Timeout {
+            let exit_code = if self.scenario == FakeRuntimeScenario::ProcessCrash {
+                17
+            } else {
+                0
+            };
+            events.push_back(RawEvent {
+                channel: RawEventChannel::Protocol,
+                sequence: u64::try_from(events.len() + 1).unwrap_or(u64::MAX),
+                bytes: serde_json::to_vec(&serde_json::json!({
+                    "type": "orchestrator.process_exited",
+                    "exit_code": exit_code,
+                }))
+                .unwrap_or_default(),
+                received_at: Utc::now(),
+            });
+        }
         let output = RuntimeOutput {
             resolved_executable: Some(ResolvedExecutable {
                 configured: invocation.executable.clone(),
@@ -269,7 +286,7 @@ fn fake_probe_output(args: &[String]) -> String {
     {
         r#"{"definitions":{"initialize":{"method":"initialize"},"initialized":{"method":"initialized"},"threadStart":{"method":"thread/start","sandbox":["read-only","workspace-write"]},"threadResume":{"method":"thread/resume"},"turnStart":{"method":"turn/start"},"itemStarted":{"method":"item/started"},"itemCompleted":{"method":"item/completed"},"turnCompleted":{"method":"turn/completed","tokenUsage":{}}}}"#.to_owned()
     } else {
-        "Commands: exec app-server\n--print --prompt --output-format stream-json --permission-mode plan acceptEdits --approval-mode auto_edit --resume --effort\n".to_owned()
+        "Commands: exec app-server\n--print --prompt --output-format stream-json --permission-mode plan acceptEdits --approval-mode auto_edit --resume --effort --mode accept-edits --sandbox --conversation\n".to_owned()
     }
 }
 
@@ -323,6 +340,13 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
             r#"{"type":"message","role":"assistant","content":"api_key=supersecretvalue"}"#,
             r#"{"type":"result","result":"done"}"#,
         ],
+        (ProviderId::Agy, FakeRuntimeScenario::Success) => vec!["done"],
+        (ProviderId::Agy, FakeRuntimeScenario::QuotaExceeded) => vec!["Daily quota exceeded"],
+        (ProviderId::Agy, FakeRuntimeScenario::MalformedOutput) => vec!["plain output"],
+        (ProviderId::Agy, FakeRuntimeScenario::UnknownEvent) => vec!["optional output"],
+        (ProviderId::Agy, FakeRuntimeScenario::SecretOutput) => {
+            vec!["api_key=supersecretvalue"]
+        }
         (_, FakeRuntimeScenario::ProcessCrash | FakeRuntimeScenario::Timeout) => Vec::new(),
     };
     lines
@@ -356,12 +380,18 @@ where
         ProviderId::Codex
     } else if args.iter().any(|arg| arg == "--permission-mode") {
         ProviderId::Claude
+    } else if args.iter().any(|arg| arg == "--print") && args.iter().any(|arg| arg == "--mode") {
+        ProviderId::Agy
     } else {
         ProviderId::Gemini
     };
 
     if let Some(prompt) = planning_prompt(&stdin) {
         emit_planner_fixture(provider, &args, &prompt);
+        return;
+    }
+    if is_handover_acknowledgement(&stdin) {
+        emit_handover_acknowledgement(provider, &stdin);
         return;
     }
 
@@ -371,10 +401,6 @@ where
             for line in scenario_lines(provider, FakeRuntimeScenario::QuotaExceeded) {
                 println!("{}", String::from_utf8_lossy(&line));
             }
-            return;
-        }
-        if is_handover_acknowledgement(&stdin) {
-            emit_handover_acknowledgement(provider, &stdin);
             return;
         }
         if provider == ProviderId::Claude
@@ -518,6 +544,9 @@ fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_js
 }
 
 fn planner_lines(provider: ProviderId, text: &str) -> Vec<Vec<u8>> {
+    if provider == ProviderId::Agy {
+        return vec![text.as_bytes().to_vec()];
+    }
     let values = match provider {
         ProviderId::Codex => vec![
             serde_json::json!({"type":"thread.started","thread_id":"fake-planner"}),
@@ -535,6 +564,7 @@ fn planner_lines(provider: ProviderId, text: &str) -> Vec<Vec<u8>> {
             serde_json::json!({"type":"message","role":"assistant","content":text}),
             serde_json::json!({"type":"result","result":text}),
         ],
+        ProviderId::Agy => unreachable!("Agy plain text is handled above"),
     };
     values
         .into_iter()
@@ -555,11 +585,17 @@ fn is_handover_acknowledgement(stdin: &str) -> bool {
 }
 
 fn emit_handover_acknowledgement(provider: ProviderId, stdin: &str) {
+    for line in handover_acknowledgement_lines(provider, stdin) {
+        println!("{}", String::from_utf8_lossy(&line));
+    }
+}
+
+fn handover_acknowledgement_lines(provider: ProviderId, stdin: &str) -> Vec<Vec<u8>> {
     let Some(bundle) = serde_json::from_str::<serde_json::Value>(stdin)
         .ok()
         .and_then(|payload| payload.get("handover").cloned())
     else {
-        return;
+        return Vec::new();
     };
     let acknowledgement = serde_json::json!({
         "type": "handover_ack",
@@ -571,48 +607,35 @@ fn emit_handover_acknowledgement(provider: ProviderId, stdin: &str) {
         "unresolved_questions": bundle.get("unresolved_questions"),
     })
     .to_string();
-    match provider {
-        ProviderId::Claude => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "assistant",
-                    "message": {"content": [{"type": "text", "text": acknowledgement}]}
-                })
-            );
-            println!(
-                "{}",
-                serde_json::json!({"type": "result", "is_error": false, "result": "acknowledged"})
-            );
-        }
-        ProviderId::Gemini => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": acknowledgement
-                })
-            );
-            println!(
-                "{}",
-                serde_json::json!({"type": "result", "result": "acknowledged"})
-            );
-        }
-        ProviderId::Codex => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "type": "item.completed",
-                    "item": {"id": "ack", "type": "agent_message", "text": acknowledgement}
-                })
-            );
-            println!(
-                "{}",
-                serde_json::json!({"type": "turn.completed", "usage": {}})
-            );
-        }
-    }
+    let values = match provider {
+        ProviderId::Agy => return vec![acknowledgement.into_bytes()],
+        ProviderId::Claude => vec![
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": acknowledgement}]}
+            }),
+            serde_json::json!({"type": "result", "is_error": false, "result": "acknowledged"}),
+        ],
+        ProviderId::Gemini => vec![
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": acknowledgement
+            }),
+            serde_json::json!({"type": "result", "result": "acknowledged"}),
+        ],
+        ProviderId::Codex => vec![
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"id": "ack", "type": "agent_message", "text": acknowledgement}
+            }),
+            serde_json::json!({"type": "turn.completed", "usage": {}}),
+        ],
+    };
+    values
+        .into_iter()
+        .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+        .collect()
 }
 
 fn write_partial_handover_fixture() {
@@ -771,6 +794,28 @@ fn argument_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_handover_acknowledgement_is_plain_text_json() -> Result<(), serde_json::Error> {
+        let stdin = serde_json::json!({
+            "handover": {
+                "integrity_hash": "sealed-hash",
+                "objective": "continue safely",
+                "constraints": ["preserve work"],
+                "acceptance_criteria": ["tests pass"],
+                "unresolved_questions": []
+            }
+        })
+        .to_string();
+
+        let lines = handover_acknowledgement_lines(ProviderId::Agy, &stdin);
+
+        assert_eq!(lines.len(), 1);
+        let acknowledgement: serde_json::Value = serde_json::from_slice(&lines[0])?;
+        assert_eq!(acknowledgement["type"], "handover_ack");
+        assert_eq!(acknowledgement["bundle_hash"], "sealed-hash");
+        Ok(())
+    }
 
     #[test]
     fn rejects_real_provider_names() {

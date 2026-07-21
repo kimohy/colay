@@ -122,7 +122,7 @@ replace checking the release archive and GitHub attestation above.
    nightly source event.
 2. Let `.github/workflows/release.yml` classify the event, build each native
    target, stage one immutable bundle, and run its platform-local tarball
-   smoke test. It never runs Codex, Claude, or Gemini inference and provider
+   smoke test. It never runs Codex, Claude, Gemini, or Agy inference and provider
    credentials are cleared; release smoke invokes only `colay --version`.
 3. Inspect `SHA256SUMS`, `release-manifest.json`, GitHub artifact attestations,
    and npm provenance before accepting the release. The manifest carries the

@@ -4,10 +4,15 @@ config_version = 4
 # [orchestrator]
 # timezone = "Asia/Seoul"
 # max_parallel_workers = 2
-# provider_parallel_limits = { codex = 2, claude = 1, gemini = 1 }
+# provider_parallel_limits = { codex = 2, claude = 1, agy = 1, gemini = 1 }
 
 # [orchestrator.providers.codex]
 # executable = "C:\\path\\to\\codex.exe"
+
+# Agy and Gemini are separate providers and can both stay enabled.
+# [orchestrator.providers.agy]
+# executable = "agy"
+# priority = 80
 
 # Colay supplies complete built-in profiles. Override only organization-specific values.
 # [orchestrator.model_profiles.claude.premium]
@@ -17,3 +22,15 @@ config_version = 4
 # [orchestrator.model_profiles.gemini.standard]
 # model = "gemini-3.5-flash"
 # effort = "medium"
+#
+# [orchestrator.model_profiles.agy.economy]
+# model = "gemini-3.5-flash-low"
+# effort = "low"
+#
+# [orchestrator.model_profiles.agy.standard]
+# model = "gemini-3.5-flash-medium"
+# effort = "medium"
+#
+# [orchestrator.model_profiles.agy.premium]
+# model = "gemini-3.1-pro-high"
+# effort = "high"

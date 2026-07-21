@@ -47,7 +47,7 @@ fn agy_provider_identity_is_stable() {
 }
 ```
 
-Run: `cargo test -p orchestrator-domain agy_provider_identity_is_stable -- --exact`
+Run: `cargo test -p orchestrator-domain --lib usage::tests::agy_provider_identity_is_stable -- --exact`
 
 Expected: FAIL because `ProviderId::Agy` does not exist.
 
@@ -67,7 +67,7 @@ Self::Agy => "agy",
 "agy" => Ok(Self::Agy),
 ```
 
-Run: `cargo test -p orchestrator-domain agy_provider_identity_is_stable -- --exact`
+Run: `cargo test -p orchestrator-domain --lib usage::tests::agy_provider_identity_is_stable -- --exact`
 
 Expected: PASS.
 
@@ -98,7 +98,7 @@ assert_eq!(
 
 Update `effective_rows_identify_builtin_and_customized_values` to expect 12 rows and include an Agy row.
 
-Run: `cargo test -p orchestrator-state config::tests --lib && cargo test -p orchestrator-cli profile_config::tests --lib`
+Run: `cargo test -p orchestrator-state config::tests --lib && cargo test -p colay --bin colay profile_config::tests`
 
 Expected: FAIL because Agy defaults and rows are absent.
 
@@ -127,7 +127,7 @@ Add the complete model map:
 
 Accept `agy` in provider-limit and profile-target validation and iterate `codex`, `claude`, `agy`, `gemini` when producing effective rows.
 
-Run: `cargo test -p orchestrator-state config::tests --lib && cargo test -p orchestrator-cli profile_config::tests --lib`
+Run: `cargo test -p orchestrator-state config::tests --lib && cargo test -p colay --bin colay profile_config::tests`
 
 Expected: PASS.
 
@@ -366,7 +366,7 @@ async fn agy_plain_text_worker_completes_through_fake_runtime() -> Result<()> {
 }
 ```
 
-Run: `cargo test -p orchestrator-test-support --test provider_e2e agy_plain_text_worker_completes_through_fake_runtime -- --exact`
+Run: `cargo test -p orchestrator-test-support --test provider_e2e fake_agy_plain_text_completes_through_production_process_runtime -- --exact`
 
 Expected: FAIL because fake Agy scenarios are missing.
 
@@ -376,7 +376,7 @@ Make fake help include `--print --mode plan accept-edits --sandbox --model --con
 
 Extend every exhaustive provider match in `runtime.rs` so Agy planner text and handover acknowledgements remain plain text and are followed by completion.
 
-Run: `cargo test -p orchestrator-test-support --test provider_e2e agy_plain_text_worker_completes_through_fake_runtime -- --exact`
+Run: `cargo test -p orchestrator-test-support --test provider_e2e fake_agy_plain_text_completes_through_production_process_runtime -- --exact`
 
 Expected: PASS.
 
@@ -449,7 +449,7 @@ Extend `provider_enable_adds_only_the_requested_boolean` to disable `ProviderId:
 
 In the planner priority test, provide safe capabilities for all four providers and assert `primary_provider() == ProviderId::Codex`; disable Codex and Claude in the cloned config and assert the next selection is `ProviderId::Agy`, ahead of Gemini.
 
-Run: `cargo test -p orchestrator-cli agy --all-features`
+Run: `cargo test -p colay --test chat_plan_fake_provider --features test-fixtures plans_through_agy_plain_text_without_disabling_gemini_support -- --exact`
 
 Expected: FAIL because CLI wiring does not recognize Agy.
 
@@ -490,7 +490,7 @@ Expected: PASS.
 
 - [ ] **Step 4: Run focused CLI and engine integration tests**
 
-Run: `cargo test -p orchestrator-cli --all-features && cargo test -p orchestrator-engine --all-features && cargo test -p orchestrator-daemon --all-features && cargo test -p orchestrator-policy --all-features && cargo test -p orchestrator-state --all-features`
+Run: `cargo test -p colay --all-features && cargo test -p orchestrator-engine --all-features && cargo test -p orchestrator-daemon --all-features && cargo test -p orchestrator-policy --all-features && cargo test -p orchestrator-state --all-features`
 
 Expected: PASS.
 
@@ -539,7 +539,7 @@ Extend `scripts/release/test/license-contract.test.mjs` with:
 assert.match(testingGuide, /never invoke real Codex, Claude, Gemini, or Agy inference/);
 ```
 
-Run: `cargo test -p orchestrator-cli shipped_docs_describe_profile_management_and_current_presets --lib -- --exact && node --test scripts/release/test/license-contract.test.mjs`
+Run: `cargo test -p colay --bin colay shipped_docs_describe_profile_management_and_current_presets && node --test scripts/release/test/workflow-contract.test.mjs`
 
 Expected: FAIL because the documents describe only three providers.
 
@@ -549,7 +549,7 @@ Describe Agy as independent from retained Gemini CLI support. Add the three Agy 
 
 Update CI wording and credential-empty environment blocks where they enumerate providers; do not add credentials, live probes, or inference commands.
 
-Run: `cargo test -p orchestrator-cli shipped_docs_describe_profile_management_and_current_presets --lib -- --exact && node --test scripts/release/test/license-contract.test.mjs`
+Run: `cargo test -p colay --bin colay shipped_docs_describe_profile_management_and_current_presets && node --test scripts/release/test/workflow-contract.test.mjs`
 
 Expected: PASS.
 

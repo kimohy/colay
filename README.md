@@ -25,7 +25,7 @@ For beta and stable builds without Node.js, download the matching archive from
 [GitHub Releases](https://github.com/kimohy/colay/releases). Nightly workflow
 artifacts expire after 14 days; npm is the normal way to install a nightly.
 
-Colay is a local-first enterprise orchestrator for approved Codex CLI, Claude Code, and Gemini CLI installations. It selects a provider and logical model profile, records why it made that decision, preserves work in isolated Git worktrees, and can resume from a vendor-neutral checkpoint after a provider becomes unavailable.
+Colay is a local-first enterprise orchestrator for approved Codex CLI, Claude Code, Antigravity CLI (`agy`), and Gemini CLI installations. Agy and Gemini are independent providers and remain available together. Colay selects a provider and logical model profile, records why it made that decision, preserves work in isolated Git worktrees, and can resume from a vendor-neutral checkpoint after a provider becomes unavailable.
 
 The orchestrator never rotates identities, bypasses quotas, scrapes usage pages, extracts credentials, purchases credits, or calls unofficial provider endpoints. Provider inference is performed only by the official CLIs with their existing authenticated state. Tests use fake binaries and consume no provider credit.
 
@@ -125,11 +125,14 @@ Colay analyzes each task and automatically selects `economy`, `standard`, or `pr
 | --- | --- | --- | --- |
 | Codex | `gpt-5.6-luna` | `gpt-5.6-terra` | `gpt-5.6-sol` |
 | Claude | `claude-haiku-4-5` | `claude-sonnet-5` | `claude-fable-5` |
+| Agy | `gemini-3.5-flash-low` | `gemini-3.5-flash-medium` | `gemini-3.1-pro-high` |
 | Gemini | `gemini-3.1-flash-lite` | `gemini-3.5-flash` | `gemini-3.1-pro-preview` |
 
 Inspect effective settings with `colay profiles` or `colay profiles --json`. Administrators can override one entry with `colay profiles set <provider> <profile> --model <id> [--effort low|medium|high]`, and remove the writable-layer override with `colay profiles reset <provider> <profile>`. Reset reveals the compiled or lower-precedence value; it does not delete it. The TUI exposes the same matrix and editor under `f:profiles`.
 
 Layered TOML remains supported for managed deployments. A configured model must also be available to the installed official provider CLI and the authenticated account; a preset does not grant model access.
+
+Agy defaults to priority `80`, between Claude (`90`) and Gemini (`70`). Its official CLI is invoked with bounded plain-text output using `--print`, an explicit safe mode, and `--sandbox`; Colay never adds `--dangerously-skip-permissions`. Agy quota usage remains unknown unless an administrator configures an approved usage probe or records a manual override.
 
 ## Configuration
 

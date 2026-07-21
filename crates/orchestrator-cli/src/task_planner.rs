@@ -15,9 +15,9 @@ use orchestrator_engine::{
     TaskPlanner,
 };
 use orchestrator_providers::{
-    AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
-    CodexTransportFeatures, GeminiAdapter, GeminiAdapterConfig, RuntimeTermination,
-    UsageProbeConfig, WorkerAdapter,
+    AdapterRuntime, AgyAdapter, AgyAdapterConfig, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter,
+    CodexAdapterConfig, CodexTransportFeatures, GeminiAdapter, GeminiAdapterConfig,
+    RuntimeTermination, UsageProbeConfig, WorkerAdapter,
 };
 use orchestrator_state::{OrchestratorConfig, ProviderConfig, RootConfig};
 use serde::Serialize;
@@ -85,7 +85,12 @@ impl OfficialCliTaskPlanner {
         profile: ModelProfile,
     ) -> Result<Self, PlannerFailure> {
         let mut capabilities = Vec::new();
-        for provider in [ProviderId::Gemini, ProviderId::Codex, ProviderId::Claude] {
+        for provider in [
+            ProviderId::Gemini,
+            ProviderId::Agy,
+            ProviderId::Codex,
+            ProviderId::Claude,
+        ] {
             let Some(provider_config) =
                 configured_provider(&config.orchestrator.providers, provider)
             else {
@@ -381,6 +386,7 @@ fn configured_provider(
 ) -> Option<&ProviderConfig> {
     match provider {
         ProviderId::Gemini => providers.gemini.as_ref(),
+        ProviderId::Agy => providers.agy.as_ref(),
         ProviderId::Codex => providers.codex.as_ref(),
         ProviderId::Claude => providers.claude.as_ref(),
     }
@@ -437,6 +443,14 @@ pub(crate) fn build_provider_adapter(
         ))),
         ProviderId::Gemini => Ok(Box::new(GeminiAdapter::new(
             GeminiAdapterConfig {
+                executable: PathBuf::from(&provider_config.executable),
+                usage_probe,
+                usage_scope: scope,
+            },
+            runtime,
+        ))),
+        ProviderId::Agy => Ok(Box::new(AgyAdapter::new(
+            AgyAdapterConfig {
                 executable: PathBuf::from(&provider_config.executable),
                 usage_probe,
                 usage_scope: scope,

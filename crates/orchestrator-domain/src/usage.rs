@@ -13,6 +13,7 @@ pub const SUPPORTED_USAGE_SNAPSHOT_SCHEMA_VERSIONS: &[&str] = &[USAGE_SNAPSHOT_S
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Gemini,
+    Agy,
     Codex,
     Claude,
 }
@@ -22,6 +23,7 @@ impl ProviderId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Gemini => "gemini",
+            Self::Agy => "agy",
             Self::Codex => "codex",
             Self::Claude => "claude",
         }
@@ -40,6 +42,7 @@ impl FromStr for ProviderId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "gemini" => Ok(Self::Gemini),
+            "agy" => Ok(Self::Agy),
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             _ => Err(ProviderIdParseError(value.to_owned())),
@@ -315,6 +318,14 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+
+    #[test]
+    fn agy_provider_identity_is_stable() -> Result<(), serde_json::Error> {
+        assert_eq!(ProviderId::from_str("agy"), Ok(ProviderId::Agy));
+        assert_eq!(ProviderId::Agy.as_str(), "agy");
+        assert_eq!(serde_json::to_string(&ProviderId::Agy)?, "\"agy\"");
+        Ok(())
+    }
 
     #[test]
     fn unknown_never_invents_values() {

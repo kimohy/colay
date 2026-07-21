@@ -272,7 +272,7 @@ async fn run_worker_chain(
     redaction: &RedactionConfig,
 ) -> Result<RuntimeOutput, String> {
     if active.output != StructuredOutput::CodexAppServerStdio {
-        return drive_static(session, job, event_sender).await;
+        return drive_static(active.output, session, job, event_sender, redactor).await;
     }
 
     match drive_app_server(session, &active, job, event_sender, redactor).await {
@@ -289,15 +289,17 @@ async fn run_worker_chain(
                 .await
                 .map_err(|error| format!("exec fallback failed to start: {error}"))?;
             *job.process_id.lock().await = session.process_id();
-            drive_static(session, job, event_sender).await
+            drive_static(fallback.output, session, job, event_sender, redactor).await
         }
     }
 }
 
 async fn drive_static(
+    output: StructuredOutput,
     mut session: ProcessSession,
     job: &Arc<ProcessJob>,
     event_sender: &mpsc::Sender<RawEvent>,
+    redactor: &Redactor,
 ) -> Result<RuntimeOutput, String> {
     let mut cancellation_requested = false;
     loop {
@@ -310,17 +312,25 @@ async fn drive_static(
                 let Some(event) = event else {
                     break;
                 };
-                let exited = matches!(event, ProcessEvent::Exited { .. });
                 match event {
                     ProcessEvent::FramesDropped { count } => add_dropped(job, count),
+                    ProcessEvent::Exited { exit_code, .. } => {
+                        if output == StructuredOutput::AgyText {
+                            let value = serde_json::json!({
+                                "type": "orchestrator.process_exited",
+                                "exit_code": exit_code,
+                            });
+                            if let Ok(raw) = canonical_protocol_event(job, redactor, &value) {
+                                try_send(job, event_sender, raw);
+                            }
+                        }
+                        break;
+                    }
                     other => {
                         if let Some(raw) = raw_process_event(job, other) {
                             try_send(job, event_sender, raw);
                         }
                     }
-                }
-                if exited {
-                    break;
                 }
             }
         }
@@ -522,6 +532,20 @@ fn canonical_raw_event(
     let serialized = serde_json::to_string(&event).map_err(|error| error.to_string())?;
     Ok(RawEvent {
         channel: RawEventChannel::Stdout,
+        sequence: next_sequence(job),
+        bytes: redactor.redact(&serialized).into_bytes(),
+        received_at: Utc::now(),
+    })
+}
+
+fn canonical_protocol_event(
+    job: &ProcessJob,
+    redactor: &Redactor,
+    event: &serde_json::Value,
+) -> Result<RawEvent, String> {
+    let serialized = serde_json::to_string(event).map_err(|error| error.to_string())?;
+    Ok(RawEvent {
+        channel: RawEventChannel::Protocol,
         sequence: next_sequence(job),
         bytes: redactor.redact(&serialized).into_bytes(),
         received_at: Utc::now(),

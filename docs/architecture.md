@@ -2,7 +2,7 @@
 
 ## Boundary
 
-Colay is an independent Rust workspace. OpenAI Codex, Claude Code, and Gemini CLI are child processes behind compatibility adapters. No orchestration, usage, routing, persistence, or handover code is added to an upstream provider project.
+Colay is an independent Rust workspace. OpenAI Codex, Claude Code, Antigravity CLI (`agy`), and Gemini CLI are child processes behind compatibility adapters. Agy is independent from the retained Gemini provider. No orchestration, usage, routing, persistence, or handover code is added to an upstream provider project.
 
 Codex integration follows its public automation surfaces: [`codex exec`](https://learn.chatgpt.com/docs/non-interactive-mode) with JSONL is the default, while the version-gated [App Server](https://learn.chatgpt.com/docs/app-server) stdio protocol is isolated behind the compatibility adapter. Same-provider resume is opportunistic; cross-provider continuity always uses the vendor-neutral handover bundle.
 
@@ -22,7 +22,7 @@ The domain crate contains no filesystem, database, process, or provider wire typ
 4. Exclude ineligible providers, score the rest, and persist all score components.
 5. Atomically claim a dependency-ready task and its normalized write scope.
 6. Create a task branch and isolated worktree for the writable worker.
-7. Run one bounded official-CLI invocation and normalize its structured events.
+7. Run one bounded official-CLI invocation and normalize its events. Agy's dedicated adapter converts bounded, redacted plain text plus the observed process exit into the same lifecycle without weakening structured-provider parsing.
 8. At a safe boundary, collect Git and command evidence into a checkpoint.
 9. Independently verify the worktree and acceptance criteria before completion.
 

@@ -31,7 +31,7 @@ Executable resolution is platform-specific but shared by diagnostics and executi
 - `Untested`: writable Codex work is blocked; read-only Codex is allowed only when its sandbox capability is present.
 - `Incompatible`: Codex is disabled.
 
-Codex incompatibility does not disable a usable Claude or Gemini adapter. An incompatible state, config, or handover schema blocks task execution rather than attempting an implicit downgrade.
+Codex incompatibility does not disable a usable Claude, Agy, or Gemini adapter. Agy and Gemini are configured and routed independently. An incompatible state, config, or handover schema blocks task execution rather than attempting an implicit downgrade.
 
 When `.colay/config.toml` is absent, Colay can continue using a legacy `.codex/orchestrator/config.toml` in place and emits a warning. It never moves or copies live state automatically because persisted worktree and rollback paths may be absolute. If both config locations exist, startup fails closed and requires an explicit `--config` path; `colay init` also refuses to create a second state root over a legacy installation.
 

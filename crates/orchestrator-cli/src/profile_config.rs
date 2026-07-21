@@ -24,8 +24,8 @@ pub fn effective_profile_rows(
     effective: &RootConfig,
     defaults: &RootConfig,
 ) -> Result<Vec<ProfileReportRow>> {
-    let mut rows = Vec::with_capacity(9);
-    for provider in ["codex", "claude", "gemini"] {
+    let mut rows = Vec::with_capacity(12);
+    for provider in ["codex", "claude", "agy", "gemini"] {
         for profile in ["economy", "standard", "premium"] {
             let value = profile_value(effective, provider, profile)?;
             let default = profile_value(defaults, provider, profile)?;
@@ -69,7 +69,7 @@ fn profile_description(profile: &str) -> Result<&'static str> {
 }
 
 fn validate_target(provider: &str, profile: &str) -> Result<()> {
-    if !["codex", "claude", "gemini"].contains(&provider) {
+    if !["codex", "claude", "agy", "gemini"].contains(&provider) {
         bail!("unknown approved provider `{provider}`");
     }
     if !["economy", "standard", "premium"].contains(&profile) {
@@ -199,10 +199,15 @@ mod tests {
             .iter()
             .find(|row| row.provider == "claude" && row.profile == "premium")
             .ok_or_else(|| anyhow!("missing claude premium row"))?;
+        let agy = rows
+            .iter()
+            .find(|row| row.provider == "agy" && row.profile == "economy")
+            .ok_or_else(|| anyhow!("missing agy economy row"))?;
         assert_eq!(builtin.source, ProfileSource::Preset);
         assert_eq!(customized.source, ProfileSource::Customized);
         assert_eq!(customized.model, "company-fable");
-        assert_eq!(rows.len(), 9);
+        assert_eq!(agy.model, "gemini-3.5-flash-low");
+        assert_eq!(rows.len(), 12);
         Ok(())
     }
 

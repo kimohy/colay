@@ -177,6 +177,8 @@ pub struct ProviderConfigs {
     #[serde(default)]
     pub gemini: Option<ProviderConfig>,
     #[serde(default)]
+    pub agy: Option<ProviderConfig>,
+    #[serde(default)]
     pub codex: Option<ProviderConfig>,
     #[serde(default)]
     pub claude: Option<ProviderConfig>,
@@ -186,6 +188,7 @@ impl Default for ProviderConfigs {
     fn default() -> Self {
         Self {
             gemini: Some(default_gemini_provider()),
+            agy: Some(default_agy_provider()),
             codex: Some(default_codex_provider()),
             claude: Some(default_claude_provider()),
         }
@@ -196,6 +199,7 @@ impl ProviderConfigs {
     fn iter(&self) -> impl Iterator<Item = (&'static str, &ProviderConfig)> {
         [
             ("gemini", self.gemini.as_ref()),
+            ("agy", self.agy.as_ref()),
             ("codex", self.codex.as_ref()),
             ("claude", self.claude.as_ref()),
         ]
@@ -206,6 +210,10 @@ impl ProviderConfigs {
 
 fn default_gemini_provider() -> ProviderConfig {
     default_provider("gemini", "calendar_day", None, 70)
+}
+
+fn default_agy_provider() -> ProviderConfig {
+    default_provider("agy", "calendar_day", None, 80)
 }
 
 fn default_codex_provider() -> ProviderConfig {
@@ -338,6 +346,14 @@ fn default_model_profiles() -> BTreeMap<String, BTreeMap<String, ModelProfileCon
         (
             "claude".to_owned(),
             provider_profiles("claude-haiku-4-5", "claude-sonnet-5", "claude-fable-5"),
+        ),
+        (
+            "agy".to_owned(),
+            provider_profiles(
+                "gemini-3.5-flash-low",
+                "gemini-3.5-flash-medium",
+                "gemini-3.1-pro-high",
+            ),
         ),
         (
             "gemini".to_owned(),
@@ -802,10 +818,10 @@ fn validate(config: &RootConfig) -> Result<(), Vec<ConfigValidationError>> {
         ));
     }
     for (provider, limit) in &orchestrator.provider_parallel_limits {
-        if !matches!(provider.as_str(), "codex" | "claude" | "gemini") {
+        if !matches!(provider.as_str(), "codex" | "claude" | "agy" | "gemini") {
             errors.push(validation_error(
                 format!("orchestrator.provider_parallel_limits.{provider}"),
-                "provider must be codex, claude, or gemini",
+                "provider must be codex, claude, agy, or gemini",
             ));
         }
         if *limit == 0 {
@@ -1142,13 +1158,16 @@ mod tests {
             ("claude", "economy", "claude-haiku-4-5", "low"),
             ("claude", "standard", "claude-sonnet-5", "medium"),
             ("claude", "premium", "claude-fable-5", "high"),
+            ("agy", "economy", "gemini-3.5-flash-low", "low"),
+            ("agy", "standard", "gemini-3.5-flash-medium", "medium"),
+            ("agy", "premium", "gemini-3.1-pro-high", "high"),
             ("gemini", "economy", "gemini-3.1-flash-lite", "low"),
             ("gemini", "standard", "gemini-3.5-flash", "medium"),
             ("gemini", "premium", "gemini-3.1-pro-preview", "high"),
         ] {
             assert_profile(&config, provider, profile, model, effort);
         }
-        assert_eq!(config.orchestrator.model_profiles.len(), 3);
+        assert_eq!(config.orchestrator.model_profiles.len(), 4);
     }
 
     #[test]
@@ -1157,6 +1176,7 @@ mod tests {
         let cases = [
             ("codex", "codex", "calendar_month", Some(1), 100),
             ("claude", "claude", "calendar_month", Some(1), 90),
+            ("agy", "agy", "calendar_day", None, 80),
             ("gemini", "gemini", "calendar_day", None, 70),
         ];
 
@@ -1164,6 +1184,7 @@ mod tests {
             let provider = match identity {
                 "codex" => config.orchestrator.providers.codex.as_ref(),
                 "claude" => config.orchestrator.providers.claude.as_ref(),
+                "agy" => config.orchestrator.providers.agy.as_ref(),
                 "gemini" => config.orchestrator.providers.gemini.as_ref(),
                 _ => unreachable!("provider table contains only compiled identities"),
             }

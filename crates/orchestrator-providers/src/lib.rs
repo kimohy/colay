@@ -5,6 +5,7 @@
 //! inside each already-authenticated Enterprise CLI.
 
 mod adapter;
+mod agy;
 mod claude;
 mod codex;
 mod error;
@@ -17,6 +18,7 @@ pub use adapter::{
     AdapterRuntime, PreparedInvocation, RuntimeOutput, RuntimeTermination, StructuredOutput,
     WorkerAdapter,
 };
+pub use agy::{AgyAdapter, AgyAdapterConfig};
 pub use claude::{ClaudeAdapter, ClaudeAdapterConfig};
 pub use codex::{
     CodexAdapter, CodexAdapterConfig, CodexTransportFeatures, CodexTransportPreference,

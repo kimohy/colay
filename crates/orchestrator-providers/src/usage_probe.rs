@@ -149,7 +149,7 @@ pub fn parse_usage_probe_output(
 #[must_use]
 pub fn unknown_usage(provider: ProviderId, now: DateTime<Utc>) -> UsageSnapshot {
     let (name, period) = match provider {
-        ProviderId::Gemini => ("primary_daily", QuotaPeriod::CalendarDay),
+        ProviderId::Gemini | ProviderId::Agy => ("primary_daily", QuotaPeriod::CalendarDay),
         ProviderId::Codex | ProviderId::Claude => ("primary_monthly", QuotaPeriod::CalendarMonth),
     };
     UsageSnapshot::unknown(

@@ -24,7 +24,11 @@ fn fake_provider_binary() -> PathBuf {
 }
 
 fn capability() -> ProviderCapabilities {
-    let mut capability = ProviderCapabilities::unsupported(ProviderId::Codex);
+    capability_for(ProviderId::Codex)
+}
+
+fn capability_for(provider: ProviderId) -> ProviderCapabilities {
+    let mut capability = ProviderCapabilities::unsupported(provider);
     capability.non_interactive = CapabilitySupport::Verified;
     capability.structured_output = CapabilitySupport::Verified;
     capability.read_only = CapabilitySupport::Verified;
@@ -48,6 +52,21 @@ fn request(goal: &str) -> PlannerRequest {
         },
         sandbox: SandboxMode::ReadOnly,
     }
+}
+
+fn agy_capability() -> ProviderCapabilities {
+    let mut capability = capability_for(ProviderId::Agy);
+    capability.non_interactive = CapabilitySupport::Advertised;
+    capability.structured_output = CapabilitySupport::Degraded;
+    capability.evidence = vec!["fake Agy CLI probe verified safe plain text".to_owned()];
+    capability
+}
+
+fn agy_request(goal: &str) -> PlannerRequest {
+    let mut request = request(goal);
+    request.validation_policy.eligible_providers = BTreeSet::from([ProviderId::Agy]);
+    request.validation_policy.per_provider_limits = BTreeMap::from([(ProviderId::Agy, 1)]);
+    request
 }
 
 #[tokio::test]
@@ -113,6 +132,105 @@ async fn plans_through_a_bounded_read_only_shell_free_fake_cli()
     );
     assert_eq!(log["timeout_seconds"], 60);
     assert_eq!(log["stdout_limit"], 1024 * 1024);
+    Ok(())
+}
+
+#[test]
+fn planner_priority_keeps_agy_ahead_of_gemini() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let runtime: Arc<dyn AdapterRuntime> =
+        Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
+    let capabilities = [
+        capability_for(ProviderId::Codex),
+        capability_for(ProviderId::Claude),
+        agy_capability(),
+        capability_for(ProviderId::Gemini),
+    ];
+    let config = RootConfig::default();
+    let planner = OfficialCliTaskPlanner::from_config(
+        &config,
+        &repository,
+        Arc::clone(&runtime),
+        &capabilities,
+        ModelProfile::Standard,
+    )?;
+    assert_eq!(planner.primary_provider(), ProviderId::Codex);
+
+    let mut fallback = config;
+    fallback
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .enabled = false;
+    fallback
+        .orchestrator
+        .providers
+        .claude
+        .as_mut()
+        .ok_or("claude config")?
+        .enabled = false;
+    let planner = OfficialCliTaskPlanner::from_config(
+        &fallback,
+        &repository,
+        runtime,
+        &capabilities,
+        ModelProfile::Standard,
+    )?;
+    assert_eq!(planner.primary_provider(), ProviderId::Agy);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plans_through_agy_plain_text_without_disabling_gemini_support()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    fs::create_dir_all(repository.join(".colay"))?;
+    let mut config = RootConfig::default();
+    config.orchestrator.default_timeout_minutes = 1;
+    config.orchestrator.providers.codex = None;
+    config.orchestrator.providers.claude = None;
+    config.orchestrator.providers.gemini = None;
+    let agy = config
+        .orchestrator
+        .providers
+        .agy
+        .as_mut()
+        .ok_or("agy config")?;
+    agy.executable = fake_provider_binary().to_string_lossy().into_owned();
+    let runtime: Arc<dyn AdapterRuntime> =
+        Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
+    let planner = OfficialCliTaskPlanner::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[agy_capability()],
+        ModelProfile::Standard,
+    )?;
+
+    let request = agy_request("plan through agy");
+    let response = planner.propose(request.clone()).await?;
+    let graph = collect_planner_response(&request, response)?;
+    assert_eq!(graph.proposal.nodes.len(), 2);
+
+    let log: Value = serde_json::from_slice(&fs::read(
+        repository.join(".colay/fake-planner-invocation.json"),
+    )?)?;
+    let args = log["args"].as_array().ok_or("missing args")?;
+    assert!(args.iter().any(|arg| arg == "--print"));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--mode" && pair[1] == "plan")
+    );
+    assert!(args.iter().any(|arg| arg == "--sandbox"));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions")
+    );
     Ok(())
 }
 

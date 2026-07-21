@@ -36,9 +36,9 @@ use orchestrator_process::{
     validate_resolution_evidence,
 };
 use orchestrator_providers::{
-    AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
-    CodexTransportFeatures, GeminiAdapter, GeminiAdapterConfig, ProcessAdapterRuntime,
-    RuntimeTermination, WorkerAdapter,
+    AdapterRuntime, AgyAdapter, AgyAdapterConfig, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter,
+    CodexAdapterConfig, CodexTransportFeatures, GeminiAdapter, GeminiAdapterConfig,
+    ProcessAdapterRuntime, RuntimeTermination, WorkerAdapter,
 };
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
@@ -2616,6 +2616,14 @@ fn provider_adapter(
         ))),
         ProviderId::Gemini => Ok(Box::new(GeminiAdapter::new(
             GeminiAdapterConfig {
+                executable: PathBuf::from(&provider_config.executable),
+                usage_probe,
+                usage_scope: scope,
+            },
+            runtime,
+        ))),
+        ProviderId::Agy => Ok(Box::new(AgyAdapter::new(
+            AgyAdapterConfig {
                 executable: PathBuf::from(&provider_config.executable),
                 usage_probe,
                 usage_scope: scope,
@@ -5743,6 +5751,13 @@ async fn probe_provider(
         help.stdout.redacted_text, help.stderr.redacted_text
     );
     let structured = match provider {
+        ProviderId::Agy => {
+            help_text.contains("--print")
+                && help_text.contains("--mode")
+                && help_text.contains("plan")
+                && help_text.contains("accept-edits")
+                && help_text.contains("--sandbox")
+        }
         ProviderId::Claude => {
             help_text.contains("--output-format")
                 && (help_text.contains("stream-json") || help_text.contains("json"))
@@ -5754,7 +5769,9 @@ async fn probe_provider(
         }
         ProviderId::Codex => false,
     };
-    let support = if structured {
+    let support = if structured && provider == ProviderId::Agy {
+        CapabilitySupport::Degraded
+    } else if structured {
         CapabilitySupport::Advertised
     } else {
         CapabilitySupport::Unsupported
@@ -5765,7 +5782,11 @@ async fn probe_provider(
     capabilities.structured_output = support;
     capabilities.writable = support;
     capabilities.read_only = support;
-    capabilities.reasoning_effort = CapabilitySupport::Advertised;
+    capabilities.reasoning_effort = if provider == ProviderId::Agy {
+        CapabilitySupport::Unsupported
+    } else {
+        CapabilitySupport::Advertised
+    };
     capabilities.evidence = vec!["public --version and --help output".to_owned()];
     let status = if structured {
         HealthStatus::Healthy
@@ -6413,6 +6434,7 @@ fn provider_configs(
 ) -> impl Iterator<Item = (ProviderId, &ProviderConfig)> {
     [
         (ProviderId::Gemini, config.providers.gemini.as_ref()),
+        (ProviderId::Agy, config.providers.agy.as_ref()),
         (ProviderId::Codex, config.providers.codex.as_ref()),
         (ProviderId::Claude, config.providers.claude.as_ref()),
     ]
@@ -6423,6 +6445,7 @@ fn provider_configs(
 fn provider_config(config: &OrchestratorConfig, provider: ProviderId) -> Option<&ProviderConfig> {
     match provider {
         ProviderId::Gemini => config.providers.gemini.as_ref(),
+        ProviderId::Agy => config.providers.agy.as_ref(),
         ProviderId::Codex => config.providers.codex.as_ref(),
         ProviderId::Claude => config.providers.claude.as_ref(),
     }
@@ -6961,6 +6984,9 @@ mod tests {
             "colay profiles reset",
             "claude-fable-5",
             "gemini-3.5-flash",
+            "gemini-3.5-flash-low",
+            "gemini-3.5-flash-medium",
+            "gemini-3.1-pro-high",
             "gpt-5.6-sol",
             "f:profiles",
         ] {
@@ -6968,10 +6994,12 @@ mod tests {
         }
         assert!(example.contains("orchestrator.model_profiles.claude.premium"));
         assert!(example.contains("claude-fable-5"));
+        assert!(example.contains("orchestrator.providers.agy"));
+        assert!(example.contains("orchestrator.model_profiles.agy.premium"));
     }
 
     #[test]
-    fn provider_enable_adds_only_the_requested_boolean() -> Result<()> {
+    fn provider_enable_adds_only_the_requested_agy_boolean() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -6981,17 +7009,21 @@ mod tests {
             None,
             environment,
             &runtime,
-            ProviderId::Codex,
-            true,
+            ProviderId::Agy,
+            false,
             true,
         )?;
 
         let persisted = fs::read_to_string(&runtime.explicit_edit_path)?.parse::<DocumentMut>()?;
-        let provider = persisted["orchestrator"]["providers"]["codex"]
+        let providers = persisted["orchestrator"]["providers"]
             .as_table()
-            .ok_or_else(|| anyhow::anyhow!("codex override is not a table"))?;
+            .ok_or_else(|| anyhow::anyhow!("providers override is not a table"))?;
+        let provider = providers["agy"]
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("agy override is not a table"))?;
         assert_eq!(provider.len(), 1);
-        assert_eq!(provider["enabled"].as_bool(), Some(true));
+        assert_eq!(provider["enabled"].as_bool(), Some(false));
+        assert_eq!(providers.len(), 1);
         Ok(())
     }
 
