@@ -19,6 +19,7 @@ mod migrations;
 mod paths;
 mod permissions;
 mod records;
+mod scheduling;
 mod sessions;
 mod workspace;
 
@@ -59,6 +60,7 @@ pub use records::{
     NewTaskRecord, RecoveredControl, RoutingAuditRecord, StoredHandover, StoredTask,
     StoredTaskAttempt, StoredWorktree, TaskListFilter,
 };
+pub use scheduling::{ClaimReadyTaskRequest, ClaimedTask};
 pub use sessions::{NewSessionRecord, SessionListFilter, StoredSession};
 pub use workspace::{
     WorkspaceAttention, WorkspaceAttentionKind, WorkspaceInspector, WorkspaceProjection,
