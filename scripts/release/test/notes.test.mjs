@@ -20,6 +20,6 @@ test("release notes derive every current limitation and compatibility obligation
   assert.match(notes, /State schema 3 and config schema 4/);
   assert.match(notes, /codex exec --json/);
   assert.match(notes, /sensitive local source artifacts/);
-  assert.match(notes, /concurrent read-only fan-out is not implemented/);
+  assert.match(notes, /Read-only reviewer fan-out is not implemented/);
   assert.match(notes, /release manifest, explicit approval, recovery journal, and restart procedure/);
 });
