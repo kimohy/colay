@@ -130,6 +130,9 @@ pub struct OrchestratorConfig {
     pub providers: ProviderConfigs,
     #[serde(default)]
     pub model_profiles: BTreeMap<String, BTreeMap<String, ModelProfileConfig>>,
+    /// Optional per-provider writable worker limits. Missing providers inherit the global limit.
+    #[serde(default)]
+    pub provider_parallel_limits: BTreeMap<String, u32>,
     /// Administrator-defined patterns for organization-specific secret formats.
     /// Exact credential values are deliberately not accepted by persisted config.
     #[serde(default)]
@@ -157,6 +160,7 @@ impl Default for OrchestratorConfig {
             minimum_forecast_observations: 3,
             providers: ProviderConfigs::default(),
             model_profiles: default_model_profiles(),
+            provider_parallel_limits: BTreeMap::new(),
             redaction: RedactionSettings::default(),
         }
     }
@@ -797,6 +801,20 @@ fn validate(config: &RootConfig) -> Result<(), Vec<ConfigValidationError>> {
             "must be greater than zero",
         ));
     }
+    for (provider, limit) in &orchestrator.provider_parallel_limits {
+        if !matches!(provider.as_str(), "codex" | "claude" | "gemini") {
+            errors.push(validation_error(
+                format!("orchestrator.provider_parallel_limits.{provider}"),
+                "provider must be codex, claude, or gemini",
+            ));
+        }
+        if *limit == 0 {
+            errors.push(validation_error(
+                format!("orchestrator.provider_parallel_limits.{provider}"),
+                "must be greater than zero",
+            ));
+        }
+    }
     if orchestrator.default_timeout_minutes == 0 {
         errors.push(validation_error(
             "orchestrator.default_timeout_minutes",
@@ -1256,6 +1274,31 @@ orchestrator = true
             "handover_threshold_percent = 40",
         );
         assert!(ConfigDocument::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_optional_provider_parallel_limits() {
+        let valid = VALID.replace(
+            "minimum_forecast_observations = 3",
+            "minimum_forecast_observations = 3\nprovider_parallel_limits = { codex = 2, claude = 1 }",
+        );
+        let document = ConfigDocument::parse(&valid).unwrap_or_else(|error| {
+            panic!("valid provider limits should parse: {error}");
+        });
+        assert_eq!(
+            document
+                .config()
+                .orchestrator
+                .provider_parallel_limits
+                .get("codex"),
+            Some(&2)
+        );
+
+        let zero = valid.replace("codex = 2", "codex = 0");
+        assert!(ConfigDocument::parse(&zero).is_err());
+
+        let unknown = valid.replace("codex = 2", "other = 2");
+        assert!(ConfigDocument::parse(&unknown).is_err());
     }
 
     #[test]
