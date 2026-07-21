@@ -213,13 +213,14 @@ impl GitWorktreeManager {
     }
 
     fn validate_managed_worktree(&self, worktree: &GitWorktree) -> EngineResult<()> {
-        if worktree.repository_root != self.repository_root
-            || worktree.path.parent() != Some(self.worktrees_root.as_path())
-        {
+        if !paths_equal(&worktree.repository_root, &self.repository_root) {
             return Err(EngineError::UnsafePath(worktree.path.clone()));
         }
         let canonical = canonicalize_directory(&worktree.path)?;
-        if canonical.parent() != Some(self.worktrees_root.as_path()) {
+        if !canonical
+            .parent()
+            .is_some_and(|parent| paths_equal(parent, &self.worktrees_root))
+        {
             return Err(EngineError::UnsafePath(canonical));
         }
         Ok(())
@@ -256,6 +257,17 @@ impl GitWorktreeManager {
             Err(EngineError::UnsafeGitBoundary(active.join(", ")))
         }
     }
+}
+
+#[cfg(windows)]
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
 }
 
 #[derive(Clone, Debug, Default)]

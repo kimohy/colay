@@ -187,9 +187,12 @@ pub(crate) fn queue_instruction_in_transaction(
         )
     })?;
     let task_state: TaskState = parse_enum("task state", &state)?;
-    if task_state.is_terminal() {
+    if !matches!(
+        task_state,
+        TaskState::Queued | TaskState::Analyzing | TaskState::Planned | TaskState::Running
+    ) {
         return Err(StateError::InvalidRecord(format!(
-            "terminal task {task_id} cannot accept instructions"
+            "task {task_id} cannot accept instructions in state {task_state:?}"
         )));
     }
     let ordinal: i64 = transaction.query_row(

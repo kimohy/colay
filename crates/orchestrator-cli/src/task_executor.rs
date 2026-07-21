@@ -12,7 +12,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     CheckpointInput, CheckpointManager, EngineError, EngineResult, GitCheckpointEvidence,
     GitWorktreeManager, TaskExecutionReport, TaskExecutionRequest, TaskExecutor,
-    VerificationEngine, VerificationInput,
+    VerificationEngine, VerificationInput, canonicalize_directory,
 };
 use orchestrator_providers::{AdapterRuntime, RuntimeTermination, WorkerAdapter};
 use orchestrator_state::{ArtifactStore, RootConfig};
@@ -38,12 +38,7 @@ impl OfficialCliTaskExecutor {
         repository_root: &Path,
         runtime: Arc<dyn AdapterRuntime>,
     ) -> EngineResult<Self> {
-        let repository_root =
-            std::fs::canonicalize(repository_root).map_err(|error| EngineError::CommandFailed {
-                executable: "git".to_owned(),
-                exit_code: None,
-                message: error.to_string(),
-            })?;
+        let repository_root = canonicalize_directory(repository_root)?;
         if !repository_root.is_dir() {
             return Err(EngineError::UnsafePath(repository_root));
         }
@@ -113,12 +108,22 @@ impl TaskExecutor for OfficialCliTaskExecutor {
         request: TaskExecutionRequest,
         cancellation: CancellationToken,
     ) -> EngineResult<TaskExecutionReport> {
-        if request.repository_root != self.repository_root {
+        if canonicalize_directory(&request.repository_root)? != self.repository_root {
             return Err(EngineError::UnsafePath(request.repository_root));
         }
         let worktrees_root = request.state_root.join("worktrees");
         let manager = GitWorktreeManager::open(&self.repository_root, &worktrees_root)?;
-        let worktree = {
+        let worktree = if let Some(worktree) = request.existing_worktree.clone() {
+            if worktree.task_id != request.claim.task_id
+                || worktree.repository_root != self.repository_root
+            {
+                return Err(EngineError::IntegrityMismatch {
+                    artifact: "continued task worktree identity",
+                });
+            }
+            manager.snapshot(&worktree).await?;
+            worktree
+        } else {
             let _creation_guard = self.worktree_creation.lock().await;
             manager.create(request.claim.task_id, "HEAD").await?
         };

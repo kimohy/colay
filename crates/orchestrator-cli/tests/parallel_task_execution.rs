@@ -155,7 +155,7 @@ fn seed_approved_graph(
     let node = |key: &str, scope: &str| TaskGraphNode {
         key: key.to_owned(),
         title: format!("{key} task"),
-        objective: format!("Inspect and complete {key}"),
+        objective: format!("Inspect and complete {key}; scenario:delayed-success"),
         dependencies: Vec::new(),
         constraints: vec!["stay inside the declared scope".to_owned()],
         acceptance_criteria: vec![format!("{key} structured execution completes")],
@@ -252,7 +252,32 @@ async fn wait_for_completion(database: &Database) -> Result<(), Box<dyn std::err
             return Ok(());
         }
         if tasks.iter().any(|task| task.state == TaskState::Failed) {
-            return Err("parallel execution produced a failed task".into());
+            let evidence = tasks
+                .iter()
+                .map(|task| {
+                    let attempts = database
+                        .list_task_attempts(task.task_id)
+                        .unwrap_or_default();
+                    let verification = database
+                        .with_connection(|connection| {
+                            connection
+                                .query_row(
+                                    "SELECT result_json FROM verification_results WHERE task_id = ?1 ORDER BY completed_at DESC LIMIT 1",
+                                    [task.task_id.to_string()],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .map_err(orchestrator_state::StateError::from)
+                        })
+                        .ok();
+                    let checkpoint = database.latest_sealed_checkpoint(task.task_id).ok().flatten();
+                    format!(
+                        "{}={:?} attempts={attempts:?} verification={verification:?} checkpoint={checkpoint:?}",
+                        task.task_id, task.state
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!("parallel execution produced a failed task: {evidence}").into());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -312,18 +337,34 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         )
         .await
     });
+    for _ in 0..100 {
+        if database
+            .load_task(task_ids[0])?
+            .is_some_and(|task| task.state == TaskState::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    queue_instruction(&database, session_id, task_ids[0])?;
     wait_for_completion(&database).await?;
     cancellation.cancel();
     service.await??;
 
-    for task_id in &task_ids {
+    for (index, task_id) in task_ids.iter().enumerate() {
         assert!(database.latest_sealed_checkpoint(*task_id)?.is_some());
         assert!(database.active_worktree(*task_id)?.is_some());
-        assert_eq!(database.list_task_attempts(*task_id)?.len(), 1);
+        assert_eq!(
+            database.list_task_attempts(*task_id)?.len(),
+            if index == 0 { 2 } else { 1 }
+        );
     }
-    assert_eq!(
-        database.list_task_instructions(task_ids[0])?[0].state,
-        TaskInstructionState::Applied
+    assert!(
+        database
+            .list_task_instructions(task_ids[0])?
+            .iter()
+            .all(|instruction| instruction.state == TaskInstructionState::Applied)
     );
     database.with_connection(|connection| {
         let claims: i64 =
@@ -369,8 +410,11 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     tokio::time::sleep(Duration::from_millis(75)).await;
     restart_cancellation.cancel();
     restart.await??;
-    for task_id in task_ids {
-        assert_eq!(database.list_task_attempts(task_id)?.len(), 1);
+    for (index, task_id) in task_ids.into_iter().enumerate() {
+        assert_eq!(
+            database.list_task_attempts(task_id)?.len(),
+            if index == 0 { 2 } else { 1 }
+        );
     }
     Ok(())
 }

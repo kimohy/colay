@@ -94,7 +94,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     let backup = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let backup_status = MigrationManager::status(&backup)?;
     assert_eq!(backup_status.current_version, 1);
-    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6]);
+    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6, 7]);
     Ok(())
 }
 

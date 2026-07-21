@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::EngineResult;
+use crate::GitWorktree;
 
 #[derive(Clone, Debug)]
 pub struct TaskExecutionRequest {
@@ -16,6 +17,7 @@ pub struct TaskExecutionRequest {
     pub repository_root: PathBuf,
     pub state_root: PathBuf,
     pub instructions: Vec<StoredTaskInstruction>,
+    pub existing_worktree: Option<GitWorktree>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -5,7 +5,9 @@ use orchestrator_domain::{
     CorrelationId, DaemonInstanceId, EventActor, EventId, EventType, ProviderId, SchemaVersion,
     TaskEvent, TaskInstructionState, TaskState, TransitionGuards, WorkerOutcome,
 };
-use orchestrator_engine::{TaskExecutionReport, TaskExecutionRequest, TaskExecutor};
+use orchestrator_engine::{
+    GitWorktree, TaskExecutionReport, TaskExecutionRequest, TaskExecutor, canonicalize_directory,
+};
 use orchestrator_state::{
     ClaimReadyTaskRequest, ClaimedTask, Database, NewTaskAttemptRecord, NewWorktreeRecord,
 };
@@ -166,73 +168,46 @@ async fn run_claimed_task_inner(
         TaskState::Running,
         false,
     )?;
-    let mut instructions = Vec::new();
-    while let Some(instruction) = database.claim_next_task_instruction(claim.task_id, Utc::now())? {
-        instructions.push(instruction);
-    }
-    let execution_request = TaskExecutionRequest {
-        claim: claim.clone(),
-        repository_root: services.repository_root.clone(),
-        state_root: services.state_root.clone(),
-        instructions: instructions.clone(),
-    };
-    let execution = services
-        .executor
-        .execute(execution_request, cancellation.clone());
-    tokio::pin!(execution);
-    let renew_millis = (services.claim_ttl.num_milliseconds() / 3).max(100);
-    let mut renew = tokio::time::interval(Duration::from_millis(
-        u64::try_from(renew_millis).unwrap_or(u64::MAX),
-    ));
-    let result = loop {
-        tokio::select! {
-            result = &mut execution => break result,
-            _ = renew.tick() => {
-                database.renew_schedule_claim(
-                    claim.schedule_claim_id,
-                    instance_id,
-                    Utc::now(),
-                    services.claim_ttl,
-                )?;
-            }
+    let mut existing_worktree = None;
+    loop {
+        let mut instructions = Vec::new();
+        while let Some(instruction) =
+            database.claim_next_task_instruction(claim.task_id, Utc::now())?
+        {
+            instructions.push(instruction);
         }
-    };
-    match result {
-        Ok(report) => {
-            persist_report(
-                database,
-                claim,
-                &report,
-                &services.repository_root,
-                redactor,
-            )?;
-            finish_instructions(database, &instructions, report.passed_completion_gate())?;
-            if report.outcome == WorkerOutcome::Succeeded {
-                transition(
-                    database,
-                    claim,
-                    TaskState::Running,
-                    TaskState::Verifying,
-                    false,
-                )?;
-                if report.passed_completion_gate() {
-                    transition(
-                        database,
-                        claim,
-                        TaskState::Verifying,
-                        TaskState::Completed,
-                        true,
-                    )?;
-                } else {
-                    transition(
-                        database,
-                        claim,
-                        TaskState::Verifying,
-                        TaskState::Failed,
-                        false,
+        let execution_request = TaskExecutionRequest {
+            claim: claim.clone(),
+            repository_root: services.repository_root.clone(),
+            state_root: services.state_root.clone(),
+            instructions: instructions.clone(),
+            existing_worktree: existing_worktree.clone(),
+        };
+        let execution = services
+            .executor
+            .execute(execution_request, cancellation.clone());
+        tokio::pin!(execution);
+        let renew_millis = (services.claim_ttl.num_milliseconds() / 3).max(100);
+        let mut renew = tokio::time::interval(Duration::from_millis(
+            u64::try_from(renew_millis).unwrap_or(u64::MAX),
+        ));
+        let result = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                _ = renew.tick() => {
+                    database.renew_schedule_claim(
+                        claim.schedule_claim_id,
+                        instance_id,
+                        Utc::now(),
+                        services.claim_ttl,
                     )?;
                 }
-            } else {
+            }
+        };
+        let report = match result {
+            Ok(report) => report,
+            Err(error) => {
+                finish_instructions(database, &instructions, false)?;
                 transition(
                     database,
                     claim,
@@ -240,10 +215,20 @@ async fn run_claimed_task_inner(
                     TaskState::Failed,
                     false,
                 )?;
+                let _redacted_failure = redactor.redact(&error.to_string());
+                break;
             }
-        }
-        Err(error) => {
-            finish_instructions(database, &instructions, false)?;
+        };
+        persist_report(
+            database,
+            claim,
+            &report,
+            &services.repository_root,
+            redactor,
+        )?;
+        let passed = report.passed_completion_gate();
+        finish_instructions(database, &instructions, passed)?;
+        if report.outcome != WorkerOutcome::Succeeded || !passed {
             transition(
                 database,
                 claim,
@@ -251,7 +236,39 @@ async fn run_claimed_task_inner(
                 TaskState::Failed,
                 false,
             )?;
-            let _redacted_failure = redactor.redact(&error.to_string());
+            break;
+        }
+        existing_worktree = Some(GitWorktree {
+            task_id: report.task_id,
+            repository_root: canonicalize_directory(&services.repository_root).map_err(
+                |error| {
+                    DaemonError::InvalidSettings(format!(
+                        "continued task repository root is unsafe: {error}"
+                    ))
+                },
+            )?,
+            path: report.worktree_path,
+            branch: report.branch,
+            base_revision: report.base_revision,
+        });
+        let task = database
+            .load_task(claim.task_id)?
+            .ok_or_else(|| DaemonError::InvalidSettings("claimed task disappeared".to_owned()))?;
+        let occurred_at = Utc::now();
+        if database.transition_running_to_verifying_if_instructions_drained(
+            claim.task_id,
+            task.revision,
+            occurred_at,
+            transition_event(claim, TaskState::Running, TaskState::Verifying, occurred_at),
+        )? {
+            transition(
+                database,
+                claim,
+                TaskState::Verifying,
+                TaskState::Completed,
+                true,
+            )?;
+            break;
         }
     }
     Ok(())
@@ -269,14 +286,26 @@ fn persist_report(
             "task execution report identity mismatch".to_owned(),
         ));
     }
-    database.record_active_worktree(&NewWorktreeRecord {
-        task_id: report.task_id,
-        repo_root: repository_root.to_path_buf(),
-        worktree_path: report.worktree_path.clone(),
-        branch_name: report.branch.clone(),
-        base_revision: report.base_revision.clone(),
-        created_at: Utc::now(),
-    })?;
+    if let Some(worktree) = database.active_worktree(report.task_id)? {
+        if worktree.repo_root != repository_root
+            || worktree.worktree_path != report.worktree_path
+            || worktree.branch_name != report.branch
+            || worktree.base_revision != report.base_revision
+        {
+            return Err(DaemonError::InvalidSettings(
+                "continued task worktree projection mismatch".to_owned(),
+            ));
+        }
+    } else {
+        database.record_active_worktree(&NewWorktreeRecord {
+            task_id: report.task_id,
+            repo_root: repository_root.to_path_buf(),
+            worktree_path: report.worktree_path.clone(),
+            branch_name: report.branch.clone(),
+            base_revision: report.base_revision.clone(),
+            created_at: Utc::now(),
+        })?;
+    }
     database.record_task_attempt_started(&NewTaskAttemptRecord {
         attempt_id: report.attempt_id,
         task_id: report.task_id,
@@ -362,35 +391,44 @@ fn transition(
             ..TransitionGuards::default()
         },
         occurred_at,
-        TaskEvent {
-            schema_version: SchemaVersion::state_current(),
-            sequence: 0,
-            event_id: EventId::new(),
-            session_id: Some(claim.session_id),
-            task_id: Some(claim.task_id),
-            occurred_at,
-            event_type: match next {
-                TaskState::Running => EventType::WorkerStarted,
-                TaskState::Verifying => EventType::VerificationStarted,
-                TaskState::Completed => EventType::TaskCompleted,
-                _ => EventType::StateTransitioned,
-            },
-            from_state: Some(expected),
-            to_state: Some(next),
-            reason: Some("approved task graph execution".to_owned()),
-            actor: EventActor::Orchestrator,
-            correlation_id: CorrelationId::new(),
-            causation_id: None,
-            payload: serde_json::json!({
-                "revision_id": claim.revision_id,
-                "schedule_claim_id": claim.schedule_claim_id,
-                "provider": claim.provider,
-            }),
-            previous_hash: None,
-            event_hash: String::new(),
-        },
+        transition_event(claim, expected, next, occurred_at),
     )?;
     Ok(())
+}
+
+fn transition_event(
+    claim: &ClaimedTask,
+    expected: TaskState,
+    next: TaskState,
+    occurred_at: chrono::DateTime<Utc>,
+) -> TaskEvent {
+    TaskEvent {
+        schema_version: SchemaVersion::state_current(),
+        sequence: 0,
+        event_id: EventId::new(),
+        session_id: Some(claim.session_id),
+        task_id: Some(claim.task_id),
+        occurred_at,
+        event_type: match next {
+            TaskState::Running => EventType::WorkerStarted,
+            TaskState::Verifying => EventType::VerificationStarted,
+            TaskState::Completed => EventType::TaskCompleted,
+            _ => EventType::StateTransitioned,
+        },
+        from_state: Some(expected),
+        to_state: Some(next),
+        reason: Some("approved task graph execution".to_owned()),
+        actor: EventActor::Orchestrator,
+        correlation_id: CorrelationId::new(),
+        causation_id: None,
+        payload: serde_json::json!({
+            "revision_id": claim.revision_id,
+            "schedule_claim_id": claim.schedule_claim_id,
+            "provider": claim.provider,
+        }),
+        previous_hash: None,
+        event_hash: String::new(),
+    }
 }
 
 const fn worker_outcome_text(outcome: WorkerOutcome) -> &'static str {

@@ -432,6 +432,64 @@ impl Database {
         Ok((next_revision, event))
     }
 
+    /// Atomically enters verification only when no instruction can still be
+    /// delivered to the running provider boundary.
+    pub fn transition_running_to_verifying_if_instructions_drained(
+        &self,
+        task_id: TaskId,
+        expected_revision: u64,
+        updated_at: DateTime<Utc>,
+        mut event: TaskEvent,
+    ) -> StateResult<bool> {
+        TaskState::Running
+            .validate_transition(TaskState::Verifying, &TransitionGuards::default())
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        if event.task_id != Some(task_id)
+            || event.from_state != Some(TaskState::Running)
+            || event.to_state != Some(TaskState::Verifying)
+        {
+            return Err(StateError::InvalidRecord(
+                "verification transition event does not match task projection update".to_owned(),
+            ));
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| StateError::InvalidRecord("task revision overflow".to_owned()))?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let pending: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_instructions
+                WHERE task_id = ?1 AND state IN ('queued', 'applying', 'interrupted')
+             )",
+            [task_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if pending {
+            return Ok(false);
+        }
+        let changed = transaction.execute(
+            "UPDATE tasks SET revision = ?1, state = 'verifying', resume_state = NULL,
+                paused = 0, updated_at = ?2
+             WHERE task_id = ?3 AND revision = ?4 AND state = 'running'
+               AND archived_at IS NULL",
+            params![
+                next_revision,
+                updated_at.to_rfc3339(),
+                task_id.to_string(),
+                expected_revision,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("task {task_id}"),
+            });
+        }
+        append_event_in_transaction(&transaction, &mut event)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Atomically projects a safe-boundary pause and records the corresponding audit event.
     ///
     /// The task's current state is retained as its resume point. Running work must first reach a

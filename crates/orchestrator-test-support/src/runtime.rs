@@ -406,6 +406,9 @@ where
         std::thread::sleep(Duration::from_mins(5));
         return;
     }
+    if stdin.contains("scenario:delayed-success") {
+        std::thread::sleep(Duration::from_millis(1_200));
+    }
     if scenario == "crash" {
         eprintln!("fake provider crash");
         std::process::exit(17);
