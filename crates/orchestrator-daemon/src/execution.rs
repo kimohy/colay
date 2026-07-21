@@ -613,8 +613,9 @@ mod tests {
     async fn scheduler_runs_disjoint_tasks_in_parallel_and_releases_all_claims()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let database = Arc::new(Database::open(directory.path().join("state.db"))?);
-        database.migrate_with_backup(&directory.path().join("backups"))?;
+        let root = std::fs::canonicalize(directory.path())?;
+        let database = Arc::new(Database::open(root.join("state.db"))?);
+        database.migrate_with_backup(&root.join("backups"))?;
         let daemon = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: daemon,
@@ -631,8 +632,8 @@ mod tests {
         });
         let services = ExecutionServices {
             executor: executor.clone(),
-            repository_root: std::fs::canonicalize(directory.path())?,
-            state_root: std::fs::canonicalize(directory.path())?,
+            repository_root: root.clone(),
+            state_root: root,
             global_limit: 2,
             provider_limits: BTreeMap::from([(ProviderId::Codex, 2)]),
             claim_ttl: TimeDelta::seconds(30),

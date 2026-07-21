@@ -530,9 +530,10 @@ mod tests {
     fn setup() -> Result<(tempfile::TempDir, Database, DaemonInstanceId), Box<dyn std::error::Error>>
     {
         let directory = tempfile::tempdir()?;
-        let path = directory.path().join("orchestrator.db");
+        let root = std::fs::canonicalize(directory.path())?;
+        let path = root.join("orchestrator.db");
         let database = Database::open(&path)?;
-        database.migrate_with_backup(&directory.path().join("backups"))?;
+        database.migrate_with_backup(&root.join("backups"))?;
         let daemon = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: daemon,

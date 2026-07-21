@@ -529,9 +529,11 @@ mod tests {
     #[test]
     fn concurrent_claim_has_one_winner() -> StateResult<()> {
         let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
-        let path = directory.path().join("state.db");
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
         let setup = Database::open(&path)?;
-        setup.migrate_with_backup(&directory.path().join("backups"))?;
+        setup.migrate_with_backup(&root.join("backups"))?;
         let pending = command(ClientCommandAction::CreateSession, "concurrent");
         setup.submit_client_command(&pending)?;
 
