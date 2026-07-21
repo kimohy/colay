@@ -2,7 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 #![cfg_attr(test, allow(clippy::panic))]
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::{TimeDelta, Utc};
 use orchestrator_domain::DaemonInstanceId;
@@ -12,8 +12,10 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 mod commands;
+mod planning;
 
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
+pub use planning::{PlanningServices, process_next_orchestration_command};
 
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonSettings {
@@ -107,6 +109,75 @@ pub async fn serve_with_commands(
             }
         }
     };
+    database.release_daemon(instance_id, Utc::now())?;
+    Ok(exit)
+}
+
+pub async fn serve_with_orchestration(
+    database: Arc<Database>,
+    instance_id: DaemonInstanceId,
+    pid: u32,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: Arc<dyn MessageRedactor>,
+    planning: PlanningServices,
+) -> Result<DaemonExit, DaemonError> {
+    validate_settings(settings)?;
+    let started_at = Utc::now();
+    database.acquire_daemon_lease(&DaemonLeaseRequest {
+        instance_id,
+        pid,
+        started_at,
+        ttl: settings.lease_ttl,
+    })?;
+    let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
+    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut command_interval = tokio::time::interval(settings.command_poll_interval);
+    command_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut active_planning = None;
+    let exit = loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break DaemonExit::Cancelled,
+            _ = heartbeat_interval.tick() => {
+                if database.daemon_stop_requested(instance_id)? {
+                    break DaemonExit::StopRequested;
+                }
+                database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
+            }
+            _ = command_interval.tick() => {
+                process_next_client_command(&database, redactor.as_ref(), Utc::now())?;
+                if active_planning
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    let finished = active_planning.take().ok_or_else(|| {
+                        DaemonError::InvalidSettings("finished planning job disappeared".to_owned())
+                    })?;
+                    finished.await.map_err(|error| {
+                        DaemonError::InvalidSettings(format!("planning job failed: {error}"))
+                    })??;
+                }
+                if active_planning.is_none() {
+                    let job_database = Arc::clone(&database);
+                    let job_redactor = Arc::clone(&redactor);
+                    let job_services = planning.clone();
+                    active_planning = Some(tokio::spawn(async move {
+                        process_next_orchestration_command(
+                            &job_database,
+                            &job_services,
+                            job_redactor.as_ref(),
+                            Utc::now(),
+                        )
+                        .await
+                    }));
+                }
+            }
+        }
+    };
+    if let Some(job) = active_planning {
+        job.abort();
+        let _ = job.await;
+    }
     database.release_daemon(instance_id, Utc::now())?;
     Ok(exit)
 }

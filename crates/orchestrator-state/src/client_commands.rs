@@ -149,6 +149,42 @@ impl Database {
         Ok(Some(command))
     }
 
+    pub fn claim_next_orchestration_client_command(
+        &self,
+        claimed_at: DateTime<Utc>,
+    ) -> StateResult<Option<ClientCommand>> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let command = {
+            let mut statement = transaction.prepare(
+                "SELECT command_id, session_id, task_id, action, payload_json, idempotency_key,
+                        state, requested_by, requested_at, claimed_at, completed_at, outcome
+                 FROM client_commands WHERE state = 'pending'
+                   AND action IN ('request_plan', 'approve_graph', 'revise_graph', 'cancel_plan')
+                 ORDER BY requested_at, command_id LIMIT 1",
+            )?;
+            statement.query_row([], map_client_command).optional()?
+        };
+        let Some(mut command) = command else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let changed = transaction.execute(
+            "UPDATE client_commands SET state = 'claimed', claimed_at = ?1
+             WHERE command_id = ?2 AND state = 'pending'",
+            params![claimed_at.to_rfc3339(), command.command_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("client command {}", command.command_id),
+            });
+        }
+        transaction.commit()?;
+        command.state = ClientCommandState::Claimed;
+        command.claimed_at = Some(claimed_at);
+        Ok(Some(command))
+    }
+
     pub fn complete_client_command(
         &self,
         command_id: ClientCommandId,
@@ -206,7 +242,10 @@ impl Database {
                 ClientCommandRecoveryDisposition::StillClaimed
             } else if matches!(
                 command.action,
-                ClientCommandAction::CreateSession | ClientCommandAction::AppendMessage
+                ClientCommandAction::CreateSession
+                    | ClientCommandAction::AppendMessage
+                    | ClientCommandAction::RequestPlan
+                    | ClientCommandAction::ApproveGraph
             ) {
                 let changed = transaction.execute(
                     "UPDATE client_commands SET state = 'pending', claimed_at = NULL
@@ -330,6 +369,10 @@ const fn action_name(action: ClientCommandAction) -> &'static str {
         ClientCommandAction::CreateSession => "create_session",
         ClientCommandAction::AppendMessage => "append_message",
         ClientCommandAction::StopDaemon => "stop_daemon",
+        ClientCommandAction::RequestPlan => "request_plan",
+        ClientCommandAction::ApproveGraph => "approve_graph",
+        ClientCommandAction::ReviseGraph => "revise_graph",
+        ClientCommandAction::CancelPlan => "cancel_plan",
     }
 }
 
@@ -338,6 +381,10 @@ fn parse_action(value: &str) -> Result<ClientCommandAction, std::io::Error> {
         "create_session" => Ok(ClientCommandAction::CreateSession),
         "append_message" => Ok(ClientCommandAction::AppendMessage),
         "stop_daemon" => Ok(ClientCommandAction::StopDaemon),
+        "request_plan" => Ok(ClientCommandAction::RequestPlan),
+        "approve_graph" => Ok(ClientCommandAction::ApproveGraph),
+        "revise_graph" => Ok(ClientCommandAction::ReviseGraph),
+        "cancel_plan" => Ok(ClientCommandAction::CancelPlan),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown client command action `{value}`"),

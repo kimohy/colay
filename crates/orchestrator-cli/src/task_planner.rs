@@ -72,6 +72,56 @@ impl OfficialCliTaskPlanner {
         })
     }
 
+    /// Probes only configured official CLIs and constructs a planner from the observed evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlannerFailure`] when no configured provider proves the required safe
+    /// non-interactive, structured-output, and read-only capabilities.
+    pub async fn probe_from_config(
+        config: &RootConfig,
+        repository: &Path,
+        runtime: Arc<dyn AdapterRuntime>,
+        profile: ModelProfile,
+    ) -> Result<Self, PlannerFailure> {
+        let mut capabilities = Vec::new();
+        for provider in [ProviderId::Gemini, ProviderId::Codex, ProviderId::Claude] {
+            let Some(provider_config) =
+                configured_provider(&config.orchestrator.providers, provider)
+            else {
+                continue;
+            };
+            if !provider_config.enabled {
+                continue;
+            }
+            let adapter =
+                build_provider_adapter(provider, config, Arc::clone(&runtime), repository)?;
+            if let Ok(observed) = adapter.capabilities().await
+                && capability_is_safe(&observed)
+            {
+                capabilities.push(observed);
+            }
+        }
+        Self::from_config(config, repository, runtime, &capabilities, profile)
+    }
+
+    #[must_use]
+    pub fn primary_provider(&self) -> ProviderId {
+        let mut candidates = self
+            .capabilities
+            .keys()
+            .copied()
+            .filter_map(|provider| {
+                configured_provider(&self.config.orchestrator.providers, provider)
+                    .map(|config| (config.priority, provider))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.cmp(left));
+        candidates
+            .first()
+            .map_or(ProviderId::Codex, |(_, provider)| *provider)
+    }
+
     fn select_provider(&self, request: &PlannerRequest) -> Result<ProviderId, PlannerFailure> {
         if request.sandbox != SandboxMode::ReadOnly {
             return Err(PlannerFailure::NotReadOnly);
@@ -123,7 +173,7 @@ impl OfficialCliTaskPlanner {
             .clamp(1, 3_600);
         let prompt = serde_json::to_string(&PlanningPrompt {
             schema_version: SchemaVersion::V1,
-            revision_id: GraphRevisionId::new(),
+            revision_id: request.revision_id,
             session_id: request.session_id,
             goal_message_id: request.goal_message_id,
             planner_provider: provider,

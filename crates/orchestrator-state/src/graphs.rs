@@ -24,6 +24,16 @@ pub enum GraphRevisionStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPlanningAttempt {
+    pub attempt_id: PlanningAttemptId,
+    pub revision_id: GraphRevisionId,
+    pub session_id: SessionId,
+    pub goal_message_id: MessageId,
+    pub planner_provider: ProviderId,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewGraphAttempt {
     pub attempt_id: PlanningAttemptId,
     pub revision_id: GraphRevisionId,
@@ -150,6 +160,168 @@ pub struct ApprovedGraph {
 }
 
 impl Database {
+    pub fn begin_graph_attempt(
+        &self,
+        attempt: &NewPlanningAttempt,
+    ) -> StateResult<StoredGraphRevision> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_goal_identity(&transaction, attempt.session_id, attempt.goal_message_id)?;
+        if let Some(existing) = graph_revision_by_id(&transaction, attempt.revision_id)? {
+            let identity_matches = existing.session_id == attempt.session_id
+                && existing.goal_message_id == attempt.goal_message_id
+                && existing.planner_provider == Some(attempt.planner_provider)
+                && existing.created_at == attempt.started_at;
+            if !identity_matches {
+                return Err(StateError::InvalidRecord(
+                    "planning attempt replay conflicts with its revision".to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let ordinal: i64 = transaction.query_row(
+            "SELECT coalesce(max(ordinal), 0) + 1 FROM graph_revisions WHERE session_id = ?1",
+            [attempt.session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
+             WHERE revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
+             AND status IN ('planning', 'awaiting_approval', 'approved')",
+            params![attempt.started_at.to_rfc3339(), attempt.session_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO graph_revisions(
+                revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
+                proposal_json, validation_json, planner_provider, created_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, 'planning', NULL, NULL, '{}', ?5, ?6, NULL)",
+            params![
+                attempt.revision_id.to_string(),
+                attempt.session_id.to_string(),
+                attempt.goal_message_id.to_string(),
+                ordinal,
+                attempt.planner_provider.as_str(),
+                attempt.started_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO planning_attempts(
+                attempt_id, revision_id, session_id, goal_message_id, planner_provider,
+                outcome, error_redacted, started_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'planning', NULL, ?6, NULL)",
+            params![
+                attempt.attempt_id.to_string(),
+                attempt.revision_id.to_string(),
+                attempt.session_id.to_string(),
+                attempt.goal_message_id.to_string(),
+                attempt.planner_provider.as_str(),
+                attempt.started_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET revision_id = excluded.revision_id,
+                 updated_at = excluded.updated_at",
+            params![
+                attempt.session_id.to_string(),
+                attempt.revision_id.to_string(),
+                attempt.started_at.to_rfc3339(),
+            ],
+        )?;
+        let mut event = graph_event(
+            attempt.session_id,
+            EventType::GraphRevisionRecorded,
+            EventActor::Provider(attempt.planner_provider),
+            attempt.started_at,
+            serde_json::json!({"revision_id": attempt.revision_id, "status": "planning"}),
+        );
+        append_event_in_transaction(&transaction, &mut event)?;
+        let stored = graph_revision_by_id(&transaction, attempt.revision_id)?.ok_or_else(|| {
+            StateError::InvalidRecord("started graph revision is missing".to_owned())
+        })?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    pub fn finish_graph_attempt(
+        &self,
+        attempt: &NewGraphAttempt,
+    ) -> StateResult<StoredGraphRevision> {
+        validate_new_attempt(attempt)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing =
+            graph_revision_by_id(&transaction, attempt.revision_id)?.ok_or_else(|| {
+                StateError::InvalidRecord("planning graph revision does not exist".to_owned())
+            })?;
+        if existing.status != GraphRevisionStatus::Planning
+            || existing.session_id != attempt.session_id
+            || existing.goal_message_id != attempt.goal_message_id
+            || existing.planner_provider != Some(attempt.planner_provider)
+        {
+            return Err(StateError::InvalidRecord(
+                "planning graph completion conflicts with its started attempt".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE graph_revisions SET status = ?1, proposal_hash = ?2, proposal_json = ?3,
+                    validation_json = ?4, completed_at = ?5
+             WHERE revision_id = ?6 AND status = 'planning'",
+            params![
+                enum_text(&attempt.status)?,
+                attempt.proposal_hash,
+                attempt
+                    .proposal
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                serde_json::to_string(&attempt.validation)?,
+                attempt.completed_at.to_rfc3339(),
+                attempt.revision_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("graph revision {}", attempt.revision_id),
+            });
+        }
+        let changed = transaction.execute(
+            "UPDATE planning_attempts SET outcome = ?1, error_redacted = ?2, completed_at = ?3
+             WHERE attempt_id = ?4 AND revision_id = ?5 AND outcome = 'planning'",
+            params![
+                enum_text(&attempt.status)?,
+                attempt.error_redacted,
+                attempt.completed_at.to_rfc3339(),
+                attempt.attempt_id.to_string(),
+                attempt.revision_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("planning attempt {}", attempt.attempt_id),
+            });
+        }
+        let mut event = graph_event(
+            attempt.session_id,
+            EventType::GraphRevisionRecorded,
+            EventActor::Provider(attempt.planner_provider),
+            attempt.completed_at,
+            serde_json::json!({
+                "revision_id": attempt.revision_id,
+                "status": attempt.status,
+                "proposal_hash": attempt.proposal_hash,
+            }),
+        );
+        append_event_in_transaction(&transaction, &mut event)?;
+        let stored = graph_revision_by_id(&transaction, attempt.revision_id)?.ok_or_else(|| {
+            StateError::InvalidRecord("finished graph revision is missing".to_owned())
+        })?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
     pub fn record_graph_attempt(
         &self,
         attempt: &NewGraphAttempt,

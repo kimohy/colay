@@ -40,7 +40,7 @@ pub use error::{StateError, StateResult};
 pub use event_log::{EventLog, ReconciliationReport};
 pub use graphs::{
     ApprovedGraph, GraphApprovalRequest, GraphProjection, GraphRevisionStatus, GraphTaskDependency,
-    GraphTaskProjection, NewGraphAttempt, StoredGraphRevision,
+    GraphTaskProjection, NewGraphAttempt, NewPlanningAttempt, StoredGraphRevision,
 };
 pub use leases::{
     CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, WorkerLease, WorkerLeaseMode,

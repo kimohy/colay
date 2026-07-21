@@ -35,6 +35,7 @@ fn capability() -> ProviderCapabilities {
 
 fn request(goal: &str) -> PlannerRequest {
     PlannerRequest {
+        revision_id: orchestrator_domain::GraphRevisionId::new(),
         session_id: SessionId::new(),
         goal_message_id: MessageId::new(),
         goal_redacted: goal.to_owned(),

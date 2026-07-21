@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use orchestrator_domain::{
-    GraphValidationError, GraphValidationPolicy, MessageId, ProviderId, SandboxMode, SchemaVersion,
-    SessionId, TaskGraphProposal, ValidatedTaskGraph, validate_task_graph,
+    GraphRevisionId, GraphValidationError, GraphValidationPolicy, MessageId, ProviderId,
+    SandboxMode, SchemaVersion, SessionId, TaskGraphProposal, ValidatedTaskGraph,
+    validate_task_graph,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,6 +13,7 @@ pub const PLANNER_RESPONSE_SCHEMA_VERSION: &str = SchemaVersion::V1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannerRequest {
+    pub revision_id: GraphRevisionId,
     pub session_id: SessionId,
     pub goal_message_id: MessageId,
     pub goal_redacted: String,
@@ -164,6 +166,12 @@ pub fn collect_planner_response(
             evidence_redacted,
         });
     }
+    if proposal.revision_id != request.revision_id {
+        return Err(PlannerFailure::IdentityMismatch {
+            field: "proposal.revision_id",
+            evidence_redacted,
+        });
+    }
     if proposal.goal_message_id != request.goal_message_id {
         return Err(PlannerFailure::IdentityMismatch {
             field: "proposal.goal_message_id",
@@ -249,6 +257,7 @@ mod tests {
 
     fn request() -> PlannerRequest {
         PlannerRequest {
+            revision_id: GraphRevisionId::new(),
             session_id: SessionId::new(),
             goal_message_id: MessageId::new(),
             goal_redacted: "build chat orchestration".to_owned(),

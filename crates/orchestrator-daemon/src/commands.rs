@@ -69,6 +69,12 @@ fn execute_command(
         ClientCommandAction::StopDaemon => Err(CommandExecutionError::Rejected(
             "stop command requires daemon lease reconciliation",
         )),
+        ClientCommandAction::RequestPlan
+        | ClientCommandAction::ApproveGraph
+        | ClientCommandAction::ReviseGraph
+        | ClientCommandAction::CancelPlan => Err(CommandExecutionError::Rejected(
+            "orchestration command requires planning services",
+        )),
     }
 }
 

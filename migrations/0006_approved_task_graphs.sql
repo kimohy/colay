@@ -53,10 +53,12 @@ CREATE TABLE planning_attempts (
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE RESTRICT,
     goal_message_id TEXT NOT NULL REFERENCES conversation_messages(message_id) ON DELETE RESTRICT,
     planner_provider TEXT NOT NULL CHECK (planner_provider IN ('gemini', 'codex', 'claude')),
-    outcome TEXT NOT NULL CHECK (outcome IN ('invalid', 'awaiting_approval', 'failed', 'cancelled')),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'planning', 'invalid', 'awaiting_approval', 'failed', 'cancelled'
+    )),
     error_redacted TEXT,
     started_at TEXT NOT NULL,
-    completed_at TEXT NOT NULL
+    completed_at TEXT
 ) STRICT;
 
 CREATE TABLE session_tasks (
@@ -105,6 +107,7 @@ CREATE INDEX task_dependencies_revision
 CREATE TRIGGER graph_revisions_immutable_payload
 BEFORE UPDATE OF session_id, goal_message_id, ordinal, proposal_hash, proposal_json,
                  validation_json, planner_provider, created_at ON graph_revisions
+WHEN OLD.status <> 'planning'
 BEGIN
     SELECT RAISE(ABORT, 'graph revision payload is immutable');
 END;
@@ -115,10 +118,18 @@ BEGIN
     SELECT RAISE(ABORT, 'graph revisions are append-only');
 END;
 
-CREATE TRIGGER planning_attempts_no_update
-BEFORE UPDATE ON planning_attempts
+CREATE TRIGGER planning_attempts_immutable_identity
+BEFORE UPDATE OF attempt_id, revision_id, session_id, goal_message_id,
+                 planner_provider, started_at ON planning_attempts
 BEGIN
-    SELECT RAISE(ABORT, 'planning attempts are immutable');
+    SELECT RAISE(ABORT, 'planning attempt identity is immutable');
+END;
+
+CREATE TRIGGER planning_attempts_single_completion
+BEFORE UPDATE OF outcome, error_redacted, completed_at ON planning_attempts
+WHEN OLD.outcome <> 'planning' OR NEW.outcome = 'planning' OR NEW.completed_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'planning attempt completion is append-once');
 END;
 
 CREATE TRIGGER planning_attempts_no_delete

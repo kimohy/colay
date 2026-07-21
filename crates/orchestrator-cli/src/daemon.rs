@@ -1,20 +1,28 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
+use async_trait::async_trait;
 use chrono::Utc;
-use orchestrator_daemon::{DaemonSettings, MessageRedactor, serve_with_commands};
-use orchestrator_domain::DaemonInstanceId;
+use orchestrator_daemon::{
+    DaemonSettings, MessageRedactor, PlanningServices, serve_with_orchestration,
+};
+use orchestrator_domain::{DaemonInstanceId, GraphValidationPolicy, ModelProfile, ProviderId};
+use orchestrator_engine::{PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner};
 use orchestrator_process::{RedactionConfig, Redactor};
+use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{DaemonStatus, Database, EventLog, RepositoryStatePaths, RootConfig};
 use serde::Serialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::DaemonAction;
+use colay::task_planner::OfficialCliTaskPlanner;
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,7 +87,7 @@ pub(crate) async fn ensure_started(
 
 async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> {
     let paths = RepositoryStatePaths::from_config(repository, config)?;
-    let database = open_ready_database(&paths)?;
+    let database = Arc::new(open_ready_database(&paths)?);
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
@@ -87,17 +95,52 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             signal_cancellation.cancel();
         }
     });
-    let redactor = ProcessMessageRedactor(Redactor::new(&RedactionConfig {
+    let redaction = RedactionConfig {
         literals: Vec::new(),
         patterns: config.orchestrator.redaction.patterns.clone(),
-    })?);
-    let result = serve_with_commands(
-        &database,
+    };
+    let redactor: Arc<dyn MessageRedactor> =
+        Arc::new(ProcessMessageRedactor(Redactor::new(&redaction)?));
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
+    let (planner, planner_provider): (Arc<dyn TaskPlanner>, ProviderId) =
+        match OfficialCliTaskPlanner::probe_from_config(
+            config,
+            repository,
+            runtime,
+            ModelProfile::Standard,
+        )
+        .await
+        {
+            Ok(planner) => {
+                let provider = planner.primary_provider();
+                (Arc::new(planner), provider)
+            }
+            Err(error) => (
+                Arc::new(UnavailablePlanner {
+                    reason: error.to_string(),
+                }),
+                ProviderId::Codex,
+            ),
+        };
+    let result = serve_with_orchestration(
+        database,
         DaemonInstanceId::new(),
         std::process::id(),
         cancellation,
         DaemonSettings::default(),
-        &redactor,
+        redactor,
+        PlanningServices {
+            planner,
+            planner_provider,
+            validation_policy: GraphValidationPolicy {
+                eligible_providers: BTreeSet::from([planner_provider]),
+                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                max_parallel_workers: usize::try_from(config.orchestrator.max_parallel_workers)
+                    .unwrap_or(usize::MAX)
+                    .max(1),
+                per_provider_limits: BTreeMap::new(),
+            },
+        },
     )
     .await;
     signal_task.abort();
@@ -207,6 +250,20 @@ struct ProcessMessageRedactor(Redactor);
 impl MessageRedactor for ProcessMessageRedactor {
     fn redact(&self, value: &str) -> String {
         self.0.redact(value)
+    }
+}
+
+struct UnavailablePlanner {
+    reason: String,
+}
+
+#[async_trait]
+impl TaskPlanner for UnavailablePlanner {
+    async fn propose(&self, _request: PlannerRequest) -> Result<PlannerResponse, PlannerFailure> {
+        Err(PlannerFailure::Invocation {
+            reason: self.reason.clone(),
+            evidence_redacted: String::new(),
+        })
     }
 }
 

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ClientCommandId, MessageId, SchemaVersion, SessionId, TaskId};
+use crate::{ClientCommandId, GraphRevisionId, MessageId, SchemaVersion, SessionId, TaskId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +224,40 @@ pub struct AppendMessageCommandPayload {
     pub content: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestPlanCommandPayload {
+    pub goal_message_id: MessageId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveGraphCommandPayload {
+    pub revision_id: GraphRevisionId,
+    pub proposal_hash: String,
+    pub approved_by: String,
+}
+
+impl ApproveGraphCommandPayload {
+    /// Validates the typed authority fields for exact graph approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for a non-hex SHA-256 hash or blank approver identity.
+    pub fn validate(&self) -> Result<(), SessionValidationError> {
+        if self.proposal_hash.len() != 64
+            || !self
+                .proposal_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(SessionValidationError::InvalidProposalHash);
+        }
+        if self.approved_by.trim().is_empty() {
+            return Err(SessionValidationError::BlankApprover);
+        }
+        Ok(())
+    }
+}
+
 impl AppendMessageCommandPayload {
     /// Validates a durable user-message command payload.
     ///
@@ -245,6 +279,10 @@ pub enum ClientCommandAction {
     CreateSession,
     AppendMessage,
     StopDaemon,
+    RequestPlan,
+    ApproveGraph,
+    ReviseGraph,
+    CancelPlan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,6 +367,10 @@ pub enum SessionValidationError {
     BlankIdempotencyKey,
     #[error("client command requester must not be blank")]
     BlankRequester,
+    #[error("graph approval proposal hash must be a hexadecimal SHA-256 value")]
+    InvalidProposalHash,
+    #[error("graph approver identity must not be blank")]
+    BlankApprover,
     #[error("client command state does not match its lifecycle timestamps")]
     InvalidCommandLifecycle,
 }
@@ -339,11 +381,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AppendMessageCommandPayload, ClientCommand, ClientCommandAction, ClientCommandState,
-        ConversationMessage, CreateSessionCommandPayload, MessageKind, MessageRole, MessageState,
-        Session, SessionState,
+        AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand,
+        ClientCommandAction, ClientCommandState, ConversationMessage, CreateSessionCommandPayload,
+        MessageKind, MessageRole, MessageState, RequestPlanCommandPayload, Session, SessionState,
     };
-    use crate::{ClientCommandId, MessageId, SessionId};
+    use crate::{ClientCommandId, GraphRevisionId, MessageId, SessionId};
 
     fn timestamp() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 9, 0, 0)
@@ -381,6 +423,27 @@ mod tests {
             SessionState::Stopping.validate_transition(SessionState::Cancelled),
             Ok(())
         );
+    }
+
+    #[test]
+    fn typed_graph_commands_round_trip_and_validate_exact_authority() {
+        let request = RequestPlanCommandPayload {
+            goal_message_id: MessageId::new(),
+        };
+        let parsed = serde_json::from_value::<RequestPlanCommandPayload>(
+            serde_json::to_value(&request).unwrap_or_default(),
+        );
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.ok(), Some(request));
+        let approval = ApproveGraphCommandPayload {
+            revision_id: GraphRevisionId::new(),
+            proposal_hash: "a".repeat(64),
+            approved_by: "operator".to_owned(),
+        };
+        assert!(approval.validate().is_ok());
+        let mut invalid = approval;
+        invalid.proposal_hash = "not-a-hash".to_owned();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
