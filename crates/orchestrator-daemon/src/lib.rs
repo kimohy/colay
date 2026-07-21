@@ -94,6 +94,8 @@ pub async fn serve_with_commands(
         started_at,
         ttl: settings.lease_ttl,
     })?;
+    database.recover_stale_client_commands(started_at)?;
+    database.reconcile_interrupted_integrations(started_at)?;
 
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);

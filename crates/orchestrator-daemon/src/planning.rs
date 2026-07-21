@@ -62,9 +62,10 @@ pub async fn process_next_orchestration_command(
                 ))
             }
         }
-        ClientCommandAction::CreateResolutionTask => Err(ExecutionError::Rejected(
-            "integration resolution task requires a blocked preview".to_owned(),
-        )),
+        ClientCommandAction::CreateResolutionTask => {
+            crate::integration::create_resolution_task(database, &command, now)
+                .map_err(map_integration_error)
+        }
         ClientCommandAction::CreateSession
         | ClientCommandAction::AppendMessage
         | ClientCommandAction::StopDaemon => Err(ExecutionError::Rejected(

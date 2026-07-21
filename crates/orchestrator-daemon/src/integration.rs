@@ -2,8 +2,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ApproveIntegrationCommandPayload, ClientCommand, IntegrationApplication,
-    IntegrationApplicationId, IntegrationApproval, IntegrationBatchId, TaskState,
+    ApproveIntegrationCommandPayload, ClientCommand, CorrelationId,
+    CreateResolutionTaskCommandPayload, EventActor, EventId, EventType, IntegrationApplication,
+    IntegrationApplicationId, IntegrationApproval, IntegrationBatchId, SchemaVersion, SessionId,
+    SessionState, TaskEvent, TaskState,
 };
 use orchestrator_engine::{
     GitIntegrationManager, GitWorktree, IntegrationCandidate, IntegrationPreviewRequest,
@@ -53,7 +55,16 @@ pub async fn request_integration(
         .preview(&request)
         .await
         .map_err(|error| IntegrationCommandError::Rejected(error.to_string()))?;
-    database.record_integration_preview(&preview)?;
+    let stored = database.record_integration_preview(&preview)?;
+    if stored.status == IntegrationBatchStatus::Blocked {
+        transition_session(
+            database,
+            command,
+            session_id,
+            SessionState::NeedsAttention,
+            now,
+        )?;
+    }
     Ok(format!("integration:{batch_id}"))
 }
 
@@ -102,6 +113,13 @@ pub async fn approve_integration(
         approved_at: now,
     };
     let approved = database.approve_integration(&approval)?;
+    transition_session(
+        database,
+        command,
+        session_id,
+        SessionState::Integrating,
+        now,
+    )?;
     let request = build_request(
         database,
         services,
@@ -128,9 +146,24 @@ pub async fn approve_integration(
     {
         Ok((_worktree, application)) => {
             database.finish_integration_application(&application)?;
+            transition_session(
+                database,
+                command,
+                session_id,
+                SessionState::Verifying,
+                application.completed_at,
+            )?;
+            transition_session(
+                database,
+                command,
+                session_id,
+                SessionState::Completed,
+                application.completed_at,
+            )?;
             Ok(format!("integration-applied:{}", approved.preview.batch_id))
         }
         Err(error) => {
+            let failed_at = Utc::now();
             database.finish_integration_application(&IntegrationApplication {
                 application_id,
                 batch_id: approved.preview.batch_id,
@@ -140,13 +173,104 @@ pub async fn approve_integration(
                 resulting_tree: None,
                 succeeded: false,
                 detail_redacted: error.to_string(),
-                completed_at: Utc::now(),
+                completed_at: failed_at,
             })?;
+            transition_session(
+                database,
+                command,
+                session_id,
+                SessionState::NeedsAttention,
+                failed_at,
+            )?;
             Err(IntegrationCommandError::Rejected(
                 "integration application needs attention".to_owned(),
             ))
         }
     }
+}
+
+pub fn create_resolution_task(
+    database: &Database,
+    command: &ClientCommand,
+    now: DateTime<Utc>,
+) -> Result<String, IntegrationCommandError> {
+    let session_id = command.session_id.ok_or_else(|| {
+        IntegrationCommandError::Rejected(
+            "create-resolution-task command requires a session target".to_owned(),
+        )
+    })?;
+    if command.task_id.is_some() {
+        return Err(IntegrationCommandError::Rejected(
+            "create-resolution-task cannot target one task".to_owned(),
+        ));
+    }
+    let payload: CreateResolutionTaskCommandPayload =
+        serde_json::from_value(command.payload.clone()).map_err(|_| {
+            IntegrationCommandError::Rejected(
+                "create-resolution-task payload is invalid".to_owned(),
+            )
+        })?;
+    let current = database
+        .current_integration_batch(session_id)?
+        .ok_or_else(|| {
+            IntegrationCommandError::Rejected("integration preview does not exist".to_owned())
+        })?;
+    if current.preview.batch_id != payload.batch_id {
+        return Err(IntegrationCommandError::Rejected(
+            "integration resolution batch is not current".to_owned(),
+        ));
+    }
+    let task_id = database.create_integration_resolution_task(
+        payload.batch_id,
+        &command.requested_by,
+        now,
+    )?;
+    transition_session(database, command, session_id, SessionState::Running, now)?;
+    Ok(format!("integration-resolution-task:{task_id}"))
+}
+
+fn transition_session(
+    database: &Database,
+    command: &ClientCommand,
+    session_id: SessionId,
+    next: SessionState,
+    now: DateTime<Utc>,
+) -> Result<(), IntegrationCommandError> {
+    let session = database.load_session(session_id)?.ok_or_else(|| {
+        IntegrationCommandError::Rejected("integration session does not exist".to_owned())
+    })?;
+    if session.state == next {
+        return Ok(());
+    }
+    session
+        .state
+        .validate_transition(next)
+        .map_err(|error| IntegrationCommandError::Rejected(error.to_string()))?;
+    database.transition_session_with_event(
+        session_id,
+        session.revision,
+        next,
+        now,
+        TaskEvent {
+            schema_version: SchemaVersion::state_current(),
+            sequence: 0,
+            event_id: EventId::new(),
+            session_id: Some(session_id),
+            task_id: None,
+            occurred_at: now,
+            event_type: EventType::SessionStateTransitioned,
+            from_state: None,
+            to_state: None,
+            reason: Some(format!("integration command {}", command.command_id)),
+            actor: EventActor::Orchestrator,
+            correlation_id: CorrelationId::new(),
+            causation_id: None,
+            payload: serde_json::json!({"command_id": command.command_id, "next": next}),
+            previous_hash: None,
+            event_hash: String::new(),
+        },
+    )?;
+    Ok(())
 }
 
 async fn build_request(
@@ -175,8 +299,14 @@ async fn build_request(
                     .push(dependency.depends_on_task_id);
                 values
             });
-    let mut candidates = Vec::with_capacity(graph.tasks.len());
-    for graph_task in &graph.tasks {
+    let resolution_task = database.latest_completed_resolution_task(session_id)?;
+    let selected_tasks = graph
+        .tasks
+        .iter()
+        .filter(|graph_task| resolution_task.is_none_or(|task_id| graph_task.task_id == task_id))
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::with_capacity(selected_tasks.len());
+    for graph_task in selected_tasks {
         let task = database.load_task(graph_task.task_id)?.ok_or_else(|| {
             IntegrationCommandError::Rejected("graph task disappeared".to_owned())
         })?;
@@ -197,10 +327,14 @@ async fn build_request(
         candidates.push(IntegrationCandidate {
             task_id: graph_task.task_id,
             graph_order: graph_task.display_order,
-            dependencies: dependency_map
-                .get(&graph_task.task_id)
-                .cloned()
-                .unwrap_or_default(),
+            dependencies: if resolution_task.is_some() {
+                Vec::new()
+            } else {
+                dependency_map
+                    .get(&graph_task.task_id)
+                    .cloned()
+                    .unwrap_or_default()
+            },
             worktree,
             checkpoint: if evidence_allowed {
                 database.latest_sealed_checkpoint(task.task_id)?
