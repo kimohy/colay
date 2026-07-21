@@ -33,9 +33,16 @@ the global limit, the provider-specific limit, unique active task ownership,
 and component-aware write-scope exclusion. Disjoint tasks execute concurrently
 in isolated Git worktrees; conflicting scopes wait. Claims are renewable and
 released with an explicit terminal reason, so a daemon restart cannot silently
-duplicate an attempt. Reviewers remain read-only. Integration, merge, push,
-publication, and worktree deletion are disabled until a separately approved
-Phase 5 operation.
+duplicate an attempt. Reviewers remain read-only.
+
+Result integration is a second exact-approval boundary. A read-only preview
+recomputes managed worktree snapshots and validates checkpoint and verification
+identity before sealing the graph revision, base, ordered sources, paths, diff
+hashes, and blockers. Typed approval names one exact current preview hash.
+Apply revalidates the seal, then creates a dedicated integration worktree and
+applies patches in dependency order. User/task worktrees, remotes, and branches
+are not mutated. Ambiguous interrupted applications become durable
+`needs_attention` records and are never blindly replayed.
 
 ## Safe boundaries
 

@@ -46,8 +46,10 @@ Completion is blocked by failed verification, out-of-scope files, secret
 findings, inconclusive large-file scans, or a missing required independent
 review. Task instructions have no integration authority: they are accepted only
 for relationally valid current-graph targets and move through an auditable
-one-way lifecycle at provider safe boundaries. Worktree deletion, integration,
-merge, push, and publication are not automated in Phase 4. Release and
+one-way lifecycle at provider safe boundaries. Integration requires a second
+typed approval bound to a canonical preview hash and is confined to a dedicated
+retained worktree. Worktree deletion, merge to the user's branch, push, and
+publication are not automated. Release and
 database-migration rollback both require an explicit `--approved-by` identity
 and an exact plan-bound integrity hash. Quality-floor downgrade approval records
 exist in the state schema; this release does not silently lower critical-task

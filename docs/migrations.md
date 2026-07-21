@@ -36,9 +36,14 @@ path components or repository-wide ownership and are released with the parent
 claim. Instructions retain per-task order and the
 `queued -> applying -> applied|rejected|interrupted` lifecycle across restarts.
 
+State schema v8 adds immutable integration batches, ordered source evidence,
+exact approvals, application journals, resolution-task links, and the three
+typed integration command actions. Existing command rows are preserved through
+the constrained-table rebuild.
+
 For an existing nonzero schema, `migrate apply` creates an online SQLite backup under `.colay/backups/orchestrator.db.backup.<timestamp>` before applying pending versions. A legacy config keeps using its explicitly selected state root. A brand-new empty database has no prior state to back up. After migration, `doctor` reports SQLite integrity and foreign-key health.
 
-`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5/v6/v7 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. Separate v5 and v6 fixtures prove the later migrations preserve completed command rows and create a verified pre-apply backup.
+`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5/v6/v7/v8 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
 
 ## Configuration
 

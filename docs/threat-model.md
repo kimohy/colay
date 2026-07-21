@@ -26,6 +26,7 @@ Provider output, task text, repository files, Git metadata, usage-probe output, 
 | Silent chat retargeting | Navigation and composer target are separate reducer fields; target changes require an explicit picker or one-message mention |
 | Secret persistence through chat | Client-side redaction before command persistence, daemon-side redaction before projection, redacted-only TUI mapping |
 | Forged or stale plan approval | Typed revision ID plus exact SHA-256 proposal hash, current-head check, seal recomputation, explicit `y`, stale-overlay closure; display text has no authority |
+| Forged, stale, or partial result integration | Canonical preview binds base/source/checkpoint/verification/diff/blockers; apply recomputes sources and runs only in a dedicated worktree; interrupted application is not replayed |
 | Planner-induced mutation | Official CLI capability probe, explicit read-only sandbox, bounded separated argv/process, no task/worktree materialization before approval |
 | Malicious task graph | Provider-neutral strict JSON, bounded collector, deterministic DAG/scope/provider/profile validation, invalid revision retention without approval hash |
 | Mutation during daemon loss | Heartbeat-derived online/stale/offline state; stale and offline snapshots are explicitly read-only |
@@ -66,7 +67,7 @@ semaphore. Provider success is insufficient: dependency readiness uses only a
 completed task whose latest verification passed. Declared scopes are never
 widened after dispatch, and an overlap or out-of-scope change blocks progress.
 Schedule/resource claims and instruction transitions remain auditable after a
-daemon crash. None of those records authorizes integration into the user's
-branch.
+daemon crash. Integration approval authorizes only the exact sealed preview in
+its dedicated worktree; it never authorizes merge into the user's branch.
 
 The design does not attempt to defend against a host administrator who can replace binaries, read process memory, or rewrite all state and hashes. Enterprise endpoint security and code-signing policy remain required.

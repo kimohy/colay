@@ -106,7 +106,7 @@ Ctrl+Space          request pause or resume
 ?                   show contextual help
 ```
 
-The command palette exposes `/tasks`, `/plan`, `/approve`, `/pause`, `/resume`, `/cancel`, `/handover`, `/retry`, `/checkpoint`, and `/provider`. Destructive or scope-expanding commands open typed confirmation views rather than executing from the text alone.
+The command palette exposes `/tasks`, `/plan`, `/integrate`, `/approve`, `/resolve`, `/pause`, `/resume`, `/cancel`, `/handover`, `/retry`, `/checkpoint`, and `/provider`. Destructive or scope-expanding commands open typed confirmation views rather than executing from the text alone.
 
 ## Responsive Behavior
 

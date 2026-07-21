@@ -100,14 +100,21 @@ write-scope ownership in SQLite. Independent tasks run concurrently through
 official CLI adapters in separate Git worktrees and reach `completed` only
 after sealed checkpoint evidence and independent verification.
 
-Phase 3 established the exact proposal-hash approval boundary; Phase 4 adds
-the bounded parallel execution described above without weakening that approval.
+Phase 3 established the exact proposal-hash approval boundary, Phase 4 added
+bounded parallel execution, and Phase 5 completes the approved-result workflow
+without weakening either boundary.
 
 Send `@task-<id> ...` to create an ordered durable instruction for one current
 graph task, or `@all ...` to fan out separately auditable instructions. Task
-selection still never changes the composer target. Results and worktrees remain
-isolated after execution; integration, merge, push, publication, cleanup, and
-`/retry` remain separately gated in Phase 5.
+selection still never changes the composer target. After intended sources are
+completed and verified, `/integrate` creates a read-only sealed preview. Its
+card displays the exact SHA-256 hash, base, ordered evidence, changed paths,
+blockers, and dedicated destination. `/approve` requires `y` for that exact
+preview; every source is revalidated before application only to the retained
+`.colay/integration/<batch-id>` worktree. `/resolve` turns a blocked batch into
+one auditable task whose result requires a new preview and approval. Merge to
+the user's branch, push, publication, automatic cleanup, and `/retry` remain
+unavailable.
 
 ## Model profiles
 

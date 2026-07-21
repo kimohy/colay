@@ -7,7 +7,7 @@ This repository versions Colay and its persisted/public contracts independently.
 | Colay | `0.1.0` | workspace `Cargo.toml` |
 | Tested Codex | `0.144.5`, `0.144.6` | `compatibility/codex-version.toml` |
 | Recommended Codex | `0.144.6` | `compatibility/codex-version.toml` |
-| SQLite state schema | `7` | `STATE_SCHEMA_VERSION` and migrations |
+| SQLite state schema | `8` | `STATE_SCHEMA_VERSION` and migrations |
 | Config schema | `4` | `CONFIG_SCHEMA_VERSION` |
 | Checkpoint/handover schema | `1` | domain writers |
 
@@ -20,7 +20,7 @@ Current known limitations:
 - The CLI intentionally keeps `codex exec --json` as the default transport; selecting App Server first is an adapter policy rather than a user-facing CLI switch.
 - Authoritative checkpoint diffs remain sensitive local source artifacts even though persistence/handover preflight blocks known secret patterns and oversized unscanned files.
 - The daemon executes dependency-ready approved tasks concurrently within exact global/provider and write-scope limits. Read-only reviewer fan-out is not implemented.
-- Task results remain isolated and retained after verification. Integration, merge, push, publication, cleanup, and `/retry` remain unavailable until Phase 5.
+- Exact approved results can be applied only to a retained integration worktree. Merge to the user's branch, push, publication, cleanup, and `/retry` remain unavailable.
 
 See [`rollback.md`](rollback.md) for the release manifest, explicit approval, recovery journal, and restart procedure.
 

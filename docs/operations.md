@@ -61,7 +61,9 @@ Ctrl+L            full log
 Ctrl+T            explicit composer target
 ?                 help
 /plan             plan the newest session-level user goal (read-only)
-/approve          review and confirm the exact current graph revision/hash
+/integrate        build a read-only sealed result preview
+/approve          confirm the exact current graph or integration hash
+/resolve          create one task for the current blocked integration batch
 /admin            five-panel administration compatibility view
 ```
 
@@ -86,7 +88,17 @@ only after checkpoint sealing and verification; failure releases its claim and
 does not cancel an independent sibling. An invalid plan is retained with a
 redacted attention error and no approvable hash. Re-run `/plan` after correcting
 the goal to create a new revision; earlier revisions remain historical.
-`/retry` and integration actions still fail visibly as unavailable.
+`/retry` still fails visibly as unavailable.
+
+After intended graph tasks complete, `/integrate` recomputes managed Git
+snapshots and sealed checkpoint/verification evidence. The preview card shows
+the base, exact hash, ordered sources and changed files, blockers, and retained
+destination. Previewing never creates that destination. Only `y` in the
+integration approval overlay submits typed authority for the displayed hash.
+Any source or base change invalidates it. Missing evidence, failed verification,
+overlap, stale base, or patch failure stops closed. `/resolve` materializes one
+idempotent task bound to the blocked batch; completing it grants no authority,
+and `/integrate` plus `/approve` must run again.
 
 ## Repository daemon
 
@@ -115,8 +127,11 @@ endpoint.
 
 SQLite and the hash-chained JSONL log retain tasks, attempts, checkpoints, handovers, leases, and worktree metadata across process restarts. Stale claimed pause/resume/cancel controls can be requeued safely; ambiguous handover/usage-override controls require manual reconciliation.
 
-Client commands use unique idempotency keys. Stale claimed session creation and
-message append commands are replay-safe and requeued on recovery. A stale
+Client commands use unique idempotency keys. Stale claimed session creation,
+message append, planning, graph approval, and preview commands are reconciled or
+requeued on recovery. Integration application is never blindly replayed: an
+ambiguous `applying` record becomes `interrupted`, and its batch/session become
+`needs_attention`. A stale
 `stop_daemon` command remains claimed for manual reconciliation because blind
 replay could stop a replacement instance.
 
@@ -135,10 +150,9 @@ The current manual command accepts `provider`, optional `--used`, `--limit`, and
 ## Worktree retention
 
 Worktrees and task branches are retained after completion, failure,
-cancellation, daemon restart, and rollback. Phase 4 never applies a task result
-to the user's branch and has no automatic worktree removal, merge, push, or
-publication path. These retained verified results are the only inputs eligible
-for a later exact-hash integration preview.
+cancellation, daemon restart, and rollback. Approved results may be copied only
+to a separately retained integration worktree. Colay has no automatic worktree
+removal, merge to the user's branch, push, or publication path.
 
 ## Provider prerequisites
 

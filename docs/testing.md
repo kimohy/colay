@@ -44,6 +44,14 @@ overlapping invocation intervals, distinct retained worktrees, target-exact
 instruction application, sealed completion evidence, and restart without a
 duplicate attempt or mutation of the user's branch.
 
+Phase 5 domain/engine/state tests cover stable preview seals, exact approval,
+overlap and source mutation, immutable persistence, idempotent resolution-task
+creation, and interrupted-application reconciliation. The daemon
+`result_integration.rs` test uses a real temporary Git repository: typed preview
+remains read-only, exact approval applies two verified sources only to the
+dedicated integration worktree, session state completes, and the user plus task
+worktrees remain unchanged.
+
 ## Required local verification
 
 ```text
@@ -83,11 +91,12 @@ No provider credentials are needed. If an integration test asks for a provider l
 - `orchestrator-test-support/tests/provider_e2e.rs` runs each adapter through fake structured streams, malformed/error/quota paths, cancellation, redaction, bounded process execution, and executable/argv usage probes.
 - `orchestrator-test-support/tests/multi_provider_handover_e2e.rs` drives the vendor-neutral lifecycle from a fake Gemini daily quota event through a sealed checkpoint, Codex implementation, a monthly-headroom warning carried into the Claude handover, Claude read-only review, and the independent completion gate.
 - `orchestrator-cli/tests/fake_cli_handover_e2e.rs` launches the compiled `colay` and gated `colay-e2e-fake-provider` binaries. It proves a Codex quota failure preserves a partial Git diff, Claude exactly acknowledges the sealed bundle before writing, local fmt/clippy/check/test evidence reaches `Completed`, the original branch remains untouched, and no merge/push/cleanup occurs. A second scenario exercises sealed, explicitly approved SQLite restore, recovery backup retention, and the post-restore JSONL hash chain.
-- `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential v2/v3/v4/v5/v6/v7 plan and historical event hashes, separately rebuilds v5 commands into v6 graph-aware constraints and upgrades v6 scheduling state to v7, proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.
+- `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential v2/v3/v4/v5/v6/v7/v8 plan and historical event hashes, rebuilds constrained command tables without losing rows, proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.
 - `orchestrator-cli/tests/daemon_lifecycle.rs` proves public help, hidden internal serve, absent-state status, single-instance start, idempotent start, restart ownership transfer, graceful stop, and child cleanup.
 - `orchestrator-cli/tests/chat_tui_reconnect.rs` proves chat help/docs, durable daemon command processing, redacted persistence, a second SQLite connection restoring the session, and daemon survival/cleanup.
 - `orchestrator-cli/tests/chat_plan_approval.rs` proves the full goal -> read-only fake planner -> validated revision -> exact typed approval path through a real daemon process, with no pre-approval writable artifact and no real provider.
 - `orchestrator-cli/tests/parallel_task_execution.rs` proves approved disjoint tasks overlap through fake official CLI processes in isolated Git worktrees, task instructions stay target-exact, claims are released, restart is idempotent, and no integration/merge/push/cleanup occurs.
+- `orchestrator-daemon/tests/result_integration.rs` proves typed exact-hash integration through the daemon with real Git worktrees and no mutation of the user or source task worktrees.
 
 The multi-provider test deliberately uses synthetic Git evidence, the persistence secret preflight, and an in-memory fake runtime; it validates orchestration contracts without executing a real model or mutating a user repository. Engine worktree tests separately exercise actual temporary Git repositories.
 
