@@ -131,6 +131,25 @@ pub struct StoredTaskAttempt {
     pub worker_result: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewTaskAttemptRecord {
+    pub attempt_id: AttemptId,
+    pub task_id: TaskId,
+    pub provider: ProviderId,
+    pub worker_mode: String,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewWorktreeRecord {
+    pub task_id: TaskId,
+    pub repo_root: PathBuf,
+    pub worktree_path: PathBuf,
+    pub branch_name: String,
+    pub base_revision: String,
+    pub created_at: DateTime<Utc>,
+}
+
 impl StoredTaskAttempt {
     /// Decodes a complete persisted worker result. Incomplete start-failure
     /// evidence deliberately remains available through [`Self::worker_result`].
@@ -715,6 +734,96 @@ impl Database {
             )
             .optional()
             .map_err(StateError::from)
+    }
+
+    pub fn record_task_attempt_started(&self, attempt: &NewTaskAttemptRecord) -> StateResult<u32> {
+        if attempt.worker_mode.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "task attempt worker mode must not be blank".to_owned(),
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let ordinal: i64 = transaction.query_row(
+            "SELECT coalesce(max(ordinal), 0) + 1 FROM task_attempts WHERE task_id = ?1",
+            [attempt.task_id.to_string()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, worker_mode,
+                started_at, ended_at, outcome, worker_result_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
+            params![
+                attempt.attempt_id.to_string(),
+                attempt.task_id.to_string(),
+                ordinal,
+                attempt.provider.as_str(),
+                attempt.worker_mode.trim(),
+                attempt.started_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        u32::try_from(ordinal)
+            .map_err(|_| StateError::InvalidRecord("task attempt ordinal overflow".to_owned()))
+    }
+
+    pub fn finish_task_attempt(
+        &self,
+        attempt_id: AttemptId,
+        outcome: &str,
+        worker_result: &serde_json::Value,
+        ended_at: DateTime<Utc>,
+    ) -> StateResult<()> {
+        if outcome.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "task attempt outcome must not be blank".to_owned(),
+            ));
+        }
+        let changed = self.lock()?.execute(
+            "UPDATE task_attempts SET ended_at = ?1, outcome = ?2, worker_result_json = ?3
+             WHERE attempt_id = ?4 AND ended_at IS NULL",
+            params![
+                ended_at.to_rfc3339(),
+                outcome.trim(),
+                serde_json::to_string(worker_result)?,
+                attempt_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("unfinished task attempt {attempt_id}"),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn record_active_worktree(&self, worktree: &NewWorktreeRecord) -> StateResult<Uuid> {
+        if !worktree.repo_root.is_absolute() || !worktree.worktree_path.is_absolute() {
+            return Err(StateError::InvalidRecord(
+                "worktree paths must be absolute".to_owned(),
+            ));
+        }
+        if worktree.branch_name.trim().is_empty() || worktree.base_revision.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "worktree branch and base revision must not be blank".to_owned(),
+            ));
+        }
+        let worktree_id = Uuid::now_v7();
+        self.lock()?.execute(
+            "INSERT INTO worktrees(worktree_id, task_id, repo_root, worktree_path, branch_name,
+                base_revision, state, created_at, cleanup_approved_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, NULL, NULL)",
+            params![
+                worktree_id.to_string(),
+                worktree.task_id.to_string(),
+                worktree.repo_root.to_string_lossy(),
+                worktree.worktree_path.to_string_lossy(),
+                worktree.branch_name.trim(),
+                worktree.base_revision.trim(),
+                worktree.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(worktree_id)
     }
 
     /// Returns the one active worktree for a task.

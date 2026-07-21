@@ -12,9 +12,11 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 mod commands;
+mod execution;
 mod planning;
 
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
+pub use execution::ExecutionServices;
 pub use planning::{PlanningServices, process_next_orchestration_command};
 
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +124,55 @@ pub async fn serve_with_orchestration(
     redactor: Arc<dyn MessageRedactor>,
     planning: PlanningServices,
 ) -> Result<DaemonExit, DaemonError> {
+    serve_with_runtime(
+        database,
+        instance_id,
+        pid,
+        cancellation,
+        settings,
+        redactor,
+        planning,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_full_orchestration(
+    database: Arc<Database>,
+    instance_id: DaemonInstanceId,
+    pid: u32,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: Arc<dyn MessageRedactor>,
+    planning: PlanningServices,
+    execution: ExecutionServices,
+) -> Result<DaemonExit, DaemonError> {
+    execution::validate_execution_services(&execution)?;
+    serve_with_runtime(
+        database,
+        instance_id,
+        pid,
+        cancellation,
+        settings,
+        redactor,
+        planning,
+        Some(execution),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_with_runtime(
+    database: Arc<Database>,
+    instance_id: DaemonInstanceId,
+    pid: u32,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: Arc<dyn MessageRedactor>,
+    planning: PlanningServices,
+    execution: Option<ExecutionServices>,
+) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
     let started_at = Utc::now();
     database.acquire_daemon_lease(&DaemonLeaseRequest {
@@ -135,6 +186,8 @@ pub async fn serve_with_orchestration(
     let mut command_interval = tokio::time::interval(settings.command_poll_interval);
     command_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut active_planning = None;
+    let execution_cancellation = cancellation.child_token();
+    let mut execution_jobs = Vec::new();
     let exit = loop {
         tokio::select! {
             () = cancellation.cancelled() => break DaemonExit::Cancelled,
@@ -146,6 +199,7 @@ pub async fn serve_with_orchestration(
             }
             _ = command_interval.tick() => {
                 process_next_client_command(&database, redactor.as_ref(), Utc::now())?;
+                execution::reap_finished_tasks(&mut execution_jobs).await?;
                 if active_planning
                     .as_ref()
                     .is_some_and(tokio::task::JoinHandle::is_finished)
@@ -171,6 +225,16 @@ pub async fn serve_with_orchestration(
                         .await
                     }));
                 }
+                if let Some(execution) = execution.as_ref() {
+                    execution::spawn_ready_tasks(
+                        &database,
+                        instance_id,
+                        execution,
+                        &redactor,
+                        &execution_cancellation,
+                        &mut execution_jobs,
+                    )?;
+                }
             }
         }
     };
@@ -178,6 +242,7 @@ pub async fn serve_with_orchestration(
         job.abort();
         let _ = job.await;
     }
+    execution::stop_execution_jobs(&execution_cancellation, execution_jobs).await?;
     database.release_daemon(instance_id, Utc::now())?;
     Ok(exit)
 }

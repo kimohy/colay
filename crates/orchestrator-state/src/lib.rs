@@ -59,8 +59,8 @@ pub use permissions::{
 };
 pub use records::{
     ClaimedControlRecoveryPolicy, ControlAction, ControlRecoveryDisposition, ControlRequest,
-    NewTaskRecord, RecoveredControl, RoutingAuditRecord, StoredHandover, StoredTask,
-    StoredTaskAttempt, StoredWorktree, TaskListFilter,
+    NewTaskAttemptRecord, NewTaskRecord, NewWorktreeRecord, RecoveredControl, RoutingAuditRecord,
+    StoredHandover, StoredTask, StoredTaskAttempt, StoredWorktree, TaskListFilter,
 };
 pub use scheduling::{ClaimReadyTaskRequest, ClaimedTask};
 pub use sessions::{NewSessionRecord, SessionListFilter, StoredSession};

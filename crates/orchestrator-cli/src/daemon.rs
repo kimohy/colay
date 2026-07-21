@@ -8,9 +8,10 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use orchestrator_daemon::{
-    DaemonSettings, MessageRedactor, PlanningServices, serve_with_orchestration,
+    DaemonSettings, ExecutionServices, MessageRedactor, PlanningServices,
+    serve_with_full_orchestration,
 };
 use orchestrator_domain::{DaemonInstanceId, GraphValidationPolicy, ModelProfile, ProviderId};
 use orchestrator_engine::{PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner};
@@ -22,6 +23,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::DaemonAction;
+use colay::task_executor::OfficialCliTaskExecutor;
 use colay::task_planner::OfficialCliTaskPlanner;
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -106,7 +108,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         match OfficialCliTaskPlanner::probe_from_config(
             config,
             repository,
-            runtime,
+            Arc::clone(&runtime),
             ModelProfile::Standard,
         )
         .await
@@ -122,7 +124,22 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                 ProviderId::Codex,
             ),
         };
-    let result = serve_with_orchestration(
+    let executor = Arc::new(OfficialCliTaskExecutor::new(config, repository, runtime)?);
+    let provider_limits = config
+        .orchestrator
+        .provider_parallel_limits
+        .iter()
+        .filter_map(|(provider, limit)| {
+            let provider = match provider.as_str() {
+                "codex" => ProviderId::Codex,
+                "claude" => ProviderId::Claude,
+                "gemini" => ProviderId::Gemini,
+                _ => return None,
+            };
+            Some((provider, usize::try_from(*limit).unwrap_or(usize::MAX)))
+        })
+        .collect();
+    let result = serve_with_full_orchestration(
         database,
         DaemonInstanceId::new(),
         std::process::id(),
@@ -140,6 +157,20 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                     .max(1),
                 per_provider_limits: BTreeMap::new(),
             },
+        },
+        ExecutionServices {
+            executor,
+            repository_root: std::fs::canonicalize(repository)?,
+            state_root: paths.root.clone(),
+            global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
+                .unwrap_or(usize::MAX)
+                .max(1),
+            provider_limits,
+            claim_ttl: TimeDelta::minutes(
+                i64::try_from(config.orchestrator.default_timeout_minutes)
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(10),
+            ),
         },
     )
     .await;
