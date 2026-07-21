@@ -68,6 +68,7 @@ pub async fn request_integration(
     Ok(format!("integration:{batch_id}"))
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn approve_integration(
     database: &Database,
     services: &IntegrationServices,

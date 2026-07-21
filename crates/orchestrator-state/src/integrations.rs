@@ -276,6 +276,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn create_integration_resolution_task(
         &self,
         batch_id: IntegrationBatchId,
@@ -764,6 +765,7 @@ mod tests {
     use crate::Database;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn blocked_preview_materializes_one_audited_resolution_task()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = Database::open_in_memory()?;

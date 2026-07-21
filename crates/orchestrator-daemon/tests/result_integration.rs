@@ -117,7 +117,7 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     let repository = canonicalize_directory(&repository)?;
     let state_root = repository.join(".colay");
     fs::create_dir_all(&state_root)?;
-    let database = Database::open(&state_root.join("orchestrator.db"))?;
+    let database = Database::open(state_root.join("orchestrator.db"))?;
     database.migrate_with_backup(&state_root.join("backups"))?;
     let session_id = SessionId::new();
     let message_id = MessageId::new();

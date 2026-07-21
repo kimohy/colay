@@ -286,6 +286,7 @@ impl WorkspaceState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_overlay_key(&mut self, key: KeyEvent, snapshot: &WorkspaceSnapshot) -> UiEffect {
         if key.code == KeyCode::Esc {
             self.overlay = None;
@@ -900,16 +901,10 @@ mod tests {
             })
         );
 
-        snapshot
-            .integration_approval
-            .as_mut()
-            .expect("card")
-            .blockers = vec!["path overlap: src/lib.rs".to_owned()];
-        snapshot
-            .integration_approval
-            .as_mut()
-            .expect("card")
-            .approvable = false;
+        if let Some(card) = snapshot.integration_approval.as_mut() {
+            card.blockers = vec!["path overlap: src/lib.rs".to_owned()];
+            card.approvable = false;
+        }
         state.set_composer("/resolve");
         assert_eq!(
             state.handle_key(key(KeyCode::Enter), &snapshot, LayoutMode::Wide),

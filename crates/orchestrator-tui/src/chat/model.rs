@@ -499,11 +499,9 @@ mod tests {
         });
         assert_eq!(snapshot.validate(), Ok(()));
 
-        snapshot
-            .integration_approval
-            .as_mut()
-            .expect("card")
-            .preview_hash = "not-a-hash".to_owned();
+        if let Some(card) = snapshot.integration_approval.as_mut() {
+            card.preview_hash = "not-a-hash".to_owned();
+        }
         assert_eq!(
             snapshot.validate(),
             Err(WorkspaceModelError::InvalidIntegrationPreviewHash)
