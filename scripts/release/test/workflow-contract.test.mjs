@@ -54,7 +54,7 @@ test("release workflow uses the reviewed multi-platform channel contract", async
   for (const credential of ["CODEX_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]) {
     assert.match(workflow, new RegExp(`${credential}:\\s*""`));
   }
-  for (const forbidden of [/codex exec/, /claude /, /gemini /, /npm_token/, /--clobber/, /git push/, /gh pr/]) {
+  for (const forbidden of [/codex exec/, /claude /, /gemini /, /agy /, /npm_token/, /--clobber/, /git push/, /gh pr/]) {
     assert.doesNotMatch(workflow, forbidden);
   }
 });

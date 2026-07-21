@@ -9,9 +9,10 @@ use orchestrator_domain::{
 use orchestrator_process::EnvironmentPolicy;
 use orchestrator_process::{CommandSpec, ExecutableKind, ProcessRunner};
 use orchestrator_providers::{
-    AdapterRuntime, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter, CodexAdapterConfig,
-    GeminiAdapter, GeminiAdapterConfig, PreparedInvocation, ProcessAdapterRuntime, ProviderError,
-    RuntimeTermination, StructuredOutput, UsageProbeConfig, UsageProbeFormat, WorkerAdapter,
+    AdapterRuntime, AgyAdapter, AgyAdapterConfig, ClaudeAdapter, ClaudeAdapterConfig, CodexAdapter,
+    CodexAdapterConfig, GeminiAdapter, GeminiAdapterConfig, PreparedInvocation,
+    ProcessAdapterRuntime, ProviderError, RuntimeTermination, StructuredOutput, UsageProbeConfig,
+    UsageProbeFormat, WorkerAdapter,
 };
 use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
 use tokio_util::sync::CancellationToken;
@@ -44,7 +45,7 @@ fn request(provider: ProviderId, prompt: &str) -> Result<WorkerRequest, std::io:
 
 fn scope(provider: ProviderId) -> QuotaScope {
     match provider {
-        ProviderId::Gemini => {
+        ProviderId::Gemini | ProviderId::Agy => {
             QuotaScope::new("daily", QuotaPeriod::CalendarDay, UsageUnit::Requests)
         }
         ProviderId::Codex | ProviderId::Claude => {
@@ -179,6 +180,101 @@ async fn fake_codex_stream_runs_through_production_process_runtime()
     }
     let result = adapter.wait(&handle).await?;
     assert_eq!(result.exit_code, Some(0));
+    assert!(completed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_agy_plain_text_completes_through_production_process_runtime()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        runtime(),
+    );
+    let handle = adapter.start(request(ProviderId::Agy, "success")?).await?;
+    let mut message = false;
+    let mut completed = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Message { text } if text.contains("done") => message = true,
+            WorkerEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+    let result = adapter.wait(&handle).await?;
+    assert_eq!(result.exit_code, Some(0));
+    assert!(message);
+    assert!(completed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_agy_acknowledges_a_vendor_neutral_handover() -> Result<(), Box<dyn std::error::Error>>
+{
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        runtime(),
+    );
+    let mut worker = request(ProviderId::Agy, "acknowledge")?;
+    worker.objective = "Acknowledge a sealed vendor-neutral handover".to_owned();
+    worker.handover_payload = Some(serde_json::json!({
+        "integrity_hash": "sealed-hash",
+        "objective": "continue safely",
+        "constraints": ["preserve partial work"],
+        "acceptance_criteria": ["tests pass"],
+        "unresolved_questions": []
+    }));
+    let handle = adapter.start(worker).await?;
+    let mut acknowledged = false;
+    let mut completed = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Message { text } => {
+                let value: serde_json::Value = serde_json::from_str(text.trim())?;
+                acknowledged =
+                    value["type"] == "handover_ack" && value["bundle_hash"] == "sealed-hash";
+            }
+            WorkerEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+    assert!(acknowledged);
+    assert!(completed);
+    assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_memory_fake_agy_emits_a_completion_boundary() -> Result<(), Box<dyn std::error::Error>>
+{
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        Arc::new(FakeAdapterRuntime::new(
+            fake_binary(),
+            FakeRuntimeScenario::Success,
+        )?),
+    );
+    let handle = adapter.start(request(ProviderId::Agy, "success")?).await?;
+    let mut completed = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        completed |= matches!(
+            adapter.parse_event(raw).await?,
+            WorkerEvent::Completed { .. }
+        );
+    }
+
     assert!(completed);
     Ok(())
 }
@@ -375,6 +471,35 @@ async fn streaming_runtime_redacts_before_domain_normalization()
 }
 
 #[tokio::test]
+async fn agy_plain_text_is_redacted_before_domain_normalization()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        runtime(),
+    );
+    let handle = adapter
+        .start(request(ProviderId::Agy, "scenario:secret")?)
+        .await?;
+    let mut saw_redaction = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        assert!(!String::from_utf8_lossy(&raw.bytes).contains("supersecretvalue"));
+        if matches!(
+            adapter.parse_event(raw).await?,
+            WorkerEvent::Message { ref text } if text.contains("[REDACTED]")
+        ) {
+            saw_redaction = true;
+        }
+    }
+    assert!(saw_redaction);
+    assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn configured_usage_probe_uses_executable_and_argv_array()
 -> Result<(), Box<dyn std::error::Error>> {
     let adapter = GeminiAdapter::new(
@@ -501,6 +626,37 @@ async fn fake_process_crash_preserves_exit_and_bounded_stderr()
     assert_eq!(result.exit_code, Some(17));
     assert!(String::from_utf8_lossy(&result.stderr).contains("fake provider crash"));
     assert!(!result.truncated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn agy_process_crash_emits_error_and_preserves_exit() -> Result<(), Box<dyn std::error::Error>>
+{
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        runtime(),
+    );
+    let handle = adapter
+        .start(request(ProviderId::Agy, "scenario:crash")?)
+        .await?;
+    let mut saw_error = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        saw_error |= matches!(
+            adapter.parse_event(raw).await?,
+            WorkerEvent::Error {
+                code: Some(ref code),
+                ..
+            } if code == "agy_process_exit"
+        );
+    }
+    let result = adapter.wait(&handle).await?;
+    assert!(saw_error);
+    assert_eq!(result.termination, RuntimeTermination::Exited);
+    assert_eq!(result.exit_code, Some(17));
     Ok(())
 }
 

@@ -362,32 +362,32 @@ fn role_affinity(role: TaskRole, provider: ProviderId) -> f64 {
         | TaskRole::Refactoring => match provider {
             ProviderId::Codex => 25.0,
             ProviderId::Claude => 18.0,
-            ProviderId::Gemini => 15.0,
+            ProviderId::Gemini | ProviderId::Agy => 15.0,
         },
         TaskRole::Architecture => match provider {
             ProviderId::Claude => 25.0,
             ProviderId::Codex => 20.0,
-            ProviderId::Gemini => 18.0,
+            ProviderId::Gemini | ProviderId::Agy => 18.0,
         },
         TaskRole::SecurityReview => match provider {
             ProviderId::Claude => 25.0,
             ProviderId::Codex => 22.0,
-            ProviderId::Gemini => 15.0,
+            ProviderId::Gemini | ProviderId::Agy => 15.0,
         },
         TaskRole::IndependentReview => match provider {
             ProviderId::Claude => 25.0,
             ProviderId::Codex => 23.0,
-            ProviderId::Gemini => 18.0,
+            ProviderId::Gemini | ProviderId::Agy => 18.0,
         },
         TaskRole::RepositoryResearch => match provider {
-            ProviderId::Gemini => 25.0,
+            ProviderId::Gemini | ProviderId::Agy => 25.0,
             ProviderId::Codex => 20.0,
             ProviderId::Claude => 18.0,
         },
         TaskRole::Planning | TaskRole::Integration => match provider {
             ProviderId::Codex => 25.0,
             ProviderId::Claude => 20.0,
-            ProviderId::Gemini => 18.0,
+            ProviderId::Gemini | ProviderId::Agy => 18.0,
         },
     }
 }
