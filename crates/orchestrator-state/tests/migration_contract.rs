@@ -12,6 +12,8 @@ use sha2::{Digest as _, Sha256};
 const CORE_MIGRATION: &str = include_str!("../../../migrations/0001_core.sql");
 const EXECUTION_MIGRATION: &str = include_str!("../../../migrations/0002_execution.sql");
 const AUDIT_MIGRATION: &str = include_str!("../../../migrations/0003_audit_and_control.sql");
+const SESSION_MIGRATION: &str = include_str!("../../../migrations/0004_durable_sessions.sql");
+const WORKSPACE_MIGRATION: &str = include_str!("../../../migrations/0005_chat_workspace_state.sql");
 
 fn seed_v1(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::open(path)?;
@@ -39,7 +41,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 
     let initial = database.migration_status()?;
     assert_eq!(initial.current_version, 1);
-    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5]);
+    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5, 6]);
 
     let dry_run = database.dry_run_migrations()?;
     assert_eq!(dry_run.current_version, STATE_SCHEMA_VERSION);
@@ -58,6 +60,12 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
             "client_commands",
             "daemon_instances",
             "session_workspace_state",
+            "graph_revisions",
+            "planning_attempts",
+            "session_tasks",
+            "task_dependencies",
+            "session_graph_heads",
+            "graph_approvals",
         ] {
             let count: i64 = connection.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -83,7 +91,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     let backup = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let backup_status = MigrationManager::status(&backup)?;
     assert_eq!(backup_status.current_version, 1);
-    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5]);
+    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6]);
     Ok(())
 }
 
@@ -106,6 +114,73 @@ fn seed_v3(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             ],
         )?;
     }
+    Ok(())
+}
+
+fn seed_v5(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    seed_v3(path)?;
+    let connection = Connection::open(path)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    for (version, name, sql) in [
+        (4, "durable_sessions", SESSION_MIGRATION),
+        (5, "chat_workspace_state", WORKSPACE_MIGRATION),
+    ] {
+        connection.execute_batch(sql)?;
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                version,
+                name,
+                format!("{:x}", Sha256::digest(sql.as_bytes())),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+    }
+    connection.execute(
+        "INSERT INTO client_commands(
+            command_id, action, payload_json, idempotency_key, state,
+            requested_by, requested_at, outcome
+         ) VALUES (?1, 'stop_daemon', '{}', 'preserved-v5-command', 'completed',
+                   'migration-test', ?2, 'stopped')",
+        params![uuid::Uuid::now_v7().to_string(), Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn v5_to_v6_dry_run_backup_and_command_rebuild_preserve_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(directory.path())?;
+    let database_path = root.join("orchestrator.db");
+    seed_v5(&database_path)?;
+    let database = Database::open(&database_path)?;
+    assert_eq!(database.migration_status()?.current_version, 5);
+
+    assert_eq!(database.dry_run_migrations()?.current_version, 6);
+    assert_eq!(database.migration_status()?.current_version, 5);
+    database.migrate_with_backup(&root.join("v5-backups"))?;
+
+    database.with_connection(|connection| {
+        let preserved: (String, String) = connection.query_row(
+            "SELECT action, outcome FROM client_commands WHERE idempotency_key = ?1",
+            ["preserved-v5-command"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(preserved, ("stop_daemon".to_owned(), "stopped".to_owned()));
+        connection.execute(
+            "INSERT INTO client_commands(
+                command_id, action, payload_json, idempotency_key, state,
+                requested_by, requested_at
+             ) VALUES (?1, 'request_plan', '{}', 'new-v6-command', 'pending',
+                       'migration-test', ?2)",
+            params![uuid::Uuid::now_v7().to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })?;
+    let backups = std::fs::read_dir(root.join("v5-backups"))?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(backups.len(), 1);
     Ok(())
 }
 

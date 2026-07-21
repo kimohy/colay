@@ -222,19 +222,31 @@ pub fn validate_task_graph(
         maximum_parallel_width,
         configured_parallel_workers: policy.max_parallel_workers,
     };
-    let proposal_hash = canonical_sha256(&GraphSeal {
-        proposal: &proposal,
-        validation: &validation,
-    })
-    .map_err(|error| GraphValidationError::Integrity {
-        message: error.to_string(),
-    })?;
+    let proposal_hash = task_graph_proposal_hash(&proposal, &validation)?;
 
     Ok(ValidatedTaskGraph {
         proposal,
         topological_order,
         validation,
         proposal_hash,
+    })
+}
+
+/// Recomputes the canonical seal used to bind a proposal to its validation summary.
+///
+/// # Errors
+///
+/// Returns [`GraphValidationError::Integrity`] when canonical serialization fails.
+pub fn task_graph_proposal_hash(
+    proposal: &TaskGraphProposal,
+    validation: &GraphValidationSummary,
+) -> Result<String, GraphValidationError> {
+    canonical_sha256(&GraphSeal {
+        proposal,
+        validation,
+    })
+    .map_err(|error| GraphValidationError::Integrity {
+        message: error.to_string(),
     })
 }
 

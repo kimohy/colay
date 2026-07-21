@@ -12,6 +12,8 @@ pub enum EventType {
     SessionCreated,
     SessionStateTransitioned,
     MessageAppended,
+    GraphRevisionRecorded,
+    GraphApproved,
     TaskCreated,
     AssessmentCompleted,
     UsageCollected,
