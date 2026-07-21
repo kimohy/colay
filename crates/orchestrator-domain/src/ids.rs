@@ -88,6 +88,8 @@ uuid_id!(SessionId);
 uuid_id!(MessageId);
 uuid_id!(ClientCommandId);
 uuid_id!(DaemonInstanceId);
+uuid_id!(GraphRevisionId);
+uuid_id!(PlanningAttemptId);
 
 #[cfg(test)]
 mod tests {
