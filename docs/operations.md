@@ -51,6 +51,14 @@ starts the daemon when needed. The header reports `online`, `stale`, or
 controls are rejected. Run `colay daemon restart` from another terminal, then
 the open workspace reconnects on its 200ms refresh cycle.
 
+A session-level message automatically queues a read-only official-CLI
+conversation turn. A normal answer ends with only the durable timeline; an
+incomplete implementation request records an immutable requirement revision and
+asks a follow-up question. Only a complete `worktree_task_candidate` queues graph
+planning. Git is checked at that promotion boundary, so non-Git directories and
+repositories without an initial commit remain usable for conversation and show
+preparation guidance without creating tasks or leases.
+
 The text layout and bindings are:
 
 ```text
@@ -76,13 +84,15 @@ Task selection never changes the composer target. `@task-<id>` is a one-message
 override that atomically records an ordered instruction for that graph task.
 `@all` fans the same redacted instruction out into separate durable rows for
 every current non-terminal graph task, preserving per-task audit identity.
-`/plan` selects only the newest final, session-level user message and
-submits a durable read-only planning request. The resulting plan card shows its
-revision, SHA-256 proposal hash, ordered nodes, dependencies, scopes,
-providers/profiles, risks, and parallelism. `/approve` is enabled only for a
-validated current revision while the daemon is online. Only `y` confirms;
-`n`/`Esc` cancels, and a refresh with a different hash closes the overlay.
-Typing "yes" in chat remains an ordinary message.
+`/plan` is the explicit compatibility action for the newest final session-level
+user message; complete conversation candidates queue the same durable read-only
+planning request automatically. The plan card shows its requirement revision,
+validation hash, base commit, validation checks, revision, SHA-256 proposal
+hash, ordered nodes, dependencies, scopes, providers/profiles, risks, and
+parallelism. `/approve` is enabled only for the validated current requirement
+and repository revision while the daemon is online. Only `y` confirms;
+`n`/`Esc` cancels, a newer user message hides the stale card, and a changed hash
+or Git `HEAD` rejects approval. Typing "yes" in chat remains an ordinary message.
 
 Before approval there are no writable tasks, worktrees, or worker leases. Exact
 approval materializes queued tasks and dependency rows once. The daemon claims

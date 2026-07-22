@@ -4,7 +4,7 @@ State, config, handover, worker result, checkpoint, routing decision, and usage 
 
 ## SQLite
 
-SQLite migrations are embedded, ordered `v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7`, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
+SQLite migrations are embedded, ordered through v10, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
 
 State schema v4 adds `sessions`, ordered `conversation_messages`, idempotent
 `client_commands`, and repository `daemon_instances`. It also adds nullable
@@ -41,9 +41,19 @@ exact approvals, application journals, resolution-task links, and the three
 typed integration command actions. Existing command rows are preserved through
 the constrained-table rebuild.
 
+State schema v9 adds durable daemon startup phases and redacted diagnostics so
+booting and provider probing remain observable and timeout cleanup can release
+only the exact spawned instance.
+
+State schema v10 adds read-only conversation attempts, immutable requirement
+revisions and session heads, typed conversation commands, and validation
+authority on graph revisions. The authority binds an approvable graph to the
+exact requirement revision, validation hash, and Git base commit. Existing
+command rows are preserved through the constrained-table rebuild.
+
 For an existing nonzero schema, `migrate apply` creates an online SQLite backup under `.colay/backups/orchestrator.db.backup.<timestamp>` before applying pending versions. A legacy config keeps using its explicitly selected state root. A brand-new empty database has no prior state to back up. After migration, `doctor` reports SQLite integrity and foreign-key health.
 
-`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the v2/v3/v4/v5/v6/v7/v8 plan, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
+`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the complete plan through v10, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
 
 ## Configuration
 

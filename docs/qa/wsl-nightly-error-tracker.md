@@ -241,27 +241,37 @@ fatal: not a git repository (or any of the parent directories): .git
 - 이미 materialize된 task의 `resume`은 이 초기 대화 흐름과 별개이며, lease 및 Git
   안전성 검사를 그대로 적용한다.
 
-### 현재 구현과의 차이
+### 구현 결과
 
-- 현재 `run --plan-only`는 provider를 호출하지 않고 정적 assessment/routing을 수행하지만
-  task를 먼저 영속화하므로 사용자가 정의한 plan-only가 아니다.
-- 현재 TUI의 `/plan`은 read-only planner provider를 호출하고 `/approve` 전에는 writable
-  task/worktree/worker lease를 만들지 않아 원하는 경계에 더 가깝다.
-- 다만 `/plan`은 최신 goal을 곧바로 task graph proposal으로 바꾸는 기능이고, 일반적인
-  질의응답·요구 명확화·`answer_complete` 종료를 담당하는 conversational provider turn은
-  아직 분리돼 있다.
+- session-level 사용자 메시지는 task가 아니라 durable
+  `request_conversation_turn`으로 이어진다. official CLI adapter는 read-only sandbox에서
+  `answer_complete`, `more_information_needed`, `worktree_task_candidate`,
+  `needs_attention` 중 하나의 엄격한 JSON outcome만 반환한다.
+- 답변과 인터뷰는 conversation attempt와 timeline, 필요 시 immutable requirement revision만
+  기록한다. task, task attempt, worktree, coordinator/worker lease는 만들지 않는다.
+- 완전한 candidate만 read-only graph planning을 자동 queue한다. Git repository와 valid
+  `HEAD`는 이 승격 단계에서 검사하며, 실패하면 session을 유지하고 `Initialize Git and
+  create HEAD` 안내를 남긴 채 approvable hash를 만들지 않는다.
+- 승인 카드는 requirement revision, validation hash, base commit, validation checks와
+  proposal hash를 표시한다. 최신 사용자 메시지 또는 Git `HEAD`가 바뀌면 승인을
+  숨기거나 거부한다. 정확한 typed 승인 이후에만 task를 atomic materialize한다.
+- provider 실패는 redacted `needs_attention` 응답으로 종료하고 session과 사용자 메시지를
+  보존한다. crash replay는 deterministic ID와 idempotency key로 중복 응답·계획을 막는다.
+- 기존 `run --plan-only`는 provider를 호출하지 않는 static persisted assessment라는
+  compatibility 의미를 유지해 conversation-first 흐름과 구분했다.
 
-### 정정된 완료 조건
+### 정정된 완료 조건 검증
 
-- 단순 질의는 provider 답변을 반환하지만 task/worktree/worker/coordinator lease가 모두
-  0건이다.
-- 구현 요청도 먼저 session 대화로 들어오며, orchestrator 판단 전에는 task가 없다.
-- worktree 작업 필요성이 확정된 전환 지점에서 Git repository와 valid HEAD를 preflight한
-  뒤에만 task graph와 worktree를 materialize한다.
-- Git preflight 실패 시 질의응답 session은 유지되고, task 생성 없이 구체적인 준비
-  안내를 반환한다.
-- 현재 `run --plan-only`와 새로운 conversation-first plan mode는 이름과 출력에서
-  혼동되지 않게 분리하거나 기존 명령의 의미를 명시적으로 마이그레이션한다.
+- `fixed`: 단순 질의와 인터뷰에서 task/worktree/worker/coordinator lease가 모두 0건임을
+  Windows fake-provider 통합 테스트로 검증했다.
+- `fixed`: 구현 요청도 session 대화로 시작하고 완전한 candidate와 검증 전에는 task가
+  없다.
+- `fixed`: Git repository와 valid HEAD를 task graph 승인 후보 승격 직전에 검사하고,
+  정확한 최종 승인 이후에만 task를 materialize한다. worktree는 scheduler가 이후 별도로
+  생성한다.
+- `fixed`: non-Git 및 unborn HEAD에서 session을 유지하고 task 없이 준비 안내를 반환한다.
+- `fixed`: `run --plan-only`를 static compatibility command로 문서화하고 자동
+  conversation-first TUI session과 분리했다.
 - 승인된 접근법의 정식 설계는
   `docs/superpowers/specs/2026-07-22-conversation-first-plan-mode-design.md`에서 추적한다.
 
@@ -558,8 +568,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 
 ## Prioritized improvement queue
 
-1. `P0`: 모든 입력을 task로 시작하지 않는 conversation-first plan mode를 기본 진입점으로
-   두고, Git preflight는 worktree task 승격 직전에만 수행한다.
+1. `완료`: 모든 session 입력을 task로 시작하지 않는 conversation-first plan mode를
+   기본 TUI 진입점으로 두고, Git preflight는 승인 후보 승격 직전에만 수행한다.
 2. `완료`: provider terminal 오류를 finalization하고 장기 고정 lease를 짧은 renewable
    lease로 교체했다 (`WSL-008`).
 3. `완료`: idle daemon의 불필요한 immediate transaction을 제거하고 writer starvation을
@@ -624,5 +634,10 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   exact process-tree 종료/reap, PID 일치 lease 실패·해제, redacted durable 진단을 적용했다.
   Windows slow fake probe와 전체 Rust 418개, npm 65개, fmt/Clippy 검증이 통과해 `WSL-002`를
   `fixed`로 전환했다. 이 전체 실행에서도 `WIN-003`은 재발하지 않았다.
+- conversation-first domain/engine/provider/state/daemon/TUI 경계를 schema 10으로 구현했다.
+  Windows에서 자동 답변, 인터뷰, provider 실패 redaction, non-Git 차단, 정확 승인 1회
+  materialization, 승인 전 writable table 0건, Git HEAD drift 거부를 fake-provider와 임시
+  Git repository로 검증했다. 승인 카드는 requirement/validation/base-commit authority를
+  표시하며 새 사용자 메시지는 stale card를 숨긴다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.

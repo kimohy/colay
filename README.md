@@ -73,6 +73,14 @@ the repository daemon, restores the latest session and selected task, and shows
 a text-only task list, conversation timeline, inspector, attention queue, and
 explicit composer target. The daemon continues after the TUI closes.
 
+Every session-level message first goes to one eligible official CLI through an
+explicitly read-only sandbox and conversation adapter. The adapter returns one strict
+outcome: a completed answer, an interview question with an immutable partial
+requirement revision, a complete worktree-task candidate, or redacted attention.
+Answers and interviews never create tasks, attempts, leases, or worktrees. A
+complete candidate is planned and repository-validated, but still creates no
+task until the operator approves the exact current revision and hashes.
+
 The wide layout has three panes; medium terminals hide the inspector, narrow
 terminals show one selected primary view, and terminals below 60 columns become
 read-only until resized. Use `Tab`/`Shift+Tab` to traverse panes, `Ctrl+P` or
@@ -89,15 +97,18 @@ the timeline readable but disables messages and task controls until
 redacted before durable command submission and again before conversation
 projection.
 
-Use `/plan` after sending a session-level goal. The daemon invokes one eligible
-official CLI in an explicitly read-only sandbox, requires exactly one bounded
-JSON task-graph proposal, validates its DAG, providers, profiles, concurrency,
-and write-scope isolation, and persists the revision without creating a task or
-worktree. `/approve` opens a text confirmation containing the exact proposal hash,
-nodes, dependencies, scopes, providers/profiles, risks, and proposed
-parallelism. Only `y` submits typed approval for that exact revision/hash;
+For compatibility, `/plan` can explicitly plan the newest session-level goal.
+Normally the conversation adapter requests planning only after requirements are
+complete. The daemon requires one bounded JSON graph, validates its DAG,
+providers, profiles, concurrency, write-scope isolation, verification plan, Git
+readiness, and base commit, then seals those results without creating a task or
+worktree. `/approve` shows the requirement revision, validation hash, base
+commit, checks, exact proposal hash, nodes, dependencies, scopes,
+providers/profiles, risks, and proposed parallelism. Only `y` submits typed
+approval for that exact authority;
 `n`/`Esc`, an offline daemon, an invalid plan, or a changed hash fails closed.
-Chat text such as "yes" has no approval authority.
+Chat text such as "yes" has no approval authority. A newer user message or a
+changed Git `HEAD` invalidates the pending approval.
 
 No writable task before approval is a hard boundary. Exact approval atomically
 materializes the graph as queued session tasks. The daemon then claims only
