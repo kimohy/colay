@@ -269,9 +269,28 @@ impl SqliteWorkspaceDriver {
                 "daemon is offline or stale; graph approval is read-only",
             ));
         }
+        let revision_id = GraphRevisionId::from_str(revision_id)
+            .map_err(|error| DriverError::new(format!("invalid graph revision ID: {error}")))?;
+        let revision = self
+            .database
+            .load_graph_revision(revision_id)
+            .map_err(driver_error)?
+            .ok_or_else(|| DriverError::new("graph revision no longer exists"))?;
+        if revision.proposal_hash.as_deref() != Some(proposal_hash) {
+            return Err(DriverError::new(
+                "approval card proposal hash is stale; refresh the workspace",
+            ));
+        }
+        let validation = serde_json::from_value::<GraphValidationSummary>(revision.validation)
+            .map_err(driver_error)?;
+        let authority = validation.authority.ok_or_else(|| {
+            DriverError::new("graph has no sealed requirement and repository validation authority")
+        })?;
         let payload = ApproveGraphCommandPayload {
-            revision_id: GraphRevisionId::from_str(revision_id)
-                .map_err(|error| DriverError::new(format!("invalid graph revision ID: {error}")))?,
+            revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash,
+            base_commit: authority.base_commit,
             proposal_hash: proposal_hash.to_owned(),
             approved_by: approved_by.to_owned(),
         };
@@ -420,6 +439,50 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             .map_err(driver_error)?;
         let mut snapshot =
             projection_to_snapshot(&self.repository, projection, &daemon).map_err(driver_error)?;
+        if let Some(plan) = snapshot.plan_approval.as_mut() {
+            let requirement = self
+                .database
+                .current_requirement_revision(self.session_id)
+                .map_err(driver_error)?;
+            if let Some(requirement) = requirement.filter(|requirement| {
+                plan.requirement_revision_id.as_deref()
+                    == Some(requirement.requirement_revision_id.to_string().as_str())
+            }) {
+                plan.objective = requirement.snapshot.objective;
+                plan.in_scope = requirement.snapshot.in_scope;
+                plan.out_of_scope = requirement.snapshot.out_of_scope;
+                plan.acceptance_criteria = requirement.snapshot.acceptance_criteria;
+                plan.verification_commands = requirement
+                    .snapshot
+                    .verification_plan
+                    .into_iter()
+                    .map(|command| {
+                        format!(
+                            "{} {}",
+                            command.executable,
+                            serde_json::to_string(&command.args)
+                                .unwrap_or_else(|_| "[]".to_owned())
+                        )
+                    })
+                    .collect();
+                plan.risks.extend(requirement.snapshot.risks);
+                plan.risks.sort();
+                plan.risks.dedup();
+                plan.required_approvals = vec!["exact validated graph approval".to_owned()];
+                if plan
+                    .nodes
+                    .iter()
+                    .any(|node| node.repository_wide_write_scope)
+                {
+                    plan.required_approvals
+                        .push("repository-wide write scope acknowledgement".to_owned());
+                }
+                if !plan.risks.is_empty() {
+                    plan.required_approvals
+                        .push("recorded risk acknowledgement".to_owned());
+                }
+            }
+        }
         snapshot.integration_approval = self
             .database
             .current_integration_batch(self.session_id)
@@ -631,19 +694,19 @@ fn projection_to_snapshot(
             Some(PlanApprovalCard {
                 revision_id: revision.revision_id.to_string(),
                 proposal_hash,
+                objective: String::new(),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                acceptance_criteria: Vec::new(),
+                verification_commands: Vec::new(),
                 requirement_revision_id: authority
                     .map(|value| value.requirement_revision_id.to_string()),
                 validation_hash: authority.map(|value| value.validation_hash.clone()),
+                git_root_redacted: authority.map(|value| value.git_root_redacted.clone()),
                 base_commit: authority.map(|value| value.base_commit.clone()),
-                validation_checks: authority.map_or_else(Vec::new, |_| {
-                    vec![
-                        "git_ready".to_owned(),
-                        "graph_valid".to_owned(),
-                        "write_scopes_valid".to_owned(),
-                        "provider_profile_eligible".to_owned(),
-                        "verification_plan_present".to_owned(),
-                    ]
-                }),
+                validation_checks: authority
+                    .map_or_else(Vec::new, |value| value.validation_checks.clone()),
+                required_approvals: Vec::new(),
                 nodes: proposal
                     .nodes
                     .iter()
@@ -993,10 +1056,12 @@ mod tests {
         ApproveGraphCommandPayload, ApproveIntegrationCommandPayload, CheckpointId, ClientCommand,
         ClientCommandAction, ClientCommandId, ClientCommandState,
         CreateResolutionTaskCommandPayload, CreateSessionCommandPayload, DaemonInstanceId,
-        GraphRevisionId, GraphValidationPolicy, IntegrationBatchId, IntegrationPreview,
-        IntegrationSource, ModelProfile, PlanningAttemptId, ProviderId, RepoPath,
-        RequestPlanCommandPayload, RiskTag, SchemaVersion, SessionId, TaskGraphNode,
-        TaskGraphProposal, TaskId, VerificationId, validate_task_graph,
+        GraphRevisionId, GraphValidationAuthority, GraphValidationPolicy, IntegrationBatchId,
+        IntegrationPreview, IntegrationSource, ModelProfile, PlanningAttemptId, ProviderId,
+        RepoPath, RequestPlanCommandPayload, RequirementRevision, RequirementRevisionId,
+        RequirementSnapshot, RiskTag, SchemaVersion, SessionId, TaskGraphNode, TaskGraphProposal,
+        TaskId, VerificationCommand, VerificationId, validate_task_graph,
+        validate_task_graph_with_authority,
     };
     use orchestrator_process::{RedactionConfig, Redactor};
     use orchestrator_state::{
@@ -1203,6 +1268,7 @@ mod tests {
             .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
+                authority: None,
                 approved_by: "test".to_owned(),
                 approved_at: chrono::Utc::now(),
             })?;
@@ -1242,6 +1308,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn chat_tui_submits_typed_plan_and_exact_approval_commands() -> anyhow::Result<()> {
         let database = database()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
@@ -1261,11 +1328,93 @@ mod tests {
             redactor,
         );
         let goal_message_id = orchestrator_domain::MessageId::new();
+        driver.database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO conversation_messages(
+                    message_id, session_id, ordinal, role, kind, state,
+                    content_redacted, created_at, finalized_at
+                 ) VALUES (?1, ?2, 1, 'user', 'user_message', 'final', ?3, ?4, ?4)",
+                rusqlite::params![
+                    goal_message_id.to_string(),
+                    session_id.to_string(),
+                    "test approval goal",
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })?;
+        let requirement = RequirementRevision::seal(
+            RequirementRevisionId::new(),
+            session_id,
+            goal_message_id,
+            1,
+            RequirementSnapshot {
+                objective: "test typed approval authority".to_owned(),
+                in_scope: vec!["typed approval payload".to_owned()],
+                out_of_scope: Vec::new(),
+                constraints: vec!["local only".to_owned()],
+                acceptance_criteria: vec!["typed payload is exact".to_owned()],
+                verification_plan: vec![VerificationCommand {
+                    executable: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                }],
+                risks: Vec::new(),
+                open_questions: Vec::new(),
+            },
+            chrono::Utc::now(),
+        )?;
+        driver.database.record_requirement_revision(&requirement)?;
+        let authority = GraphValidationAuthority {
+            requirement_revision_id: requirement.requirement_revision_id,
+            validation_hash: "b".repeat(64),
+            base_commit: "c".repeat(40),
+            git_root_redacted: "C:/repo".to_owned(),
+            validation_checks: vec!["git head is ready".to_owned()],
+        };
+        let graph = validate_task_graph_with_authority(
+            TaskGraphProposal {
+                schema_version: SchemaVersion::v1(),
+                revision_id: GraphRevisionId::new(),
+                session_id,
+                goal_message_id,
+                planner_provider: ProviderId::Codex,
+                proposed_at: chrono::Utc::now(),
+                nodes: vec![TaskGraphNode {
+                    key: "test".to_owned(),
+                    title: "test approval".to_owned(),
+                    objective: "test typed approval authority".to_owned(),
+                    dependencies: Vec::new(),
+                    constraints: vec!["local only".to_owned()],
+                    acceptance_criteria: vec!["typed payload is exact".to_owned()],
+                    provider: Some(ProviderId::Codex),
+                    profile: ModelProfile::Standard,
+                    write_scopes: vec![RepoPath::try_from("src")?],
+                    repository_wide_write_scope: false,
+                    risks: Vec::new(),
+                    parallel_safety: "one task".to_owned(),
+                }],
+            },
+            &GraphValidationPolicy {
+                eligible_providers: BTreeSet::from([ProviderId::Codex]),
+                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                max_parallel_workers: 1,
+                per_provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+            },
+            authority.clone(),
+        )?;
+        driver
+            .database
+            .record_graph_attempt(&NewGraphAttempt::from_validated(
+                PlanningAttemptId::new(),
+                graph.clone(),
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+            ))?;
         driver.dispatch(WorkspaceAction::RequestPlan {
             goal_message_id: goal_message_id.to_string(),
         })?;
-        let revision_id = GraphRevisionId::new();
-        let proposal_hash = "a".repeat(64);
+        let revision_id = graph.proposal.revision_id;
+        let proposal_hash = graph.proposal_hash;
         driver.dispatch(WorkspaceAction::ApproveGraph {
             revision_id: revision_id.to_string(),
             proposal_hash: proposal_hash.clone(),
@@ -1309,6 +1458,12 @@ mod tests {
             assert_eq!(commands[1].0, "approve_graph");
             assert_eq!(approval.revision_id, revision_id);
             assert_eq!(approval.proposal_hash, proposal_hash);
+            assert_eq!(
+                approval.requirement_revision_id,
+                authority.requirement_revision_id
+            );
+            assert_eq!(approval.validation_hash, authority.validation_hash);
+            assert_eq!(approval.base_commit, authority.base_commit);
             assert_eq!(approval.approved_by, "operator");
             assert_eq!(commands[1].2, "operator");
             assert_eq!(commands[2].0, "request_integration");

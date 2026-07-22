@@ -218,6 +218,12 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         started_at: Utc::now(),
         ttl: settings.lease_ttl,
     })?;
+    database.record_daemon_runtime_identity(
+        instance_id,
+        &std::env::current_exe()?.to_string_lossy(),
+        crate::args::COLAY_VERSION,
+        &format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    )?;
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {

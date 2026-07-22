@@ -88,6 +88,18 @@ impl FakeAdapterRuntime {
             )))
         }
     }
+
+    /// Returns the number of fake jobs that observed a cancellation request.
+    ///
+    /// This is test evidence for lifecycle cleanup; it never starts a real provider.
+    pub async fn cancelled_job_count(&self) -> usize {
+        self.jobs
+            .lock()
+            .await
+            .values()
+            .filter(|job| job.cancelled)
+            .count()
+    }
 }
 
 #[async_trait]
@@ -397,9 +409,12 @@ fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
             "response_redacted": "Which crate and acceptance boundary should be used?",
             "requirements": {
                 "objective": "clarify the requested change",
+                "in_scope": ["requested change"],
+                "out_of_scope": [],
                 "constraints": ["no task before approval"],
                 "acceptance_criteria": [],
                 "verification_plan": [],
+                "risks": [],
                 "open_questions": ["Which crate should change?"]
             }
         })
@@ -409,9 +424,15 @@ fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
             "response_redacted": "The requirement is ready for deterministic validation.",
             "requirements": {
                 "objective": "implement the approved candidate",
+                "in_scope": ["approved candidate"],
+                "out_of_scope": ["automatic merge or push"],
                 "constraints": ["no task before approval"],
                 "acceptance_criteria": ["fake integration test passes"],
-                "verification_plan": ["cargo test --workspace --all-features"],
+                "verification_plan": [{
+                    "executable": "cargo",
+                    "args": ["test", "--workspace", "--all-features"]
+                }],
+                "risks": ["stale approval"],
                 "open_questions": []
             }
         })
@@ -493,6 +514,9 @@ where
         emit_planner_fixture(provider, &args, &prompt);
         return;
     }
+    if emit_conversation_fixture(provider, &stdin) {
+        return;
+    }
     if is_handover_acknowledgement(&stdin) {
         emit_handover_acknowledgement(provider, &stdin);
         return;
@@ -570,6 +594,24 @@ fn planning_prompt(stdin: &str) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_str(bridge.get("task")?.as_str()?).ok()
+}
+
+fn conversation_prompt(stdin: &str) -> Option<String> {
+    let bridge: serde_json::Value = serde_json::from_str(stdin).ok()?;
+    if bridge.get("objective")?.as_str()? != "Conduct a read-only conversation turn" {
+        return None;
+    }
+    bridge.get("task")?.as_str().map(ToOwned::to_owned)
+}
+
+fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
+    let Some(prompt) = conversation_prompt(stdin) else {
+        return false;
+    };
+    for line in conversation_lines(provider, &prompt) {
+        println!("{}", String::from_utf8_lossy(&line));
+    }
+    true
 }
 
 fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_json::Value) {

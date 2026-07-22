@@ -1,7 +1,7 @@
 use chrono::Utc;
 use orchestrator_domain::{
     ConversationAttemptId, ConversationOutcome, MessageId, ProviderId, RequirementRevision,
-    RequirementRevisionId, RequirementSnapshot, SessionId,
+    RequirementRevisionId, RequirementSnapshot, SessionId, VerificationCommand,
 };
 use orchestrator_state::{Database, NewConversationAttempt};
 use rusqlite::params;
@@ -33,9 +33,19 @@ fn seed_session_message(
 fn ready_snapshot() -> RequirementSnapshot {
     RequirementSnapshot {
         objective: "fix the conversation flow".to_owned(),
+        in_scope: vec!["conversation flow".to_owned()],
+        out_of_scope: vec!["automatic merge".to_owned()],
         constraints: vec!["no task before approval".to_owned()],
         acceptance_criteria: vec!["ordinary answers create zero tasks".to_owned()],
-        verification_plan: vec!["cargo test --workspace --all-features".to_owned()],
+        verification_plan: vec![VerificationCommand {
+            executable: "cargo".to_owned(),
+            args: vec![
+                "test".to_owned(),
+                "--workspace".to_owned(),
+                "--all-features".to_owned(),
+            ],
+        }],
+        risks: vec!["stale approval".to_owned()],
         open_questions: Vec::new(),
     }
 }
@@ -99,6 +109,67 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
             )?;
             assert_eq!(count, 0, "pre-approval row in {table}");
         }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = Database::open_in_memory()?;
+    database.migrate_with_backup(std::path::Path::new("unused"))?;
+    let (session_id, message_id) = seed_session_message(&database)?;
+    let attempt_id = ConversationAttemptId::new();
+    let started_at = Utc::now();
+    database.begin_conversation_attempt(&NewConversationAttempt {
+        attempt_id,
+        session_id,
+        source_message_id: message_id,
+        provider: ProviderId::Codex,
+        started_at,
+    })?;
+    database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO client_commands(
+                command_id, session_id, action, payload_json, idempotency_key, state,
+                requested_by, requested_at, claimed_at)
+             VALUES (?1, ?2, 'request_conversation_turn', ?3, ?4, 'claimed',
+                     'test', ?5, ?5)",
+            params![
+                attempt_id.to_string(),
+                session_id.to_string(),
+                serde_json::json!({"source_message_id": message_id}).to_string(),
+                format!("interrupted-{attempt_id}"),
+                started_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    })?;
+
+    let recovered = database
+        .reconcile_interrupted_conversation_attempts(Utc::now(), "interrupted by daemon restart")?;
+
+    assert_eq!(recovered, vec![attempt_id]);
+    let attempt = database
+        .load_conversation_attempt(attempt_id)?
+        .ok_or("missing attempt")?;
+    assert_eq!(
+        attempt.status,
+        orchestrator_state::ConversationAttemptStatus::Failed
+    );
+    assert_eq!(
+        attempt.error_redacted.as_deref(),
+        Some("interrupted by daemon restart")
+    );
+    database.with_connection(|connection| {
+        let (state, outcome): (String, String) = connection.query_row(
+            "SELECT state, outcome FROM client_commands WHERE command_id = ?1",
+            [attempt_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(state, "failed");
+        assert_eq!(outcome, "interrupted by daemon restart");
         Ok(())
     })?;
     Ok(())

@@ -12,10 +12,24 @@ use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
 use orchestrator_domain::{
     AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand, ClientCommandAction,
-    ClientCommandId, ClientCommandState, CreateSessionCommandPayload, MessageId,
-    RequestPlanCommandPayload, SessionId,
+    ClientCommandId, ClientCommandState, CreateSessionCommandPayload, GraphValidationSummary,
+    MessageId, SessionId, TaskState,
 };
-use orchestrator_state::{Database, RootConfig};
+use orchestrator_state::{Database, GraphRevisionStatus, RootConfig, TaskListFilter};
+
+fn git(repository: &std::path::Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(repository)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -31,6 +45,15 @@ impl Fixture {
         let repository = root.join("repository");
         let colay_home = root.join("home/.colay");
         fs::create_dir_all(&repository)?;
+        fs::write(repository.join(".gitignore"), ".colay/\n")?;
+        git(&repository, &["init"])?;
+        git(&repository, &["config", "user.name", "Chat Plan E2E"])?;
+        git(
+            &repository,
+            &["config", "user.email", "chat-plan-e2e@example.invalid"],
+        )?;
+        git(&repository, &["add", "."])?;
+        git(&repository, &["commit", "-m", "fixture base"])?;
         Ok(Self {
             _temp: temp,
             root,
@@ -49,12 +72,16 @@ impl Fixture {
             .parent()
             .context("colay binary parent")?
             .to_path_buf();
+        let inherited_path = env::var_os("PATH").unwrap_or_default();
+        let command_path = env::join_paths(
+            std::iter::once(executable_parent).chain(env::split_paths(&inherited_path)),
+        )?;
         let mut command = Command::new(executable);
         command
             .current_dir(&self.repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
-            .env("PATH", executable_parent)
+            .env("PATH", command_path)
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
             .env("TEMP", &self.root)
@@ -170,7 +197,7 @@ fn pending_command(
 }
 
 fn wait_command(database: &Database, command_id: ClientCommandId) -> Result<ClientCommand> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(command) = database.load_client_command(command_id)?
             && matches!(
@@ -184,6 +211,43 @@ fn wait_command(database: &Database, command_id: ClientCommandId) -> Result<Clie
             bail!("client command {command_id} did not finish");
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_approval_candidate(database: &Database, session_id: SessionId) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if database
+            .current_graph(session_id)?
+            .is_some_and(|graph| graph.revision.status == GraphRevisionStatus::AwaitingApproval)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("conversation-first planning did not produce an approval candidate");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_task_completion(database: &Database) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let tasks = database.list_tasks(&TaskListFilter {
+            state: None,
+            include_archived: false,
+            limit: 10,
+        })?;
+        if tasks.len() == 2 && tasks.iter().all(|task| task.state == TaskState::Completed) {
+            return Ok(());
+        }
+        if tasks.iter().any(|task| task.state == TaskState::Failed) {
+            bail!("approved conversation graph produced a failed task: {tasks:?}");
+        }
+        if Instant::now() >= deadline {
+            bail!("approved conversation graph did not complete through worktree execution");
+        }
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -209,7 +273,7 @@ fn mutation_counts(database: &Database) -> Result<(i64, i64, i64, i64)> {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()> {
+fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.initialize_with_fake_planner()?;
     assert!(
@@ -241,7 +305,7 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
         Some(session_id),
         serde_json::to_value(AppendMessageCommandPayload {
             message_id: goal_message_id,
-            content: "Plan a local task graph".to_owned(),
+            content: "candidate: implement a local task graph".to_owned(),
         })?,
         "plan-e2e-goal",
     );
@@ -250,16 +314,7 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
         ClientCommandState::Completed
     );
 
-    let plan = pending_command(
-        ClientCommandAction::RequestPlan,
-        Some(session_id),
-        serde_json::to_value(RequestPlanCommandPayload { goal_message_id })?,
-        "plan-e2e-request",
-    );
-    assert_eq!(
-        submit_and_wait(&database, &plan)?.state,
-        ClientCommandState::Completed
-    );
+    wait_for_approval_candidate(&database, session_id)?;
     let graph = database
         .current_graph(session_id)?
         .context("current graph after successful planning")?;
@@ -268,6 +323,10 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
         .proposal_hash
         .clone()
         .context("approvable graph hash")?;
+    let authority =
+        serde_json::from_value::<GraphValidationSummary>(graph.revision.validation.clone())?
+            .authority
+            .context("validated graph authority")?;
     assert_eq!(mutation_counts(&database)?, (0, 0, 0, 0));
     assert!(!fixture.repository.join(".colay/worktrees").exists());
 
@@ -276,6 +335,9 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
         Some(session_id),
         serde_json::to_value(ApproveGraphCommandPayload {
             revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash.clone(),
+            base_commit: authority.base_commit.clone(),
             proposal_hash: "0".repeat(64),
             approved_by: "operator".to_owned(),
         })?,
@@ -287,6 +349,9 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
 
     let exact_payload = ApproveGraphCommandPayload {
         revision_id: graph.revision.revision_id,
+        requirement_revision_id: authority.requirement_revision_id,
+        validation_hash: authority.validation_hash,
+        base_commit: authority.base_commit,
         proposal_hash: proposal_hash.clone(),
         approved_by: "operator".to_owned(),
     };
@@ -300,7 +365,16 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
         submit_and_wait(&database, &exact)?.state,
         ClientCommandState::Completed
     );
-    assert_eq!(mutation_counts(&database)?, (2, 0, 0, 1));
+    assert_eq!(
+        database
+            .list_tasks(&TaskListFilter {
+                state: None,
+                include_archived: false,
+                limit: 10,
+            })?
+            .len(),
+        2
+    );
 
     let replay = pending_command(
         ClientCommandAction::ApproveGraph,
@@ -310,7 +384,11 @@ fn goal_to_exact_approval_uses_one_read_only_fake_planner_process() -> Result<()
     );
     let stored = database.submit_client_command(&replay)?;
     assert_eq!(stored.command_id, exact.command_id);
-    assert_eq!(mutation_counts(&database)?, (2, 0, 0, 1));
+    wait_for_task_completion(&database)?;
+    let completed_counts = mutation_counts(&database)?;
+    assert_eq!(completed_counts.0, 2);
+    assert_eq!(completed_counts.1, 2);
+    assert_eq!(completed_counts.3, 1);
 
     drop(database);
     let reopened = fixture.database()?;

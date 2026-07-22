@@ -7,21 +7,25 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use orchestrator_daemon::{
-    MessageRedactor, PlanningServices, process_next_client_command,
-    process_next_orchestration_command,
+    DaemonSettings, MessageRedactor, PlanningServices, process_next_client_command,
+    process_next_orchestration_command, serve_with_orchestration,
 };
 use orchestrator_domain::{
     AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand, ClientCommandAction,
-    ClientCommandId, ClientCommandState, ConversationOutcome, GraphValidationPolicy, MessageId,
-    ModelProfile, ProviderId, RequirementSnapshot, SandboxMode, SessionId,
+    ClientCommandId, ClientCommandState, ConversationAttemptId, ConversationOutcome,
+    DaemonInstanceId, GraphValidationPolicy, MessageId, ModelProfile, ProviderId,
+    RequirementSnapshot, SandboxMode, SessionId, SessionState, VerificationCommand,
 };
 use orchestrator_engine::{
     ConversationExit, ConversationFailure, ConversationOrchestrator, ConversationRequest,
     ConversationResponse, PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse,
     TaskPlanner,
 };
-use orchestrator_state::{Database, GraphRevisionStatus};
+use orchestrator_state::{
+    ConversationAttemptStatus, Database, GraphRevisionStatus, NewConversationAttempt,
+};
 use rusqlite::params;
+use tokio_util::sync::CancellationToken;
 
 struct IdentityRedactor;
 
@@ -44,6 +48,17 @@ struct FakeConversation {
 }
 
 struct FailingConversation;
+
+fn verification_plan() -> Vec<VerificationCommand> {
+    vec![VerificationCommand {
+        executable: "cargo".to_owned(),
+        args: vec![
+            "test".to_owned(),
+            "--workspace".to_owned(),
+            "--all-features".to_owned(),
+        ],
+    }]
+}
 
 #[async_trait]
 impl ConversationOrchestrator for FailingConversation {
@@ -267,9 +282,12 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
             response_redacted: "Which verification target should be required?".to_owned(),
             requirements: RequirementSnapshot {
                 objective: "improve the flow".to_owned(),
+                in_scope: vec!["conversation flow".to_owned()],
+                out_of_scope: Vec::new(),
                 constraints: vec!["stay read-only before approval".to_owned()],
                 acceptance_criteria: Vec::new(),
                 verification_plan: Vec::new(),
+                risks: Vec::new(),
                 open_questions: vec!["Which verification target is required?".to_owned()],
             },
         },
@@ -343,9 +361,12 @@ async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_appro
             response_redacted: "Ready for validation.".to_owned(),
             requirements: RequirementSnapshot {
                 objective: "fix conversation flow".to_owned(),
+                in_scope: vec!["conversation flow".to_owned()],
+                out_of_scope: vec!["automatic merge".to_owned()],
                 constraints: vec!["no task before approval".to_owned()],
                 acceptance_criteria: vec!["tests pass".to_owned()],
-                verification_plan: vec!["cargo test --workspace --all-features".to_owned()],
+                verification_plan: verification_plan(),
+                risks: vec!["stale approval".to_owned()],
                 open_questions: Vec::new(),
             },
         },
@@ -379,9 +400,12 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
             response_redacted: "Ready for validation.".to_owned(),
             requirements: RequirementSnapshot {
                 objective: "fix conversation flow".to_owned(),
+                in_scope: vec!["conversation flow".to_owned()],
+                out_of_scope: vec!["automatic merge".to_owned()],
                 constraints: vec!["no task before approval".to_owned()],
                 acceptance_criteria: vec!["tests pass".to_owned()],
-                verification_plan: vec!["cargo test --workspace --all-features".to_owned()],
+                verification_plan: verification_plan(),
+                risks: vec!["stale approval".to_owned()],
                 open_questions: Vec::new(),
             },
         },
@@ -390,6 +414,14 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
     assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);
+    let session = database
+        .load_session(session_id)?
+        .ok_or("missing session")?;
+    assert_eq!(session.state, SessionState::AwaitingApproval);
+    assert_eq!(
+        session.revision, 3,
+        "planning must persist a validating phase"
+    );
     let proposal_hash = graph
         .revision
         .proposal_hash
@@ -397,7 +429,7 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
         .ok_or("missing validated hash")?;
     let summary: orchestrator_domain::GraphValidationSummary =
         serde_json::from_value(graph.revision.validation.clone())?;
-    assert!(summary.authority.is_some());
+    let authority = summary.authority.ok_or("missing graph authority")?;
     assert_zero_writable_rows(&database)?;
 
     let approval = ClientCommand {
@@ -407,6 +439,9 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
         action: ClientCommandAction::ApproveGraph,
         payload: serde_json::to_value(ApproveGraphCommandPayload {
             revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash.clone(),
+            base_commit: authority.base_commit.clone(),
             proposal_hash,
             approved_by: "operator".to_owned(),
         })?,
@@ -429,8 +464,134 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
             connection.query_row("SELECT count(*) FROM worktrees", [], |row| row.get(0))?;
         assert_eq!(tasks, 1);
         assert_eq!(worktrees, 0);
+        let persisted_authority: (String, String, String, String) = connection.query_row(
+            "SELECT session_id, requirement_revision_id, validation_hash, base_commit
+             FROM graph_approvals WHERE revision_id = ?1",
+            [graph.revision.revision_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(persisted_authority.0, session_id.to_string());
+        assert_eq!(
+            persisted_authority.1,
+            authority.requirement_revision_id.to_string()
+        );
+        assert_eq!(persisted_authority.2, authority.validation_hash);
+        assert_eq!(persisted_authority.3, authority.base_commit);
         Ok(())
     })?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_message_atomically_supersedes_approval_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database()?;
+    let session_id = seed_session(&database)?;
+    database.submit_client_command(&append_command(session_id, "candidate"))?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let repository = git_repository()?;
+    let services = services(
+        std::fs::canonicalize(repository.path())?,
+        ConversationOutcome::WorktreeTaskCandidate {
+            response_redacted: "Ready for validation.".to_owned(),
+            requirements: RequirementSnapshot {
+                objective: "fix conversation flow".to_owned(),
+                in_scope: vec!["conversation flow".to_owned()],
+                out_of_scope: vec!["automatic merge".to_owned()],
+                constraints: vec!["no task before approval".to_owned()],
+                acceptance_criteria: vec!["tests pass".to_owned()],
+                verification_plan: verification_plan(),
+                risks: vec!["stale approval".to_owned()],
+                open_questions: Vec::new(),
+            },
+        },
+    );
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let graph_id = database
+        .current_graph(session_id)?
+        .ok_or("missing graph")?
+        .revision
+        .revision_id;
+
+    database.submit_client_command(&append_command(session_id, "change the scope"))?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+
+    assert_eq!(
+        database
+            .load_graph_revision(graph_id)?
+            .map(|graph| graph.status),
+        Some(GraphRevisionStatus::Superseded)
+    );
+    assert_eq!(
+        database
+            .load_session(session_id)?
+            .map(|session| session.state),
+        Some(SessionState::Drafting)
+    );
+    assert_zero_writable_rows(&database)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = Arc::new(database()?);
+    let session_id = seed_session(&database)?;
+    database.submit_client_command(&append_command(session_id, "hello"))?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let claimed = database
+        .claim_next_orchestration_client_command(Utc::now())?
+        .ok_or("missing conversation command")?;
+    let attempt_id = ConversationAttemptId::from_uuid(claimed.command_id.into_uuid());
+    database.begin_conversation_attempt(&NewConversationAttempt {
+        attempt_id,
+        session_id,
+        source_message_id: claimed
+            .payload
+            .get("source_message_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing source message")?
+            .parse()?,
+        provider: ProviderId::Codex,
+        started_at: claimed.requested_at,
+    })?;
+    let directory = tempfile::tempdir()?;
+    let services = services_with_conversation(
+        std::fs::canonicalize(directory.path())?,
+        Arc::new(FakeConversation {
+            outcome: ConversationOutcome::AnswerComplete {
+                response_redacted: "unused".to_owned(),
+            },
+        }),
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    serve_with_orchestration(
+        Arc::clone(&database),
+        DaemonInstanceId::new(),
+        42,
+        cancellation,
+        DaemonSettings::default(),
+        Arc::new(IdentityRedactor),
+        services,
+    )
+    .await?;
+
+    assert_eq!(
+        database
+            .load_conversation_attempt(attempt_id)?
+            .map(|attempt| attempt.status),
+        Some(ConversationAttemptStatus::Failed)
+    );
+    assert_eq!(
+        database
+            .load_client_command(claimed.command_id)?
+            .map(|command| command.state),
+        Some(ClientCommandState::Failed)
+    );
+    assert_zero_writable_rows(&database)?;
     Ok(())
 }
 
@@ -448,9 +609,12 @@ async fn repository_head_drift_rejects_approval_without_materializing_tasks()
             response_redacted: "Ready for validation.".to_owned(),
             requirements: RequirementSnapshot {
                 objective: "fix conversation flow".to_owned(),
+                in_scope: vec!["conversation flow".to_owned()],
+                out_of_scope: vec!["automatic merge".to_owned()],
                 constraints: vec!["no task before approval".to_owned()],
                 acceptance_criteria: vec!["tests pass".to_owned()],
-                verification_plan: vec!["cargo test --workspace --all-features".to_owned()],
+                verification_plan: verification_plan(),
+                risks: vec!["stale approval".to_owned()],
                 open_questions: Vec::new(),
             },
         },
@@ -463,6 +627,11 @@ async fn repository_head_drift_rejects_approval_without_materializing_tasks()
         .proposal_hash
         .clone()
         .ok_or("missing validated hash")?;
+    let authority = serde_json::from_value::<orchestrator_domain::GraphValidationSummary>(
+        graph.revision.validation.clone(),
+    )?
+    .authority
+    .ok_or("missing graph authority")?;
 
     std::fs::write(repository.path().join("README.md"), "changed\n")?;
     git(repository.path(), &["add", "."])?;
@@ -476,6 +645,9 @@ async fn repository_head_drift_rejects_approval_without_materializing_tasks()
         action: ClientCommandAction::ApproveGraph,
         payload: serde_json::to_value(ApproveGraphCommandPayload {
             revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash,
+            base_commit: authority.base_commit,
             proposal_hash,
             approved_by: "operator".to_owned(),
         })?,

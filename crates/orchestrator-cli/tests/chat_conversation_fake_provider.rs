@@ -7,7 +7,8 @@ use orchestrator_domain::{
     ProviderCapabilities, ProviderId, SandboxMode, SessionId,
 };
 use orchestrator_engine::{
-    ConversationOrchestrator, ConversationRequest, collect_conversation_response,
+    ConversationExit, ConversationFailure, ConversationOrchestrator, ConversationRequest,
+    collect_conversation_response,
 };
 use orchestrator_providers::AdapterRuntime;
 use orchestrator_state::RootConfig;
@@ -122,4 +123,88 @@ async fn fake_provider_emits_interview_and_candidate_outcomes()
         );
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn fake_provider_timeout_is_reported_as_a_terminal_lifecycle_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::Timeout,
+    )?);
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.agy = None;
+    config.orchestrator.providers.claude = None;
+    config
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+    let request = request("candidate");
+    let response = orchestrator.converse(request.clone()).await?;
+    assert_eq!(response.exit, ConversationExit::TimedOut);
+    assert!(matches!(
+        collect_conversation_response(&request, response),
+        Err(ConversationFailure::Lifecycle {
+            exit: ConversationExit::TimedOut,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_a_conversation_future_cancels_the_active_fake_provider_job()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::TerminalError,
+    )?);
+    let adapter_runtime: Arc<dyn AdapterRuntime> = runtime.clone();
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.agy = None;
+    config.orchestrator.providers.claude = None;
+    config
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        adapter_runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+    let conversation =
+        tokio::spawn(async move { orchestrator.converse(request("candidate")).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    conversation.abort();
+    let _ = conversation.await;
+    for _ in 0..100 {
+        if runtime.cancelled_job_count().await == 1 {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Err("active fake provider job was not cancelled when the conversation future ended".into())
 }

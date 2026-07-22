@@ -92,9 +92,12 @@ fn rejects_incomplete_task_candidate() -> Result<(), Box<dyn std::error::Error>>
         "response_redacted": "ready",
         "requirements": {
             "objective": "fix it",
+            "in_scope": ["requested fix"],
+            "out_of_scope": [],
             "constraints": [],
             "acceptance_criteria": ["passes"],
-            "verification_plan": ["cargo test"],
+            "verification_plan": [{"executable": "cargo", "args": ["test"]}],
+            "risks": [],
             "open_questions": ["which crate?"]
         }
     }))?;

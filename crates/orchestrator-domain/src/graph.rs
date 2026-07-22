@@ -64,6 +64,10 @@ pub struct GraphValidationAuthority {
     pub requirement_revision_id: RequirementRevisionId,
     pub validation_hash: String,
     pub base_commit: String,
+    #[serde(default)]
+    pub git_root_redacted: String,
+    #[serde(default)]
+    pub validation_checks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +170,12 @@ pub fn validate_task_graph_with_authority(
             .base_commit
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+        || authority.git_root_redacted.trim().is_empty()
+        || authority.validation_checks.is_empty()
+        || authority
+            .validation_checks
+            .iter()
+            .any(|check| check.trim().is_empty())
     {
         return Err(GraphValidationError::InvalidAuthority);
     }
@@ -567,6 +577,8 @@ mod tests {
             requirement_revision_id: RequirementRevisionId::new(),
             validation_hash: "b".repeat(64),
             base_commit: "a".repeat(40),
+            git_root_redacted: "C:/repo".to_owned(),
+            validation_checks: vec!["git_ready".to_owned(), "graph_valid".to_owned()],
         };
         let bound = validate_task_graph_with_authority(draft, &policy(), authority.clone())
             .expect("bound graph");

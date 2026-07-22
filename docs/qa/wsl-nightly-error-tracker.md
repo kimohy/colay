@@ -8,7 +8,7 @@
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-22
+- 마지막 갱신: 2026-07-23
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260721.8c7f638`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
@@ -24,12 +24,13 @@
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
 | `WSL-004` | high | fixed | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
 | `WSL-005` | high | fixed | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
-| `WSL-006` | medium | workaround-confirmed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
+| `WSL-006` | medium | fixed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
-| `WIN-001` | medium | workaround-confirmed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
-| `WIN-002` | medium | open | Windows nightly PE에 Authenticode 서명이 없어 OS 신뢰 체인이 없음 |
+| `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
+| `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | closed | Windows 전체 테스트에서 `icacls.exe` 접근 거부가 1회 발생한 플래이크 |
+| `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 
@@ -457,6 +458,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Git status가 전체 파일의 줄바꿈 변경으로 보이는 패턴을 감지해 writable 실행을
   fail-closed하거나 명시적 승인을 요구한다.
 
+### 수정 구현 및 재검증
+
+- `doctor`가 Linux에서 `/mnt/<drive>/...` checkout을 감지하면 Windows/WSL Git 혼용과
+  줄바꿈·권한 위험을 경고한다. 경로 판별은 platform-neutral 단위 테스트로 고정했다.
+- 운영 문서는 Linux Colay에는 WSL ext4 내부 native clone을, Windows checkout에는
+  Windows Colay/Windows Git을 사용하고 writable 승인 전 `git status --short`를 검토하도록
+  명시한다. 전체 줄바꿈 변경의 자동 수정이나 사용자 Git 설정 변경은 수행하지 않는다.
+
 ## WIN-001: Windows PATH가 오래된 Cargo 설치본을 선택
 
 ### 재현된 증상
@@ -499,6 +508,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `target/debug/colay.exe`, `windows/x86_64`가 보고됐고 `.colay` state는 생성되지 않았다.
 - PATH 우선순위 변경이나 오래된 Cargo binary 제거는 사용자 환경 변경이므로 자동화하지
   않으며, `Get-Command colay -All`과 `where.exe colay` 확인 절차를 유지한다.
+- schema v11은 active daemon의 실제 executable 경로, build version, target을 영속화하며
+  `doctor.daemon_runtime`이 현재 CLI와 비교한다. 불일치 시 intended binary로 daemon을
+  stop/restart하라는 경고를 반환하므로 PATH 충돌과 stale daemon을 한 진단에서 구분한다.
 
 ## WIN-002: Windows nightly PE의 Authenticode 부재
 
@@ -526,6 +538,16 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - 서명 도입 전에는 npm integrity/provenance와 공개 checksum 검증 방법을 명시한다.
 - code signing이 초기 release 범위 밖이라는 기존 결정을 유지한다면 Windows enterprise
   지원 제한으로 명확히 문서화한다.
+
+### 종료 근거
+
+- 현재 release/security 문서는 Windows PE가 Authenticode `NotSigned`임을 명시하고,
+  GitHub attestation·npm provenance·SHA-256이 OS publisher trust를 대체하지 않는다고
+  구분한다.
+- WDAC/AppLocker/SmartScreen publisher trust가 필수인 환경은 검증된 digest allowlist 또는
+  조직 내부 build/sign을 사용해야 하며, upstream Authenticode가 필수인 배포는 현재 지원
+  범위 밖이다. 서명 인증서 권한 없이 허위로 signed artifact를 주장하지 않고 명시적 지원
+  제한을 제공했으므로 queue의 허용된 종료 조건에 따라 `closed` 처리한다.
 
 ## WSL-007: chat TUI reconnect 500ms 플래이크
 
@@ -578,6 +600,24 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   또는 endpoint policy, 동시 실행 중인 `icacls` 프로세스를 실패 시점에 수집한다.
 - 원인이 확인되기 전에는 무조건적인 retry나 권한 완화를 추가하지 않는다.
 
+## WIN-004: Agy provider 관리 CLI 누락
+
+### 재현 및 영향
+
+- Windows source QA에서 `colay providers disable agy`가 가능한 값으로 Gemini, Codex,
+  Claude만 출력하며 Agy를 거부했다. Agy는 scheduler/config/profile에서 독립 provider로
+  지원되므로 관리 CLI만 비대칭인 결함이었다.
+- 운영자는 config TOML을 직접 수정하지 않고 Agy를 enable/disable하거나 profile target으로
+  선택할 수 없었다.
+
+### 수정 및 검증
+
+- `ProviderName`과 문자열 parser에 Agy를 추가하고 `ProviderId::Agy`로 변환하도록 했다.
+- `providers disable agy`와 `profiles reset agy standard` clap 회귀 테스트가 통과했다.
+- Windows 실제 source binary에서 `provider_updated { provider: agy, enabled: false }`가
+  반환되고 effective provider report에도 `enabled=false`가 반영됨을 확인했다.
+- 변경 후 workspace 전체 target/feature Clippy `-D warnings`와 전체 Rust suite가 통과했다.
+
 ## Confirmed healthy controls
 
 - 설치된 Linux native binary는 x86-64 static PIE였고 `--version`이 정상 동작했다.
@@ -605,16 +645,51 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
    lease로 교체했다 (`WSL-008`).
 3. `완료`: idle daemon의 불필요한 immediate transaction을 제거하고 writer starvation을
    회귀 테스트로 고정했다 (`WSL-003`).
-4. `P1`: daemon startup timeout 시 child 정리와 phase diagnostics를 보장한다.
-5. `P1`: 실패 후 `planned` task를 중복 없이 재개하는 명시적 UX를 제공한다.
-6. `P1`: WSL/NVM과 Windows Cargo/npm 충돌을 포함한 실제 실행 binary 경로를
-   `doctor`에 노출한다.
-7. `P2`: Windows release Authenticode 서명 또는 명시적인 enterprise 지원 제한을
-   제공한다.
-8. `P2`: `/mnt/c` mixed-Git 환경 경고와 WSL native clone 문서를 추가한다.
+4. `완료`: daemon startup timeout 시 child 정리와 phase diagnostics를 보장한다.
+5. `완료`: 실패 후 `planned` task는 `colay resume <task-id>`로 동일 task/worktree를
+   재사용하며, fake CLI 회귀 테스트로 중복이 없음을 고정한다.
+6. `완료`: WSL/NVM과 Windows Cargo/npm 충돌을 포함한 CLI/daemon 실제 binary 경로와
+   build identity를 `doctor`에 노출한다.
+7. `완료`: Windows PE의 Authenticode 부재와 enterprise 지원 제한을 release/security
+   문서에 명시한다.
+8. `완료`: `/mnt/c` mixed-Git 환경 경고와 WSL native clone 문서를 추가한다.
 9. `완료`: 500ms reconnect 테스트를 condition-based wait로 바꿨다 (`WSL-007`).
 
 ## Update log
+
+### 2026-07-23
+
+- `/plan`이 요구사항 revision 없이 approval 후보를 만들던 우회 경로를 차단하고, 새 사용자
+  메시지가 planning/awaiting-approval graph를 같은 transaction에서 supersede하도록 했다.
+- session의 실제 `validating` 상태, Agy provider compatibility, exact graph approval authority,
+  daemon executable/build identity를 schema v11 projection으로 추가했다. migration v1→v11과
+  backup pending-plan 회귀 테스트가 통과했다.
+- requirement를 scope/acceptance/구조화 verification command/risk/open-question으로 확장하고,
+  shell interpreter·metacharacter가 포함된 검증 명령을 approval 전에 fail-closed하도록 했다.
+- 자동 conversation→complete requirement→validation→exact approval→두 task materialization→
+  scheduler isolated worktree→fake worker completion E2E가 Windows source build에서 통과했다.
+  승인 전 task/worktree/worker lease는 0건이며 실제 provider inference는 호출하지 않았다.
+- provider timeout과 conversation future cancellation을 fake runtime으로 검증하는 회귀를
+  추가했고, daemon restart가 interrupted conversation/command를 terminal failed로 함께
+  정리하도록 했다.
+- `planned` task의 명시적 `colay resume <task-id>` 경로, CLI/daemon identity 진단,
+  `/mnt/<drive>` mixed-Git 경고, WSL native clone 안내, unsigned Windows PE enterprise 지원
+  제한을 코드·테스트·운영 문서에 반영했다. 전체 Windows/WSL 게이트 결과는 아래 최종 QA
+  실행 후 이 항목에 이어 기록한다.
+- Windows source QA에서 Agy가 provider 관리 CLI enum에서 누락된 `WIN-004`를 추가로
+  발견했다. Agy selector와 profile target을 추가하고 실제 `providers disable agy`, 전체
+  Clippy, 전체 Rust suite로 수정 완료를 확인했다.
+- 최종 Windows source 검증에서 `cargo fmt --all -- --check`, workspace 전체 target/feature
+  Clippy `-D warnings`, `cargo test --workspace --all-features`, Node 24의 npm 66개 테스트가
+  통과했다. 격리 Git repository의 `init`은 schema v11을 적용했고 `doctor`는 database,
+  current runtime, active daemon runtime, fake Codex provider를 모두 pass로 보고했다.
+- WSL 2 Ubuntu 24.04의 Rust 1.95 Linux container에서 source를 read-only mount하고
+  conversation answer/interview/candidate/timeout/cancel 4개, `/mnt/c` mixed-Git 경고,
+  conversation→exact approval→scheduler worktree E2E를 통과했다. 최초 slim image 실행의
+  `os error 2`는 제품이 아니라 image에 Git package가 없던 환경 오류였고, Git을 임시
+  설치한 동일 container에서 E2E가 통과했다. Linux build volume은 검증 후 제거했다.
+- 최종 Windows/WSL QA에서도 실제 Codex, Claude, Gemini, Agy 모델 inference는 호출하지
+  않았다. 수동 provider 진단은 공개 `--version`/`--help` capability probe에만 한정했다.
 
 ### 2026-07-22
 

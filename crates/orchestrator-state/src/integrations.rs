@@ -345,7 +345,7 @@ impl Database {
             ));
         }
         let (provider, profile): (String, String) = transaction.query_row(
-            "SELECT provider_id, model_profile FROM session_tasks
+            "SELECT coalesce(provider_id_v2, provider_id), model_profile FROM session_tasks
              WHERE session_id = ?1 AND revision_id = ?2 ORDER BY display_order LIMIT 1",
             params![session_id.to_string(), revision_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -417,8 +417,9 @@ impl Database {
         )?;
         transaction.execute(
             "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
-                display_order, provider_id, model_profile)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                display_order, provider_id, provider_id_v2, model_profile)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     CASE WHEN ?6 = 'agy' THEN 'codex' ELSE ?6 END, ?6, ?7)",
             params![
                 session_id.to_string(),
                 revision_id,
@@ -507,7 +508,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let batches = {
             let mut statement = transaction.prepare(
-                "SELECT batch.batch_id, batch.session_id, batch.status, session.state
+                "SELECT batch.batch_id, batch.session_id, batch.status,
+                        coalesce(session.state_v2, session.state)
                  FROM integration_batches batch
                  JOIN sessions session ON session.session_id = batch.session_id
                  WHERE batch.status IN ('approved', 'applying', 'applied')
@@ -602,18 +604,29 @@ fn transition_session_in_transaction(
 ) -> StateResult<()> {
     from.validate_transition(to)
         .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+    let to_text = serde_json::to_value(to)?
+        .as_str()
+        .ok_or_else(|| StateError::InvalidRecord("invalid session state".to_owned()))?
+        .to_owned();
+    let legacy_to_text = if to == SessionState::Validating {
+        "planning".to_owned()
+    } else {
+        to_text.clone()
+    };
+    let from_text = serde_json::to_value(from)?
+        .as_str()
+        .ok_or_else(|| StateError::InvalidRecord("invalid session state".to_owned()))?
+        .to_owned();
     let changed = transaction.execute(
-        "UPDATE sessions SET state = ?1, revision = revision + 1, updated_at = ?2
-         WHERE session_id = ?3 AND state = ?4",
+        "UPDATE sessions SET state = ?1, state_v2 = ?2,
+         revision = revision + 1, updated_at = ?3
+         WHERE session_id = ?4 AND coalesce(state_v2, state) = ?5",
         params![
-            serde_json::to_value(to)?
-                .as_str()
-                .ok_or_else(|| StateError::InvalidRecord("invalid session state".to_owned()))?,
+            legacy_to_text,
+            to_text,
             now.to_rfc3339(),
             session_id.to_string(),
-            serde_json::to_value(from)?
-                .as_str()
-                .ok_or_else(|| StateError::InvalidRecord("invalid session state".to_owned()))?,
+            from_text,
         ],
     )?;
     if changed != 1 {

@@ -199,11 +199,14 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     })?;
     assert_eq!(sessions[0].session_id, session_id);
     let messages = reopened.messages_after(session_id, 0, 10)?;
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].1.content_redacted.contains("[REDACTED]"));
+    let stored_user_message = messages
+        .iter()
+        .find(|(_, message)| message.message_id == message_id)
+        .map(|(_, message)| message)
+        .context("reconnected timeline lost the durable user message")?;
+    assert!(stored_user_message.content_redacted.contains("[REDACTED]"));
     assert!(
-        !messages[0]
-            .1
+        !stored_user_message
             .content_redacted
             .contains("super-secret-token")
     );

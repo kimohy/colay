@@ -2,8 +2,9 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ClientCommand, ClientCommandAction, ClientCommandState, ConversationMessage, EventType,
-    MessageId, MessageState, SessionId, SessionState, TaskEvent, TaskId,
+    ClientCommand, ClientCommandAction, ClientCommandState, ConversationMessage, CorrelationId,
+    EventActor, EventId, EventType, MessageId, MessageState, SchemaVersion, SessionId,
+    SessionState, TaskEvent, TaskId,
 };
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -57,9 +58,9 @@ impl Database {
         self.with_transaction(|transaction| {
             transaction.execute(
                 "INSERT INTO sessions(
-                    session_id, schema_version, revision, title, state, created_at, updated_at,
+                    session_id, schema_version, revision, title, state, state_v2, created_at, updated_at,
                     archived_at
-                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?5, NULL)",
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?4, ?5, ?5, NULL)",
                 params![
                     session.session_id.to_string(),
                     session.schema_version,
@@ -78,7 +79,7 @@ impl Database {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT session_id, schema_version, revision, title, state, created_at,
+                    "SELECT session_id, schema_version, revision, title, coalesce(state_v2, state), created_at,
                      updated_at, archived_at FROM sessions WHERE session_id = ?1",
                     [session_id.to_string()],
                     map_session,
@@ -108,11 +109,11 @@ impl Database {
         let limit = i64::try_from(filter.limit).unwrap_or(i64::MAX);
         self.with_connection(|connection| {
             let sql = if filter.include_archived {
-                "SELECT session_id, schema_version, revision, title, state, created_at,
+                "SELECT session_id, schema_version, revision, title, coalesce(state_v2, state), created_at,
                  updated_at, archived_at FROM sessions
                  ORDER BY updated_at DESC, session_id DESC LIMIT ?1"
             } else {
-                "SELECT session_id, schema_version, revision, title, state, created_at,
+                "SELECT session_id, schema_version, revision, title, coalesce(state_v2, state), created_at,
                  updated_at, archived_at FROM sessions WHERE archived_at IS NULL
                  ORDER BY updated_at DESC, session_id DESC LIMIT ?1"
             };
@@ -147,9 +148,11 @@ impl Database {
                 .validate_transition(next)
                 .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
             let changed = transaction.execute(
-                "UPDATE sessions SET state = ?1, revision = revision + 1, updated_at = ?2
-                 WHERE session_id = ?3 AND revision = ?4",
+                "UPDATE sessions SET state = ?1, state_v2 = ?2,
+                 revision = revision + 1, updated_at = ?3
+                 WHERE session_id = ?4 AND revision = ?5",
                 params![
+                    legacy_session_state(next)?,
                     enum_text(&next)?,
                     updated_at.to_rfc3339(),
                     session_id.to_string(),
@@ -282,6 +285,13 @@ impl Database {
                 ],
             )?;
             append_event_in_transaction(transaction, &mut event)?;
+            invalidate_pre_task_candidate_in_transaction(
+                transaction,
+                message.session_id,
+                message.created_at,
+                event.event_id,
+                event.correlation_id,
+            )?;
             Ok(ordinal)
         })
     }
@@ -357,6 +367,71 @@ impl Database {
                 .map_err(StateError::from)
         })
     }
+}
+
+fn invalidate_pre_task_candidate_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    changed_at: DateTime<Utc>,
+    causation_id: EventId,
+    correlation_id: CorrelationId,
+) -> StateResult<()> {
+    let current = session_by_id(transaction, session_id)?
+        .ok_or_else(|| StateError::InvalidRecord(format!("session {session_id} does not exist")))?;
+    let invalidates_pre_task_state = matches!(
+        current.state,
+        SessionState::Planning
+            | SessionState::Validating
+            | SessionState::AwaitingApproval
+            | SessionState::NeedsAttention
+    );
+    if !invalidates_pre_task_state {
+        return Ok(());
+    }
+
+    transaction.execute(
+        "UPDATE graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
+         WHERE revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
+         AND status IN ('planning', 'awaiting_approval')",
+        params![changed_at.to_rfc3339(), session_id.to_string()],
+    )?;
+    let changed = transaction.execute(
+        "UPDATE sessions SET state = 'drafting', state_v2 = 'drafting',
+         revision = revision + 1, updated_at = ?1
+         WHERE session_id = ?2 AND revision = ?3",
+        params![
+            changed_at.to_rfc3339(),
+            session_id.to_string(),
+            current.revision
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StateError::OptimisticConflict {
+            entity: format!("session {session_id}"),
+        });
+    }
+    let mut transition_event = TaskEvent {
+        schema_version: SchemaVersion::state_current(),
+        sequence: 0,
+        event_id: EventId::new(),
+        session_id: Some(session_id),
+        task_id: None,
+        occurred_at: changed_at,
+        event_type: EventType::SessionStateTransitioned,
+        from_state: None,
+        to_state: None,
+        reason: Some("new user message invalidated the pre-task approval candidate".to_owned()),
+        actor: EventActor::User,
+        correlation_id,
+        causation_id: Some(causation_id),
+        payload: serde_json::json!({
+            "from_session_state": current.state,
+            "to_session_state": SessionState::Drafting,
+        }),
+        previous_hash: None,
+        event_hash: String::new(),
+    };
+    append_event_in_transaction(transaction, &mut transition_event)
 }
 
 fn append_message_in_transaction(
@@ -436,7 +511,7 @@ fn session_by_id(
 ) -> StateResult<Option<StoredSession>> {
     transaction
         .query_row(
-            "SELECT session_id, schema_version, revision, title, state, created_at,
+            "SELECT session_id, schema_version, revision, title, coalesce(state_v2, state), created_at,
              updated_at, archived_at FROM sessions WHERE session_id = ?1",
             [session_id.to_string()],
             map_session,
@@ -506,6 +581,14 @@ fn enum_text(value: &impl Serialize) -> StateResult<String> {
         .as_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| StateError::InvalidRecord("enum did not serialize as a string".to_owned()))
+}
+
+fn legacy_session_state(state: SessionState) -> StateResult<String> {
+    if state == SessionState::Validating {
+        Ok("planning".to_owned())
+    } else {
+        enum_text(&state)
+    }
 }
 
 fn parse_enum<T: DeserializeOwned>(value: &str, column: usize) -> rusqlite::Result<T> {
@@ -637,6 +720,16 @@ mod tests {
             Some(new.session_id)
         );
 
+        let validating = database.transition_session_with_event(
+            new.session_id,
+            1,
+            SessionState::Validating,
+            timestamp(),
+            session_event(new.session_id, EventType::SessionStateTransitioned),
+        )?;
+        assert_eq!(validating.revision, 2);
+        assert_eq!(validating.state, SessionState::Validating);
+
         let conflict = database.transition_session_with_event(
             new.session_id,
             0,
@@ -648,7 +741,7 @@ mod tests {
             conflict,
             Err(StateError::OptimisticConflict { .. })
         ));
-        assert_eq!(database.event_at(3)?, None);
+        assert_eq!(database.event_at(4)?, None);
         Ok(())
     }
 

@@ -38,6 +38,9 @@ pub struct DaemonInstance {
     pub startup_error: Option<String>,
     pub stop_requested_at: Option<DateTime<Utc>>,
     pub released_at: Option<DateTime<Utc>>,
+    pub executable_path: Option<String>,
+    pub build_version: Option<String>,
+    pub build_target: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +97,9 @@ impl Database {
             startup_error: None,
             stop_requested_at: None,
             released_at: None,
+            executable_path: None,
+            build_version: None,
+            build_target: None,
         };
 
         let mut connection = self.lock()?;
@@ -215,7 +221,8 @@ impl Database {
         let instance = connection
             .query_row(
                 "SELECT instance_id, pid, started_at, heartbeat_at, lease_expires_at,
-                        phase, startup_error, stop_requested_at, released_at
+                        phase, startup_error, stop_requested_at, released_at,
+                        executable_path, build_version, build_target
                  FROM daemon_instances WHERE released_at IS NULL
                  ORDER BY started_at DESC LIMIT 1",
                 [],
@@ -245,6 +252,42 @@ impl Database {
             )
             .optional()
             .map_err(StateError::from)
+    }
+
+    pub fn record_daemon_runtime_identity(
+        &self,
+        instance_id: DaemonInstanceId,
+        executable_path: &str,
+        build_version: &str,
+        build_target: &str,
+    ) -> StateResult<DaemonInstance> {
+        if [executable_path, build_version, build_target]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(StateError::InvalidRecord(
+                "daemon runtime identity fields must not be blank".to_owned(),
+            ));
+        }
+        let changed = self.lock()?.execute(
+            "UPDATE daemon_instances
+             SET executable_path = ?1, build_version = ?2, build_target = ?3
+             WHERE instance_id = ?4 AND released_at IS NULL",
+            params![
+                executable_path,
+                build_version,
+                build_target,
+                instance_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ownership_error(instance_id));
+        }
+        self.load_daemon_instance(instance_id)?.ok_or_else(|| {
+            StateError::InvalidRecord(format!(
+                "daemon instance {instance_id} disappeared after identity update"
+            ))
+        })
     }
 
     pub fn request_daemon_stop(
@@ -299,7 +342,8 @@ impl Database {
         self.lock()?
             .query_row(
                 "SELECT instance_id, pid, started_at, heartbeat_at, lease_expires_at,
-                        phase, startup_error, stop_requested_at, released_at
+                        phase, startup_error, stop_requested_at, released_at,
+                        executable_path, build_version, build_target
                  FROM daemon_instances WHERE instance_id = ?1",
                 [instance_id.to_string()],
                 map_daemon_instance,
@@ -339,6 +383,9 @@ fn map_daemon_instance(row: &Row<'_>) -> rusqlite::Result<DaemonInstance> {
     let startup_error: Option<String> = row.get(6)?;
     let stop_requested_at: Option<String> = row.get(7)?;
     let released_at: Option<String> = row.get(8)?;
+    let executable_path: Option<String> = row.get(9)?;
+    let build_version: Option<String> = row.get(10)?;
+    let build_target: Option<String> = row.get(11)?;
     Ok(DaemonInstance {
         instance_id: DaemonInstanceId::from_str(&instance_id)
             .map_err(|error| conversion_error(0, error))?,
@@ -354,6 +401,9 @@ fn map_daemon_instance(row: &Row<'_>) -> rusqlite::Result<DaemonInstance> {
         released_at: released_at
             .map(|value| parse_timestamp(&value, 8))
             .transpose()?,
+        executable_path,
+        build_version,
+        build_target,
     })
 }
 
@@ -493,6 +543,32 @@ mod tests {
             database.daemon_status(timestamp())?,
             DaemonStatus::Online(online)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_runtime_identity_round_trips_in_status() -> StateResult<()> {
+        let database = migrated_database();
+        let lease = request(timestamp());
+        database.acquire_daemon_lease(&lease)?;
+        database.record_daemon_runtime_identity(
+            lease.instance_id,
+            "C:/tools/colay.exe",
+            "0.1.1-nightly.20260723.abcdef0",
+            "windows/x86_64",
+        )?;
+        let DaemonStatus::Online(instance) = database.daemon_status(timestamp())? else {
+            return Err(StateError::InvalidRecord("daemon is not online".to_owned()));
+        };
+        assert_eq!(
+            instance.executable_path.as_deref(),
+            Some("C:/tools/colay.exe")
+        );
+        assert_eq!(
+            instance.build_version.as_deref(),
+            Some("0.1.1-nightly.20260723.abcdef0")
+        );
+        assert_eq!(instance.build_target.as_deref(), Some("windows/x86_64"));
         Ok(())
     }
 

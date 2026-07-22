@@ -97,9 +97,10 @@ the timeline readable but disables messages and task controls until
 redacted before durable command submission and again before conversation
 projection.
 
-For compatibility, `/plan` can explicitly plan the newest session-level goal.
-Normally the conversation adapter requests planning only after requirements are
-complete. The daemon requires one bounded JSON graph, validates its DAG,
+For compatibility, `/plan` can explicitly revalidate the newest session-level goal,
+but it cannot bypass the provider interview or create approval authority without a
+complete latest requirement revision. Normally the conversation adapter requests
+planning automatically after requirements are complete. The daemon requires one bounded JSON graph, validates its DAG,
 providers, profiles, concurrency, write-scope isolation, verification plan, Git
 readiness, and base commit, then seals those results without creating a task or
 worktree. `/approve` shows the requirement revision, validation hash, base
@@ -130,9 +131,10 @@ blockers, and dedicated destination. `/approve` requires `y` for that exact
 preview; every source is revalidated before application only to the retained
 `.colay/integration/<batch-id>` worktree. `/resolve` turns a resolvable overlap
 or application failure into one auditable task whose result requires a new
-preview and approval. Merge to
-the user's branch, push, publication, automatic cleanup, and `/retry` remain
-unavailable.
+preview and approval. Merge to the user's branch, push, publication, automatic
+cleanup, and chat `/retry` remain unavailable. Use `colay resume <task-id>` to
+restart an existing non-terminal task, including one persisted in `planned`, without
+creating a second task identity.
 
 ## Model profiles
 

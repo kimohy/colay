@@ -171,6 +171,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
     let wrong = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: first.proposal.revision_id,
         expected_proposal_hash: "0".repeat(64),
+        authority: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(5),
     });
@@ -179,6 +180,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
     let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: first.proposal.revision_id,
         expected_proposal_hash: first.proposal_hash.clone(),
+        authority: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(5),
     })?;
@@ -188,6 +190,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
         database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
             revision_id: first.proposal.revision_id,
             expected_proposal_hash: first.proposal_hash.clone(),
+            authority: None,
             approved_by: "tester".to_owned(),
             approved_at: timestamp(5),
         })?;
@@ -243,6 +246,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
             .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
                 revision_id: stale_revision_id,
                 expected_proposal_hash: stale_hash,
+                authority: None,
                 approved_by: "tester".to_owned(),
                 approved_at: timestamp(8),
             })
@@ -273,6 +277,7 @@ fn newer_session_message_invalidates_pending_graph_approval()
     let approval = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: graph.proposal.revision_id,
         expected_proposal_hash: graph.proposal_hash,
+        authority: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(4),
     });
@@ -287,6 +292,47 @@ fn newer_session_message_invalidates_pending_graph_approval()
         assert_eq!(tasks, 0);
         Ok(())
     })?;
+    Ok(())
+}
+
+#[test]
+fn agy_planner_and_worker_provider_round_trip_through_graph_materialization()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database()?;
+    let session_id = SessionId::new();
+    let goal_id = MessageId::new();
+    seed_session(&database, session_id, goal_id)?;
+    let mut proposal = validated_graph(session_id, goal_id).proposal;
+    proposal.planner_provider = ProviderId::Agy;
+    for node in &mut proposal.nodes {
+        node.provider = Some(ProviderId::Agy);
+    }
+    let graph = validate_task_graph(
+        proposal,
+        &GraphValidationPolicy {
+            eligible_providers: BTreeSet::from([ProviderId::Agy]),
+            eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+            max_parallel_workers: 2,
+            per_provider_limits: BTreeMap::from([(ProviderId::Agy, 1)]),
+        },
+    )?;
+    record_valid(&database, &graph)?;
+    let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
+        revision_id: graph.proposal.revision_id,
+        expected_proposal_hash: graph.proposal_hash,
+        authority: None,
+        approved_by: "tester".to_owned(),
+        approved_at: timestamp(5),
+    })?;
+    assert_eq!(approved.task_ids.len(), 2);
+    let projection = database.current_graph(session_id)?.ok_or("missing graph")?;
+    assert_eq!(projection.revision.planner_provider, Some(ProviderId::Agy));
+    assert!(
+        projection
+            .tasks
+            .iter()
+            .all(|task| task.provider == ProviderId::Agy)
+    );
     Ok(())
 }
 
@@ -318,6 +364,7 @@ fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::
             .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
+                authority: None,
                 approved_by: "tester".to_owned(),
                 approved_at: timestamp(8),
             })

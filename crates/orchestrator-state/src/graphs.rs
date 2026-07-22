@@ -147,6 +147,7 @@ pub struct GraphProjection {
 pub struct GraphApprovalRequest {
     pub revision_id: GraphRevisionId,
     pub expected_proposal_hash: String,
+    pub authority: Option<orchestrator_domain::GraphValidationAuthority>,
     pub approved_by: String,
     pub approved_at: DateTime<Utc>,
 }
@@ -194,13 +195,15 @@ impl Database {
         transaction.execute(
             "INSERT INTO graph_revisions(
                 revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
-                proposal_json, validation_json, planner_provider, created_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, 'planning', NULL, NULL, '{}', ?5, ?6, NULL)",
+                proposal_json, validation_json, planner_provider, planner_provider_v2,
+                created_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, 'planning', NULL, NULL, '{}', ?5, ?6, ?7, NULL)",
             params![
                 attempt.revision_id.to_string(),
                 attempt.session_id.to_string(),
                 attempt.goal_message_id.to_string(),
                 ordinal,
+                legacy_provider_text(attempt.planner_provider),
                 attempt.planner_provider.as_str(),
                 attempt.started_at.to_rfc3339(),
             ],
@@ -208,13 +211,15 @@ impl Database {
         transaction.execute(
             "INSERT INTO planning_attempts(
                 attempt_id, revision_id, session_id, goal_message_id, planner_provider,
+                planner_provider_v2,
                 outcome, error_redacted, started_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'planning', NULL, ?6, NULL)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'planning', NULL, ?7, NULL)",
             params![
                 attempt.attempt_id.to_string(),
                 attempt.revision_id.to_string(),
                 attempt.session_id.to_string(),
                 attempt.goal_message_id.to_string(),
+                legacy_provider_text(attempt.planner_provider),
                 attempt.planner_provider.as_str(),
                 attempt.started_at.to_rfc3339(),
             ],
@@ -352,9 +357,10 @@ impl Database {
         transaction.execute(
             "INSERT INTO graph_revisions(
                 revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
-                proposal_json, validation_json, planner_provider, created_at, completed_at,
+                proposal_json, validation_json, planner_provider, planner_provider_v2,
+                created_at, completed_at,
                 requirement_revision_id, validation_hash, base_commit
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 attempt.revision_id.to_string(),
                 attempt.session_id.to_string(),
@@ -368,6 +374,7 @@ impl Database {
                     .map(serde_json::to_string)
                     .transpose()?,
                 serde_json::to_string(&attempt.validation)?,
+                legacy_provider_text(attempt.planner_provider),
                 attempt.planner_provider.as_str(),
                 attempt.started_at.to_rfc3339(),
                 attempt.completed_at.to_rfc3339(),
@@ -381,13 +388,15 @@ impl Database {
         transaction.execute(
             "INSERT INTO planning_attempts(
                 attempt_id, revision_id, session_id, goal_message_id, planner_provider,
+                planner_provider_v2,
                 outcome, error_redacted, started_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 attempt.attempt_id.to_string(),
                 attempt.revision_id.to_string(),
                 attempt.session_id.to_string(),
                 attempt.goal_message_id.to_string(),
+                legacy_provider_text(attempt.planner_provider),
                 attempt.planner_provider.as_str(),
                 enum_text(&attempt.status)?,
                 attempt.error_redacted,
@@ -474,17 +483,48 @@ impl Database {
                     request.revision_id
                 ))
             })?;
+        let stored_authority = authority_from_validation(&revision.validation);
+        if stored_authority != request.authority {
+            return Err(StateError::InvalidRecord(
+                "graph approval authority does not match the sealed graph validation".to_owned(),
+            ));
+        }
 
-        if let Some((stored_hash, approved_by)) = transaction
+        if let Some((
+            stored_hash,
+            approved_by,
+            session_id,
+            requirement_revision_id,
+            validation_hash,
+            base_commit,
+        )) = transaction
             .query_row(
-                "SELECT proposal_hash, approved_by FROM graph_approvals WHERE revision_id = ?1",
+                "SELECT proposal_hash, approved_by, session_id, requirement_revision_id,
+                        validation_hash, base_commit
+                 FROM graph_approvals WHERE revision_id = ?1",
                 [request.revision_id.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
             )
             .optional()?
         {
             if stored_hash != request.expected_proposal_hash
                 || approved_by != request.approved_by.trim()
+                || session_id.as_deref() != Some(revision.session_id.to_string().as_str())
+                || request.authority.as_ref().is_some_and(|authority| {
+                    requirement_revision_id.as_deref()
+                        != Some(authority.requirement_revision_id.to_string().as_str())
+                        || validation_hash.as_deref() != Some(authority.validation_hash.as_str())
+                        || base_commit.as_deref() != Some(authority.base_commit.as_str())
+                })
             {
                 return Err(StateError::InvalidRecord(
                     "graph approval replay does not match the stored approval".to_owned(),
@@ -591,8 +631,8 @@ impl Database {
             transaction.execute(
                 "INSERT INTO session_tasks(
                     session_id, revision_id, task_id, node_key, display_order,
-                    provider_id, model_profile
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    provider_id, provider_id_v2, model_profile
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     proposal.session_id.to_string(),
                     proposal.revision_id.to_string(),
@@ -601,6 +641,7 @@ impl Database {
                     i64::try_from(index + 1).map_err(|_| StateError::InvalidRecord(
                         "graph has too many nodes".to_owned()
                     ))?,
+                    legacy_provider_text(provider),
                     provider.as_str(),
                     enum_text(&node.profile)?,
                 ],
@@ -633,13 +674,28 @@ impl Database {
             }
         }
         transaction.execute(
-            "INSERT INTO graph_approvals(revision_id, proposal_hash, approved_by, approved_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO graph_approvals(
+                revision_id, proposal_hash, approved_by, approved_at, session_id,
+                requirement_revision_id, validation_hash, base_commit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 request.revision_id.to_string(),
                 request.expected_proposal_hash,
                 request.approved_by.trim(),
                 request.approved_at.to_rfc3339(),
+                revision.session_id.to_string(),
+                request
+                    .authority
+                    .as_ref()
+                    .map(|authority| authority.requirement_revision_id.to_string()),
+                request
+                    .authority
+                    .as_ref()
+                    .map(|authority| &authority.validation_hash),
+                request
+                    .authority
+                    .as_ref()
+                    .map(|authority| &authority.base_commit),
             ],
         )?;
         transaction.execute(
@@ -771,7 +827,8 @@ fn graph_revision_by_id(
     let row = connection
         .query_row(
             "SELECT revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
-                    proposal_json, validation_json, planner_provider, created_at, completed_at
+                    proposal_json, validation_json, coalesce(planner_provider_v2, planner_provider),
+                    created_at, completed_at
              FROM graph_revisions WHERE revision_id = ?1",
             [revision_id.to_string()],
             |row| {
@@ -828,7 +885,7 @@ pub(crate) fn graph_projection(
         StateError::InvalidRecord("graph head references a missing revision".to_owned())
     })?;
     let mut task_statement = connection.prepare(
-        "SELECT task_id, node_key, display_order, provider_id, model_profile
+        "SELECT task_id, node_key, display_order, coalesce(provider_id_v2, provider_id), model_profile
          FROM session_tasks WHERE revision_id = ?1 ORDER BY display_order",
     )?;
     let tasks = task_statement
@@ -1005,6 +1062,14 @@ fn enum_text(value: &impl Serialize) -> StateResult<String> {
         .as_str()
         .map(ToOwned::to_owned)
         .ok_or_else(|| StateError::InvalidRecord("expected enum string".to_owned()))
+}
+
+const fn legacy_provider_text(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Gemini => "gemini",
+        ProviderId::Agy | ProviderId::Codex => "codex",
+        ProviderId::Claude => "claude",
+    }
 }
 
 fn parse_enum<T: for<'de> Deserialize<'de>>(label: &str, value: &str) -> StateResult<T> {

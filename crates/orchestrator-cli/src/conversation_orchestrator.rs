@@ -87,6 +87,7 @@ impl OfficialCliConversationOrchestrator {
                 "needs_attention",
             ],
             required_output: "Return exactly one ConversationOutcome JSON object and no fences or prose",
+            requirements_contract: "Requirement snapshots use objective, in_scope, out_of_scope, constraints, acceptance_criteria, verification_plan, risks, and open_questions. Each verification_plan item is {executable,args}; never return shell command strings or shell interpreters.",
             timeout_seconds,
             stdout_limit: CONVERSATION_MAX_OUTPUT_BYTES,
         })
@@ -129,6 +130,7 @@ struct ConversationPrompt<'a> {
     repository_summary_redacted: &'a str,
     allowed_outcomes: [&'static str; 4],
     required_output: &'static str,
+    requirements_contract: &'static str,
     timeout_seconds: u64,
     stdout_limit: usize,
 }

@@ -454,6 +454,21 @@ fn approval_confirmation_lines(
                 .as_deref()
                 .unwrap_or("compatibility plan")
         )),
+        Line::from(format!("objective   {}", plan.objective)),
+        Line::from(format!("in scope    {}", list_or_none(&plan.in_scope))),
+        Line::from(format!("out of scope {}", list_or_none(&plan.out_of_scope))),
+        Line::from(format!(
+            "acceptance  {}",
+            list_or_none(&plan.acceptance_criteria)
+        )),
+        Line::from(format!(
+            "verification {}",
+            list_or_none(&plan.verification_commands)
+        )),
+        Line::from(format!(
+            "Git root    {}",
+            plan.git_root_redacted.as_deref().unwrap_or("not sealed")
+        )),
         Line::from(format!(
             "base commit {}",
             plan.base_commit.as_deref().unwrap_or("not sealed")
@@ -467,6 +482,10 @@ fn approval_confirmation_lines(
             list_or_none(&plan.validation_checks)
         )),
         Line::from(format!("parallelism {}", plan.proposed_parallelism)),
+        Line::from(format!(
+            "approvals   {}",
+            list_or_none(&plan.required_approvals)
+        )),
         Line::from(format!("all risks    {}", list_or_none(&plan.risks))),
         Line::default(),
     ];
@@ -708,6 +727,11 @@ mod tests {
         snapshot.plan_approval = Some(PlanApprovalCard {
             revision_id: "revision-01".to_owned(),
             proposal_hash: "a".repeat(64),
+            objective: "Implement conversation-first approval".to_owned(),
+            in_scope: vec!["chat approval".to_owned()],
+            out_of_scope: vec!["automatic merge".to_owned()],
+            acceptance_criteria: vec!["tests pass".to_owned()],
+            verification_commands: vec!["cargo [\"test\"]".to_owned()],
             nodes: vec![PlanNodeSummary {
                 key: "ui".to_owned(),
                 title: "Chat UI".to_owned(),
@@ -726,8 +750,10 @@ mod tests {
             risks: vec!["concurrency".to_owned()],
             requirement_revision_id: Some("requirement-01".to_owned()),
             validation_hash: Some("b".repeat(64)),
+            git_root_redacted: Some("C:/repo".to_owned()),
             base_commit: Some("c".repeat(40)),
             validation_checks: vec!["git_ready".to_owned()],
+            required_approvals: vec!["exact validated graph approval".to_owned()],
         });
         let mut state = WorkspaceState::default();
         state.set_focus(FocusPane::Composer);

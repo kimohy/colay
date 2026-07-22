@@ -44,7 +44,10 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 
     let initial = database.migration_status()?;
     assert_eq!(initial.current_version, 1);
-    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(
+        initial.pending_versions,
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
 
     let dry_run = database.dry_run_migrations()?;
     assert_eq!(dry_run.current_version, STATE_SCHEMA_VERSION);
@@ -107,7 +110,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(backup_status.current_version, 1);
     assert_eq!(
         backup_status.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     );
     Ok(())
 }

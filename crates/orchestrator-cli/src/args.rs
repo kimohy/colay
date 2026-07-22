@@ -10,7 +10,7 @@ const fn selected_build_version(override_version: Option<&'static str>) -> &'sta
     }
 }
 
-const COLAY_VERSION: &str = selected_build_version(option_env!("COLAY_BUILD_VERSION"));
+pub(crate) const COLAY_VERSION: &str = selected_build_version(option_env!("COLAY_BUILD_VERSION"));
 
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -239,6 +239,7 @@ pub enum RollbackAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ProviderName {
     Gemini,
+    Agy,
     Codex,
     Claude,
 }
@@ -247,6 +248,7 @@ impl From<ProviderName> for ProviderId {
     fn from(value: ProviderName) -> Self {
         match value {
             ProviderName::Gemini => Self::Gemini,
+            ProviderName::Agy => Self::Agy,
             ProviderName::Codex => Self::Codex,
             ProviderName::Claude => Self::Claude,
         }
@@ -345,6 +347,30 @@ mod tests {
             Command::Profiles(ProfileArgs {
                 action: Some(ProfileAction::Reset(ProfileTargetArgs {
                     provider: ProviderName::Gemini,
+                    profile: ProfileName::Standard,
+                }))
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_agy_provider_management_and_profile_targets() -> Result<(), clap::Error> {
+        let provider = Cli::try_parse_from(["colay", "providers", "disable", "agy"])?;
+        assert!(matches!(
+            provider.command,
+            Command::Providers(ProviderArgs {
+                action: Some(ProviderAction::Disable {
+                    provider: ProviderName::Agy
+                })
+            })
+        ));
+        let profile = Cli::try_parse_from(["colay", "profiles", "reset", "agy", "standard"])?;
+        assert!(matches!(
+            profile.command,
+            Command::Profiles(ProfileArgs {
+                action: Some(ProfileAction::Reset(ProfileTargetArgs {
+                    provider: ProviderName::Agy,
                     profile: ProfileName::Standard,
                 }))
             })

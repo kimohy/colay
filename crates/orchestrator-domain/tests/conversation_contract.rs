@@ -1,18 +1,45 @@
+use std::collections::BTreeMap;
+
 use chrono::{TimeZone as _, Utc};
 use orchestrator_domain::{
-    ClientCommandAction, ConversationOutcome, GraphRevisionId, MessageId, ProviderId,
+    ClientCommandAction, ConversationOutcome, GraphRevisionId, MessageId, ModelProfile, ProviderId,
     RepoValidationEvidence, RequestConversationTurnCommandPayload, RequirementRevision,
     RequirementRevisionId, RequirementSnapshot, SchemaVersion, SessionId, SessionState,
+    VerificationCommand,
 };
 
 fn snapshot(open_questions: Vec<String>) -> RequirementSnapshot {
     RequirementSnapshot {
         objective: "make ordinary chat conversation-first".to_owned(),
+        in_scope: vec!["session-level conversation".to_owned()],
+        out_of_scope: vec!["automatic merge or push".to_owned()],
         constraints: vec!["do not create tasks before approval".to_owned()],
         acceptance_criteria: vec!["answer-only chat creates zero tasks".to_owned()],
-        verification_plan: vec!["cargo test --workspace --all-features".to_owned()],
+        verification_plan: vec![VerificationCommand {
+            executable: "cargo".to_owned(),
+            args: vec![
+                "test".to_owned(),
+                "--workspace".to_owned(),
+                "--all-features".to_owned(),
+            ],
+        }],
+        risks: vec!["stale approval".to_owned()],
         open_questions,
     }
+}
+
+#[test]
+fn candidate_verification_rejects_shell_interpolation() {
+    let mut candidate = snapshot(Vec::new());
+    candidate.verification_plan[0].executable = "cargo && git".to_owned();
+    assert!(
+        ConversationOutcome::WorktreeTaskCandidate {
+            response_redacted: "ready".to_owned(),
+            requirements: candidate,
+        }
+        .validate()
+        .is_err()
+    );
 }
 
 #[test]
@@ -111,10 +138,17 @@ fn repository_validation_evidence_is_sealable_approval_authority()
     let evidence = RepoValidationEvidence {
         schema_version: SchemaVersion::v1(),
         requirement_revision_id: RequirementRevisionId::new(),
+        requirement_snapshot_hash: "d".repeat(64),
         graph_revision_id: GraphRevisionId::new(),
         git_root_redacted: "C:/repo".to_owned(),
         base_commit: "a".repeat(40),
         eligible_providers: vec![ProviderId::Codex],
+        eligible_profiles: vec![ModelProfile::Standard],
+        max_parallel_workers: 2,
+        per_provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+        normalized_write_scopes: vec!["crates/orchestrator-domain".to_owned()],
+        verification_plan: snapshot(Vec::new()).verification_plan,
+        required_approvals: vec!["exact validated graph approval".to_owned()],
         checks: vec!["git_ready".to_owned(), "graph_valid".to_owned()],
         validated_at: Utc
             .with_ymd_and_hms(2026, 7, 22, 9, 1, 0)

@@ -44,10 +44,10 @@ use orchestrator_providers::{
 };
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
-    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, Database, EffectiveConfig, EventLog,
-    LeaseRenewal, MigratableConfigDocument, OrchestratorConfig, ProviderConfig,
-    RepositoryStatePaths as StatePaths, RootConfig, StateError, WorkerLease, WorkerLeaseMode,
-    WorkerLeaseRequest, load_effective_config,
+    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, DaemonStatus, Database,
+    EffectiveConfig, EventLog, LeaseRenewal, MigratableConfigDocument, OrchestratorConfig,
+    ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig, StateError, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest, load_effective_config,
 };
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -457,13 +457,16 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
         "runtime",
         true,
         json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "executable": executable,
+            "version": crate::args::COLAY_VERSION,
+            "executable": &executable,
             "invoked_as": std::env::args_os().next(),
             "target_os": std::env::consts::OS,
             "target_arch": std::env::consts::ARCH,
         }),
     ));
+    if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
+        checks.push(Check::warn("wsl_mixed_git_checkout", warning));
+    }
     let config = effective.config();
     {
         let redaction = process_redaction(&config.orchestrator);
@@ -477,6 +480,10 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
                         "database",
                         health.integrity_ok,
                         json!(health),
+                    ));
+                    checks.push(daemon_runtime_check(
+                        &database.daemon_status(Utc::now())?,
+                        &executable,
                     ));
                     if state.events.exists() {
                         let reconciliation = EventLog::open(&state.events)?.reconcile(&database)?;
@@ -533,6 +540,60 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
             checks,
             inference_requests: 0,
         },
+    )
+}
+
+fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Check {
+    let (status, detail) = match daemon_status {
+        DaemonStatus::Online(instance)
+        | DaemonStatus::Booting(instance)
+        | DaemonStatus::Probing(instance) => {
+            let version_matches =
+                instance.build_version.as_deref() == Some(crate::args::COLAY_VERSION);
+            let executable_matches =
+                instance
+                    .executable_path
+                    .as_deref()
+                    .is_some_and(|daemon_executable| {
+                        let daemon = Path::new(daemon_executable);
+                        if cfg!(windows) {
+                            daemon
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&executable.to_string_lossy())
+                        } else {
+                            daemon == executable
+                        }
+                    });
+            if version_matches && executable_matches {
+                (
+                    CheckStatus::Pass,
+                    "daemon runtime matches this CLI".to_owned(),
+                )
+            } else {
+                (
+                    CheckStatus::Warn,
+                    "daemon executable or build version differs from this CLI; restart the repository daemon with the intended Colay binary".to_owned(),
+                )
+            }
+        }
+        DaemonStatus::Stopped => (
+            CheckStatus::Warn,
+            "repository daemon is stopped; start it to compare runtime identity".to_owned(),
+        ),
+        DaemonStatus::Failed(_) | DaemonStatus::Stale(_) => (
+            CheckStatus::Warn,
+            "repository daemon is failed or stale; restart it before writable execution".to_owned(),
+        ),
+    };
+    Check::with_status_data(
+        "daemon_runtime",
+        status,
+        detail,
+        json!({
+            "current_executable": executable,
+            "current_version": crate::args::COLAY_VERSION,
+            "status": daemon_status,
+        }),
     )
 }
 
@@ -5422,6 +5483,7 @@ fn parse_provider_id(value: &str) -> Result<ProviderId> {
 fn parse_provider_name(value: &str) -> Result<crate::args::ProviderName> {
     match value.to_ascii_lowercase().as_str() {
         "gemini" => Ok(crate::args::ProviderName::Gemini),
+        "agy" => Ok(crate::args::ProviderName::Agy),
         "codex" => Ok(crate::args::ProviderName::Codex),
         "claude" => Ok(crate::args::ProviderName::Claude),
         _ => bail!("unknown approved provider `{value}`"),
@@ -6852,6 +6914,38 @@ impl Check {
             data: Some(data),
         }
     }
+
+    fn with_status_data(
+        name: impl Into<String>,
+        status: CheckStatus,
+        detail: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status,
+            detail: Some(detail.into()),
+            data: Some(data),
+        }
+    }
+}
+
+fn mixed_git_checkout_warning(repository: &Path, target_os: &str) -> Option<String> {
+    if target_os != "linux" {
+        return None;
+    }
+    let path = repository.to_string_lossy().replace('\\', "/");
+    let remainder = path.strip_prefix("/mnt/")?;
+    let mut components = remainder.split('/');
+    let drive = components.next()?;
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() || components.next().is_none()
+    {
+        return None;
+    }
+    Some(
+        "repository is on a Windows-mounted /mnt/<drive> path; Windows Git and WSL Git may report mass line-ending changes. Use a WSL-native clone under the Linux filesystem for Linux Colay, or use Windows Colay with the Windows checkout."
+            .to_owned(),
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -6910,9 +7004,9 @@ mod tests {
     use super::{
         ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
         acquire_task_coordinator, acquire_worker_lease, block_for_unconfirmed_termination,
-        initialize, load_config_runtime, provider_adapter, reset_model_profile,
-        rollback_resolution_context, run_with_coordinator_renewal, run_worker, set_model_profile,
-        set_provider_enabled, trusted_rollback_steps, worker_started_payload,
+        initialize, load_config_runtime, mixed_git_checkout_warning, provider_adapter,
+        reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
+        set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
 
     fn test_state(root: PathBuf) -> StatePaths {
@@ -6926,6 +7020,16 @@ mod tests {
             worktrees: root.join("worktrees"),
             root,
         }
+    }
+
+    #[test]
+    fn linux_mounted_windows_checkout_warns_about_mixed_git_line_endings() {
+        let warning = mixed_git_checkout_warning(Path::new("/mnt/c/work/project"), "linux")
+            .unwrap_or_default();
+        assert!(warning.contains("WSL-native clone"));
+        assert!(warning.contains("line-ending"));
+        assert!(mixed_git_checkout_warning(Path::new("/home/user/project"), "linux").is_none());
+        assert!(mixed_git_checkout_warning(Path::new("C:/work/project"), "windows").is_none());
     }
 
     fn write_fake_executable(path: &Path, bytes: &[u8]) -> Result<()> {

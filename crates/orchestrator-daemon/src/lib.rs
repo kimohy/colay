@@ -95,6 +95,10 @@ pub async fn serve_with_commands(
         started_at,
         ttl: settings.lease_ttl,
     })?;
+    database.reconcile_interrupted_conversation_attempts(
+        started_at,
+        "conversation attempt was interrupted before daemon startup",
+    )?;
     database.recover_stale_client_commands(started_at)?;
     database.reconcile_interrupted_integrations(started_at)?;
     serve_with_commands_on_owned_lease(database, instance_id, cancellation, settings, redactor)
@@ -219,16 +223,23 @@ async fn serve_with_runtime(
     acquire_lease: bool,
 ) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
+    let started_at = Utc::now();
     if acquire_lease {
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id,
             pid,
-            started_at: Utc::now(),
+            started_at,
             ttl: settings.lease_ttl,
         })?;
     } else {
-        database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
+        database.heartbeat_daemon(instance_id, started_at, settings.lease_ttl)?;
     }
+    database.reconcile_interrupted_conversation_attempts(
+        started_at,
+        "conversation attempt was interrupted before daemon startup",
+    )?;
+    database.recover_stale_client_commands(started_at)?;
+    database.reconcile_interrupted_integrations(started_at)?;
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut command_interval = tokio::time::interval(settings.command_poll_interval);
@@ -290,6 +301,10 @@ async fn serve_with_runtime(
         job.abort();
         let _ = job.await;
     }
+    database.reconcile_interrupted_conversation_attempts(
+        Utc::now(),
+        "conversation attempt was interrupted by daemon shutdown",
+    )?;
     execution::stop_execution_jobs(&execution_cancellation, execution_jobs).await?;
     database.release_daemon(instance_id, Utc::now())?;
     Ok(exit)

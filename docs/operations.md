@@ -20,7 +20,7 @@ compiled defaults
 
 The personal `$COLAY_HOME` layer and `$COLAY_CONFIG` provide configuration inputs only. The effective `state_dir` is constrained beneath the repository, so task state remains repository-local. When neither explicit selector is used, Colay discovers either `.colay/config.toml` or the legacy `.codex/orchestrator/config.toml` without moving live state. If both are present, automatic resolution fails closed; use `--config` to select one explicitly.
 
-`colay doctor` performs only non-inference checks: config validation, SQLite integrity/schema health when the database exists, event-log reconciliation when the log exists, and `<provider> --version` for configured CLIs. Only a successful provider version check includes structured configured-executable, resolved-executable, and executable-kind evidence. Failed resolution, spawn, or nonzero version checks report their detail without that structured evidence. Doctor does not prove sandbox behavior or start a model turn.
+`colay doctor` performs only non-inference checks: config validation, current native executable/build/target identity, SQLite integrity/schema health when the database exists, event-log reconciliation when the log exists, active repository-daemon executable/build identity, and `<provider> --version` for configured CLIs. A CLI/daemon identity mismatch is a warning that requires stopping and restarting the daemon with the intended binary. Only a successful provider version check includes structured configured-executable, resolved-executable, and executable-kind evidence. Failed resolution, spawn, or nonzero version checks report their detail without that structured evidence. Doctor does not prove sandbox behavior or start a model turn.
 
 Executable resolution is platform-specific but shared by diagnostics and execution. On Windows, a bare executable name is searched through the effective `PATH` using only `.exe`, `.com`, `.cmd`, and `.bat` entries from `PATHEXT`, in `PATHEXT` order; matching is case-insensitive and `.cmd`/`.bat` are reported as command scripts. A bare Unix name must be a regular file with an executable permission bit. An explicit path is resolved from the working directory when relative, and a missing explicit path does not fall back to `PATH`.
 
@@ -43,6 +43,12 @@ If a normal run reports that the directory is not a Git repository, move to the 
 repository. If it reports that the repository has no base commit, review the intended initial file
 set and create an initial commit. Do not use a broad `git add .` in an arbitrary parent workspace:
 it can capture credentials, dependency directories, or nested repositories.
+
+On WSL, prefer a Linux-native clone under the distribution filesystem (for example
+`~/workspace/project`) for Linux Colay. `doctor` warns when the active checkout is under
+`/mnt/<drive>/...` because Windows Git and WSL Git can apply different line-ending and permission
+rules to the same files. Use Windows Colay with Windows Git for a Windows checkout; do not alternate
+Windows and WSL Git against one working tree. Review `git status --short` before writable approval.
 
 `status`, `usage`, `providers`, `explain-routing`, and `compatibility` support
 global `--json`. `colay tui [task-id]` opens the durable chat workspace and
@@ -73,7 +79,7 @@ Ctrl+O            overview
 Ctrl+L            full log
 Ctrl+T            explicit composer target
 ?                 help
-/plan             plan the newest session-level user goal (read-only)
+/plan             revalidate the newest complete requirement (read-only)
 /integrate        build a read-only sealed result preview
 /approve          confirm the exact current graph or integration hash
 /resolve          create one task for a resolvable integration conflict
@@ -84,9 +90,11 @@ Task selection never changes the composer target. `@task-<id>` is a one-message
 override that atomically records an ordered instruction for that graph task.
 `@all` fans the same redacted instruction out into separate durable rows for
 every current non-terminal graph task, preserving per-task audit identity.
-`/plan` is the explicit compatibility action for the newest final session-level
-user message; complete conversation candidates queue the same durable read-only
-planning request automatically. The plan card shows its requirement revision,
+`/plan` is an explicit compatibility trigger for the newest final session-level
+user message, but it cannot bypass the provider interview or manufacture approval
+authority. It succeeds only when the latest immutable requirement revision is complete;
+complete conversation candidates queue the same durable read-only planning request
+automatically. The plan card shows its requirement revision,
 validation hash, base commit, validation checks, revision, SHA-256 proposal
 hash, ordered nodes, dependencies, scopes, providers/profiles, risks, and
 parallelism. `/approve` is enabled only for the validated current requirement
@@ -101,9 +109,12 @@ dependency-ready tasks subject to `max_parallel_workers`, optional
 claim creates one isolated worktree and one provider attempt. A task completes
 only after checkpoint sealing and verification; failure releases its claim and
 does not cancel an independent sibling. An invalid plan is retained with a
-redacted attention error and no approvable hash. Re-run `/plan` after correcting
-the goal to create a new revision; earlier revisions remain historical.
-`/retry` still fails visibly as unavailable.
+redacted attention error and no approvable hash. Send a correcting message so the
+interview creates a new requirement revision, then allow automatic planning or re-run
+`/plan`; earlier revisions remain historical. Chat `/retry` still fails visibly as
+unavailable. A persisted non-terminal task that stopped after reaching `planned` is
+restarted explicitly with `colay resume <task-id>`; this reuses its task identity and
+creates at most one managed worktree instead of materializing a duplicate task.
 
 After intended graph tasks complete, `/integrate` recomputes managed Git
 snapshots and sealed checkpoint/verification evidence. The preview card shows

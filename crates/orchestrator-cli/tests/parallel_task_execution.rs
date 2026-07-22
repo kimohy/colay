@@ -195,6 +195,7 @@ fn seed_approved_graph(
     let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: graph.proposal.revision_id,
         expected_proposal_hash: graph.proposal_hash,
+        authority: None,
         approved_by: "parallel-e2e".to_owned(),
         approved_at: Utc::now(),
     })?;

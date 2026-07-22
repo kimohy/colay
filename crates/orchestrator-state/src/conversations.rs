@@ -5,7 +5,7 @@ use orchestrator_domain::{
     ConversationAttemptId, ConversationOutcome, MessageId, ProviderId, RequirementRevision,
     RequirementRevisionId, RequirementSnapshot, SchemaVersion, SessionId,
 };
-use rusqlite::{OptionalExtension as _, Row, params};
+use rusqlite::{OptionalExtension as _, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{Database, StateError, StateResult};
@@ -130,6 +130,62 @@ impl Database {
                 StateError::InvalidRecord("completed conversation attempt is missing".to_owned())
             })
         })
+    }
+
+    pub fn reconcile_interrupted_conversation_attempts(
+        &self,
+        completed_at: DateTime<Utc>,
+        error_redacted: &str,
+    ) -> StateResult<Vec<ConversationAttemptId>> {
+        if error_redacted.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "interrupted conversation evidence must not be blank".to_owned(),
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT attempt_id FROM conversation_attempts
+                 WHERE status = 'running' ORDER BY started_at, attempt_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|value| parse_id("attempt_id", &value))
+                .collect::<StateResult<Vec<ConversationAttemptId>>>()?
+        };
+        for attempt_id in &attempt_ids {
+            let changed = transaction.execute(
+                "UPDATE conversation_attempts
+                 SET status = 'failed', error_redacted = ?1, completed_at = ?2
+                 WHERE attempt_id = ?3 AND status = 'running'",
+                params![
+                    error_redacted.trim(),
+                    completed_at.to_rfc3339(),
+                    attempt_id.to_string(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StateError::OptimisticConflict {
+                    entity: format!("conversation attempt {attempt_id}"),
+                });
+            }
+            transaction.execute(
+                "UPDATE client_commands
+                 SET state = 'failed', completed_at = ?1, outcome = ?2
+                 WHERE command_id = ?3 AND action = 'request_conversation_turn'
+                 AND state IN ('pending', 'claimed')",
+                params![
+                    completed_at.to_rfc3339(),
+                    error_redacted.trim(),
+                    attempt_id.to_string(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(attempt_ids)
     }
 
     pub fn record_requirement_revision(

@@ -68,10 +68,17 @@ pub struct PlanNodeSummary {
 pub struct PlanApprovalCard {
     pub revision_id: String,
     pub proposal_hash: String,
+    pub objective: String,
+    pub in_scope: Vec<String>,
+    pub out_of_scope: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub verification_commands: Vec<String>,
     pub requirement_revision_id: Option<String>,
     pub validation_hash: Option<String>,
+    pub git_root_redacted: Option<String>,
     pub base_commit: Option<String>,
     pub validation_checks: Vec<String>,
+    pub required_approvals: Vec<String>,
     pub nodes: Vec<PlanNodeSummary>,
     pub proposed_parallelism: usize,
     pub risks: Vec<String>,
@@ -96,12 +103,32 @@ impl PlanApprovalCard {
                 if !requirement.trim().is_empty()
                     && valid_hex(validation, 64, 64)
                     && valid_hex(base_commit, 40, 64)
+                    && !self.objective.trim().is_empty()
+                    && !self.in_scope.is_empty()
+                    && !self.acceptance_criteria.is_empty()
+                    && !self.verification_commands.is_empty()
+                    && self
+                        .git_root_redacted
+                        .as_deref()
+                        .is_some_and(|root| !root.trim().is_empty())
                     && !self.validation_checks.is_empty()
                     && self
                         .validation_checks
                         .iter()
                         .all(|check| !check.trim().is_empty()) => {}
             _ => return Err(WorkspaceModelError::InvalidPlanValidationAuthority),
+        }
+        if self
+            .in_scope
+            .iter()
+            .chain(&self.out_of_scope)
+            .chain(&self.acceptance_criteria)
+            .chain(&self.verification_commands)
+            .chain(&self.required_approvals)
+            .chain(&self.risks)
+            .any(|item| item.trim().is_empty())
+        {
+            return Err(WorkspaceModelError::InvalidPlanValidationAuthority);
         }
         let mut node_keys = HashSet::with_capacity(self.nodes.len());
         for node in &self.nodes {

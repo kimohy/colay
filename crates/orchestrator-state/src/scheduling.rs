@@ -321,7 +321,8 @@ fn ensure_daemon_owner(
 fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRecord>> {
     let mut statement = transaction.prepare(
         "SELECT st.session_id, st.revision_id, st.task_id, st.node_key, st.display_order,
-                st.provider_id, st.model_profile, t.state, t.paused, t.task_envelope_json,
+                coalesce(st.provider_id_v2, st.provider_id), st.model_profile,
+                t.state, t.paused, t.task_envelope_json,
                 t.created_at
          FROM session_tasks st
          JOIN tasks t ON t.task_id = st.task_id
