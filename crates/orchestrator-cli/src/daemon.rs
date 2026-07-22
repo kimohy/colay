@@ -203,6 +203,7 @@ fn startup_timeout(config: &RootConfig) -> Duration {
     probe_budget.saturating_add(STARTUP_MARGIN)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> {
     let paths = RepositoryStatePaths::from_config(repository, config)?;
     let repository_root = std::fs::canonicalize(repository)?;
@@ -290,7 +291,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                 &startup_heartbeat,
                 &signal_task,
                 redactor.as_ref(),
-                error.into(),
+                &error,
             );
         }
     };
@@ -303,7 +304,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                 &startup_heartbeat,
                 &signal_task,
                 redactor.as_ref(),
-                error.into(),
+                &error,
             );
         }
     };
@@ -346,7 +347,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                     instance_id,
                     &signal_task,
                     redactor.as_ref(),
-                    anyhow::anyhow!("daemon startup heartbeat stopped unexpectedly"),
+                    &anyhow::anyhow!("daemon startup heartbeat stopped unexpectedly"),
                 );
             }
             Ok(Err(error)) => {
@@ -355,7 +356,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                     instance_id,
                     &signal_task,
                     redactor.as_ref(),
-                    error,
+                    &error,
                 );
             }
             Err(error) => {
@@ -364,7 +365,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                     instance_id,
                     &signal_task,
                     redactor.as_ref(),
-                    anyhow::anyhow!("daemon startup heartbeat task failed: {error}"),
+                    &anyhow::anyhow!("daemon startup heartbeat task failed: {error}"),
                 );
             }
         }
@@ -417,7 +418,7 @@ fn fail_startup(
     startup_heartbeat: &tokio::task::JoinHandle<Result<()>>,
     signal_task: &tokio::task::JoinHandle<()>,
     redactor: &dyn MessageRedactor,
-    error: anyhow::Error,
+    error: &dyn std::fmt::Display,
 ) -> Result<()> {
     startup_heartbeat.abort();
     fail_startup_without_heartbeat(database, instance_id, signal_task, redactor, error)
@@ -428,7 +429,7 @@ fn fail_startup_without_heartbeat(
     instance_id: DaemonInstanceId,
     signal_task: &tokio::task::JoinHandle<()>,
     redactor: &dyn MessageRedactor,
-    error: anyhow::Error,
+    error: &dyn std::fmt::Display,
 ) -> Result<()> {
     let diagnostic = redactor.redact(&error.to_string());
     database.transition_daemon_phase(instance_id, DaemonPhase::Failed, Some(&diagnostic))?;
@@ -593,51 +594,36 @@ mod tests {
 
     use super::fail_and_release_spawned_lease;
 
-    fn database() -> Database {
-        let database =
-            Database::open_in_memory().unwrap_or_else(|error| panic!("database: {error}"));
-        database
-            .migrate_with_backup(std::path::Path::new("unused"))
-            .unwrap_or_else(|error| panic!("migrations: {error}"));
-        database
+    fn database() -> Result<Database, Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        Ok(database)
     }
 
     #[test]
-    fn timeout_cleanup_fails_and_releases_only_the_spawned_pid() {
-        let database = database();
+    fn timeout_cleanup_fails_and_releases_only_the_spawned_pid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database()?;
         let instance_id = DaemonInstanceId::new();
-        database
-            .acquire_daemon_startup_lease(&DaemonLeaseRequest {
-                instance_id,
-                pid: 42,
-                started_at: Utc::now(),
-                ttl: TimeDelta::seconds(5),
-            })
-            .unwrap_or_else(|error| panic!("startup lease: {error}"));
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: TimeDelta::seconds(5),
+        })?;
 
-        fail_and_release_spawned_lease(&database, 43, "wrong owner")
-            .unwrap_or_else(|error| panic!("non-owner cleanup: {error}"));
+        fail_and_release_spawned_lease(&database, 43, "wrong owner")?;
         assert!(matches!(
-            database
-                .daemon_status(Utc::now())
-                .unwrap_or_else(|error| panic!("status: {error}")),
+            database.daemon_status(Utc::now())?,
             DaemonStatus::Booting(_)
         ));
 
-        fail_and_release_spawned_lease(&database, 42, "bounded timeout")
-            .unwrap_or_else(|error| panic!("owner cleanup: {error}"));
+        fail_and_release_spawned_lease(&database, 42, "bounded timeout")?;
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
         assert_eq!(
-            database
-                .daemon_status(Utc::now())
-                .unwrap_or_else(|error| panic!("status: {error}")),
-            DaemonStatus::Stopped
-        );
-        assert_eq!(
-            database
-                .daemon_startup_diagnostic_for_pid(42)
-                .unwrap_or_else(|error| panic!("diagnostic: {error}"))
-                .as_deref(),
+            database.daemon_startup_diagnostic_for_pid(42)?.as_deref(),
             Some("bounded timeout")
         );
+        Ok(())
     }
 }
