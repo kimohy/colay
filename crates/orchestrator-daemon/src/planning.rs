@@ -36,6 +36,9 @@ pub async fn process_next_orchestration_command(
         ClientCommandAction::RequestPlan => {
             request_plan(database, services, redactor, &command, now).await
         }
+        ClientCommandAction::RequestConversationTurn => Err(ExecutionError::Rejected(
+            "conversation orchestration is not enabled".to_owned(),
+        )),
         ClientCommandAction::ApproveGraph => approve_graph(database, &command, now),
         ClientCommandAction::ReviseGraph | ClientCommandAction::CancelPlan => Err(
             ExecutionError::Rejected("revise/cancel planning commands are not enabled".to_owned()),

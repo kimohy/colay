@@ -121,7 +121,13 @@ impl AdapterRuntime for FakeAdapterRuntime {
         invocation: PreparedInvocation,
     ) -> Result<WorkerHandle, ProviderError> {
         self.ensure_fake(&invocation.executable)?;
-        let lines = scenario_lines(provider, self.scenario);
+        let lines = if request.objective == "Conduct a read-only conversation turn"
+            && self.scenario == FakeRuntimeScenario::Success
+        {
+            conversation_lines(provider, &request.prompt)
+        } else {
+            scenario_lines(provider, self.scenario)
+        };
         let mut events = lines
             .into_iter()
             .enumerate()
@@ -376,6 +382,74 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
     lines
         .into_iter()
         .map(|line| line.as_bytes().to_vec())
+        .collect()
+}
+
+fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
+    let prompt: serde_json::Value = serde_json::from_str(prompt).unwrap_or_default();
+    let transcript = prompt
+        .get("transcript_redacted")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let outcome = if transcript.contains("needs-info") {
+        serde_json::json!({
+            "outcome": "more_information_needed",
+            "response_redacted": "Which crate and acceptance boundary should be used?",
+            "requirements": {
+                "objective": "clarify the requested change",
+                "constraints": ["no task before approval"],
+                "acceptance_criteria": [],
+                "verification_plan": [],
+                "open_questions": ["Which crate should change?"]
+            }
+        })
+    } else if transcript.contains("candidate") {
+        serde_json::json!({
+            "outcome": "worktree_task_candidate",
+            "response_redacted": "The requirement is ready for deterministic validation.",
+            "requirements": {
+                "objective": "implement the approved candidate",
+                "constraints": ["no task before approval"],
+                "acceptance_criteria": ["fake integration test passes"],
+                "verification_plan": ["cargo test --workspace --all-features"],
+                "open_questions": []
+            }
+        })
+    } else if transcript.contains("attention") {
+        serde_json::json!({
+            "outcome": "needs_attention",
+            "response_redacted": "The provider could not classify this turn.",
+            "evidence_redacted": "fake attention fixture"
+        })
+    } else {
+        serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Git is needed only after an approved writable task candidate."
+        })
+    };
+    let text = serde_json::to_string(&outcome).unwrap_or_default();
+    let lines = match provider {
+        ProviderId::Codex => vec![
+            serde_json::json!({"type":"thread.started","thread_id":"fake-conversation"}),
+            serde_json::json!({"type":"turn.started"}),
+            serde_json::json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":text}}),
+            serde_json::json!({"type":"turn.completed","usage":{}}),
+        ],
+        ProviderId::Claude => vec![
+            serde_json::json!({"type":"system","subtype":"init","session_id":"fake-conversation"}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
+            serde_json::json!({"type":"result","is_error":false,"result":text}),
+        ],
+        ProviderId::Gemini => vec![
+            serde_json::json!({"type":"init","session_id":"fake-conversation"}),
+            serde_json::json!({"type":"message","role":"assistant","content":text}),
+            serde_json::json!({"type":"result","result":text}),
+        ],
+        ProviderId::Agy => return vec![text.into_bytes()],
+    };
+    lines
+        .into_iter()
+        .map(|line| serde_json::to_vec(&line).unwrap_or_default())
         .collect()
 }
 

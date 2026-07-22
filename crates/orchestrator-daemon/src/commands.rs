@@ -69,7 +69,8 @@ fn execute_command(
         ClientCommandAction::StopDaemon => Err(CommandExecutionError::Rejected(
             "stop command requires daemon lease reconciliation",
         )),
-        ClientCommandAction::RequestPlan
+        ClientCommandAction::RequestConversationTurn
+        | ClientCommandAction::RequestPlan
         | ClientCommandAction::ApproveGraph
         | ClientCommandAction::ReviseGraph
         | ClientCommandAction::CancelPlan
