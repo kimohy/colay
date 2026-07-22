@@ -62,6 +62,12 @@ colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity
 colay tui [task-id]
 ```
 
+`colay run` is the direct writable-task compatibility path. Before creating `.colay` state or a
+task, it requires a Git repository with a valid base commit and no unresolved merge, rebase,
+cherry-pick, revert, or bisect operation. A non-Git directory and an unborn `HEAD` return distinct
+actionable errors without leaving a `planned` task. `run --plan-only` remains a static persisted
+assessment; it does not invoke a provider and is not the conversation-first interview mode.
+
 `colay tui` is the primary durable chat workspace. It starts or reconnects to
 the repository daemon, restores the latest session and selected task, and shows
 a text-only task list, conversation timeline, inspector, attention queue, and
@@ -148,6 +154,6 @@ compiled defaults
 
 `COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Configuration files are partial overrides: tables merge by key, while arrays replace the lower-precedence array rather than concatenate. Every loaded file must declare the supported `config_version`. Absent automatic layers are ignored, but normal runtime commands fail when an explicitly selected `$COLAY_CONFIG` or `--config` file is missing. `init` is the creation-path exception: it treats a missing explicit selector as the destination for its new minimal override.
 
-Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely. Other read-only commands do not create repository state, but the first `run`—including `run --plan-only`—initializes and persists repository state. Start from [`config.example.toml`](config.example.toml).
+Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely. Other read-only commands do not create repository state. `run --plan-only` initializes its persisted static assessment state; a normal `run` does so only after Git readiness succeeds. Start from [`config.example.toml`](config.example.toml).
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.

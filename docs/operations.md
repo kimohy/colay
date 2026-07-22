@@ -2,7 +2,7 @@
 
 ## Initialize and diagnose
 
-Run `colay init` once in the repository. It writes a minimal versioned override (rather than a materialized copy of every default), creates `.colay`, migrates a new SQLite database to the current schema, and creates/reconciles `events.jsonl`. Initialization does not invoke a provider. Other read-only commands do not create repository state; the first `colay run`, including `run --plan-only`, creates and persists repository state safely if it is absent.
+Run `colay init` once in the repository. It writes a minimal versioned override (rather than a materialized copy of every default), creates `.colay`, migrates a new SQLite database to the current schema, and creates/reconciles `events.jsonl`. Initialization does not invoke a provider. Other read-only commands do not create repository state. `run --plan-only` creates persisted static-assessment state if it is absent; a normal `colay run` creates state only after Git readiness succeeds.
 
 ## Configuration resolution
 
@@ -37,7 +37,12 @@ When `.colay/config.toml` is absent, Colay can continue using a legacy `.codex/o
 
 ## Running and inspecting tasks
 
-Use `run --plan-only` to persist an assessment and routing decision without creating a worktree or invoking a provider. A normal writable run creates a task branch/worktree, runs a bounded worker, checkpoints Git evidence, and independently verifies the result before completion.
+Use `run --plan-only` to persist an assessment and routing decision without creating a worktree or invoking a provider. It is a static compatibility command, not the conversation-first provider interview. A normal writable run first resolves the repository root, verifies `HEAD^{commit}`, and rejects unresolved Git operations before it creates `.colay` state or a task. It then creates a task branch/worktree, runs a bounded worker, checkpoints Git evidence, and independently verifies the result before completion.
+
+If a normal run reports that the directory is not a Git repository, move to the intended project
+repository. If it reports that the repository has no base commit, review the intended initial file
+set and create an initial commit. Do not use a broad `git add .` in an arbitrary parent workspace:
+it can capture credentials, dependency directories, or nested repositories.
 
 `status`, `usage`, `providers`, `explain-routing`, and `compatibility` support
 global `--json`. `colay tui [task-id]` opens the durable chat workspace and

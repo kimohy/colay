@@ -22,13 +22,14 @@
 | `WSL-001` | medium | workaround-confirmed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | open | daemon start timeout 이후 child가 살아남아 뒤늦게 lease 획득 |
 | `WSL-003` | high | open | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
-| `WSL-004` | high | open | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
-| `WSL-005` | high | open | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
+| `WSL-004` | high | fixed | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
+| `WSL-005` | high | fixed | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
 | `WSL-006` | medium | workaround-confirmed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
 | `WSL-007` | low | open | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | open | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WIN-001` | medium | workaround-confirmed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | open | Windows nightly PE에 Authenticode 서명이 없어 OS 신뢰 체인이 없음 |
+| `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부가 1회 발생한 플래이크 |
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 
@@ -172,6 +173,17 @@ fatal: not a git repository (or any of the parent directories): .git
 - 사용자 오류는 `colay run must be executed inside a Git repository`처럼 제품 문맥으로
   변환하고 실행한 Git argv와 안전한 cwd를 진단 데이터로 남긴다.
 
+### 수정 구현
+
+- `codex/fix-git-readiness-preflight`에서 read-only Git readiness 검사를 추가했다.
+- direct `colay run`은 `.colay` state와 task를 만들기 전에 repository root와
+  `HEAD^{commit}`을 검사한다.
+- non-Git 상태는 `direct task execution requires a Git repository`로 분류하며 raw Git 128을
+  사용자 오류로 노출하지 않는다.
+- Windows 호환 CLI 회귀 테스트가 실패 후 `.colay`가 존재하지 않음을 검증한다.
+- 수정 커밋 `787ffdf`, `64583f7`과 Windows 전체 Rust 테스트 407개 통과로 완료 조건을
+  확인했다.
+
 ### 사용자 정정: conversation-first plan mode
 
 - 사용자가 의미하는 plan-only는 현재 CLI의 `run --plan-only`와 다르다. orchestrator가
@@ -263,6 +275,16 @@ fatal: Needed a single revision
 - unborn HEAD를 `repository has no base commit; create an initial commit first`로 설명한다.
 - 중첩 repository를 포함하는 상위 폴더에서 실행할 때 repository 선택 경고를 제공한다.
 - 이 검사 역시 task 영속화보다 먼저 수행한다.
+
+### 수정 구현
+
+- Git root probe가 성공한 뒤 `git rev-parse --verify HEAD^{commit}`을 별도 실행한다.
+- unborn `HEAD`는 `Git repository has no base commit; create an initial commit before task
+  execution`으로 분류한다.
+- Windows 호환 CLI 회귀 테스트가 실패 후 `.colay`와 `planned` task가 생성되지 않음을
+  검증한다.
+- 수정 커밋 `787ffdf`, `64583f7`과 Windows 전체 Rust 테스트 407개 통과로 완료 조건을
+  확인했다.
 
 ## WSL-008: provider 오류 후 남은 장기 lease
 
@@ -443,6 +465,23 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - timeout 시 daemon heartbeat, command state, claimed/completed timestamps를 출력한다.
 - CI 부하 상태에서 반복 실행하는 플래이크 검증을 추가한다.
 
+## WIN-003: Windows `icacls.exe` 접근 거부 테스트 플래이크
+
+### 증거
+
+- Git readiness 수정 후 첫 전체 suite에서 기존
+  `rollback_relative_codex_target_matches_persisted_writable_worker_worktree` 테스트가
+  `C:\Windows\System32\icacls.exe: Access is denied (os error 5)`로 한 번 실패했다.
+- 동일 테스트만 연속 3회 실행했을 때 모두 통과했다.
+- 다음 전체 workspace suite에서도 통과했으므로 현재 Git 변경과의 인과관계는 확인되지
+  않았고 간헐적 Windows 권한/프로세스 실행 플래이크로 분류한다.
+
+### 다음 조사 조건
+
+- 동일 오류가 다시 발생하면 executable resolution evidence, 현재 identity, ACL, antivirus
+  또는 endpoint policy, 동시 실행 중인 `icacls` 프로세스를 실패 시점에 수집한다.
+- 원인이 확인되기 전에는 무조건적인 retry나 권한 완화를 추가하지 않는다.
+
 ## Confirmed healthy controls
 
 - 설치된 Linux native binary는 x86-64 static PIE였고 `--version`이 정상 동작했다.
@@ -457,8 +496,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `run --plan-only`, daemon start/status/stop이 fake provider로 정상 동작했다.
 - Windows `doctor`의 6개 check가 모두 pass였고 schema v8, DB integrity, foreign key
   integrity가 정상이었다.
-- Windows에서 `cargo fmt --all -- --check`, 전체 clippy `-D warnings`, npm 테스트 65개,
-  Rust 전체 테스트 402개가 통과했다.
+- Windows에서 `cargo fmt --all -- --check`, 전체 clippy `-D warnings`, npm 테스트 65개가
+  통과했다. 최초 nightly QA에서는 Rust 402개, Git readiness 수정 후에는 신규 회귀를
+  포함한 Rust 407개가 통과했다.
 - QA 과정에서 실제 Codex, Claude, Gemini inference는 호출하지 않았다.
 
 ## Prioritized improvement queue
@@ -509,5 +549,12 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Windows daemon start의 일부 PowerShell output-capture 지연은 제품이 아니라 QA harness
   제약으로 판별해 이슈로 등록하지 않았다. 실제 lifecycle과 repository 테스트는
   정상 통과했다.
+- Git readiness 수정 작업을 시작했다. typed repository/base-commit 검사를 worktree
+  엔진과 direct `run`의 state mutation 이전에 적용했으며, non-Git/unborn 회귀 테스트를
+  Windows에서 추가했다.
+- Git readiness 수정의 fmt, 전체 clippy, npm 65개, Rust 407개 검증이 통과해
+  `WSL-004`와 `WSL-005`를 `fixed`로 전환했다.
+- 전체 suite 첫 시도에서 기존 rollback 테스트의 `icacls.exe` 접근 거부가 한 번
+  발생했지만 단독 3회와 전체 재실행에서는 통과했다. 이를 `WIN-003`으로 추가했다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
