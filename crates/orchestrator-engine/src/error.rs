@@ -23,6 +23,12 @@ pub enum EngineError {
     UnsafePath(PathBuf),
     #[error("repository contains unresolved Git operations: {0}")]
     UnsafeGitBoundary(String),
+    #[error("direct task execution requires a Git repository: {0}")]
+    NotGitRepository(PathBuf),
+    #[error(
+        "Git repository has no base commit; create an initial commit before task execution: {0}"
+    )]
+    MissingGitBaseCommit(PathBuf),
     #[error("file {path} is already owned by writable worker {owner}")]
     FileOwnershipConflict { path: String, owner: String },
     #[error("worktree cleanup requires a matching explicit approval")]

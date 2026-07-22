@@ -7,6 +7,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Database, StateError, StateResult};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonPhase {
+    Booting,
+    Probing,
+    Online,
+    Failed,
+}
+
+impl DaemonPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Booting => "booting",
+            Self::Probing => "probing",
+            Self::Online => "online",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonInstance {
     pub instance_id: DaemonInstanceId,
@@ -14,8 +34,13 @@ pub struct DaemonInstance {
     pub started_at: DateTime<Utc>,
     pub heartbeat_at: DateTime<Utc>,
     pub lease_expires_at: DateTime<Utc>,
+    pub phase: DaemonPhase,
+    pub startup_error: Option<String>,
     pub stop_requested_at: Option<DateTime<Utc>>,
     pub released_at: Option<DateTime<Utc>>,
+    pub executable_path: Option<String>,
+    pub build_version: Option<String>,
+    pub build_target: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -30,7 +55,10 @@ pub struct DaemonLeaseRequest {
 #[serde(tag = "state", content = "instance", rename_all = "snake_case")]
 pub enum DaemonStatus {
     Stopped,
+    Booting(DaemonInstance),
+    Probing(DaemonInstance),
     Online(DaemonInstance),
+    Failed(DaemonInstance),
     Stale(DaemonInstance),
 }
 
@@ -38,6 +66,21 @@ impl Database {
     pub fn acquire_daemon_lease(
         &self,
         request: &DaemonLeaseRequest,
+    ) -> StateResult<DaemonInstance> {
+        self.acquire_daemon_lease_with_phase(request, DaemonPhase::Online)
+    }
+
+    pub fn acquire_daemon_startup_lease(
+        &self,
+        request: &DaemonLeaseRequest,
+    ) -> StateResult<DaemonInstance> {
+        self.acquire_daemon_lease_with_phase(request, DaemonPhase::Booting)
+    }
+
+    fn acquire_daemon_lease_with_phase(
+        &self,
+        request: &DaemonLeaseRequest,
+        phase: DaemonPhase,
     ) -> StateResult<DaemonInstance> {
         validate_pid_and_ttl(request.pid, request.ttl)?;
         let lease_expires_at = request
@@ -50,8 +93,13 @@ impl Database {
             started_at: request.started_at,
             heartbeat_at: request.started_at,
             lease_expires_at,
+            phase,
+            startup_error: None,
             stop_requested_at: None,
             released_at: None,
+            executable_path: None,
+            build_version: None,
+            build_target: None,
         };
 
         let mut connection = self.lock()?;
@@ -76,17 +124,66 @@ impl Database {
         transaction.execute(
             "INSERT INTO daemon_instances(
                 instance_id, pid, started_at, heartbeat_at, lease_expires_at,
-                stop_requested_at, released_at
-             ) VALUES (?1, ?2, ?3, ?3, ?4, NULL, NULL)",
+                phase, startup_error, stop_requested_at, released_at
+             ) VALUES (?1, ?2, ?3, ?3, ?4, ?5, NULL, NULL, NULL)",
             params![
                 request.instance_id.to_string(),
                 i64::from(request.pid),
                 request.started_at.to_rfc3339(),
                 lease_expires_at.to_rfc3339(),
+                phase.as_str(),
             ],
         )?;
         transaction.commit()?;
         Ok(instance)
+    }
+
+    pub fn transition_daemon_phase(
+        &self,
+        instance_id: DaemonInstanceId,
+        phase: DaemonPhase,
+        startup_error: Option<&str>,
+    ) -> StateResult<DaemonInstance> {
+        let allowed_source = match phase {
+            DaemonPhase::Probing => "phase = 'booting'",
+            DaemonPhase::Online => "phase = 'probing'",
+            DaemonPhase::Failed => "phase IN ('booting', 'probing')",
+            DaemonPhase::Booting => {
+                return Err(StateError::InvalidRecord(
+                    "daemon phase cannot transition back to booting".to_owned(),
+                ));
+            }
+        };
+        match (phase, startup_error) {
+            (DaemonPhase::Failed, Some(error)) if !error.trim().is_empty() => {}
+            (DaemonPhase::Failed, _) => {
+                return Err(StateError::InvalidRecord(
+                    "failed daemon phase requires a startup diagnostic".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(StateError::InvalidRecord(
+                    "startup diagnostic is only valid for failed daemon phase".to_owned(),
+                ));
+            }
+            (_, None) => {}
+        }
+        let sql = format!(
+            "UPDATE daemon_instances SET phase = ?1, startup_error = ?2 \
+             WHERE instance_id = ?3 AND released_at IS NULL AND {allowed_source}"
+        );
+        let changed = self.lock()?.execute(
+            &sql,
+            params![phase.as_str(), startup_error, instance_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(ownership_error(instance_id));
+        }
+        self.load_daemon_instance(instance_id)?.ok_or_else(|| {
+            StateError::InvalidRecord(format!(
+                "transitioned daemon instance {instance_id} disappeared"
+            ))
+        })
     }
 
     pub fn heartbeat_daemon(
@@ -124,7 +221,8 @@ impl Database {
         let instance = connection
             .query_row(
                 "SELECT instance_id, pid, started_at, heartbeat_at, lease_expires_at,
-                        stop_requested_at, released_at
+                        phase, startup_error, stop_requested_at, released_at,
+                        executable_path, build_version, build_target
                  FROM daemon_instances WHERE released_at IS NULL
                  ORDER BY started_at DESC LIMIT 1",
                 [],
@@ -133,8 +231,62 @@ impl Database {
             .optional()?;
         Ok(match instance {
             None => DaemonStatus::Stopped,
-            Some(instance) if instance.lease_expires_at > now => DaemonStatus::Online(instance),
+            Some(instance) if instance.lease_expires_at > now => match instance.phase {
+                DaemonPhase::Booting => DaemonStatus::Booting(instance),
+                DaemonPhase::Probing => DaemonStatus::Probing(instance),
+                DaemonPhase::Online => DaemonStatus::Online(instance),
+                DaemonPhase::Failed => DaemonStatus::Failed(instance),
+            },
             Some(instance) => DaemonStatus::Stale(instance),
+        })
+    }
+
+    pub fn daemon_startup_diagnostic_for_pid(&self, pid: u32) -> StateResult<Option<String>> {
+        self.lock()?
+            .query_row(
+                "SELECT startup_error FROM daemon_instances \
+                 WHERE pid = ?1 AND startup_error IS NOT NULL \
+                 ORDER BY started_at DESC LIMIT 1",
+                [i64::from(pid)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    pub fn record_daemon_runtime_identity(
+        &self,
+        instance_id: DaemonInstanceId,
+        executable_path: &str,
+        build_version: &str,
+        build_target: &str,
+    ) -> StateResult<DaemonInstance> {
+        if [executable_path, build_version, build_target]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(StateError::InvalidRecord(
+                "daemon runtime identity fields must not be blank".to_owned(),
+            ));
+        }
+        let changed = self.lock()?.execute(
+            "UPDATE daemon_instances
+             SET executable_path = ?1, build_version = ?2, build_target = ?3
+             WHERE instance_id = ?4 AND released_at IS NULL",
+            params![
+                executable_path,
+                build_version,
+                build_target,
+                instance_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ownership_error(instance_id));
+        }
+        self.load_daemon_instance(instance_id)?.ok_or_else(|| {
+            StateError::InvalidRecord(format!(
+                "daemon instance {instance_id} disappeared after identity update"
+            ))
         })
     }
 
@@ -190,7 +342,8 @@ impl Database {
         self.lock()?
             .query_row(
                 "SELECT instance_id, pid, started_at, heartbeat_at, lease_expires_at,
-                        stop_requested_at, released_at
+                        phase, startup_error, stop_requested_at, released_at,
+                        executable_path, build_version, build_target
                  FROM daemon_instances WHERE instance_id = ?1",
                 [instance_id.to_string()],
                 map_daemon_instance,
@@ -226,8 +379,13 @@ fn map_daemon_instance(row: &Row<'_>) -> rusqlite::Result<DaemonInstance> {
     let started_at: String = row.get(2)?;
     let heartbeat_at: String = row.get(3)?;
     let lease_expires_at: String = row.get(4)?;
-    let stop_requested_at: Option<String> = row.get(5)?;
-    let released_at: Option<String> = row.get(6)?;
+    let phase: String = row.get(5)?;
+    let startup_error: Option<String> = row.get(6)?;
+    let stop_requested_at: Option<String> = row.get(7)?;
+    let released_at: Option<String> = row.get(8)?;
+    let executable_path: Option<String> = row.get(9)?;
+    let build_version: Option<String> = row.get(10)?;
+    let build_target: Option<String> = row.get(11)?;
     Ok(DaemonInstance {
         instance_id: DaemonInstanceId::from_str(&instance_id)
             .map_err(|error| conversion_error(0, error))?,
@@ -235,13 +393,31 @@ fn map_daemon_instance(row: &Row<'_>) -> rusqlite::Result<DaemonInstance> {
         started_at: parse_timestamp(&started_at, 2)?,
         heartbeat_at: parse_timestamp(&heartbeat_at, 3)?,
         lease_expires_at: parse_timestamp(&lease_expires_at, 4)?,
+        phase: parse_phase(&phase, 5)?,
+        startup_error,
         stop_requested_at: stop_requested_at
-            .map(|value| parse_timestamp(&value, 5))
+            .map(|value| parse_timestamp(&value, 7))
             .transpose()?,
         released_at: released_at
-            .map(|value| parse_timestamp(&value, 6))
+            .map(|value| parse_timestamp(&value, 8))
             .transpose()?,
+        executable_path,
+        build_version,
+        build_target,
     })
+}
+
+fn parse_phase(value: &str, column: usize) -> rusqlite::Result<DaemonPhase> {
+    match value {
+        "booting" => Ok(DaemonPhase::Booting),
+        "probing" => Ok(DaemonPhase::Probing),
+        "online" => Ok(DaemonPhase::Online),
+        "failed" => Ok(DaemonPhase::Failed),
+        _ => Err(conversion_error(
+            column,
+            StateError::InvalidRecord(format!("unknown daemon phase {value}")),
+        )),
+    }
 }
 
 fn parse_timestamp(value: &str, column: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -264,7 +440,7 @@ mod tests {
     use chrono::{TimeDelta, TimeZone as _, Utc};
     use orchestrator_domain::DaemonInstanceId;
 
-    use super::{DaemonLeaseRequest, DaemonStatus};
+    use super::{DaemonLeaseRequest, DaemonPhase, DaemonStatus};
     use crate::{Database, StateError, StateResult};
 
     fn timestamp() -> chrono::DateTime<Utc> {
@@ -329,6 +505,97 @@ mod tests {
         assert_eq!(
             database.daemon_status(heartbeat_at + TimeDelta::seconds(1))?,
             DaemonStatus::Stopped
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_phase_transitions_are_owned_and_monotonic() -> StateResult<()> {
+        let database = migrated_database();
+        let lease = request(timestamp());
+        let booting = database.acquire_daemon_startup_lease(&lease)?;
+        assert_eq!(booting.phase, DaemonPhase::Booting);
+        assert_eq!(
+            database.daemon_status(timestamp())?,
+            DaemonStatus::Booting(booting)
+        );
+
+        assert!(
+            database
+                .transition_daemon_phase(DaemonInstanceId::new(), DaemonPhase::Probing, None,)
+                .is_err()
+        );
+        let probing =
+            database.transition_daemon_phase(lease.instance_id, DaemonPhase::Probing, None)?;
+        assert_eq!(
+            database.daemon_status(timestamp())?,
+            DaemonStatus::Probing(probing)
+        );
+        assert!(
+            database
+                .transition_daemon_phase(lease.instance_id, DaemonPhase::Booting, None)
+                .is_err()
+        );
+
+        let online =
+            database.transition_daemon_phase(lease.instance_id, DaemonPhase::Online, None)?;
+        assert_eq!(
+            database.daemon_status(timestamp())?,
+            DaemonStatus::Online(online)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_runtime_identity_round_trips_in_status() -> StateResult<()> {
+        let database = migrated_database();
+        let lease = request(timestamp());
+        database.acquire_daemon_lease(&lease)?;
+        database.record_daemon_runtime_identity(
+            lease.instance_id,
+            "C:/tools/colay.exe",
+            "0.1.1-nightly.20260723.abcdef0",
+            "windows/x86_64",
+        )?;
+        let DaemonStatus::Online(instance) = database.daemon_status(timestamp())? else {
+            return Err(StateError::InvalidRecord("daemon is not online".to_owned()));
+        };
+        assert_eq!(
+            instance.executable_path.as_deref(),
+            Some("C:/tools/colay.exe")
+        );
+        assert_eq!(
+            instance.build_version.as_deref(),
+            Some("0.1.1-nightly.20260723.abcdef0")
+        );
+        assert_eq!(instance.build_target.as_deref(), Some("windows/x86_64"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_failure_preserves_redacted_diagnostic() -> StateResult<()> {
+        let database = migrated_database();
+        let lease = request(timestamp());
+        database.acquire_daemon_startup_lease(&lease)?;
+        let failed = database.transition_daemon_phase(
+            lease.instance_id,
+            DaemonPhase::Failed,
+            Some("provider probe failed: [REDACTED]"),
+        )?;
+        assert_eq!(failed.phase, DaemonPhase::Failed);
+        assert_eq!(
+            failed.startup_error.as_deref(),
+            Some("provider probe failed: [REDACTED]")
+        );
+        assert_eq!(
+            database
+                .daemon_startup_diagnostic_for_pid(lease.pid)?
+                .as_deref(),
+            Some("provider probe failed: [REDACTED]")
+        );
+        assert_eq!(
+            database.daemon_status(timestamp())?,
+            DaemonStatus::Failed(failed)
         );
         Ok(())
     }

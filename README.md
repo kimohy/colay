@@ -62,10 +62,24 @@ colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity
 colay tui [task-id]
 ```
 
+`colay run` is the direct writable-task compatibility path. Before creating `.colay` state or a
+task, it requires a Git repository with a valid base commit and no unresolved merge, rebase,
+cherry-pick, revert, or bisect operation. A non-Git directory and an unborn `HEAD` return distinct
+actionable errors without leaving a `planned` task. `run --plan-only` remains a static persisted
+assessment; it does not invoke a provider and is not the conversation-first interview mode.
+
 `colay tui` is the primary durable chat workspace. It starts or reconnects to
 the repository daemon, restores the latest session and selected task, and shows
 a text-only task list, conversation timeline, inspector, attention queue, and
 explicit composer target. The daemon continues after the TUI closes.
+
+Every session-level message first goes to one eligible official CLI through an
+explicitly read-only sandbox and conversation adapter. The adapter returns one strict
+outcome: a completed answer, an interview question with an immutable partial
+requirement revision, a complete worktree-task candidate, or redacted attention.
+Answers and interviews never create tasks, attempts, leases, or worktrees. A
+complete candidate is planned and repository-validated, but still creates no
+task until the operator approves the exact current revision and hashes.
 
 The wide layout has three panes; medium terminals hide the inspector, narrow
 terminals show one selected primary view, and terminals below 60 columns become
@@ -83,15 +97,19 @@ the timeline readable but disables messages and task controls until
 redacted before durable command submission and again before conversation
 projection.
 
-Use `/plan` after sending a session-level goal. The daemon invokes one eligible
-official CLI in an explicitly read-only sandbox, requires exactly one bounded
-JSON task-graph proposal, validates its DAG, providers, profiles, concurrency,
-and write-scope isolation, and persists the revision without creating a task or
-worktree. `/approve` opens a text confirmation containing the exact proposal hash,
-nodes, dependencies, scopes, providers/profiles, risks, and proposed
-parallelism. Only `y` submits typed approval for that exact revision/hash;
+For compatibility, `/plan` can explicitly revalidate the newest session-level goal,
+but it cannot bypass the provider interview or create approval authority without a
+complete latest requirement revision. Normally the conversation adapter requests
+planning automatically after requirements are complete. The daemon requires one bounded JSON graph, validates its DAG,
+providers, profiles, concurrency, write-scope isolation, verification plan, Git
+readiness, and base commit, then seals those results without creating a task or
+worktree. `/approve` shows the requirement revision, validation hash, base
+commit, checks, exact proposal hash, nodes, dependencies, scopes,
+providers/profiles, risks, and proposed parallelism. Only `y` submits typed
+approval for that exact authority;
 `n`/`Esc`, an offline daemon, an invalid plan, or a changed hash fails closed.
-Chat text such as "yes" has no approval authority.
+Chat text such as "yes" has no approval authority. A newer user message or a
+changed Git `HEAD` invalidates the pending approval.
 
 No writable task before approval is a hard boundary. Exact approval atomically
 materializes the graph as queued session tasks. The daemon then claims only
@@ -113,9 +131,10 @@ blockers, and dedicated destination. `/approve` requires `y` for that exact
 preview; every source is revalidated before application only to the retained
 `.colay/integration/<batch-id>` worktree. `/resolve` turns a resolvable overlap
 or application failure into one auditable task whose result requires a new
-preview and approval. Merge to
-the user's branch, push, publication, automatic cleanup, and `/retry` remain
-unavailable.
+preview and approval. Merge to the user's branch, push, publication, automatic
+cleanup, and chat `/retry` remain unavailable. Use `colay resume <task-id>` to
+restart an existing non-terminal task, including one persisted in `planned`, without
+creating a second task identity.
 
 ## Model profiles
 
@@ -148,6 +167,6 @@ compiled defaults
 
 `COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Configuration files are partial overrides: tables merge by key, while arrays replace the lower-precedence array rather than concatenate. Every loaded file must declare the supported `config_version`. Absent automatic layers are ignored, but normal runtime commands fail when an explicitly selected `$COLAY_CONFIG` or `--config` file is missing. `init` is the creation-path exception: it treats a missing explicit selector as the destination for its new minimal override.
 
-Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely. Other read-only commands do not create repository state, but the first `run`—including `run --plan-only`—initializes and persists repository state. Start from [`config.example.toml`](config.example.toml).
+Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely. Other read-only commands do not create repository state. `run --plan-only` initializes its persisted static assessment state; a normal `run` does so only after Git readiness succeeds. Start from [`config.example.toml`](config.example.toml).
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.

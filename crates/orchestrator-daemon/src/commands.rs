@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
     AppendMessageCommandPayload, ClientCommand, ClientCommandAction, ClientCommandId,
-    ConversationMessage, CorrelationId, CreateSessionCommandPayload, EventActor, EventId,
-    EventType, MessageKind, MessageRole, MessageState, SchemaVersion, SessionState, TaskEvent,
+    ClientCommandState, ConversationMessage, CorrelationId, CreateSessionCommandPayload,
+    EventActor, EventId, EventType, MessageKind, MessageRole, MessageState,
+    RequestConversationTurnCommandPayload, SchemaVersion, SessionState, TaskEvent,
 };
 use orchestrator_state::{Database, NewSessionRecord, StateError};
 use sha2::{Digest as _, Sha256};
@@ -69,7 +70,8 @@ fn execute_command(
         ClientCommandAction::StopDaemon => Err(CommandExecutionError::Rejected(
             "stop command requires daemon lease reconciliation",
         )),
-        ClientCommandAction::RequestPlan
+        ClientCommandAction::RequestConversationTurn
+        | ClientCommandAction::RequestPlan
         | ClientCommandAction::ApproveGraph
         | ClientCommandAction::ReviseGraph
         | ClientCommandAction::CancelPlan
@@ -177,6 +179,10 @@ fn append_message(
     };
     if let Some(existing) = database.load_message(payload.message_id)? {
         if existing == expected {
+            if command.task_id.is_none() {
+                database
+                    .submit_client_command(&conversation_command(command, payload.message_id)?)?;
+            }
             return Ok(format!("message:{}", payload.message_id));
         }
         return Err(CommandExecutionError::Rejected(
@@ -184,30 +190,61 @@ fn append_message(
         ));
     }
     let content_hash = hex::encode(Sha256::digest(expected.content_redacted.as_bytes()));
-    database
-        .append_message_with_event_and_instruction(
-            &expected,
-            command_event(
-                command,
-                Some(session_id),
-                command.task_id,
-                EventType::MessageAppended,
-                serde_json::json!({
-                    "command_id": command.command_id,
-                    "message_id": payload.message_id,
-                    "content_sha256": content_hash,
-                }),
-            ),
-        )
-        .map_err(|error| match error {
-            StateError::InvalidRecord(_) if command.task_id.is_some() => {
-                CommandExecutionError::Rejected(
-                    "append-message task target cannot accept instructions",
-                )
-            }
-            error => CommandExecutionError::State(error),
-        })?;
+    let event = command_event(
+        command,
+        Some(session_id),
+        command.task_id,
+        EventType::MessageAppended,
+        serde_json::json!({
+            "command_id": command.command_id,
+            "message_id": payload.message_id,
+            "content_sha256": content_hash,
+        }),
+    );
+    let result = if command.task_id.is_none() {
+        database
+            .append_session_message_and_queue_conversation(
+                &expected,
+                event,
+                &conversation_command(command, payload.message_id)?,
+            )
+            .map(|_| ())
+    } else {
+        database
+            .append_message_with_event_and_instruction(&expected, event)
+            .map(|_| ())
+    };
+    result.map_err(|error| match error {
+        StateError::InvalidRecord(_) if command.task_id.is_some() => {
+            CommandExecutionError::Rejected("append-message task target cannot accept instructions")
+        }
+        error => CommandExecutionError::State(error),
+    })?;
     Ok(format!("message:{}", payload.message_id))
+}
+
+fn conversation_command(
+    source: &ClientCommand,
+    message_id: orchestrator_domain::MessageId,
+) -> Result<ClientCommand, CommandExecutionError> {
+    let command_id = ClientCommandId::from_uuid(message_id.into_uuid());
+    Ok(ClientCommand {
+        command_id,
+        session_id: source.session_id,
+        task_id: None,
+        action: ClientCommandAction::RequestConversationTurn,
+        payload: serde_json::to_value(RequestConversationTurnCommandPayload {
+            source_message_id: message_id,
+        })
+        .map_err(StateError::from)?,
+        idempotency_key: format!("conversation-turn-{message_id}"),
+        state: ClientCommandState::Pending,
+        requested_by: source.requested_by.clone(),
+        requested_at: source.requested_at,
+        claimed_at: None,
+        completed_at: None,
+        outcome: None,
+    })
 }
 
 fn command_event(

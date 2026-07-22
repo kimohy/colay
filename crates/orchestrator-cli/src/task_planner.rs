@@ -23,11 +23,11 @@ use orchestrator_state::{OrchestratorConfig, ProviderConfig, RootConfig};
 use serde::Serialize;
 
 pub struct OfficialCliTaskPlanner {
-    config: RootConfig,
-    repository: PathBuf,
-    runtime: Arc<dyn AdapterRuntime>,
-    capabilities: BTreeMap<ProviderId, ProviderCapabilities>,
-    profile: ModelProfile,
+    pub(crate) config: RootConfig,
+    pub(crate) repository: PathBuf,
+    pub(crate) runtime: Arc<dyn AdapterRuntime>,
+    pub(crate) capabilities: BTreeMap<ProviderId, ProviderCapabilities>,
+    pub(crate) profile: ModelProfile,
 }
 
 impl OfficialCliTaskPlanner {
@@ -373,7 +373,7 @@ impl Drop for ActivePlannerGuard {
     }
 }
 
-fn capability_is_safe(capability: &ProviderCapabilities) -> bool {
+pub(crate) fn capability_is_safe(capability: &ProviderCapabilities) -> bool {
     !capability.evidence.is_empty()
         && capability.non_interactive.usable()
         && capability.structured_output.usable()

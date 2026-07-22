@@ -1,13 +1,17 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
     ApproveGraphCommandPayload, ClientCommand, ClientCommandAction, ConversationMessage,
-    CorrelationId, EventActor, EventId, EventType, GraphRevisionId, GraphValidationPolicy,
-    MessageId, MessageKind, MessageRole, MessageState, PlanningAttemptId, ProviderId,
-    RequestPlanCommandPayload, SandboxMode, SchemaVersion, SessionId, SessionState, TaskEvent,
+    CorrelationId, EventActor, EventId, EventType, GraphRevisionId, GraphValidationAuthority,
+    GraphValidationPolicy, MessageId, MessageKind, MessageRole, MessageState, PlanningAttemptId,
+    ProviderId, RepoValidationEvidence, RequestPlanCommandPayload, SandboxMode, SchemaVersion,
+    SessionId, SessionState, TaskEvent, ValidatedTaskGraph, validate_task_graph_with_authority,
 };
-use orchestrator_engine::{PlannerRequest, TaskPlanner, collect_planner_response};
+use orchestrator_engine::{
+    ConversationOrchestrator, PlannerRequest, TaskPlanner, collect_planner_response,
+    inspect_git_repository,
+};
 use orchestrator_state::{
     Database, GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt, NewPlanningAttempt,
     StateError,
@@ -17,6 +21,8 @@ use crate::{CommandProcessingResult, DaemonError, MessageRedactor};
 
 #[derive(Clone)]
 pub struct PlanningServices {
+    pub conversation: Arc<dyn ConversationOrchestrator>,
+    pub repository_root: PathBuf,
     pub planner: Arc<dyn TaskPlanner>,
     pub planner_provider: ProviderId,
     pub validation_policy: GraphValidationPolicy,
@@ -36,7 +42,19 @@ pub async fn process_next_orchestration_command(
         ClientCommandAction::RequestPlan => {
             request_plan(database, services, redactor, &command, now).await
         }
-        ClientCommandAction::ApproveGraph => approve_graph(database, &command, now),
+        ClientCommandAction::RequestConversationTurn => {
+            crate::conversation::request_conversation_turn(
+                database,
+                services.conversation.as_ref(),
+                services.planner_provider,
+                redactor,
+                &command,
+                now,
+            )
+            .await
+            .map_err(map_conversation_error)
+        }
+        ClientCommandAction::ApproveGraph => approve_graph(database, services, &command, now).await,
         ClientCommandAction::ReviseGraph | ClientCommandAction::CancelPlan => Err(
             ExecutionError::Rejected("revise/cancel planning commands are not enabled".to_owned()),
         ),
@@ -98,6 +116,15 @@ fn map_integration_error(error: crate::integration::IntegrationCommandError) -> 
     }
 }
 
+fn map_conversation_error(error: crate::conversation::ConversationCommandError) -> ExecutionError {
+    match error {
+        crate::conversation::ConversationCommandError::Rejected(reason) => {
+            ExecutionError::Rejected(reason)
+        }
+        crate::conversation::ConversationCommandError::State(error) => ExecutionError::State(error),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ExecutionError {
     #[error("{0}")]
@@ -119,29 +146,7 @@ async fn request_plan(
     command: &ClientCommand,
     now: DateTime<Utc>,
 ) -> Result<String, ExecutionError> {
-    let session_id = command.session_id.ok_or_else(|| {
-        ExecutionError::Rejected("request-plan command requires a session target".to_owned())
-    })?;
-    if command.task_id.is_some() {
-        return Err(ExecutionError::Rejected(
-            "request-plan command cannot target a task".to_owned(),
-        ));
-    }
-    let payload: RequestPlanCommandPayload = serde_json::from_value(command.payload.clone())
-        .map_err(|_| ExecutionError::Rejected("request-plan payload is invalid".to_owned()))?;
-    let goal = database
-        .load_message(payload.goal_message_id)?
-        .ok_or_else(|| {
-            ExecutionError::Rejected("planning goal message does not exist".to_owned())
-        })?;
-    if goal.session_id != session_id
-        || goal.role != MessageRole::User
-        || goal.state != MessageState::Final
-    {
-        return Err(ExecutionError::Rejected(
-            "planning goal must be a final user message in the target session".to_owned(),
-        ));
-    }
+    let (session_id, payload, goal) = planning_goal(database, command)?;
 
     let revision_id = GraphRevisionId::from_uuid(command.command_id.into_uuid());
     let attempt_id = PlanningAttemptId::from_uuid(command.command_id.into_uuid());
@@ -171,10 +176,16 @@ async fn request_plan(
         sandbox: SandboxMode::ReadOnly,
     };
     let completed_at = Utc::now();
-    let result = match services.planner.propose(planner_request.clone()).await {
-        Ok(response) => collect_planner_response(&planner_request, response),
-        Err(error) => Err(error),
-    };
+    let result = propose_validated_graph(
+        database,
+        services,
+        redactor,
+        command,
+        payload.goal_message_id,
+        planner_request,
+        completed_at,
+    )
+    .await;
     let (attempt, next_state, kind, content) = match result {
         Ok(graph) => {
             let hash = graph.proposal_hash.clone();
@@ -194,7 +205,7 @@ async fn request_plan(
             )
         }
         Err(error) => {
-            let detail = redactor.redact(&error.to_string());
+            let detail = redactor.redact(&error);
             (
                 NewGraphAttempt::invalid(
                     attempt_id,
@@ -219,8 +230,175 @@ async fn request_plan(
     Ok(format!("graph:{revision_id}"))
 }
 
-fn approve_graph(
+fn planning_goal(
     database: &Database,
+    command: &ClientCommand,
+) -> Result<(SessionId, RequestPlanCommandPayload, ConversationMessage), ExecutionError> {
+    let session_id = command.session_id.ok_or_else(|| {
+        ExecutionError::Rejected("request-plan command requires a session target".to_owned())
+    })?;
+    if command.task_id.is_some() {
+        return Err(ExecutionError::Rejected(
+            "request-plan command cannot target a task".to_owned(),
+        ));
+    }
+    let payload: RequestPlanCommandPayload = serde_json::from_value(command.payload.clone())
+        .map_err(|_| ExecutionError::Rejected("request-plan payload is invalid".to_owned()))?;
+    let goal = database
+        .load_message(payload.goal_message_id)?
+        .ok_or_else(|| {
+            ExecutionError::Rejected("planning goal message does not exist".to_owned())
+        })?;
+    if goal.session_id != session_id
+        || goal.role != MessageRole::User
+        || goal.state != MessageState::Final
+    {
+        return Err(ExecutionError::Rejected(
+            "planning goal must be a final user message in the target session".to_owned(),
+        ));
+    }
+    Ok((session_id, payload, goal))
+}
+
+async fn propose_validated_graph(
+    database: &Database,
+    services: &PlanningServices,
+    redactor: &dyn MessageRedactor,
+    command: &ClientCommand,
+    goal_message_id: MessageId,
+    request: PlannerRequest,
+    completed_at: DateTime<Utc>,
+) -> Result<ValidatedTaskGraph, String> {
+    let response = services
+        .planner
+        .propose(request.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    let graph = collect_planner_response(&request, response).map_err(|error| error.to_string())?;
+    transition_to_validating(database, command, graph.proposal.session_id, Utc::now())
+        .map_err(|error| error.to_string())?;
+    validate_candidate_authority(
+        database,
+        services,
+        redactor,
+        goal_message_id,
+        graph,
+        completed_at,
+    )
+    .await
+}
+
+async fn validate_candidate_authority(
+    database: &Database,
+    services: &PlanningServices,
+    redactor: &dyn MessageRedactor,
+    goal_message_id: MessageId,
+    graph: ValidatedTaskGraph,
+    validated_at: DateTime<Utc>,
+) -> Result<ValidatedTaskGraph, String> {
+    let requirement = database
+        .current_requirement_revision(graph.proposal.session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "No validated requirement revision exists for this planning goal; continue the interview before approval."
+                .to_owned()
+        })?;
+    if requirement.source_message_id != goal_message_id || !requirement.snapshot.is_complete() {
+        return Err(
+            "The latest requirement revision is incomplete or does not match this planning goal; continue the interview before approval."
+                .to_owned(),
+        );
+    }
+    let readiness = inspect_git_repository(&services.repository_root)
+        .await
+        .map_err(|error| {
+            format!(
+                "Repository validation failed before approval: {error}. Initialize Git and create a HEAD commit, then continue this conversation."
+            )
+        })?;
+    let mut normalized_write_scopes = graph
+        .proposal
+        .nodes
+        .iter()
+        .flat_map(|node| node.write_scopes.iter().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    if graph
+        .proposal
+        .nodes
+        .iter()
+        .any(|node| node.repository_wide_write_scope)
+    {
+        normalized_write_scopes.push("<repository-wide>".to_owned());
+    }
+    normalized_write_scopes.sort();
+    normalized_write_scopes.dedup();
+    let mut required_approvals = vec!["exact validated graph approval".to_owned()];
+    if normalized_write_scopes
+        .iter()
+        .any(|scope| scope == "<repository-wide>")
+    {
+        required_approvals.push("repository-wide write scope acknowledgement".to_owned());
+    }
+    if graph
+        .proposal
+        .nodes
+        .iter()
+        .any(|node| !node.risks.is_empty())
+        || !requirement.snapshot.risks.is_empty()
+    {
+        required_approvals.push("recorded risk acknowledgement".to_owned());
+    }
+    let evidence = RepoValidationEvidence {
+        schema_version: SchemaVersion::v1(),
+        requirement_revision_id: requirement.requirement_revision_id,
+        requirement_snapshot_hash: requirement.snapshot_hash,
+        graph_revision_id: graph.proposal.revision_id,
+        git_root_redacted: redactor.redact(&readiness.repository_root.to_string_lossy()),
+        base_commit: readiness.base_commit,
+        eligible_providers: services
+            .validation_policy
+            .eligible_providers
+            .iter()
+            .copied()
+            .collect(),
+        eligible_profiles: services
+            .validation_policy
+            .eligible_profiles
+            .iter()
+            .copied()
+            .collect(),
+        max_parallel_workers: services.validation_policy.max_parallel_workers,
+        per_provider_limits: services.validation_policy.per_provider_limits.clone(),
+        normalized_write_scopes,
+        verification_plan: requirement.snapshot.verification_plan,
+        required_approvals,
+        checks: vec![
+            "git_ready".to_owned(),
+            "graph_valid".to_owned(),
+            "write_scopes_valid".to_owned(),
+            "provider_profile_eligible".to_owned(),
+            "verification_plan_present".to_owned(),
+        ],
+        validated_at,
+    };
+    evidence
+        .validate_for(graph.proposal.planner_provider)
+        .map_err(|error| error.to_string())?;
+    let validation_hash = evidence.seal().map_err(|error| error.to_string())?;
+    let authority = GraphValidationAuthority {
+        requirement_revision_id: requirement.requirement_revision_id,
+        validation_hash,
+        base_commit: evidence.base_commit.clone(),
+        git_root_redacted: evidence.git_root_redacted.clone(),
+        validation_checks: evidence.checks.clone(),
+    };
+    validate_task_graph_with_authority(graph.proposal, &services.validation_policy, authority)
+        .map_err(|error| error.to_string())
+}
+
+async fn approve_graph(
+    database: &Database,
+    services: &PlanningServices,
     command: &ClientCommand,
     now: DateTime<Utc>,
 ) -> Result<String, ExecutionError> {
@@ -247,12 +425,70 @@ fn approve_graph(
             "approved graph revision belongs to another session".to_owned(),
         ));
     }
+    let authority = serde_json::from_value::<orchestrator_domain::GraphValidationSummary>(
+        revision.validation.clone(),
+    )
+    .ok()
+    .and_then(|summary| summary.authority)
+    .ok_or_else(|| {
+        ExecutionError::Rejected(
+            "graph approval requires sealed requirement and repository validation authority"
+                .to_owned(),
+        )
+    })?;
+    if payload.requirement_revision_id != authority.requirement_revision_id
+        || payload.validation_hash != authority.validation_hash
+        || payload.base_commit != authority.base_commit
+    {
+        return Err(ExecutionError::Rejected(
+            "graph approval authority does not match the latest validated proposal".to_owned(),
+        ));
+    }
+    let current = database
+        .current_requirement_revision(session_id)?
+        .ok_or_else(|| {
+            ExecutionError::Rejected(
+                "validated graph requirement revision is no longer current".to_owned(),
+            )
+        })?;
+    if current.requirement_revision_id != authority.requirement_revision_id {
+        return Err(ExecutionError::Rejected(
+            "validated graph requirement revision is stale".to_owned(),
+        ));
+    }
+    let readiness = inspect_git_repository(&services.repository_root)
+        .await
+        .map_err(|error| {
+            ExecutionError::Rejected(format!(
+                "repository changed or is unavailable since validation: {error}"
+            ))
+        })?;
+    if readiness.base_commit != authority.base_commit {
+        return Err(ExecutionError::Rejected(
+            "repository HEAD changed after validation; generate a new proposal".to_owned(),
+        ));
+    }
     let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: payload.revision_id,
         expected_proposal_hash: payload.proposal_hash,
+        authority: Some(authority),
         approved_by: payload.approved_by,
         approved_at: now,
     })?;
+    transition_approved_session(database, command, session_id, now)?;
+    Ok(format!(
+        "approved:{}:{}",
+        approved.revision_id,
+        approved.task_ids.len()
+    ))
+}
+
+fn transition_approved_session(
+    database: &Database,
+    command: &ClientCommand,
+    session_id: SessionId,
+    now: DateTime<Utc>,
+) -> Result<(), ExecutionError> {
     let session = database
         .load_session(session_id)?
         .ok_or_else(|| ExecutionError::Rejected("approval session does not exist".to_owned()))?;
@@ -274,11 +510,7 @@ fn approve_graph(
             "approval session is not awaiting approval".to_owned(),
         ));
     }
-    Ok(format!(
-        "approved:{}:{}",
-        approved.revision_id,
-        approved.task_ids.len()
-    ))
+    Ok(())
 }
 
 fn transition_to_planning(
@@ -329,7 +561,10 @@ fn transition_from_planning(
     if session.state == next {
         return Ok(());
     }
-    if session.state != SessionState::Planning {
+    if !matches!(
+        session.state,
+        SessionState::Planning | SessionState::Validating
+    ) {
         return Err(ExecutionError::Rejected(
             "planning completion session state conflicts".to_owned(),
         ));
@@ -338,6 +573,38 @@ fn transition_from_planning(
         session_id,
         session.revision,
         next,
+        now,
+        session_event(
+            command,
+            session_id,
+            EventType::SessionStateTransitioned,
+            now,
+        ),
+    )?;
+    Ok(())
+}
+
+fn transition_to_validating(
+    database: &Database,
+    command: &ClientCommand,
+    session_id: SessionId,
+    now: DateTime<Utc>,
+) -> Result<(), ExecutionError> {
+    let session = database
+        .load_session(session_id)?
+        .ok_or_else(|| ExecutionError::Rejected("planning session disappeared".to_owned()))?;
+    if session.state == SessionState::Validating {
+        return Ok(());
+    }
+    if session.state != SessionState::Planning {
+        return Err(ExecutionError::Rejected(
+            "session state does not allow proposal validation".to_owned(),
+        ));
+    }
+    database.transition_session_with_event(
+        session_id,
+        session.revision,
+        SessionState::Validating,
         now,
         session_event(
             command,
@@ -502,9 +769,11 @@ mod tests {
     use orchestrator_domain::{
         ApproveGraphCommandPayload, ClientCommand, ClientCommandAction, ClientCommandId,
         ClientCommandState, GraphValidationPolicy, MessageId, ModelProfile, ProviderId,
-        RequestPlanCommandPayload, SandboxMode, SessionId,
+        RequestPlanCommandPayload, RequirementRevision, RequirementRevisionId, RequirementSnapshot,
+        SandboxMode, SessionId, VerificationCommand,
     };
     use orchestrator_engine::{
+        ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
         PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
     };
     use orchestrator_state::{DaemonStatus, Database, GraphRevisionStatus};
@@ -530,6 +799,21 @@ mod tests {
         mode: FakeMode,
         delay: Duration,
         calls: AtomicUsize,
+    }
+
+    struct UnusedConversation;
+
+    #[async_trait]
+    impl ConversationOrchestrator for UnusedConversation {
+        async fn converse(
+            &self,
+            _request: ConversationRequest,
+        ) -> Result<ConversationResponse, ConversationFailure> {
+            Err(ConversationFailure::Invocation {
+                reason: "conversation is not expected".to_owned(),
+                evidence_redacted: String::new(),
+            })
+        }
     }
 
     #[async_trait]
@@ -638,6 +922,8 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let service = PlanningServices {
+            conversation: Arc::new(UnusedConversation),
+            repository_root: std::env::current_dir().unwrap_or_default(),
             planner: planner.clone(),
             planner_provider: ProviderId::Codex,
             validation_policy: GraphValidationPolicy {
@@ -649,6 +935,38 @@ mod tests {
             integration: None,
         };
         (service, planner)
+    }
+
+    fn seed_ready_requirement(
+        database: &Database,
+        session_id: SessionId,
+        message_id: MessageId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database.record_requirement_revision(&RequirementRevision::seal(
+            RequirementRevisionId::new(),
+            session_id,
+            message_id,
+            1,
+            RequirementSnapshot {
+                objective: "build it".to_owned(),
+                in_scope: vec!["requested implementation".to_owned()],
+                out_of_scope: vec!["automatic merge".to_owned()],
+                constraints: vec!["local only".to_owned()],
+                acceptance_criteria: vec!["tests pass".to_owned()],
+                verification_plan: vec![VerificationCommand {
+                    executable: "cargo".to_owned(),
+                    args: vec![
+                        "test".to_owned(),
+                        "--workspace".to_owned(),
+                        "--all-features".to_owned(),
+                    ],
+                }],
+                risks: vec!["stale approval".to_owned()],
+                open_questions: Vec::new(),
+            },
+            Utc::now(),
+        )?)?;
+        Ok(())
     }
 
     fn command(
@@ -686,7 +1004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_plan_awaits_approval_without_creating_tasks()
+    async fn explicit_plan_without_requirement_cannot_reach_approval()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
         let (session_id, goal) = seed_goal(&database)?;
@@ -702,11 +1020,17 @@ mod tests {
             database
                 .load_session(session_id)?
                 .map(|session| session.state),
-            Some(orchestrator_domain::SessionState::AwaitingApproval)
+            Some(orchestrator_domain::SessionState::NeedsAttention)
         );
         let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
-        assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);
-        assert!(graph.revision.proposal_hash.is_some());
+        assert_eq!(graph.revision.status, GraphRevisionStatus::Invalid);
+        assert!(graph.revision.proposal_hash.is_none());
+        assert!(
+            database
+                .messages_after(session_id, 1, 10)?
+                .iter()
+                .any(|(_, message)| message.content_redacted.contains("continue the interview"))
+        );
         database.with_connection(|connection| {
             let count: i64 =
                 connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
@@ -766,17 +1090,26 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
         let (session_id, goal) = seed_goal(&database)?;
+        seed_ready_requirement(&database, session_id, goal)?;
         database.submit_client_command(&plan_command(session_id, goal, "approval-plan"))?;
         let (services, _) = services(FakeMode::Valid, Duration::ZERO);
         process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
             .await?;
         let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
         let hash = graph.revision.proposal_hash.clone().ok_or("missing hash")?;
+        let authority = serde_json::from_value::<orchestrator_domain::GraphValidationSummary>(
+            graph.revision.validation.clone(),
+        )?
+        .authority
+        .ok_or("missing graph authority")?;
         let wrong = command(
             ClientCommandAction::ApproveGraph,
             session_id,
             serde_json::to_value(ApproveGraphCommandPayload {
                 revision_id: graph.revision.revision_id,
+                requirement_revision_id: authority.requirement_revision_id,
+                validation_hash: authority.validation_hash.clone(),
+                base_commit: authority.base_commit.clone(),
                 proposal_hash: "0".repeat(64),
                 approved_by: "operator".to_owned(),
             })?,
@@ -793,6 +1126,9 @@ mod tests {
             session_id,
             serde_json::to_value(ApproveGraphCommandPayload {
                 revision_id: graph.revision.revision_id,
+                requirement_revision_id: authority.requirement_revision_id,
+                validation_hash: authority.validation_hash,
+                base_commit: authority.base_commit,
                 proposal_hash: hash,
                 approved_by: "operator".to_owned(),
             })?,
@@ -823,6 +1159,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
         let (session_id, goal) = seed_goal(&database)?;
+        seed_ready_requirement(&database, session_id, goal)?;
         let command = plan_command(session_id, goal, "crash-plan");
         database.submit_client_command(&command)?;
         let claimed = database

@@ -12,6 +12,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 mod commands;
+mod conversation;
 mod execution;
 mod integration;
 mod planning;
@@ -94,9 +95,25 @@ pub async fn serve_with_commands(
         started_at,
         ttl: settings.lease_ttl,
     })?;
+    database.reconcile_interrupted_conversation_attempts(
+        started_at,
+        "conversation attempt was interrupted before daemon startup",
+    )?;
     database.recover_stale_client_commands(started_at)?;
     database.reconcile_interrupted_integrations(started_at)?;
+    serve_with_commands_on_owned_lease(database, instance_id, cancellation, settings, redactor)
+        .await
+}
 
+async fn serve_with_commands_on_owned_lease(
+    database: &Database,
+    instance_id: DaemonInstanceId,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: &dyn MessageRedactor,
+) -> Result<DaemonExit, DaemonError> {
+    validate_settings(settings)?;
+    database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut command_interval = tokio::time::interval(settings.command_poll_interval);
@@ -137,6 +154,7 @@ pub async fn serve_with_orchestration(
         redactor,
         planning,
         None,
+        true,
     )
     .await
 }
@@ -162,6 +180,32 @@ pub async fn serve_with_full_orchestration(
         redactor,
         planning,
         Some(execution),
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_full_orchestration_on_owned_lease(
+    database: Arc<Database>,
+    instance_id: DaemonInstanceId,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: Arc<dyn MessageRedactor>,
+    planning: PlanningServices,
+    execution: ExecutionServices,
+) -> Result<DaemonExit, DaemonError> {
+    execution::validate_execution_services(&execution)?;
+    serve_with_runtime(
+        database,
+        instance_id,
+        0,
+        cancellation,
+        settings,
+        redactor,
+        planning,
+        Some(execution),
+        false,
     )
     .await
 }
@@ -176,15 +220,26 @@ async fn serve_with_runtime(
     redactor: Arc<dyn MessageRedactor>,
     planning: PlanningServices,
     execution: Option<ExecutionServices>,
+    acquire_lease: bool,
 ) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
     let started_at = Utc::now();
-    database.acquire_daemon_lease(&DaemonLeaseRequest {
-        instance_id,
-        pid,
+    if acquire_lease {
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid,
+            started_at,
+            ttl: settings.lease_ttl,
+        })?;
+    } else {
+        database.heartbeat_daemon(instance_id, started_at, settings.lease_ttl)?;
+    }
+    database.reconcile_interrupted_conversation_attempts(
         started_at,
-        ttl: settings.lease_ttl,
-    })?;
+        "conversation attempt was interrupted before daemon startup",
+    )?;
+    database.recover_stale_client_commands(started_at)?;
+    database.reconcile_interrupted_integrations(started_at)?;
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut command_interval = tokio::time::interval(settings.command_poll_interval);
@@ -246,6 +301,10 @@ async fn serve_with_runtime(
         job.abort();
         let _ = job.await;
     }
+    database.reconcile_interrupted_conversation_attempts(
+        Utc::now(),
+        "conversation attempt was interrupted by daemon shutdown",
+    )?;
     execution::stop_execution_jobs(&execution_cancellation, execution_jobs).await?;
     database.release_daemon(instance_id, Utc::now())?;
     Ok(exit)
@@ -279,11 +338,14 @@ mod tests {
         ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState, DaemonInstanceId,
         SessionId,
     };
-    use orchestrator_state::{DaemonStatus, Database, StateResult};
+    use orchestrator_state::{
+        DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database, StateResult,
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::{
         DaemonError, DaemonExit, DaemonSettings, MessageRedactor, serve, serve_with_commands,
+        serve_with_commands_on_owned_lease,
     };
 
     struct IdentityRedactor;
@@ -352,6 +414,51 @@ mod tests {
             ));
         };
         assert!(current.heartbeat_at >= initial.heartbeat_at);
+        cancellation.cancel();
+        assert_eq!(
+            service.await.map_err(|error| {
+                DaemonError::InvalidSettings(format!("daemon task failed: {error}"))
+            })??,
+            DaemonExit::Cancelled
+        );
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_startup_lease_enters_loop_without_reacquiring() -> Result<(), DaemonError> {
+        let database = database()?;
+        let instance_id = DaemonInstanceId::new();
+        let now = Utc::now();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: now,
+            ttl: settings().lease_ttl,
+        })?;
+        database.transition_daemon_phase(instance_id, DaemonPhase::Probing, None)?;
+        database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
+        let cancellation = CancellationToken::new();
+        let service_database = Arc::clone(&database);
+        let service_cancellation = cancellation.clone();
+        let service = tokio::spawn(async move {
+            serve_with_commands_on_owned_lease(
+                &service_database,
+                instance_id,
+                service_cancellation,
+                settings(),
+                &IdentityRedactor,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let DaemonStatus::Online(online) = database.daemon_status(Utc::now())? else {
+            return Err(DaemonError::InvalidSettings(
+                "owned daemon lease did not remain online".to_owned(),
+            ));
+        };
+        assert!(online.heartbeat_at > now);
         cancellation.cancel();
         assert_eq!(
             service.await.map_err(|error| {

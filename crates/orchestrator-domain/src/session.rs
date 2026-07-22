@@ -2,13 +2,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ClientCommandId, GraphRevisionId, MessageId, SchemaVersion, SessionId, TaskId};
+use crate::{
+    ClientCommandId, GraphRevisionId, MessageId, RequirementRevisionId, SchemaVersion, SessionId,
+    TaskId,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Drafting,
     Planning,
+    Validating,
     AwaitingApproval,
     Running,
     NeedsAttention,
@@ -38,10 +42,21 @@ impl SessionState {
             Self::Drafting => matches!(next, Self::Planning | Self::Stopping),
             Self::Planning => matches!(
                 next,
-                Self::AwaitingApproval | Self::NeedsAttention | Self::Stopping
+                Self::Validating | Self::AwaitingApproval | Self::NeedsAttention | Self::Stopping
+            ),
+            Self::Validating => matches!(
+                next,
+                Self::AwaitingApproval
+                    | Self::NeedsAttention
+                    | Self::Planning
+                    | Self::Drafting
+                    | Self::Stopping
             ),
             Self::AwaitingApproval => {
-                matches!(next, Self::Planning | Self::Running | Self::Stopping)
+                matches!(
+                    next,
+                    Self::Drafting | Self::Planning | Self::Running | Self::Stopping
+                )
             }
             Self::Running => matches!(
                 next,
@@ -49,7 +64,11 @@ impl SessionState {
             ),
             Self::NeedsAttention => matches!(
                 next,
-                Self::Planning | Self::Running | Self::Integrating | Self::Stopping
+                Self::Drafting
+                    | Self::Planning
+                    | Self::Running
+                    | Self::Integrating
+                    | Self::Stopping
             ),
             Self::Integrating => {
                 matches!(
@@ -230,8 +249,16 @@ pub struct RequestPlanCommandPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestConversationTurnCommandPayload {
+    pub source_message_id: MessageId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApproveGraphCommandPayload {
     pub revision_id: GraphRevisionId,
+    pub requirement_revision_id: RequirementRevisionId,
+    pub validation_hash: String,
+    pub base_commit: String,
     pub proposal_hash: String,
     pub approved_by: String,
 }
@@ -277,6 +304,12 @@ impl ApproveGraphCommandPayload {
     ///
     /// Returns a validation error for a non-hex SHA-256 hash or blank approver identity.
     pub fn validate(&self) -> Result<(), SessionValidationError> {
+        if !is_hex_with_len(&self.validation_hash, 64, 64) {
+            return Err(SessionValidationError::InvalidGraphValidationHash);
+        }
+        if !is_hex_with_len(&self.base_commit, 40, 64) {
+            return Err(SessionValidationError::InvalidGraphBaseCommit);
+        }
         if self.proposal_hash.len() != 64
             || !self
                 .proposal_hash
@@ -312,6 +345,7 @@ impl AppendMessageCommandPayload {
 pub enum ClientCommandAction {
     CreateSession,
     AppendMessage,
+    RequestConversationTurn,
     StopDaemon,
     RequestPlan,
     ApproveGraph,
@@ -406,12 +440,20 @@ pub enum SessionValidationError {
     BlankRequester,
     #[error("graph approval proposal hash must be a hexadecimal SHA-256 value")]
     InvalidProposalHash,
+    #[error("graph approval validation hash must be a hexadecimal SHA-256 value")]
+    InvalidGraphValidationHash,
+    #[error("graph approval base commit must be a hexadecimal Git object ID")]
+    InvalidGraphBaseCommit,
     #[error("graph approver identity must not be blank")]
     BlankApprover,
     #[error("integration preview hash must be a hexadecimal SHA-256 value")]
     InvalidIntegrationPreviewHash,
     #[error("client command state does not match its lifecycle timestamps")]
     InvalidCommandLifecycle,
+}
+
+fn is_hex_with_len(value: &str, minimum: usize, maximum: usize) -> bool {
+    (minimum..=maximum).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -424,7 +466,7 @@ mod tests {
         ClientCommandAction, ClientCommandState, ConversationMessage, CreateSessionCommandPayload,
         MessageKind, MessageRole, MessageState, RequestPlanCommandPayload, Session, SessionState,
     };
-    use crate::{ClientCommandId, GraphRevisionId, MessageId, SessionId};
+    use crate::{ClientCommandId, GraphRevisionId, MessageId, RequirementRevisionId, SessionId};
 
     fn timestamp() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 9, 0, 0)
@@ -476,12 +518,15 @@ mod tests {
         assert_eq!(parsed.ok(), Some(request));
         let approval = ApproveGraphCommandPayload {
             revision_id: GraphRevisionId::new(),
+            requirement_revision_id: RequirementRevisionId::new(),
+            validation_hash: "b".repeat(64),
+            base_commit: "c".repeat(40),
             proposal_hash: "a".repeat(64),
             approved_by: "operator".to_owned(),
         };
         assert!(approval.validate().is_ok());
         let mut invalid = approval;
-        invalid.proposal_hash = "not-a-hash".to_owned();
+        invalid.validation_hash = "not-a-hash".to_owned();
         assert!(invalid.validate().is_err());
     }
 

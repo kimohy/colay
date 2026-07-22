@@ -50,6 +50,48 @@ pub struct WorktreeCleanupPlan {
     pub requires_user_approval: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRepositoryReadiness {
+    pub repository_root: PathBuf,
+    pub base_commit: String,
+}
+
+pub async fn inspect_git_repository(path: &Path) -> EngineResult<GitRepositoryReadiness> {
+    let requested = canonicalize_directory(path)?;
+    let runner = ProcessRunner;
+    let root_output = run_git_probe(
+        &runner,
+        &requested,
+        [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")],
+    )
+    .await?;
+    if !root_output.success() {
+        return Err(EngineError::NotGitRepository(requested));
+    }
+    let repository_root = decode_git_text(root_output)?;
+    let repository_root = canonicalize_directory(Path::new(&repository_root))?;
+    let head_output = run_git_probe(
+        &runner,
+        &repository_root,
+        [
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("HEAD^{commit}"),
+        ],
+    )
+    .await?;
+    if !head_output.success() {
+        return Err(EngineError::MissingGitBaseCommit(repository_root));
+    }
+    let base_commit = decode_git_text(head_output)?;
+    validate_object_id(&base_commit)?;
+    assert_safe_git_boundary(&runner, &repository_root).await?;
+    Ok(GitRepositoryReadiness {
+        repository_root,
+        base_commit,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct GitWorktreeManager {
     repository_root: PathBuf,
@@ -76,18 +118,21 @@ impl GitWorktreeManager {
 
     pub async fn create(&self, task_id: TaskId, base_revision: &str) -> EngineResult<GitWorktree> {
         validate_revision(base_revision)?;
-        assert_git_repository(&self.runner, &self.repository_root).await?;
-        self.assert_safe_boundary().await?;
-        let resolved_base = git_text(
-            &self.runner,
-            &self.repository_root,
-            [
-                "rev-parse",
-                "--verify",
-                &format!("{base_revision}^{{commit}}"),
-            ],
-        )
-        .await?;
+        let readiness = inspect_git_repository(&self.repository_root).await?;
+        let resolved_base = if base_revision == "HEAD" {
+            readiness.base_commit
+        } else {
+            git_text(
+                &self.runner,
+                &readiness.repository_root,
+                [
+                    "rev-parse",
+                    "--verify",
+                    &format!("{base_revision}^{{commit}}"),
+                ],
+            )
+            .await?
+        };
         if !(40..=64).contains(&resolved_base.len())
             || !resolved_base.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -225,37 +270,35 @@ impl GitWorktreeManager {
         }
         Ok(())
     }
+}
 
-    async fn assert_safe_boundary(&self) -> EngineResult<()> {
-        let git_dir = git_text(
-            &self.runner,
-            &self.repository_root,
-            ["rev-parse", "--git-dir"],
-        )
-        .await?;
-        let git_dir = if Path::new(&git_dir).is_absolute() {
-            PathBuf::from(git_dir)
-        } else {
-            self.repository_root.join(git_dir)
-        };
-        let unsafe_markers = [
-            "MERGE_HEAD",
-            "CHERRY_PICK_HEAD",
-            "REVERT_HEAD",
-            "BISECT_LOG",
-            "rebase-apply",
-            "rebase-merge",
-        ];
-        let active = unsafe_markers
-            .iter()
-            .filter(|marker| git_dir.join(marker).exists())
-            .copied()
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            Ok(())
-        } else {
-            Err(EngineError::UnsafeGitBoundary(active.join(", ")))
-        }
+async fn assert_safe_git_boundary(
+    runner: &ProcessRunner,
+    repository_root: &Path,
+) -> EngineResult<()> {
+    let git_dir = git_text(runner, repository_root, ["rev-parse", "--git-dir"]).await?;
+    let git_dir = if Path::new(&git_dir).is_absolute() {
+        PathBuf::from(git_dir)
+    } else {
+        repository_root.join(git_dir)
+    };
+    let unsafe_markers = [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-apply",
+        "rebase-merge",
+    ];
+    let active = unsafe_markers
+        .iter()
+        .filter(|marker| git_dir.join(marker).exists())
+        .copied()
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        Ok(())
+    } else {
+        Err(EngineError::UnsafeGitBoundary(active.join(", ")))
     }
 }
 
@@ -369,15 +412,6 @@ fn ensure_no_symlink_components(path: &Path) -> EngineResult<()> {
     Ok(())
 }
 
-async fn assert_git_repository(runner: &ProcessRunner, path: &Path) -> EngineResult<()> {
-    let value = git_text(runner, path, ["rev-parse", "--is-inside-work-tree"]).await?;
-    if value == "true" {
-        Ok(())
-    } else {
-        Err(EngineError::UnsafePath(path.to_path_buf()))
-    }
-}
-
 fn validate_revision(revision: &str) -> EngineResult<()> {
     if revision.is_empty()
         || revision.starts_with('-')
@@ -419,7 +453,17 @@ async fn git_text<const N: usize>(
         })
 }
 
-async fn run_git_checked<I, S>(
+fn decode_git_text(output: ProcessResult) -> EngineResult<String> {
+    String::from_utf8(output.stdout.bytes)
+        .map(|text| text.trim().to_owned())
+        .map_err(|error| EngineError::CommandFailed {
+            executable: "git".to_owned(),
+            exit_code: output.exit_code,
+            message: format!("non-UTF-8 output: {error}"),
+        })
+}
+
+async fn run_git_probe<I, S>(
     runner: &ProcessRunner,
     cwd: &Path,
     args: I,
@@ -447,6 +491,19 @@ where
             message: "Git evidence exceeded the configured output bound".to_owned(),
         });
     }
+    Ok(output)
+}
+
+async fn run_git_checked<I, S>(
+    runner: &ProcessRunner,
+    cwd: &Path,
+    args: I,
+) -> EngineResult<ProcessResult>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = run_git_probe(runner, cwd, args).await?;
     if output.success() {
         return Ok(output);
     }
@@ -654,8 +711,10 @@ mod tests {
 
     use super::{
         FileOwnershipRegistry, GitWorktreeManager, append_untracked_evidence,
-        parse_name_status_paths, parse_porcelain_paths,
+        canonicalize_directory, inspect_git_repository, parse_name_status_paths,
+        parse_porcelain_paths,
     };
+    use crate::EngineError;
 
     fn run_git(cwd: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let output = Command::new("git").args(args).current_dir(cwd).output()?;
@@ -669,6 +728,81 @@ mod tests {
             )
             .into())
         }
+    }
+
+    fn git_output(
+        cwd: &Path,
+        args: &[&str],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let output = Command::new("git").args(args).current_dir(cwd).output()?;
+        if output.status.success() {
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        } else {
+            Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_non_git_directory_without_creating_state()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let repository = crate::test_support::CanonicalTempDir::new()?;
+        let expected_root = canonicalize_directory(repository.path())?;
+
+        let Err(error) = inspect_git_repository(repository.path()).await else {
+            return Err("non-Git directory unexpectedly passed readiness".into());
+        };
+
+        assert!(matches!(error, EngineError::NotGitRepository(ref path) if path == &expected_root));
+        assert!(!repository.path().join(".colay").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_distinguishes_unborn_head()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let repository = crate::test_support::CanonicalTempDir::new()?;
+        run_git(repository.path(), &["init", "--quiet"])?;
+        let expected_root = canonicalize_directory(repository.path())?;
+
+        let Err(error) = inspect_git_repository(repository.path()).await else {
+            return Err("unborn Git repository unexpectedly passed readiness".into());
+        };
+
+        assert!(
+            matches!(error, EngineError::MissingGitBaseCommit(ref path) if path == &expected_root)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_seals_root_and_full_head_commit()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let repository = crate::test_support::CanonicalTempDir::new()?;
+        run_git(repository.path(), &["init", "--quiet"])?;
+        run_git(
+            repository.path(),
+            &["config", "user.name", "Orchestrator Test"],
+        )?;
+        run_git(
+            repository.path(),
+            &["config", "user.email", "orchestrator@example.invalid"],
+        )?;
+        std::fs::write(repository.path().join("tracked.txt"), b"base\n")?;
+        run_git(repository.path(), &["add", "tracked.txt"])?;
+        run_git(repository.path(), &["commit", "--quiet", "-m", "base"])?;
+        let expected = git_output(repository.path(), &["rev-parse", "HEAD"])?;
+        let expected_root = canonicalize_directory(repository.path())?;
+
+        let readiness = inspect_git_repository(repository.path()).await?;
+
+        assert_eq!(readiness.repository_root, expected_root);
+        assert_eq!(readiness.base_commit, expected);
+        Ok(())
     }
 
     #[test]

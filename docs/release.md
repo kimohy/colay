@@ -7,7 +7,7 @@ This repository versions Colay and its persisted/public contracts independently.
 | Colay | `0.1.0` | workspace `Cargo.toml` |
 | Tested Codex | `0.144.5`, `0.144.6` | `compatibility/codex-version.toml` |
 | Recommended Codex | `0.144.6` | `compatibility/codex-version.toml` |
-| SQLite state schema | `8` | `STATE_SCHEMA_VERSION` and migrations |
+| SQLite state schema | `11` | `STATE_SCHEMA_VERSION` and migrations |
 | Config schema | `4` | `CONFIG_SCHEMA_VERSION` |
 | Checkpoint/handover schema | `1` | domain writers |
 
@@ -21,6 +21,10 @@ Current known limitations:
 - Authoritative checkpoint diffs remain sensitive local source artifacts even though persistence/handover preflight blocks known secret patterns and oversized unscanned files.
 - The daemon executes dependency-ready approved tasks concurrently within exact global/provider and write-scope limits. Read-only reviewer fan-out is not implemented.
 - Exact approved results can be applied only to a retained integration worktree. Merge to the user's branch, push, publication, cleanup, and `/retry` remain unavailable.
+- Windows native PE artifacts are currently not Authenticode-signed. GitHub attestations,
+  npm provenance, and SHA-256 checksums authenticate distribution bytes but do not establish
+  Windows OS code-signing trust. Enterprises that require WDAC/AppLocker/SmartScreen publisher
+  trust must build and sign internally or explicitly allowlist the verified release digest.
 
 See [`rollback.md`](rollback.md) for the release manifest, explicit approval, recovery journal, and restart procedure.
 
@@ -114,6 +118,12 @@ npm audit signatures --json --include-attestations
 npm Trusted Publishing automatically creates provenance for workflow-published
 packages. The audit command validates those npm attestations; it does not
 replace checking the release archive and GitHub attestation above.
+
+On Windows, also run `Get-AuthenticodeSignature` against the extracted `.exe`.
+The expected status for the current release line is `NotSigned`; treat any policy
+that requires a trusted publisher signature as an unsupported deployment until the
+organization signs its internal build or approves the verified digest. Do not interpret
+npm provenance or the checksum as an Authenticode substitute.
 
 ## Operator release procedure
 

@@ -12,7 +12,8 @@ use orchestrator_domain::{
     SessionState, TaskEnvelope, TaskId, VerificationId, VerificationResult, VerificationStatus,
 };
 use orchestrator_engine::{
-    CheckpointInput, CheckpointManager, GitCheckpointEvidence, GitIntegrationManager,
+    CheckpointInput, CheckpointManager, ConversationFailure, ConversationOrchestrator,
+    ConversationRequest, ConversationResponse, GitCheckpointEvidence, GitIntegrationManager,
     GitWorktreeManager, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
     canonicalize_directory,
 };
@@ -22,6 +23,21 @@ use orchestrator_state::{
 use rusqlite::params;
 
 struct UnusedPlanner;
+
+struct UnusedConversation;
+
+#[async_trait]
+impl ConversationOrchestrator for UnusedConversation {
+    async fn converse(
+        &self,
+        _request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        Err(ConversationFailure::Invocation {
+            reason: "conversation is not expected".to_owned(),
+            evidence_redacted: String::new(),
+        })
+    }
+}
 
 #[async_trait]
 impl TaskPlanner for UnusedPlanner {
@@ -251,6 +267,8 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
         state_root: state_root.clone(),
     };
     let services = PlanningServices {
+        conversation: Arc::new(UnusedConversation),
+        repository_root: repository.clone(),
         planner: Arc::new(UnusedPlanner),
         planner_provider: ProviderId::Codex,
         validation_policy: GraphValidationPolicy {

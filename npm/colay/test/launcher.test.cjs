@@ -8,6 +8,7 @@ const path = require("node:path");
 const { after, test } = require("node:test");
 
 const {
+  assertSupportedNodeVersion,
   launchNative,
   platformPackage,
   resolveNativeBinary,
@@ -26,6 +27,29 @@ function temporaryDirectory() {
   temporaryDirectories.push(directory);
   return directory;
 }
+
+test("rejects unsupported Node before resolving or spawning a native binary", async () => {
+  assert.throws(
+    () => assertSupportedNodeVersion("20.19.6"),
+    /Node\.js 20\.19\.6 is unsupported.*Node\.js 22 or newer.*nvm use 22/s,
+  );
+  assert.doesNotThrow(() => assertSupportedNodeVersion("22.0.0"));
+  assert.doesNotThrow(() => assertSupportedNodeVersion("24.12.0"));
+
+  let spawned = false;
+  await assert.rejects(
+    launchNative({
+      binary: "native-binary",
+      nodeVersion: "18.19.1",
+      spawn: () => {
+        spawned = true;
+        return new EventEmitter();
+      },
+    }),
+    /Node\.js 18\.19\.1 is unsupported/,
+  );
+  assert.equal(spawned, false);
+});
 
 test("maps the three supported platform pairs", () => {
   assert.deepEqual(platformPackage("win32", "x64"), {

@@ -159,7 +159,7 @@ impl Database {
         self.with_connection(|connection| {
             let session = connection
                 .query_row(
-                    "SELECT session_id, schema_version, revision, title, state, created_at,
+                    "SELECT session_id, schema_version, revision, title, coalesce(state_v2, state), created_at,
                      updated_at, archived_at FROM sessions WHERE session_id = ?1",
                     [request.session_id.to_string()],
                     map_session,
@@ -254,7 +254,8 @@ const TASK_SELECT: &str =
         ORDER BY decided_at DESC, rowid DESC LIMIT 1),
        (SELECT provider_id FROM task_attempts a WHERE a.task_id = tasks.task_id
         ORDER BY ordinal DESC LIMIT 1),
-       (SELECT provider_id FROM session_tasks st WHERE st.task_id = tasks.task_id LIMIT 1)
+       (SELECT coalesce(provider_id_v2, provider_id) FROM session_tasks st
+        WHERE st.task_id = tasks.task_id LIMIT 1)
      ),
      coalesce(
        (SELECT model_profile FROM routing_decisions r WHERE r.task_id = tasks.task_id
@@ -943,6 +944,7 @@ mod tests {
             .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
+                authority: None,
                 approved_by: "workspace-test".to_owned(),
                 approved_at: timestamp(),
             })

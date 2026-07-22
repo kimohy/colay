@@ -6,7 +6,7 @@ use orchestrator_domain::{
     ProviderId, RepoPath, ResourceClaimId, ResourceScope, ScheduleCandidate, ScheduleCapacity,
     ScheduleClaimId, SessionId, TaskEnvelope, TaskId, select_ready_tasks,
 };
-use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{Database, StateError, StateResult};
@@ -51,10 +51,11 @@ impl Database {
         request: &ClaimReadyTaskRequest,
     ) -> StateResult<Option<ClaimedTask>> {
         validate_request(request)?;
-        let expires_at = request.now.checked_add_signed(request.ttl).ok_or_else(|| {
-            StateError::InvalidRecord("schedule claim expiry overflow".to_owned())
-        })?;
+        let expires_at = schedule_claim_expiry(request.now, request.ttl)?;
         let mut connection = self.lock()?;
+        if !queued_schedule_candidate_exists(&connection)? {
+            return Ok(None);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire_claims(&transaction, request.now)?;
         ensure_daemon_owner(&transaction, request.daemon_instance_id, request.now)?;
@@ -236,6 +237,25 @@ impl Database {
     }
 }
 
+fn queued_schedule_candidate_exists(connection: &Connection) -> StateResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM session_tasks st
+                JOIN tasks t ON t.task_id = st.task_id
+                JOIN graph_revisions gr ON gr.revision_id = st.revision_id
+                JOIN session_graph_heads gh ON gh.session_id = st.session_id
+                                           AND gh.revision_id = st.revision_id
+                WHERE gr.status = 'approved' AND t.archived_at IS NULL
+                  AND t.state = 'queued' AND t.paused = 0
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StateError::from)
+}
+
 fn validate_request(request: &ClaimReadyTaskRequest) -> StateResult<()> {
     if request.global_limit == 0 {
         return Err(StateError::InvalidConfig(
@@ -253,6 +273,11 @@ fn validate_request(request: &ClaimReadyTaskRequest) -> StateResult<()> {
         ));
     }
     Ok(())
+}
+
+fn schedule_claim_expiry(now: DateTime<Utc>, ttl: TimeDelta) -> StateResult<DateTime<Utc>> {
+    now.checked_add_signed(ttl)
+        .ok_or_else(|| StateError::InvalidRecord("schedule claim expiry overflow".to_owned()))
 }
 
 fn expire_claims(transaction: &Transaction<'_>, now: DateTime<Utc>) -> StateResult<()> {
@@ -296,7 +321,8 @@ fn ensure_daemon_owner(
 fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRecord>> {
     let mut statement = transaction.prepare(
         "SELECT st.session_id, st.revision_id, st.task_id, st.node_key, st.display_order,
-                st.provider_id, st.model_profile, t.state, t.paused, t.task_envelope_json,
+                coalesce(st.provider_id_v2, st.provider_id), st.model_profile,
+                t.state, t.paused, t.task_envelope_json,
                 t.created_at
          FROM session_tasks st
          JOIN tasks t ON t.task_id = st.task_id
@@ -542,6 +568,26 @@ mod tests {
             ttl: TimeDelta::minutes(10),
         })?;
         Ok((directory, database, daemon))
+    }
+
+    #[test]
+    fn empty_scheduler_poll_stays_read_only_while_another_writer_is_active()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, database, daemon) = setup()?;
+        let blocker = rusqlite::Connection::open(directory.path().join("orchestrator.db"))?;
+        blocker.execute_batch("BEGIN IMMEDIATE")?;
+
+        let claimed = database.claim_next_ready_task(&ClaimReadyTaskRequest {
+            daemon_instance_id: daemon,
+            global_limit: 1,
+            provider_limits: BTreeMap::new(),
+            now: now(),
+            ttl: TimeDelta::minutes(1),
+        })?;
+
+        assert_eq!(claimed, None);
+        blocker.execute_batch("ROLLBACK")?;
+        Ok(())
     }
 
     fn seed_task(

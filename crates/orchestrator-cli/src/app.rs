@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     io::Write as _,
     path::{Path, PathBuf},
+    pin::Pin,
     str::FromStr as _,
     sync::Arc,
     time::Duration,
@@ -25,7 +27,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     CheckpointInput, CheckpointManager, CodexExecutionPolicy, GitCheckpointEvidence, GitWorktree,
     GitWorktreeManager, HandoverInput, HandoverManager, StartupGuard, VerificationEngine,
-    VerificationInput, canonicalize_directory,
+    VerificationInput, canonicalize_directory, inspect_git_repository,
 };
 use orchestrator_policy::{
     AnalysisHints, BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig,
@@ -42,10 +44,10 @@ use orchestrator_providers::{
 };
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
-    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, Database, EffectiveConfig, EventLog,
-    MigratableConfigDocument, OrchestratorConfig, ProviderConfig,
-    RepositoryStatePaths as StatePaths, RootConfig, WorkerLease, WorkerLeaseMode,
-    WorkerLeaseRequest, load_effective_config,
+    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, DaemonStatus, Database,
+    EffectiveConfig, EventLog, LeaseRenewal, MigratableConfigDocument, OrchestratorConfig,
+    ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig, StateError, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest, load_effective_config,
 };
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -68,6 +70,9 @@ use crate::profile_config::{
 const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
 const DEFAULT_CONFIG_PATH: &str = ".colay/config.toml";
 const LEGACY_CONFIG_PATH: &str = ".codex/orchestrator/config.toml";
+const COORDINATOR_LEASE_TTL_SECONDS: i64 = 30;
+const WORKER_LEASE_TTL_SECONDS: i64 = 20;
+const LEASE_RENEWAL_INTERVAL_SECONDS: u64 = 5;
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -447,6 +452,21 @@ fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> 
 
 async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
     let mut checks = vec![Check::pass("config", "schema and values are valid")];
+    let executable = std::env::current_exe()?;
+    checks.push(Check::with_data(
+        "runtime",
+        true,
+        json!({
+            "version": crate::args::COLAY_VERSION,
+            "executable": &executable,
+            "invoked_as": std::env::args_os().next(),
+            "target_os": std::env::consts::OS,
+            "target_arch": std::env::consts::ARCH,
+        }),
+    ));
+    if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
+        checks.push(Check::warn("wsl_mixed_git_checkout", warning));
+    }
     let config = effective.config();
     {
         let redaction = process_redaction(&config.orchestrator);
@@ -460,6 +480,10 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
                         "database",
                         health.integrity_ok,
                         json!(health),
+                    ));
+                    checks.push(daemon_runtime_check(
+                        &database.daemon_status(Utc::now())?,
+                        &executable,
                     ));
                     if state.events.exists() {
                         let reconciliation = EventLog::open(&state.events)?.reconcile(&database)?;
@@ -516,6 +540,60 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
             checks,
             inference_requests: 0,
         },
+    )
+}
+
+fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Check {
+    let (status, detail) = match daemon_status {
+        DaemonStatus::Online(instance)
+        | DaemonStatus::Booting(instance)
+        | DaemonStatus::Probing(instance) => {
+            let version_matches =
+                instance.build_version.as_deref() == Some(crate::args::COLAY_VERSION);
+            let executable_matches =
+                instance
+                    .executable_path
+                    .as_deref()
+                    .is_some_and(|daemon_executable| {
+                        let daemon = Path::new(daemon_executable);
+                        if cfg!(windows) {
+                            daemon
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&executable.to_string_lossy())
+                        } else {
+                            daemon == executable
+                        }
+                    });
+            if version_matches && executable_matches {
+                (
+                    CheckStatus::Pass,
+                    "daemon runtime matches this CLI".to_owned(),
+                )
+            } else {
+                (
+                    CheckStatus::Warn,
+                    "daemon executable or build version differs from this CLI; restart the repository daemon with the intended Colay binary".to_owned(),
+                )
+            }
+        }
+        DaemonStatus::Stopped => (
+            CheckStatus::Warn,
+            "repository daemon is stopped; start it to compare runtime identity".to_owned(),
+        ),
+        DaemonStatus::Failed(_) | DaemonStatus::Stale(_) => (
+            CheckStatus::Warn,
+            "repository daemon is failed or stale; restart it before writable execution".to_owned(),
+        ),
+    };
+    Check::with_status_data(
+        "daemon_runtime",
+        status,
+        detail,
+        json!({
+            "current_executable": executable,
+            "current_version": crate::args::COLAY_VERSION,
+            "status": daemon_status,
+        }),
     )
 }
 
@@ -729,6 +807,11 @@ async fn run_task(
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
+    if !arguments.plan_only {
+        inspect_git_repository(repository).await.with_context(|| {
+            "direct `colay run` executes a writable task and requires a committed Git repository; `run --plan-only` remains static assessment, not conversation mode"
+        })?;
+    }
     let state = StatePaths::from_config(repository, document.config())?;
     let database = if state.database.exists() {
         open_ready_database(&state)?
@@ -863,20 +946,24 @@ async fn run_task(
 
     // The execution coordinator is deliberately entered only after all persisted safety
     // gates above have passed. It uses public CLI adapters and never provider SDK tokens.
-    let coordinator = acquire_task_coordinator(&database, plan.task.task_id, document.config())?;
-    let result = execute_planned_task(
-        repository,
-        &state,
-        document.config(),
+    let coordinator = acquire_task_coordinator(&database, plan.task.task_id)?;
+    let result = run_with_coordinator_renewal(
         &database,
-        plan,
-        correlation_id,
-        runtime_prompt,
-        json_output,
-        None,
-        None,
-        false,
-        coordinator.lease_id,
+        &coordinator,
+        Box::pin(execute_planned_task(
+            repository,
+            &state,
+            document.config(),
+            &database,
+            plan,
+            correlation_id,
+            runtime_prompt,
+            json_output,
+            None,
+            None,
+            false,
+            coordinator.lease_id,
+        )),
     )
     .await;
     let released =
@@ -905,17 +992,21 @@ async fn resume_task(
     if stored.state.is_terminal() {
         bail!("terminal task {task_id} cannot be resumed");
     }
-    let coordinator = acquire_task_coordinator(&database, task_id, document.config())?;
-    let result = resume_task_coordinated(
-        repository,
-        document,
-        &state,
+    let coordinator = acquire_task_coordinator(&database, task_id)?;
+    let result = run_with_coordinator_renewal(
         &database,
-        task_id,
-        correlation_id,
-        stored,
-        coordinator.lease_id,
-        json_output,
+        &coordinator,
+        Box::pin(resume_task_coordinated(
+            repository,
+            document,
+            &state,
+            &database,
+            task_id,
+            correlation_id,
+            stored,
+            coordinator.lease_id,
+            json_output,
+        )),
     )
     .await;
     let released =
@@ -1546,7 +1637,6 @@ async fn execute_planned_task(
                 plan.task.task_id,
                 provider,
                 SandboxMode::ReadOnly,
-                acknowledgement_request.timeout_seconds,
             )?;
             let acknowledgement_run = run_worker(
                 adapter.as_ref(),
@@ -1558,6 +1648,8 @@ async fn execute_planned_task(
                 &redaction,
                 state,
                 &database,
+                coordinator_lease_id,
+                &acknowledgement_lease,
                 attempt_ordinal,
                 correlation_id,
             )
@@ -1704,7 +1796,6 @@ async fn execute_planned_task(
             plan.task.task_id,
             provider,
             SandboxMode::WorkspaceWrite,
-            request.timeout_seconds,
         )?;
         let run = run_worker(
             adapter.as_ref(),
@@ -1716,6 +1807,8 @@ async fn execute_planned_task(
             &redaction,
             state,
             &database,
+            coordinator_lease_id,
+            &worker_lease,
             attempt_ordinal,
             correlation_id,
         )
@@ -2088,6 +2181,8 @@ async fn run_worker(
     redaction_config: &RedactionConfig,
     state: &StatePaths,
     database: &Database,
+    coordinator_lease_id: Uuid,
+    worker_lease: &WorkerLease,
     ordinal: usize,
     correlation_id: CorrelationId,
 ) -> Result<WorkerRunRecord> {
@@ -2152,9 +2247,24 @@ async fn run_worker(
     let mut control_poll = tokio::time::interval(Duration::from_millis(500));
     control_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     control_poll.tick().await;
+    let mut lease_renewal =
+        tokio::time::interval(Duration::from_secs(LEASE_RENEWAL_INTERVAL_SECONDS));
+    lease_renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    lease_renewal.tick().await;
     loop {
         let next_event = tokio::select! {
             result = adapter.next_event(&handle) => Some(result),
+            _ = lease_renewal.tick() => {
+                database.renew_worker_lease(
+                    coordinator_lease_id,
+                    worker_lease.lease_id,
+                    LeaseRenewal {
+                        renewed_at: Utc::now(),
+                        ttl: TimeDelta::seconds(WORKER_LEASE_TTL_SECONDS),
+                    },
+                ).context("worker lease heartbeat failed")?;
+                continue;
+            }
             _ = control_poll.tick() => {
                 if poll_controls
                     && active_commands.is_empty()
@@ -2188,6 +2298,7 @@ async fn run_worker(
         };
         match adapter.parse_event(raw).await {
             Ok(event) => {
+                let terminal_error = matches!(&event, WorkerEvent::Error { .. });
                 match &event {
                     WorkerEvent::Started { session_id: value } => session_id.clone_from(value),
                     WorkerEvent::Message { text } => messages.push(text.clone()),
@@ -2319,6 +2430,15 @@ async fn run_worker(
                     correlation_id,
                     audit_worker_event(&event, &redactor),
                 )?;
+                if terminal_error {
+                    if let Err(error) = adapter.cancel(&handle).await {
+                        lifecycle_error = Some(format!(
+                            "{};provider_cancel_error:{error}",
+                            lifecycle_error.as_deref().unwrap_or("worker_error")
+                        ));
+                    }
+                    break;
+                }
             }
             Err(error) => {
                 lifecycle_error = Some(format!("compatibility_error:{error}"));
@@ -2863,34 +2983,88 @@ fn persist_worktree(database: &Database, worktree: &GitWorktree) -> Result<()> {
     Ok(())
 }
 
-fn acquire_task_coordinator(
-    database: &Database,
-    task_id: TaskId,
-    config: &RootConfig,
-) -> Result<CoordinatorLease> {
+fn acquire_task_coordinator(database: &Database, task_id: TaskId) -> Result<CoordinatorLease> {
     let now = Utc::now();
-    let phases = u64::from(config.orchestrator.max_retries)
-        .saturating_add(8)
-        .min(16);
-    let ttl_seconds = config
-        .orchestrator
-        .default_timeout_minutes
-        .saturating_mul(60)
-        .saturating_mul(phases)
-        .saturating_add(600);
-    let ttl = TimeDelta::seconds(i64::try_from(ttl_seconds).unwrap_or(i64::MAX));
     let worktree_id = database
         .active_worktree(task_id)?
         .map(|value| value.worktree_id);
-    database
-        .acquire_coordinator_lease(&CoordinatorLeaseRequest {
-            task_id,
-            worktree_id,
-            owner_id: Uuid::now_v7(),
-            acquired_at: now,
-            ttl,
-        })
-        .map_err(Into::into)
+    match database.acquire_coordinator_lease(&CoordinatorLeaseRequest {
+        task_id,
+        worktree_id,
+        owner_id: Uuid::now_v7(),
+        acquired_at: now,
+        ttl: TimeDelta::seconds(COORDINATOR_LEASE_TTL_SECONDS),
+    }) {
+        Ok(lease) => Ok(lease),
+        Err(error @ StateError::LeaseConflict { .. }) => {
+            Err(coordinator_conflict_diagnostic(database, task_id, error))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn coordinator_conflict_diagnostic(
+    database: &Database,
+    task_id: TaskId,
+    error: StateError,
+) -> anyhow::Error {
+    let now = Utc::now();
+    let Ok(coordinator) = database.active_coordinator_lease(task_id, now) else {
+        return error.into();
+    };
+    let Ok(workers) = database.active_worker_leases(task_id, now) else {
+        return error.into();
+    };
+    let safe_retry_at = coordinator
+        .as_ref()
+        .map(|lease| lease.expires_at)
+        .into_iter()
+        .chain(workers.iter().map(|lease| lease.expires_at))
+        .max();
+    let coordinator_detail = coordinator.map_or_else(
+        || "coordinator=none".to_owned(),
+        |lease| {
+            format!(
+                "coordinator_owner={} renewed_at={} expires_at={}",
+                lease.owner_id,
+                lease.renewed_at.to_rfc3339(),
+                lease.expires_at.to_rfc3339()
+            )
+        },
+    );
+    let retry_detail = safe_retry_at.map_or_else(
+        || "safe retry time unavailable".to_owned(),
+        |expires_at| format!("safe retry after {}", expires_at.to_rfc3339()),
+    );
+    anyhow!(
+        "{error}; {coordinator_detail}; active_workers={}; {retry_detail}",
+        workers.len()
+    )
+}
+
+async fn run_with_coordinator_renewal(
+    database: &Database,
+    coordinator: &CoordinatorLease,
+    mut operation: Pin<Box<dyn Future<Output = Result<()>> + '_>>,
+) -> Result<()> {
+    let mut renewal = tokio::time::interval(Duration::from_secs(LEASE_RENEWAL_INTERVAL_SECONDS));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    renewal.tick().await;
+    loop {
+        tokio::select! {
+            result = operation.as_mut() => return result,
+            _ = renewal.tick() => {
+                database.renew_coordinator_lease(
+                    coordinator.lease_id,
+                    coordinator.owner_id,
+                    LeaseRenewal {
+                        renewed_at: Utc::now(),
+                        ttl: TimeDelta::seconds(COORDINATOR_LEASE_TTL_SECONDS),
+                    },
+                ).context("coordinator lease heartbeat failed")?;
+            }
+        }
+    }
 }
 
 fn coordinated_result(
@@ -2913,11 +3087,8 @@ fn acquire_worker_lease(
     task_id: TaskId,
     provider: ProviderId,
     sandbox: SandboxMode,
-    timeout_seconds: u64,
 ) -> Result<WorkerLease> {
     let now = Utc::now();
-    let ttl_seconds = timeout_seconds.saturating_add(60);
-    let ttl = TimeDelta::seconds(i64::try_from(ttl_seconds).unwrap_or(i64::MAX));
     let mode = if sandbox == SandboxMode::WorkspaceWrite {
         WorkerLeaseMode::Writable
     } else {
@@ -2934,7 +3105,7 @@ fn acquire_worker_lease(
             provider,
             mode,
             acquired_at: now,
-            ttl,
+            ttl: TimeDelta::seconds(WORKER_LEASE_TTL_SECONDS),
         })
         .map_err(Into::into)
 }
@@ -3504,7 +3675,6 @@ async fn perform_independent_review(
         task.task_id,
         reviewer,
         SandboxMode::ReadOnly,
-        reviewer_timeout,
     )?;
     let run = run_worker(
         adapter.as_ref(),
@@ -3534,6 +3704,8 @@ async fn perform_independent_review(
         &redaction,
         state,
         database,
+        coordinator_lease_id,
+        &reviewer_lease,
         ordinal,
         correlation_id,
     )
@@ -5311,6 +5483,7 @@ fn parse_provider_id(value: &str) -> Result<ProviderId> {
 fn parse_provider_name(value: &str) -> Result<crate::args::ProviderName> {
     match value.to_ascii_lowercase().as_str() {
         "gemini" => Ok(crate::args::ProviderName::Gemini),
+        "agy" => Ok(crate::args::ProviderName::Agy),
         "codex" => Ok(crate::args::ProviderName::Codex),
         "claude" => Ok(crate::args::ProviderName::Claude),
         _ => bail!("unknown approved provider `{value}`"),
@@ -6741,6 +6914,38 @@ impl Check {
             data: Some(data),
         }
     }
+
+    fn with_status_data(
+        name: impl Into<String>,
+        status: CheckStatus,
+        detail: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status,
+            detail: Some(detail.into()),
+            data: Some(data),
+        }
+    }
+}
+
+fn mixed_git_checkout_warning(repository: &Path, target_os: &str) -> Option<String> {
+    if target_os != "linux" {
+        return None;
+    }
+    let path = repository.to_string_lossy().replace('\\', "/");
+    let remainder = path.strip_prefix("/mnt/")?;
+    let mut components = remainder.split('/');
+    let drive = components.next()?;
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() || components.next().is_none()
+    {
+        return None;
+    }
+    Some(
+        "repository is on a Windows-mounted /mnt/<drive> path; Windows Git and WSL Git may report mass line-ending changes. Use a WSL-native clone under the Linux filesystem for Linux Colay, or use Windows Colay with the Windows checkout."
+            .to_owned(),
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -6780,6 +6985,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use crate::args::{EffortName, MigrationAction, ProfileName, ProviderName};
@@ -6797,9 +7003,10 @@ mod tests {
 
     use super::{
         ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
-        block_for_unconfirmed_termination, initialize, load_config_runtime, reset_model_profile,
-        rollback_resolution_context, set_model_profile, set_provider_enabled,
-        trusted_rollback_steps, worker_started_payload,
+        acquire_task_coordinator, acquire_worker_lease, block_for_unconfirmed_termination,
+        initialize, load_config_runtime, mixed_git_checkout_warning, provider_adapter,
+        reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
+        set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
 
     fn test_state(root: PathBuf) -> StatePaths {
@@ -6813,6 +7020,16 @@ mod tests {
             worktrees: root.join("worktrees"),
             root,
         }
+    }
+
+    #[test]
+    fn linux_mounted_windows_checkout_warns_about_mixed_git_line_endings() {
+        let warning = mixed_git_checkout_warning(Path::new("/mnt/c/work/project"), "linux")
+            .unwrap_or_default();
+        assert!(warning.contains("WSL-native clone"));
+        assert!(warning.contains("line-ending"));
+        assert!(mixed_git_checkout_warning(Path::new("/home/user/project"), "linux").is_none());
+        assert!(mixed_git_checkout_warning(Path::new("C:/work/project"), "windows").is_none());
     }
 
     fn write_fake_executable(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -6830,6 +7047,19 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let root = fs::canonicalize(temporary.path())?;
         Ok((temporary, root))
+    }
+
+    fn attempt_completion(
+        database: &Database,
+        attempt_id: AttemptId,
+    ) -> Result<(Option<String>, Option<String>)> {
+        Ok(database.with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT ended_at, outcome FROM task_attempts WHERE attempt_id = ?1",
+                [attempt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })?)
     }
 
     #[test]
@@ -6971,6 +7201,173 @@ mod tests {
         assert_eq!(payload["model"], "claude-fable-5");
         assert_eq!(payload["profile"], "premium");
         assert_eq!(payload["reasoning_effort"], "high");
+        Ok(())
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[tokio::test]
+    async fn terminal_provider_error_requests_cancel_and_finalizes_attempt() -> Result<()> {
+        use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
+
+        let (_temporary, root) = canonical_tempdir()?;
+        let state = test_state(root.join(".colay"));
+        let database = Database::open(&state.database)?;
+        database.migrate_with_backup(&state.backups)?;
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("terminal provider error", "terminal provider error", now);
+        database.create_task(&NewTaskRecord {
+            task_id: envelope.task_id,
+            schema_version: envelope.schema_version.to_string(),
+            state: TaskState::Running,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope: &envelope,
+            created_at: now,
+        })?;
+        let coordinator = acquire_task_coordinator(&database, envelope.task_id)?;
+        let worker = acquire_worker_lease(
+            &database,
+            coordinator.lease_id,
+            envelope.task_id,
+            ProviderId::Claude,
+            SandboxMode::WorkspaceWrite,
+        )?;
+
+        let fake_executable = root.join(if cfg!(windows) {
+            "fake-provider-cli.exe"
+        } else {
+            "fake-provider-cli"
+        });
+        fs::copy(std::env::current_exe()?, &fake_executable)?;
+        let mut config = RootConfig::default();
+        config
+            .orchestrator
+            .providers
+            .claude
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("default Claude provider is missing"))?
+            .executable = fake_executable.to_string_lossy().into_owned();
+        let runtime =
+            FakeAdapterRuntime::new(&fake_executable, FakeRuntimeScenario::TerminalError)?;
+        let adapter = provider_adapter(ProviderId::Claude, &config, Arc::new(runtime), &root)?;
+        let request = WorkerRequest {
+            schema_version: SchemaVersion::v1(),
+            task_id: envelope.task_id,
+            attempt_id: AttemptId::new(),
+            provider: ProviderId::Claude,
+            objective: envelope.objective,
+            prompt: "return a terminal credit error".to_owned(),
+            constraints: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            workspace_root: root.clone(),
+            sandbox: SandboxMode::WorkspaceWrite,
+            profile: ModelProfile::Standard,
+            model: None,
+            reasoning_effort: None,
+            timeout_seconds: 60,
+            max_output_bytes: 1024,
+            resume_session_id: None,
+            handover_payload: None,
+        };
+        let provider_config = config
+            .orchestrator
+            .providers
+            .claude
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("default Claude provider is missing"))?;
+
+        let run = run_worker(
+            adapter.as_ref(),
+            request.clone(),
+            provider_config,
+            -1.0,
+            false,
+            false,
+            &RedactionConfig::default(),
+            &state,
+            &database,
+            coordinator.lease_id,
+            &worker,
+            1,
+            orchestrator_domain::CorrelationId::new(),
+        )
+        .await?;
+
+        assert_eq!(run.result.outcome, WorkerOutcome::Cancelled);
+        assert_eq!(run.lifecycle_error.as_deref(), Some("claude_result"));
+        let renewed_worker = database
+            .active_worker_leases(envelope.task_id, Utc::now())?
+            .into_iter()
+            .find(|lease| lease.lease_id == worker.lease_id)
+            .ok_or_else(|| anyhow::anyhow!("worker lease disappeared before release"))?;
+        assert!(renewed_worker.expires_at > worker.expires_at);
+        let (ended_at, outcome) = attempt_completion(&database, request.attempt_id)?;
+        assert!(ended_at.is_some());
+        assert_eq!(outcome.as_deref(), Some("cancelled"));
+        database.release_worker_lease(coordinator.lease_id, worker.lease_id, Utc::now())?;
+        database.release_coordinator_lease(
+            coordinator.lease_id,
+            coordinator.owner_id,
+            Utc::now(),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_execution_leases_have_bounded_recovery_ttls() -> Result<()> {
+        let (_temporary, root) = canonical_tempdir()?;
+        let state = test_state(root.join(".colay"));
+        let database = Database::open(&state.database)?;
+        database.migrate_with_backup(&state.backups)?;
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("bounded leases", "bounded leases", now);
+        database.create_task(&NewTaskRecord {
+            task_id: envelope.task_id,
+            schema_version: envelope.schema_version.to_string(),
+            state: TaskState::Planned,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope: &envelope,
+            created_at: now,
+        })?;
+        let coordinator = acquire_task_coordinator(&database, envelope.task_id)?;
+        let worker = acquire_worker_lease(
+            &database,
+            coordinator.lease_id,
+            envelope.task_id,
+            ProviderId::Claude,
+            SandboxMode::WorkspaceWrite,
+        )?;
+
+        assert!(coordinator.expires_at - coordinator.acquired_at <= chrono::TimeDelta::seconds(30));
+        assert!(worker.expires_at - worker.acquired_at <= chrono::TimeDelta::seconds(20));
+        let Err(conflict) = acquire_task_coordinator(&database, envelope.task_id) else {
+            anyhow::bail!("a second coordinator unexpectedly acquired the live task");
+        };
+        let diagnostic = conflict.to_string();
+        assert!(diagnostic.contains("renewed_at="));
+        assert!(diagnostic.contains("expires_at="));
+        assert!(diagnostic.contains("active_workers=1"));
+        assert!(diagnostic.contains("safe retry after"));
+        database.release_worker_lease(coordinator.lease_id, worker.lease_id, Utc::now())?;
+        run_with_coordinator_renewal(
+            &database,
+            &coordinator,
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                Ok(())
+            }),
+        )
+        .await?;
+        let renewed = database
+            .active_coordinator_lease(envelope.task_id, Utc::now())?
+            .ok_or_else(|| anyhow::anyhow!("coordinator lease expired while owner was active"))?;
+        assert!(renewed.renewed_at > renewed.acquired_at);
+        database.release_coordinator_lease(
+            coordinator.lease_id,
+            coordinator.owner_id,
+            Utc::now(),
+        )?;
         Ok(())
     }
 

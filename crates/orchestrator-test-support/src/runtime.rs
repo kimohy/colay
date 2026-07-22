@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 pub enum FakeRuntimeScenario {
     Success,
     QuotaExceeded,
+    TerminalError,
     MalformedOutput,
     UnknownEvent,
     ProcessCrash,
@@ -34,6 +35,7 @@ struct FakeJob {
     events: VecDeque<RawEvent>,
     output: RuntimeOutput,
     cancelled: bool,
+    first_event_ready_at: Option<tokio::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +88,18 @@ impl FakeAdapterRuntime {
             )))
         }
     }
+
+    /// Returns the number of fake jobs that observed a cancellation request.
+    ///
+    /// This is test evidence for lifecycle cleanup; it never starts a real provider.
+    pub async fn cancelled_job_count(&self) -> usize {
+        self.jobs
+            .lock()
+            .await
+            .values()
+            .filter(|job| job.cancelled)
+            .count()
+    }
 }
 
 #[async_trait]
@@ -119,7 +133,13 @@ impl AdapterRuntime for FakeAdapterRuntime {
         invocation: PreparedInvocation,
     ) -> Result<WorkerHandle, ProviderError> {
         self.ensure_fake(&invocation.executable)?;
-        let lines = scenario_lines(provider, self.scenario);
+        let lines = if request.objective == "Conduct a read-only conversation turn"
+            && self.scenario == FakeRuntimeScenario::Success
+        {
+            conversation_lines(provider, &request.prompt)
+        } else {
+            scenario_lines(provider, self.scenario)
+        };
         let mut events = lines
             .into_iter()
             .enumerate()
@@ -183,6 +203,8 @@ impl AdapterRuntime for FakeAdapterRuntime {
                 events,
                 output,
                 cancelled: false,
+                first_event_ready_at: (self.scenario == FakeRuntimeScenario::TerminalError)
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(6)),
             },
         );
         Ok(WorkerHandle {
@@ -194,10 +216,20 @@ impl AdapterRuntime for FakeAdapterRuntime {
     }
 
     async fn next_event(&self, handle: &WorkerHandle) -> Result<Option<RawEvent>, ProviderError> {
+        let ready_at = {
+            let jobs = self.jobs.lock().await;
+            jobs.get(&handle.attempt_id)
+                .ok_or_else(|| ProviderError::Runtime("unknown fake worker".to_owned()))?
+                .first_event_ready_at
+        };
+        if let Some(ready_at) = ready_at {
+            tokio::time::sleep_until(ready_at).await;
+        }
         let mut jobs = self.jobs.lock().await;
         let job = jobs
             .get_mut(&handle.attempt_id)
             .ok_or_else(|| ProviderError::Runtime("unknown fake worker".to_owned()))?;
+        job.first_event_ready_at = None;
         Ok(job.events.pop_front())
     }
 
@@ -301,6 +333,9 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Codex, FakeRuntimeScenario::QuotaExceeded) => vec![
             r#"{"type":"error","code":"usage_limit_reached","message":"Monthly usage limit reached"}"#,
         ],
+        (ProviderId::Codex, FakeRuntimeScenario::TerminalError) => {
+            vec![r#"{"type":"error","code":"billing_error","message":"Credit balance is too low"}"#]
+        }
         (ProviderId::Codex, FakeRuntimeScenario::MalformedOutput) => vec!["{not-json}"],
         (ProviderId::Codex, FakeRuntimeScenario::UnknownEvent) => {
             vec![r#"{"type":"turn.paused"}"#]
@@ -318,6 +353,9 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Claude, FakeRuntimeScenario::QuotaExceeded) => {
             vec![r#"{"type":"result","is_error":true,"result":"Monthly usage limit reached"}"#]
         }
+        (ProviderId::Claude, FakeRuntimeScenario::TerminalError) => {
+            vec![r#"{"type":"result","is_error":true,"result":"Credit balance is too low"}"#]
+        }
         (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::MalformedOutput) => {
             vec!["not-json"]
         }
@@ -328,6 +366,9 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         ],
         (ProviderId::Gemini, FakeRuntimeScenario::QuotaExceeded) => {
             vec![r#"{"type":"error","message":"Daily quota exceeded"}"#]
+        }
+        (ProviderId::Gemini, FakeRuntimeScenario::TerminalError) => {
+            vec![r#"{"type":"error","message":"Credit balance is too low"}"#]
         }
         (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::UnknownEvent) => {
             vec![r#"{"type":"new_optional_event","payload":1}"#]
@@ -342,6 +383,7 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         ],
         (ProviderId::Agy, FakeRuntimeScenario::Success) => vec!["done"],
         (ProviderId::Agy, FakeRuntimeScenario::QuotaExceeded) => vec!["Daily quota exceeded"],
+        (ProviderId::Agy, FakeRuntimeScenario::TerminalError) => vec!["Credit balance is too low"],
         (ProviderId::Agy, FakeRuntimeScenario::MalformedOutput) => vec!["plain output"],
         (ProviderId::Agy, FakeRuntimeScenario::UnknownEvent) => vec!["optional output"],
         (ProviderId::Agy, FakeRuntimeScenario::SecretOutput) => {
@@ -352,6 +394,83 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
     lines
         .into_iter()
         .map(|line| line.as_bytes().to_vec())
+        .collect()
+}
+
+fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
+    let prompt: serde_json::Value = serde_json::from_str(prompt).unwrap_or_default();
+    let transcript = prompt
+        .get("transcript_redacted")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let outcome = if transcript.contains("needs-info") {
+        serde_json::json!({
+            "outcome": "more_information_needed",
+            "response_redacted": "Which crate and acceptance boundary should be used?",
+            "requirements": {
+                "objective": "clarify the requested change",
+                "in_scope": ["requested change"],
+                "out_of_scope": [],
+                "constraints": ["no task before approval"],
+                "acceptance_criteria": [],
+                "verification_plan": [],
+                "risks": [],
+                "open_questions": ["Which crate should change?"]
+            }
+        })
+    } else if transcript.contains("candidate") {
+        serde_json::json!({
+            "outcome": "worktree_task_candidate",
+            "response_redacted": "The requirement is ready for deterministic validation.",
+            "requirements": {
+                "objective": "implement the approved candidate",
+                "in_scope": ["approved candidate"],
+                "out_of_scope": ["automatic merge or push"],
+                "constraints": ["no task before approval"],
+                "acceptance_criteria": ["fake integration test passes"],
+                "verification_plan": [{
+                    "executable": "cargo",
+                    "args": ["test", "--workspace", "--all-features"]
+                }],
+                "risks": ["stale approval"],
+                "open_questions": []
+            }
+        })
+    } else if transcript.contains("attention") {
+        serde_json::json!({
+            "outcome": "needs_attention",
+            "response_redacted": "The provider could not classify this turn.",
+            "evidence_redacted": "fake attention fixture"
+        })
+    } else {
+        serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Git is needed only after an approved writable task candidate."
+        })
+    };
+    let text = serde_json::to_string(&outcome).unwrap_or_default();
+    let lines = match provider {
+        ProviderId::Codex => vec![
+            serde_json::json!({"type":"thread.started","thread_id":"fake-conversation"}),
+            serde_json::json!({"type":"turn.started"}),
+            serde_json::json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":text}}),
+            serde_json::json!({"type":"turn.completed","usage":{}}),
+        ],
+        ProviderId::Claude => vec![
+            serde_json::json!({"type":"system","subtype":"init","session_id":"fake-conversation"}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
+            serde_json::json!({"type":"result","is_error":false,"result":text}),
+        ],
+        ProviderId::Gemini => vec![
+            serde_json::json!({"type":"init","session_id":"fake-conversation"}),
+            serde_json::json!({"type":"message","role":"assistant","content":text}),
+            serde_json::json!({"type":"result","result":text}),
+        ],
+        ProviderId::Agy => return vec![text.into_bytes()],
+    };
+    lines
+        .into_iter()
+        .map(|line| serde_json::to_vec(&line).unwrap_or_default())
         .collect()
 }
 
@@ -366,6 +485,11 @@ where
     let app_server_probe = args.first().is_some_and(|arg| arg == "app-server")
         && (args.iter().any(|arg| arg == "--help")
             || args.get(1).is_some_and(|arg| arg == "generate-json-schema"));
+    if args.iter().any(|arg| arg == "--version")
+        && let Some(delay) = fake_probe_delay()
+    {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     if args.iter().any(|arg| arg == "--version" || arg == "--help") || app_server_probe {
         print!("{}", fake_probe_output(&args));
         return;
@@ -388,6 +512,9 @@ where
 
     if let Some(prompt) = planning_prompt(&stdin) {
         emit_planner_fixture(provider, &args, &prompt);
+        return;
+    }
+    if emit_conversation_fixture(provider, &stdin) {
         return;
     }
     if is_handover_acknowledgement(&stdin) {
@@ -455,12 +582,36 @@ where
     }
 }
 
+fn fake_probe_delay() -> Option<u64> {
+    let executable = std::env::current_exe().ok()?;
+    let stem = executable.file_stem()?.to_string_lossy();
+    stem.rsplit_once("probe-delay-")?.1.parse().ok()
+}
+
 fn planning_prompt(stdin: &str) -> Option<serde_json::Value> {
     let bridge: serde_json::Value = serde_json::from_str(stdin).ok()?;
     if bridge.get("objective")?.as_str()? != "Propose a read-only task graph" {
         return None;
     }
     serde_json::from_str(bridge.get("task")?.as_str()?).ok()
+}
+
+fn conversation_prompt(stdin: &str) -> Option<String> {
+    let bridge: serde_json::Value = serde_json::from_str(stdin).ok()?;
+    if bridge.get("objective")?.as_str()? != "Conduct a read-only conversation turn" {
+        return None;
+    }
+    bridge.get("task")?.as_str().map(ToOwned::to_owned)
+}
+
+fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
+    let Some(prompt) = conversation_prompt(stdin) else {
+        return false;
+    };
+    for line in conversation_lines(provider, &prompt) {
+        println!("{}", String::from_utf8_lossy(&line));
+    }
+    true
 }
 
 fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_json::Value) {

@@ -372,6 +372,51 @@ fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> R
 }
 
 #[test]
+fn planned_task_resumes_without_duplicate_task_or_worktree() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let repository = fs::canonicalize(temporary.path())?.join("repository");
+    fs::create_dir_all(&repository)?;
+    let config = initialize_repository(&repository)?;
+    let task_file = write_task_file(&repository)?;
+
+    let planned = run_cli(
+        &repository,
+        &config,
+        &[
+            OsString::from("run"),
+            OsString::from("--plan-only"),
+            OsString::from("--task-file"),
+            task_file.as_os_str().to_owned(),
+        ],
+    )?;
+    let task_id = planned
+        .pointer("/data/task/task_id")
+        .or_else(|| planned.pointer("/data/task_id"))
+        .and_then(Value::as_str)
+        .context("plan-only output did not contain the persisted task ID")?;
+
+    let resumed = run_cli(
+        &repository,
+        &config,
+        &[OsString::from("resume"), OsString::from(task_id)],
+    )?;
+    assert_eq!(
+        resumed.get("command").and_then(Value::as_str),
+        Some("run_completed")
+    );
+
+    let database = Connection::open(repository.join(".colay/orchestrator.db"))?;
+    let (tasks, worktrees): (i64, i64) = database.query_row(
+        "SELECT (SELECT count(*) FROM tasks WHERE task_id = ?1),
+                (SELECT count(*) FROM worktrees WHERE task_id = ?1)",
+        [task_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((tasks, worktrees), (1, 1));
+    Ok(())
+}
+
+#[test]
 fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let repository = fs::canonicalize(temporary.path())?.join("repository");

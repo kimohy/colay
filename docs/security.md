@@ -60,3 +60,9 @@ A release rollback that replaces the Codex executable also requires validated, p
 ## Residual trust
 
 Provider output, task text, repository content, Git metadata, usage-probe JSON, and subprocess output are untrusted. The design does not defend against an administrator who can replace binaries, read process memory, or rewrite the entire state directory. Use endpoint protection, code-signing policy, repository access controls, and backup retention appropriate to the source classification.
+
+Published Windows PE artifacts are currently unsigned by Authenticode. Release checksums,
+GitHub attestations, and npm provenance protect artifact identity and origin but do not satisfy
+an OS publisher-trust policy. WDAC/AppLocker deployments must allowlist the verified digest or
+use an internally built and signed binary; environments that mandate upstream Authenticode are
+outside the current Windows enterprise support boundary.
