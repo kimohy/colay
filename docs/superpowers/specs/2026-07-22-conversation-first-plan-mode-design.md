@@ -1,7 +1,7 @@
 # Conversation-First Plan Mode Design
 
 Date: 2026-07-22
-Status: Draft for written-spec review
+Status: Approved for implementation
 
 ## Context
 

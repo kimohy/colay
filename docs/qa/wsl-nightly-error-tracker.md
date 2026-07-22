@@ -1,15 +1,17 @@
-# Colay WSL Nightly Error Tracker
+# Colay WSL/Windows Nightly Error Tracker
 
-이 문서는 WSL에서 Linux nightly Colay를 실제 사용하면서 발견한 오류와 개선 후보를
-지속적으로 누적하는 메모다. 오류를 재현했다고 해서 수정 완료로 간주하지 않으며,
-각 항목은 증거, 영향, 임시 우회, 제품 개선안, 검증 조건을 분리해서 기록한다.
+이 문서는 WSL Linux와 Windows에서 nightly Colay를 실제 사용하면서 발견한 오류와 개선
+후보를 지속적으로 누적하는 메모다. 오류를 재현했다고 해서 수정 완료로 간주하지 않으며,
+각 항목은 증거, 영향, 임시 우회, 제품 개선안, 검증 조건을 분리해서 기록한다. 기존
+`WSL-*` ID는 이력 안정성을 위해 유지하되 Windows에서도 재현되면 공통 이슈로 표시한다.
 
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
 - 마지막 갱신: 2026-07-22
-- 대상 환경: WSL 2, Ubuntu 24.04, x86-64
+- 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260721.8c7f638`
+- Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
 
@@ -19,12 +21,14 @@
 | --- | --- | --- | --- |
 | `WSL-001` | medium | workaround-confirmed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | open | daemon start timeout 이후 child가 살아남아 뒤늦게 lease 획득 |
-| `WSL-003` | high | open | idle daemon의 반복 `BEGIN IMMEDIATE`로 direct run writer starvation |
-| `WSL-004` | high | open | Git 저장소가 아닌 위치에서 task를 먼저 영속화한 뒤 raw Git 128 오류 |
-| `WSL-005` | high | open | commit 없는 빈 Git 저장소에서 raw `Needed a single revision` 오류 |
+| `WSL-003` | high | open | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
+| `WSL-004` | high | open | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
+| `WSL-005` | high | open | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
 | `WSL-006` | medium | workaround-confirmed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
 | `WSL-007` | low | open | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | open | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
+| `WIN-001` | medium | workaround-confirmed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
+| `WIN-002` | medium | open | Windows nightly PE에 Authenticode 서명이 없어 OS 신뢰 체인이 없음 |
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 
@@ -95,7 +99,7 @@ error: daemon did not publish a healthy heartbeat within five seconds
 - timeout을 강제해도 child와 lease가 나중에 다시 나타나지 않는다.
 - 반복 start/restart/stop 후 관련 프로세스가 남지 않는다.
 
-## WSL-003: SQLite writer starvation
+## WSL-003: SQLite writer starvation (WSL/Windows 공통)
 
 ### 재현된 증상
 
@@ -116,6 +120,11 @@ error: SQLite operation failed: database is locked: database is locked: Error co
 - daemon 기본 command poll은 100ms다.
 - idle poll도 session command claim, orchestration command claim, ready-task claim에서
   pending row 존재 여부를 확인하기 전에 `TransactionBehavior::Immediate`를 시작한다.
+- Windows 11의 격리 repository에서도 fake-provider daemon이 online인 동안 SQLite
+  `timeout=0`으로 `BEGIN IMMEDIATE`/rollback을 500회, 10ms 간격으로 시도했을 때
+  81회(16.2%)가 `SQLITE_BUSY`였다. daemon stop 후 동일 표본은 500회 모두 성공했다.
+- Windows 표본 전후의 `PRAGMA integrity_check`도 `ok`였으므로 플랫폼별 DB 손상이 아니라
+  활성 writer 경쟁으로 보는 것이 타당하다.
 
 ### 현재 우회
 
@@ -139,7 +148,7 @@ error: SQLite operation failed: database is locked: database is locked: Error co
 - 실패 주입 후 task가 중복 생성되지 않고 동일 task를 안전하게 재개할 수 있다.
 - DB integrity, append-only event chain, exact lease ownership이 유지된다.
 
-## WSL-004: Git 저장소가 아닌 위치의 late failure
+## WSL-004: Git 저장소가 아닌 위치의 late failure (WSL/Windows 공통)
 
 ### 재현된 증상
 
@@ -152,6 +161,8 @@ fatal: not a git repository (or any of the parent directories): .git
 - Colay/TUI가 `/home/kimohy`에서 시작됐다.
 - `/home/kimohy`는 Git repository가 아니지만 `/home/kimohy/.colay` state가 생성됐다.
 - `colay run`은 task를 `planned`까지 영속화한 뒤 worktree 생성 시 raw Git 128로 실패했다.
+- Windows 11의 격리된 non-Git 디렉터리에서도 native nightly와 fake provider로 같은 raw
+  오류를 재현했다. 실패 후 DB integrity는 정상이었지만 `planned` task 1건이 남았다.
 
 ### 제품 개선 후보
 
@@ -209,7 +220,7 @@ fatal: not a git repository (or any of the parent directories): .git
 - 승인된 접근법의 정식 설계는
   `docs/superpowers/specs/2026-07-22-conversation-first-plan-mode-design.md`에서 추적한다.
 
-## WSL-005: unborn HEAD의 late failure
+## WSL-005: unborn HEAD의 late failure (WSL/Windows 공통)
 
 ### 재현된 증상
 
@@ -224,6 +235,9 @@ fatal: Needed a single revision
 - 상위 workspace의 `.colay` DB에는 실패 후 `planned` task 1건이 남았다.
 - `git rev-parse --verify HEAD`는 동일한 `Needed a single revision` 오류를 재현했다.
 - 하위 `camping` repository는 clean 상태이고 유효한 HEAD가 있었다.
+- Windows 11의 `git init`만 수행한 격리 repository에서도 native nightly와 fake provider로
+  동일한 `fatal: Needed a single revision`을 재현했다. DB integrity는 정상이었지만
+  `planned` task 1건이 남았다.
 
 ### 추가 재현: `~/workspace/test`
 
@@ -350,6 +364,66 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Git status가 전체 파일의 줄바꿈 변경으로 보이는 패턴을 감지해 writable 실행을
   fail-closed하거나 명시적 승인을 요구한다.
 
+## WIN-001: Windows PATH가 오래된 Cargo 설치본을 선택
+
+### 재현된 증상
+
+- Windows PowerShell에서 `Get-Command colay`와 `where.exe colay`는
+  `C:\Users\kimoh\.cargo\bin\colay.exe`를 선택했다.
+- 이 binary는 `colay 0.1.0`이며, 검증 대상 nightly
+  `0.1.1-nightly.20260721.8c7f638`과 다르다.
+- Windows 전역 npm에는 `@kimohy/colay`가 설치돼 있지 않았다. 반면 격리된
+  `npm exec --package=@kimohy/colay@nightly`와 임시 npm 설치는 같은 nightly를 정상
+  선택했다.
+
+### 영향
+
+- 사용자가 nightly를 검증한다고 생각해도 Windows native 명령은 과거 Cargo build를
+  실행할 수 있다.
+- WSL과 Windows에서 같은 `colay` 명령이 서로 다른 기능, schema 기대치, 오류 처리를
+  제공해 재현 결과가 혼재할 수 있다.
+
+### 현재 우회
+
+- 실행 전에 `Get-Command colay -All`, `where.exe colay`, `colay --version`을 함께 확인한다.
+- 검증 시에는 버전이 고정된 `npm exec --yes --package=@kimohy/colay@nightly -- colay ...`
+  또는 확인된 npm shim/native 경로를 사용한다.
+- 오래된 Cargo 설치 제거 또는 PATH 순서 변경은 사용자 환경을 바꾸므로 자동 수행하지
+  않는다.
+
+### 제품 개선 후보
+
+- `doctor`가 launcher 경로/버전, native 경로/버전, daemon 경로/버전을 한 화면에 표시한다.
+- npm launcher가 자신의 package version과 native binary version 불일치를 거부한다.
+- Windows 설치 문서에 Cargo/npm 명령 충돌 확인 절차를 포함한다.
+
+## WIN-002: Windows nightly PE의 Authenticode 부재
+
+### 증거
+
+- npm의 `@kimohy/colay-win32-x64` native binary는 정상 AMD64 PE(`0x8664`)였고
+  `--version`도 nightly와 일치했다.
+- SHA-256은
+  `1BAD6DDC441320165AFBD0B8E214BEF11B02CA806B6A7F97E882C5C8F23EB5BC`였다.
+- `npm audit signatures --include-attestations`는 registry 서명과 GitHub Actions 기반
+  SLSA provenance를 정상 검증했다.
+- 그러나 Windows `Get-AuthenticodeSignature` 결과는 `NotSigned`였다. npm 공급망
+  provenance가 유효하다는 사실과 Windows OS 수준의 code-signing 신뢰는 별개다.
+
+### 영향
+
+- 이번 QA 환경에서는 실행 차단이 발생하지 않았으므로 현재 오류의 직접 원인은 아니다.
+- SmartScreen 평판, AppLocker/WDAC 또는 기업용 allowlisting 정책에서는 서명되지 않은
+  nightly 실행 파일이 경고 또는 차단될 수 있다.
+
+### 제품 개선 후보
+
+- Windows release binary에 신뢰 가능한 Authenticode 서명을 추가하고 서명 검증 절차를
+  배포 문서에 포함한다.
+- 서명 도입 전에는 npm integrity/provenance와 공개 checksum 검증 방법을 명시한다.
+- code signing이 초기 release 범위 밖이라는 기존 결정을 유지한다면 Windows enterprise
+  지원 제한으로 명확히 문서화한다.
+
 ## WSL-007: chat TUI reconnect 500ms 플래이크
 
 ### 증거
@@ -359,6 +433,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `daemon did not create session within 500ms`로 실패했다.
 - 해당 테스트만 3회 재실행했을 때 모두 통과했다.
 - 전체 suite 재실행에서는 Rust 테스트 387개가 모두 통과했다.
+- Windows 11 전체 suite에서는 같은 테스트를 포함한 Rust 테스트 402개가 한 번에 모두
+  통과했다. 따라서 Windows에서 추가 재현되지는 않았으며 기존 WSL 타이밍 플래이크
+  분류를 유지한다.
 
 ### 제품 개선 후보
 
@@ -374,6 +451,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   정상 동작했다.
 - 기존 사용자 DB의 integrity와 append-only event hash chain은 정상으로 확인됐다.
 - pseudo-terminal에서 TUI를 열고 `q`로 종료하는 흐름은 정상 동작했다.
+- Windows npm root package와 `win32-x64` optional package의 nightly version이 일치했고,
+  native binary는 정상 AMD64 PE였다.
+- Windows 격리 repository에서 `init`, `doctor`, `providers`, `compatibility`, `status`,
+  `run --plan-only`, daemon start/status/stop이 fake provider로 정상 동작했다.
+- Windows `doctor`의 6개 check가 모두 pass였고 schema v8, DB integrity, foreign key
+  integrity가 정상이었다.
+- Windows에서 `cargo fmt --all -- --check`, 전체 clippy `-D warnings`, npm 테스트 65개,
+  Rust 전체 테스트 402개가 통과했다.
 - QA 과정에서 실제 Codex, Claude, Gemini inference는 호출하지 않았다.
 
 ## Prioritized improvement queue
@@ -386,9 +471,12 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
    회귀 테스트로 고정한다.
 4. `P1`: daemon startup timeout 시 child 정리와 phase diagnostics를 보장한다.
 5. `P1`: 실패 후 `planned` task를 중복 없이 재개하는 명시적 UX를 제공한다.
-6. `P1`: WSL/NVM/실행 binary 경로를 `doctor`에 노출한다.
-7. `P2`: `/mnt/c` mixed-Git 환경 경고와 WSL native clone 문서를 추가한다.
-8. `P2`: 500ms reconnect 테스트를 condition-based wait로 바꾼다.
+6. `P1`: WSL/NVM과 Windows Cargo/npm 충돌을 포함한 실제 실행 binary 경로를
+   `doctor`에 노출한다.
+7. `P2`: Windows release Authenticode 서명 또는 명시적인 enterprise 지원 제한을
+   제공한다.
+8. `P2`: `/mnt/c` mixed-Git 환경 경고와 WSL native clone 문서를 추가한다.
+9. `P2`: 500ms reconnect 테스트를 condition-based wait로 바꾼다.
 
 ## Update log
 
@@ -412,5 +500,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   lease를 남겨 다음 `resume`이 충돌하는 현상을 `WSL-008`로 기록했다. 동일 패턴이 두
   task에서 반복됐으며 target lease의 안전한 만료 시각도 함께 남겼다.
 - Windows checkout과 WSL Git 줄바꿈 설정 차이를 기록했다.
+- Windows 11 native QA에서 npm nightly package/native PE/provenance, safe CLI, daemon,
+  SQLite 경쟁, Git edge case, 전체 fake-provider test suite를 검증했다.
+- `WSL-003`, `WSL-004`, `WSL-005`가 Windows에서도 재현되어 WSL 전용이 아닌 공통
+  이슈로 재분류했다.
+- Windows PATH가 nightly 대신 Cargo `0.1.0`을 선택하는 `WIN-001`과, npm provenance는
+  유효하지만 native PE에 Authenticode가 없는 `WIN-002`를 추가했다.
+- Windows daemon start의 일부 PowerShell output-capture 지연은 제품이 아니라 QA harness
+  제약으로 판별해 이슈로 등록하지 않았다. 실제 lifecycle과 repository 테스트는
+  정상 통과했다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
