@@ -15,6 +15,7 @@ use orchestrator_daemon::{
 };
 use orchestrator_domain::{DaemonInstanceId, GraphValidationPolicy, ModelProfile, ProviderId};
 use orchestrator_engine::{
+    ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
     GitIntegrationManager, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
 };
 use orchestrator_process::{RedactionConfig, Redactor, terminate_child_tree};
@@ -29,6 +30,7 @@ use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::DaemonAction;
+use colay::conversation_orchestrator::OfficialCliConversationOrchestrator;
 use colay::task_executor::OfficialCliTaskExecutor;
 use colay::task_planner::OfficialCliTaskPlanner;
 
@@ -262,26 +264,36 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     let redactor: Arc<dyn MessageRedactor> = Arc::new(process_redactor);
     let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
     database.transition_daemon_phase(instance_id, DaemonPhase::Probing, None)?;
-    let (planner, planner_provider): (Arc<dyn TaskPlanner>, ProviderId) =
-        match OfficialCliTaskPlanner::probe_from_config(
-            config,
-            repository,
-            Arc::clone(&runtime),
-            ModelProfile::Standard,
-        )
-        .await
-        {
-            Ok(planner) => {
-                let provider = planner.primary_provider();
-                (Arc::new(planner), provider)
-            }
-            Err(error) => (
+    let (planner, planner_provider, conversation): (
+        Arc<dyn TaskPlanner>,
+        ProviderId,
+        Arc<dyn ConversationOrchestrator>,
+    ) = match OfficialCliTaskPlanner::probe_from_config(
+        config,
+        repository,
+        Arc::clone(&runtime),
+        ModelProfile::Standard,
+    )
+    .await
+    {
+        Ok(planner) => {
+            let provider = planner.primary_provider();
+            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
+                &planner,
+            ));
+            (Arc::new(planner), provider, conversation)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            (
                 Arc::new(UnavailablePlanner {
-                    reason: error.to_string(),
+                    reason: reason.clone(),
                 }),
                 ProviderId::Codex,
-            ),
-        };
+                Arc::new(UnavailableConversation { reason }),
+            )
+        }
+    };
     let executor = match OfficialCliTaskExecutor::new(config, repository, runtime) {
         Ok(executor) => Arc::new(executor),
         Err(error) => {
@@ -379,6 +391,8 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         settings,
         redactor,
         PlanningServices {
+            conversation,
+            repository_root: repository_root.clone(),
             planner,
             planner_provider,
             validation_policy: GraphValidationPolicy {
@@ -560,6 +574,23 @@ impl MessageRedactor for ProcessMessageRedactor {
 
 struct UnavailablePlanner {
     reason: String,
+}
+
+struct UnavailableConversation {
+    reason: String,
+}
+
+#[async_trait]
+impl ConversationOrchestrator for UnavailableConversation {
+    async fn converse(
+        &self,
+        _request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        Err(ConversationFailure::Invocation {
+            reason: self.reason.clone(),
+            evidence_redacted: String::new(),
+        })
+    }
 }
 
 #[async_trait]

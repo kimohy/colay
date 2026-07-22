@@ -11,7 +11,7 @@ use orchestrator_domain::{
     ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState,
     CreateResolutionTaskCommandPayload, CreateSessionCommandPayload, GraphRevisionId,
     GraphValidationSummary, IntegrationBatchId, IntegrationBlocker, MessageId, MessageKind,
-    ProviderId, RequestPlanCommandPayload, SessionId, TaskId, TaskState,
+    MessageRole, ProviderId, RequestPlanCommandPayload, SessionId, TaskId, TaskState,
 };
 use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{
@@ -597,6 +597,12 @@ fn projection_to_snapshot(
             needs_attention: attention_task_ids.contains(&task.task.task_id),
         })
         .collect::<Vec<_>>();
+    let latest_session_user_message_id = projection
+        .messages
+        .iter()
+        .rev()
+        .find(|(_, message)| message.task_id.is_none() && message.role == MessageRole::User)
+        .map(|(_, message)| message.message_id);
     let plan_approval = projection
         .current_graph
         .as_ref()
@@ -606,6 +612,9 @@ fn projection_to_snapshot(
                 return None;
             }
             let proposal = revision.proposal.as_ref()?;
+            if latest_session_user_message_id != Some(proposal.goal_message_id) {
+                return None;
+            }
             let proposal_hash = revision.proposal_hash.clone()?;
             let validation =
                 serde_json::from_value::<GraphValidationSummary>(revision.validation.clone())
@@ -618,9 +627,23 @@ fn projection_to_snapshot(
                 .collect::<Vec<_>>();
             risks.sort();
             risks.dedup();
+            let authority = validation.authority.as_ref();
             Some(PlanApprovalCard {
                 revision_id: revision.revision_id.to_string(),
                 proposal_hash,
+                requirement_revision_id: authority
+                    .map(|value| value.requirement_revision_id.to_string()),
+                validation_hash: authority.map(|value| value.validation_hash.clone()),
+                base_commit: authority.map(|value| value.base_commit.clone()),
+                validation_checks: authority.map_or_else(Vec::new, |_| {
+                    vec![
+                        "git_ready".to_owned(),
+                        "graph_valid".to_owned(),
+                        "write_scopes_valid".to_owned(),
+                        "provider_profile_eligible".to_owned(),
+                        "verification_plan_present".to_owned(),
+                    ]
+                }),
                 nodes: proposal
                     .nodes
                     .iter()

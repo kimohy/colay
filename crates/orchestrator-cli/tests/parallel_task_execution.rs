@@ -22,7 +22,10 @@ use orchestrator_domain::{
     SessionState, TaskEvent, TaskGraphNode, TaskGraphProposal, TaskInstructionState, TaskState,
     validate_task_graph,
 };
-use orchestrator_engine::{PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner};
+use orchestrator_engine::{
+    ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
+    PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
+};
 use orchestrator_process::RedactionConfig;
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{
@@ -223,6 +226,21 @@ fn queue_instruction(
 
 struct UnusedPlanner;
 
+struct UnusedConversation;
+
+#[async_trait]
+impl ConversationOrchestrator for UnusedConversation {
+    async fn converse(
+        &self,
+        _request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        Err(ConversationFailure::Invocation {
+            reason: "conversation is not expected".to_owned(),
+            evidence_redacted: String::new(),
+        })
+    }
+}
+
 #[async_trait]
 impl TaskPlanner for UnusedPlanner {
     async fn propose(&self, _request: PlannerRequest) -> Result<PlannerResponse, PlannerFailure> {
@@ -300,6 +318,8 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
     let executor = Arc::new(OfficialCliTaskExecutor::new(&config, &repository, runtime)?);
     let planning = PlanningServices {
+        conversation: Arc::new(UnusedConversation),
+        repository_root: repository.clone(),
         planner: Arc::new(UnusedPlanner),
         planner_provider: ProviderId::Codex,
         validation_policy: GraphValidationPolicy {

@@ -172,7 +172,7 @@ impl Database {
                         state, requested_by, requested_at, claimed_at, completed_at, outcome
                  FROM client_commands WHERE state = 'pending'
                    AND action IN (
-                       'request_plan', 'approve_graph', 'revise_graph', 'cancel_plan',
+                       'request_conversation_turn', 'request_plan', 'approve_graph', 'revise_graph', 'cancel_plan',
                        'request_integration', 'approve_integration', 'create_resolution_task')
                  ORDER BY requested_at, command_id LIMIT 1",
             )?;
@@ -334,8 +334,8 @@ fn pending_command_exists(connection: &Connection, queue: ClientCommandQueue) ->
         ClientCommandQueue::Orchestration => {
             "SELECT EXISTS(
                 SELECT 1 FROM client_commands WHERE state = 'pending'
-                  AND action IN (
-                      'request_plan', 'approve_graph', 'revise_graph', 'cancel_plan',
+                   AND action IN (
+                       'request_conversation_turn', 'request_plan', 'approve_graph', 'revise_graph', 'cancel_plan',
                       'request_integration', 'approve_integration', 'create_resolution_task'
                   )
              )"

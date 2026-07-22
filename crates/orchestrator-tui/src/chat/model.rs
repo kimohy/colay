@@ -68,9 +68,62 @@ pub struct PlanNodeSummary {
 pub struct PlanApprovalCard {
     pub revision_id: String,
     pub proposal_hash: String,
+    pub requirement_revision_id: Option<String>,
+    pub validation_hash: Option<String>,
+    pub base_commit: Option<String>,
+    pub validation_checks: Vec<String>,
     pub nodes: Vec<PlanNodeSummary>,
     pub proposed_parallelism: usize,
     pub risks: Vec<String>,
+}
+
+impl PlanApprovalCard {
+    fn validate(&self) -> Result<(), WorkspaceModelError> {
+        require_non_blank(&self.revision_id, "plan revision ID")?;
+        if !valid_hex(&self.proposal_hash, 64, 64) {
+            return Err(WorkspaceModelError::InvalidProposalHash);
+        }
+        if self.nodes.is_empty() {
+            return Err(WorkspaceModelError::EmptyPlan);
+        }
+        match (
+            self.requirement_revision_id.as_deref(),
+            self.validation_hash.as_deref(),
+            self.base_commit.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(requirement), Some(validation), Some(base_commit))
+                if !requirement.trim().is_empty()
+                    && valid_hex(validation, 64, 64)
+                    && valid_hex(base_commit, 40, 64)
+                    && !self.validation_checks.is_empty()
+                    && self
+                        .validation_checks
+                        .iter()
+                        .all(|check| !check.trim().is_empty()) => {}
+            _ => return Err(WorkspaceModelError::InvalidPlanValidationAuthority),
+        }
+        let mut node_keys = HashSet::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            require_non_blank(&node.key, "plan node key")?;
+            require_non_blank(&node.title, "plan node title")?;
+            require_non_blank(&node.objective, "plan node objective")?;
+            require_non_blank(&node.provider, "plan node provider")?;
+            require_non_blank(&node.profile, "plan node profile")?;
+            if !node_keys.insert(node.key.as_str()) {
+                return Err(WorkspaceModelError::DuplicatePlanNode(node.key.clone()));
+            }
+        }
+        if self
+            .nodes
+            .iter()
+            .flat_map(|node| &node.dependencies)
+            .any(|dependency| !node_keys.contains(dependency.as_str()))
+        {
+            return Err(WorkspaceModelError::UnknownPlanDependency);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,37 +238,7 @@ impl WorkspaceSnapshot {
             }
         }
         if let Some(plan) = &self.plan_approval {
-            require_non_blank(&plan.revision_id, "plan revision ID")?;
-            if plan.proposal_hash.len() != 64
-                || !plan
-                    .proposal_hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(WorkspaceModelError::InvalidProposalHash);
-            }
-            if plan.nodes.is_empty() {
-                return Err(WorkspaceModelError::EmptyPlan);
-            }
-            let mut node_keys = HashSet::with_capacity(plan.nodes.len());
-            for node in &plan.nodes {
-                require_non_blank(&node.key, "plan node key")?;
-                require_non_blank(&node.title, "plan node title")?;
-                require_non_blank(&node.objective, "plan node objective")?;
-                require_non_blank(&node.provider, "plan node provider")?;
-                require_non_blank(&node.profile, "plan node profile")?;
-                if !node_keys.insert(node.key.as_str()) {
-                    return Err(WorkspaceModelError::DuplicatePlanNode(node.key.clone()));
-                }
-            }
-            if plan
-                .nodes
-                .iter()
-                .flat_map(|node| &node.dependencies)
-                .any(|dependency| !node_keys.contains(dependency.as_str()))
-            {
-                return Err(WorkspaceModelError::UnknownPlanDependency);
-            }
+            plan.validate()?;
         }
         if let Some(integration) = &self.integration_approval {
             require_non_blank(&integration.batch_id, "integration batch ID")?;
@@ -360,6 +383,8 @@ pub enum WorkspaceModelError {
     UnknownTaskReference(String),
     #[error("plan proposal hash is not a SHA-256 hexadecimal value")]
     InvalidProposalHash,
+    #[error("plan validation authority is incomplete or malformed")]
+    InvalidPlanValidationAuthority,
     #[error("approvable plan has no nodes")]
     EmptyPlan,
     #[error("duplicate plan node `{0}`")]

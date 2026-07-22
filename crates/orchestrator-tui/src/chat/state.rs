@@ -662,6 +662,7 @@ mod tests {
             }],
             proposed_parallelism: 1,
             risks: vec!["concurrency".to_owned()],
+            ..PlanApprovalCard::default()
         });
         snapshot
     }

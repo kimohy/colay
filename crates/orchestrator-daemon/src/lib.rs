@@ -12,6 +12,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 mod commands;
+mod conversation;
 mod execution;
 mod integration;
 mod planning;

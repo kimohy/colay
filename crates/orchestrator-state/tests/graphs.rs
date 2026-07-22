@@ -252,6 +252,45 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
 }
 
 #[test]
+fn newer_session_message_invalidates_pending_graph_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database = database()?;
+    let session_id = SessionId::new();
+    let goal_id = MessageId::new();
+    seed_session(&database, session_id, goal_id)?;
+    let graph = validated_graph(session_id, goal_id);
+    record_valid(&database, &graph)?;
+
+    let newer_id = MessageId::new();
+    database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind, state, content_redacted, created_at, finalized_at) VALUES (?1, ?2, 2, 'user', 'user_message', 'final', 'changed requirements', ?3, ?3)",
+            params![newer_id.to_string(), session_id.to_string(), timestamp(3).to_rfc3339()],
+        )?;
+        Ok(())
+    })?;
+
+    let approval = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
+        revision_id: graph.proposal.revision_id,
+        expected_proposal_hash: graph.proposal_hash,
+        approved_by: "tester".to_owned(),
+        approved_at: timestamp(4),
+    });
+    assert!(
+        approval
+            .err()
+            .is_some_and(|error| error.to_string().contains("newer user message"))
+    );
+    database.with_connection(|connection| {
+        let tasks: i64 =
+            connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
+        assert_eq!(tasks, 0);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
 fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
     let session_id = SessionId::new();

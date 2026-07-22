@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ConversationMessage, EventType, MessageId, MessageState, SessionId, SessionState, TaskEvent,
-    TaskId,
+    ClientCommand, ClientCommandAction, ClientCommandState, ConversationMessage, EventType,
+    MessageId, MessageState, SessionId, SessionState, TaskEvent, TaskId,
 };
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -236,6 +236,53 @@ impl Database {
             }
             append_event_in_transaction(transaction, &mut event)?;
             Ok((ordinal, instruction))
+        })
+    }
+
+    pub fn append_session_message_and_queue_conversation(
+        &self,
+        message: &ConversationMessage,
+        mut event: TaskEvent,
+        command: &ClientCommand,
+    ) -> StateResult<u64> {
+        message
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        command
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        if message.task_id.is_some()
+            || command.task_id.is_some()
+            || command.session_id != Some(message.session_id)
+            || command.action != ClientCommandAction::RequestConversationTurn
+            || command.state != ClientCommandState::Pending
+            || event.session_id != Some(message.session_id)
+            || event.task_id.is_some()
+            || event.event_type != EventType::MessageAppended
+        {
+            return Err(StateError::InvalidRecord(
+                "session message conversation follow-up has mismatched authority".to_owned(),
+            ));
+        }
+        self.with_transaction(|transaction| {
+            let ordinal = append_message_in_transaction(transaction, message)?;
+            transaction.execute(
+                "INSERT INTO client_commands(
+                    command_id, session_id, task_id, action, payload_json, idempotency_key, state,
+                    requested_by, requested_at, claimed_at, completed_at, outcome)
+                 VALUES (?1, ?2, NULL, 'request_conversation_turn', ?3, ?4, 'pending',
+                         ?5, ?6, NULL, NULL, NULL)",
+                params![
+                    command.command_id.to_string(),
+                    message.session_id.to_string(),
+                    serde_json::to_string(&command.payload)?,
+                    command.idempotency_key,
+                    command.requested_by,
+                    command.requested_at.to_rfc3339(),
+                ],
+            )?;
+            append_event_in_transaction(transaction, &mut event)?;
+            Ok(ordinal)
         })
     }
 

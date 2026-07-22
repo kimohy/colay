@@ -265,10 +265,12 @@ impl Database {
                 "planning graph completion conflicts with its started attempt".to_owned(),
             ));
         }
+        let authority = authority_from_validation(&attempt.validation);
         let changed = transaction.execute(
             "UPDATE graph_revisions SET status = ?1, proposal_hash = ?2, proposal_json = ?3,
-                    validation_json = ?4, completed_at = ?5
-             WHERE revision_id = ?6 AND status = 'planning'",
+                    validation_json = ?4, completed_at = ?5, requirement_revision_id = ?6,
+                    validation_hash = ?7, base_commit = ?8
+             WHERE revision_id = ?9 AND status = 'planning'",
             params![
                 enum_text(&attempt.status)?,
                 attempt.proposal_hash,
@@ -279,6 +281,11 @@ impl Database {
                     .transpose()?,
                 serde_json::to_string(&attempt.validation)?,
                 attempt.completed_at.to_rfc3339(),
+                authority
+                    .as_ref()
+                    .map(|value| value.requirement_revision_id.to_string()),
+                authority.as_ref().map(|value| &value.validation_hash),
+                authority.as_ref().map(|value| &value.base_commit),
                 attempt.revision_id.to_string(),
             ],
         )?;
@@ -341,11 +348,13 @@ impl Database {
              AND status IN ('planning', 'awaiting_approval', 'approved')",
             params![attempt.completed_at.to_rfc3339(), attempt.session_id.to_string()],
         )?;
+        let authority = authority_from_validation(&attempt.validation);
         transaction.execute(
             "INSERT INTO graph_revisions(
                 revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
-                proposal_json, validation_json, planner_provider, created_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                proposal_json, validation_json, planner_provider, created_at, completed_at,
+                requirement_revision_id, validation_hash, base_commit
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 attempt.revision_id.to_string(),
                 attempt.session_id.to_string(),
@@ -362,6 +371,11 @@ impl Database {
                 attempt.planner_provider.as_str(),
                 attempt.started_at.to_rfc3339(),
                 attempt.completed_at.to_rfc3339(),
+                authority
+                    .as_ref()
+                    .map(|value| value.requirement_revision_id.to_string()),
+                authority.as_ref().map(|value| &value.validation_hash),
+                authority.as_ref().map(|value| &value.base_commit),
             ],
         )?;
         transaction.execute(
@@ -503,6 +517,20 @@ impl Database {
                 "graph revision is not awaiting approval: {:?}",
                 revision.status
             )));
+        }
+        let latest_user_message: Option<String> = transaction
+            .query_row(
+                "SELECT message_id FROM conversation_messages
+                 WHERE session_id = ?1 AND task_id IS NULL AND role = 'user' AND state = 'final'
+                 ORDER BY ordinal DESC LIMIT 1",
+                [revision.session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest_user_message.as_deref() != Some(&revision.goal_message_id.to_string()) {
+            return Err(StateError::InvalidRecord(
+                "graph approval is stale because a newer user message exists".to_owned(),
+            ));
         }
         let stored_hash = revision.proposal_hash.as_deref().ok_or_else(|| {
             StateError::InvalidRecord("approvable graph has no proposal hash".to_owned())
@@ -667,6 +695,14 @@ impl Database {
             replayed: false,
         })
     }
+}
+
+fn authority_from_validation(
+    validation: &serde_json::Value,
+) -> Option<orchestrator_domain::GraphValidationAuthority> {
+    serde_json::from_value::<GraphValidationSummary>(validation.clone())
+        .ok()
+        .and_then(|summary| summary.authority)
 }
 
 fn validate_new_attempt(attempt: &NewGraphAttempt) -> StateResult<()> {
