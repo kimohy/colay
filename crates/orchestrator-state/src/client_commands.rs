@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use orchestrator_domain::{
     ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState, SessionId, TaskId,
 };
-use rusqlite::{OptionalExtension as _, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, TransactionBehavior, params};
 
 use crate::{Database, StateError, StateResult};
 
@@ -112,6 +112,14 @@ impl Database {
         session_actions_only: bool,
     ) -> StateResult<Option<ClientCommand>> {
         let mut connection = self.lock()?;
+        let queue = if session_actions_only {
+            ClientCommandQueue::Session
+        } else {
+            ClientCommandQueue::All
+        };
+        if !pending_command_exists(&connection, queue)? {
+            return Ok(None);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let command = {
             let sql = if session_actions_only {
@@ -154,6 +162,9 @@ impl Database {
         claimed_at: DateTime<Utc>,
     ) -> StateResult<Option<ClientCommand>> {
         let mut connection = self.lock()?;
+        if !pending_command_exists(&connection, ClientCommandQueue::Orchestration)? {
+            return Ok(None);
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let command = {
             let mut statement = transaction.prepare(
@@ -299,6 +310,39 @@ impl Database {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum ClientCommandQueue {
+    All,
+    Session,
+    Orchestration,
+}
+
+fn pending_command_exists(connection: &Connection, queue: ClientCommandQueue) -> StateResult<bool> {
+    let sql = match queue {
+        ClientCommandQueue::All => {
+            "SELECT EXISTS(SELECT 1 FROM client_commands WHERE state = 'pending')"
+        }
+        ClientCommandQueue::Session => {
+            "SELECT EXISTS(
+                SELECT 1 FROM client_commands WHERE state = 'pending'
+                  AND action IN ('create_session', 'append_message')
+             )"
+        }
+        ClientCommandQueue::Orchestration => {
+            "SELECT EXISTS(
+                SELECT 1 FROM client_commands WHERE state = 'pending'
+                  AND action IN (
+                      'request_plan', 'approve_graph', 'revise_graph', 'cancel_plan',
+                      'request_integration', 'approve_integration', 'create_resolution_task'
+                  )
+             )"
+        }
+    };
+    connection
+        .query_row(sql, [], |row| row.get::<_, bool>(0))
+        .map_err(StateError::from)
 }
 
 fn load_by_idempotency_key(
@@ -558,6 +602,30 @@ mod tests {
             })
             .collect::<StateResult<Vec<_>>>()?;
         assert_eq!(claimed.iter().filter(|value| value.is_some()).count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_claim_paths_stay_read_only_while_another_writer_is_active() -> StateResult<()> {
+        let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
+        let database = Database::open(&path)?;
+        database.migrate_with_backup(&root.join("backups"))?;
+        let blocker = rusqlite::Connection::open(&path)?;
+        blocker.execute_batch("BEGIN IMMEDIATE")?;
+
+        assert_eq!(database.claim_next_client_command(timestamp())?, None);
+        assert_eq!(
+            database.claim_next_session_client_command(timestamp())?,
+            None
+        );
+        assert_eq!(
+            database.claim_next_orchestration_client_command(timestamp())?,
+            None
+        );
+        blocker.execute_batch("ROLLBACK")?;
         Ok(())
     }
 
