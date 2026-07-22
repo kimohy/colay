@@ -753,7 +753,9 @@ mod tests {
         let repository = crate::test_support::CanonicalTempDir::new()?;
         let expected_root = canonicalize_directory(repository.path())?;
 
-        let error = inspect_git_repository(repository.path()).await.unwrap_err();
+        let Err(error) = inspect_git_repository(repository.path()).await else {
+            return Err("non-Git directory unexpectedly passed readiness".into());
+        };
 
         assert!(matches!(error, EngineError::NotGitRepository(ref path) if path == &expected_root));
         assert!(!repository.path().join(".colay").exists());
@@ -767,7 +769,9 @@ mod tests {
         run_git(repository.path(), &["init", "--quiet"])?;
         let expected_root = canonicalize_directory(repository.path())?;
 
-        let error = inspect_git_repository(repository.path()).await.unwrap_err();
+        let Err(error) = inspect_git_repository(repository.path()).await else {
+            return Err("unborn Git repository unexpectedly passed readiness".into());
+        };
 
         assert!(
             matches!(error, EngineError::MissingGitBaseCommit(ref path) if path == &expected_root)
