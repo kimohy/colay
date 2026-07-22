@@ -14,6 +14,9 @@ const EXECUTION_MIGRATION: &str = include_str!("../../../migrations/0002_executi
 const AUDIT_MIGRATION: &str = include_str!("../../../migrations/0003_audit_and_control.sql");
 const SESSION_MIGRATION: &str = include_str!("../../../migrations/0004_durable_sessions.sql");
 const WORKSPACE_MIGRATION: &str = include_str!("../../../migrations/0005_chat_workspace_state.sql");
+const GRAPH_MIGRATION: &str = include_str!("../../../migrations/0006_approved_task_graphs.sql");
+const PARALLEL_MIGRATION: &str = include_str!("../../../migrations/0007_parallel_execution.sql");
+const INTEGRATION_MIGRATION: &str = include_str!("../../../migrations/0008_result_integration.sql");
 
 fn seed_v1(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::open(path)?;
@@ -41,7 +44,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 
     let initial = database.migration_status()?;
     assert_eq!(initial.current_version, 1);
-    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(initial.pending_versions, vec![2, 3, 4, 5, 6, 7, 8, 9]);
 
     let dry_run = database.dry_run_migrations()?;
     assert_eq!(dry_run.current_version, STATE_SCHEMA_VERSION);
@@ -99,7 +102,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     let backup = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let backup_status = MigrationManager::status(&backup)?;
     assert_eq!(backup_status.current_version, 1);
-    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(backup_status.pending_versions, vec![2, 3, 4, 5, 6, 7, 8, 9]);
     Ok(())
 }
 
@@ -156,6 +159,60 @@ fn seed_v5(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn seed_v8(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    seed_v5(path)?;
+    let connection = Connection::open(path)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    for (version, name, sql) in [
+        (6, "approved_task_graphs", GRAPH_MIGRATION),
+        (7, "parallel_execution", PARALLEL_MIGRATION),
+        (8, "result_integration", INTEGRATION_MIGRATION),
+    ] {
+        connection.execute_batch(sql)?;
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                version,
+                name,
+                format!("{:x}", Sha256::digest(sql.as_bytes())),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn v8_daemon_rows_migrate_to_online_phase() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(directory.path())?;
+    let database_path = root.join("orchestrator.db");
+    seed_v8(&database_path)?;
+    let now = Utc::now();
+    let expires = now + chrono::TimeDelta::minutes(1);
+    Connection::open(&database_path)?.execute(
+        "INSERT INTO daemon_instances( \
+            instance_id, pid, started_at, heartbeat_at, lease_expires_at, \
+            stop_requested_at, released_at \
+         ) VALUES ('legacy-daemon', 42, ?1, ?1, ?2, NULL, NULL)",
+        params![now.to_rfc3339(), expires.to_rfc3339()],
+    )?;
+
+    let database = Database::open(&database_path)?;
+    database.migrate_with_backup(&root.join("backups"))?;
+    database.with_connection(|connection| {
+        let migrated: (String, Option<String>) = connection.query_row(
+            "SELECT phase, startup_error FROM daemon_instances WHERE instance_id = ?1",
+            ["legacy-daemon"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(migrated, ("online".to_owned(), None));
+        Ok(())
+    })?;
+    Ok(())
+}
+
 #[test]
 fn v5_to_current_dry_run_backup_and_command_rebuild_preserve_rows()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -166,7 +223,10 @@ fn v5_to_current_dry_run_backup_and_command_rebuild_preserve_rows()
     let database = Database::open(&database_path)?;
     assert_eq!(database.migration_status()?.current_version, 5);
 
-    assert_eq!(database.dry_run_migrations()?.current_version, 8);
+    assert_eq!(
+        database.dry_run_migrations()?.current_version,
+        STATE_SCHEMA_VERSION
+    );
     assert_eq!(database.migration_status()?.current_version, 5);
     database.migrate_with_backup(&root.join("v5-backups"))?;
 
