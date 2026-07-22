@@ -130,6 +130,21 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
     assert!(!fixture.repository.join(".colay").exists());
     let json: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(json["data"]["checks"][0]["status"], "pass");
+    let runtime = json["data"]["checks"]
+        .as_array()
+        .context("doctor checks must be an array")?
+        .iter()
+        .find(|check| check["name"] == "runtime")
+        .context("doctor must report the running Colay binary")?;
+    assert_eq!(runtime["status"], "pass");
+    assert_eq!(runtime["data"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        runtime["data"]["executable"]
+            .as_str()
+            .is_some_and(|path| !path.trim().is_empty())
+    );
+    assert_eq!(runtime["data"]["target_os"], std::env::consts::OS);
+    assert_eq!(runtime["data"]["target_arch"], std::env::consts::ARCH);
     let database = json["data"]["checks"]
         .as_array()
         .context("doctor checks must be an array")?

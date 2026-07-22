@@ -452,6 +452,18 @@ fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> 
 
 async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
     let mut checks = vec![Check::pass("config", "schema and values are valid")];
+    let executable = std::env::current_exe()?;
+    checks.push(Check::with_data(
+        "runtime",
+        true,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "executable": executable,
+            "invoked_as": std::env::args_os().next(),
+            "target_os": std::env::consts::OS,
+            "target_arch": std::env::consts::ARCH,
+        }),
+    ));
     let config = effective.config();
     {
         let redaction = process_redaction(&config.orchestrator);

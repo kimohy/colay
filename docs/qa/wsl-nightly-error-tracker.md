@@ -19,7 +19,7 @@
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WSL-001` | medium | workaround-confirmed | NVM/Node 버전 및 비대화형 PATH 불일치 |
+| `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
 | `WSL-004` | high | fixed | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
@@ -64,6 +64,19 @@ npm install --global @kimohy/colay@nightly
 - `doctor`가 launcher, native binary, daemon 각각의 실제 경로와 버전을 함께 보고한다.
 - daemon 상태에 시작 executable 경로와 Colay build version을 포함한다.
 - WSL 비대화형 실행과 NVM 사용법을 설치 문서에 명시한다.
+
+### 수정 구현 및 재검증
+
+- npm launcher가 native binary를 resolve/spawn하기 전에 실제 Node major version을 검사한다.
+  Node 22 미만이면 `nvm install 22 && nvm use 22`를 포함한 명확한 오류로 종료한다.
+- `doctor`에 `runtime` check를 추가해 실제 native executable 경로, Colay build version,
+  target OS/architecture, invocation path를 보고한다. 이 check는 state를 만들지 않는다.
+- WSL의 system Node `18.19.1`로 새 launcher를 실행하면 native를 시작하지 않고 지원 버전
+  오류를 반환하며, NVM Node `22.23.1`에서는 launcher 8개 테스트가 모두 통과했다.
+- 비대화형 shell이 NVM을 source하지 않아 명령 자체를 찾지 못하는 경우는 shell 환경
+  설정이므로 PATH에 Node 22 NVM bin을 넣거나 실행 전에 `nvm use 22`를 수행해야 한다.
+- 설치된 nightly root/native package는 모두
+  `0.1.1-nightly.20260721.8c7f638`로 일치했고 Linux native는 static PIE x86-64였다.
 
 ## WSL-002: daemon start timeout과 orphan child
 
@@ -477,6 +490,16 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - npm launcher가 자신의 package version과 native binary version 불일치를 거부한다.
 - Windows 설치 문서에 Cargo/npm 명령 충돌 확인 절차를 포함한다.
 
+### 수정 구현 및 재검증
+
+- 새 `doctor.runtime` check가 현재 실행 중인 native binary 경로와 build version을 함께
+  반환하므로, PATH가 Cargo `0.1.0` 또는 npm nightly 중 무엇을 골랐는지 JSON에서 바로
+  확인할 수 있다.
+- Windows source build에서 `runtime.status=pass`, `version=0.1.0`, 실제 격리 worktree의
+  `target/debug/colay.exe`, `windows/x86_64`가 보고됐고 `.colay` state는 생성되지 않았다.
+- PATH 우선순위 변경이나 오래된 Cargo binary 제거는 사용자 환경 변경이므로 자동화하지
+  않으며, `Get-Command colay -All`과 `where.exe colay` 확인 절차를 유지한다.
+
 ## WIN-002: Windows nightly PE의 Authenticode 부재
 
 ### 증거
@@ -639,5 +662,10 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   materialization, 승인 전 writable table 0건, Git HEAD drift 거부를 fake-provider와 임시
   Git repository로 검증했다. 승인 카드는 requirement/validation/base-commit authority를
   표시하며 새 사용자 메시지는 stale card를 숨긴다.
+- WSL 재검증에서 비대화형 shell은 system Node 18을 선택하고 NVM `colay`를 찾지 못하는
+  반면, 명시적 Node 22 PATH에서는 설치된 nightly root/native version과 Linux ELF가
+  정상임을 확인했다. launcher에 Node 22 fail-fast를 추가하고 Windows/Linux에서 테스트했으며,
+  `doctor.runtime`에 현재 native path/build/target 진단을 추가해 `WSL-001`을 `fixed`로
+  전환했다. release schema 기대값도 v10으로 갱신해 npm 66개 테스트가 통과했다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
