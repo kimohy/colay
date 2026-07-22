@@ -667,5 +667,12 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   정상임을 확인했다. launcher에 Node 22 fail-fast를 추가하고 Windows/Linux에서 테스트했으며,
   `doctor.runtime`에 현재 native path/build/target 진단을 추가해 `WSL-001`을 `fixed`로
   전환했다. release schema 기대값도 v10으로 갱신해 npm 66개 테스트가 통과했다.
+- 최종 Windows 검증에서 `cargo fmt --all -- --check`, workspace 전체 target/feature Clippy
+  `-D warnings`, `cargo test --workspace --all-features`, npm 66개 테스트가 모두 통과했다.
+  전체 Rust 실행에는 migration v1→v10, conversation/approval, daemon lifecycle, 실제 임시
+  Git worktree/rollback 회귀가 포함됐고 `WIN-003`의 `icacls.exe` 오류는 재발하지 않았다.
+- WSL 2에서는 Rust 1.95 Linux container에 source를 read-only mount하고
+  `ordinary_answer_is_automatic_and_creates_no_writable_state`를 재컴파일·실행해 통과했다.
+  실제 Codex/Claude/Gemini inference는 Windows와 WSL 검증 모두 호출하지 않았다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
