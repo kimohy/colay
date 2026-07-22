@@ -56,8 +56,8 @@ supervisor until the child becomes online.
 3. Add a failing integration test with a test-fixture-only short deadline proving the timed-out child
    cannot later acquire a lease and a subsequent start succeeds.
 4. Confirm both tests fail against the current implementation.
-5. Capture bounded child stderr, poll phase-aware status, and derive the production deadline from the
-   configured enabled-provider probe budget.
+5. Poll phase-aware status, read only redacted durable diagnostics, and derive the production
+   deadline from the configured enabled-provider probe budget.
 6. Add exact process-tree termination and confirmed child reaping for Windows and Unix without shell
    interpolation.
 7. Run the lifecycle tests repeatedly on Windows.

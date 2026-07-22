@@ -8,8 +8,8 @@ parent report a false timeout. The parent then drops its `Child` handle without 
 reaping the process, so that child can acquire the lease later and make a stopped repository appear
 online again.
 
-Startup stderr is currently discarded, which also removes the evidence needed to distinguish a slow
-probe from an actual startup failure.
+Startup stderr is currently discarded, and no safe durable diagnostic distinguishes a slow probe
+from an actual startup failure.
 
 ## Goals
 
@@ -59,14 +59,15 @@ startup cancels setup and releases the lease without entering the normal loop.
 
 ## Parent supervision
 
-`ensure_started` keeps the spawned `Child` handle and polls fresh database state. `Booting` and
+`ensure_started` keeps the spawned child handle and polls fresh database state. `Booting` and
 `Probing` are progress, not success. `Online` succeeds. An early child exit fails immediately and
-includes bounded redacted stderr.
+includes the child's persisted redacted startup diagnostic when one exists.
 
 The production startup deadline covers the bounded sequential provider-probe budget plus a small
 setup margin. Tests may select a shorter deadline only when the `test-fixtures` feature is compiled.
-At deadline, the parent terminates the process tree, waits for confirmed exit, reads bounded stderr,
-and returns an error that includes the last observed phase and diagnostic. Windows uses `taskkill`
+At deadline, the parent terminates the process tree, waits for confirmed exit, records and releases
+the exact child's failed lease, and returns an error that includes the last observed phase and
+diagnostic. Windows uses `taskkill`
 with separated arguments for tree termination. Unix starts the daemon in its own process group and
 uses `kill` with separated arguments, escalating only after a bounded graceful wait.
 
@@ -74,9 +75,10 @@ No shell interpolation is used.
 
 ## Diagnostics
 
-The child stderr pipe is retained by the parent and read only after child exit, so raw startup output
-is never persisted. Output is bounded before being passed through the configured redactor. The
-durable `startup_error` is written by the child from the same redacted error path.
+The detached child does not retain a pipe back to the short-lived parent. Child setup failures pass
+through the configured redactor before the durable `startup_error` is written. Parent-detected exits
+and timeouts use fixed, non-secret diagnostics and can read the latest diagnostic by the exact child
+PID. Raw provider stderr is never persisted.
 
 ## Tests
 

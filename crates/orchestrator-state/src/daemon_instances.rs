@@ -234,6 +234,19 @@ impl Database {
         })
     }
 
+    pub fn daemon_startup_diagnostic_for_pid(&self, pid: u32) -> StateResult<Option<String>> {
+        self.lock()?
+            .query_row(
+                "SELECT startup_error FROM daemon_instances \
+                 WHERE pid = ?1 AND startup_error IS NOT NULL \
+                 ORDER BY started_at DESC LIMIT 1",
+                [i64::from(pid)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
     pub fn request_daemon_stop(
         &self,
         instance_id: DaemonInstanceId,
@@ -496,6 +509,12 @@ mod tests {
         assert_eq!(failed.phase, DaemonPhase::Failed);
         assert_eq!(
             failed.startup_error.as_deref(),
+            Some("provider probe failed: [REDACTED]")
+        );
+        assert_eq!(
+            database
+                .daemon_startup_diagnostic_for_pid(lease.pid)?
+                .as_deref(),
             Some("provider probe failed: [REDACTED]")
         );
         assert_eq!(

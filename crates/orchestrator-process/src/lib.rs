@@ -19,5 +19,5 @@ pub use redaction::{RedactionConfig, RedactionError, Redactor};
 pub use runner::{
     CapturedOutput, CommandSpec, EnvironmentPolicy, OutputChannel, ProcessError, ProcessEvent,
     ProcessInput, ProcessResult, ProcessRunner, ProcessSession, ProcessSupervisor,
-    TerminationReason,
+    TerminationReason, terminate_child_tree,
 };

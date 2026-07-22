@@ -2,7 +2,7 @@
 
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Output, Stdio},
     thread,
     time::{Duration, Instant},
@@ -34,6 +34,10 @@ impl CliFixture {
     }
 
     fn colay<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        self.colay_with_env(&args, &[])
+    }
+
+    fn colay_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Result<Output> {
         #[cfg(windows)]
         let system_root = system_root()?;
         #[cfg(not(windows))]
@@ -42,18 +46,46 @@ impl CliFixture {
         let executable_parent = executable
             .parent()
             .context("colay binary has no parent directory")?;
-        Command::new(&executable)
+        let mut command = Command::new(&executable);
+        command
             .args(args)
             .current_dir(&self.repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
+            .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", executable_parent)
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
             .env("TEMP", &self.temp_root)
-            .env("TMP", &self.temp_root)
-            .output()
-            .context("failed to invoke colay")
+            .env("TMP", &self.temp_root);
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command.output().context("failed to invoke colay")
+    }
+
+    fn configure_slow_fake_codex(&self, delay_ms: u64) -> Result<()> {
+        let source = fake_provider_binary();
+        let extension = source.extension().and_then(|value| value.to_str());
+        let file_name = extension.map_or_else(
+            || format!("fake-provider-probe-delay-{delay_ms}"),
+            |extension| format!("fake-provider-probe-delay-{delay_ms}.{extension}"),
+        );
+        let executable = self.temp_root.join(file_name);
+        fs::copy(source, &executable)?;
+        self.configure_fake_codex_executable(&executable)
+    }
+
+    fn configure_fake_codex_executable(&self, executable: &Path) -> Result<()> {
+        fs::create_dir_all(&self.colay_home)?;
+        fs::write(
+            self.colay_home.join("config.toml"),
+            format!(
+                "config_version = 4\n[orchestrator.providers.codex]\nexecutable = {}\n",
+                toml_path(executable)
+            ),
+        )?;
+        Ok(())
     }
 
     fn json(&self, args: &[&str]) -> Result<Value> {
@@ -84,6 +116,14 @@ impl CliFixture {
     }
 
     fn invoke_without_capture(&self, args: &[&str]) -> Result<ExitStatus> {
+        self.invoke_with_env_without_capture(args, &[])
+    }
+
+    fn invoke_with_env_without_capture(
+        &self,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<ExitStatus> {
         #[cfg(windows)]
         let system_root = system_root()?;
         #[cfg(not(windows))]
@@ -92,18 +132,24 @@ impl CliFixture {
         let executable_parent = executable
             .parent()
             .context("colay binary has no parent directory")?;
-        Command::new(&executable)
+        let mut command = Command::new(&executable);
+        command
             .args(args)
             .current_dir(&self.repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
+            .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", executable_parent)
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
             .env("TEMP", &self.temp_root)
             .env("TMP", &self.temp_root)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        command
             .status()
             .context("failed to invoke colay without capture")
     }
@@ -121,6 +167,19 @@ impl CliFixture {
             thread::sleep(Duration::from_millis(25));
         }
     }
+}
+
+fn fake_provider_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_colay-e2e-fake-provider"))
+}
+
+fn toml_path(path: &Path) -> String {
+    format!(
+        "\"{}\"",
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
 }
 
 impl Drop for CliFixture {
@@ -196,5 +255,18 @@ fn daemon_help_hides_internal_serve_action() -> Result<()> {
         assert!(daemon.contains(action));
     }
     assert!(!daemon.contains("serve"));
+    Ok(())
+}
+
+#[test]
+fn slow_fake_provider_probe_does_not_make_start_fail() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    fixture.configure_slow_fake_codex(6_000)?;
+
+    let started = fixture.invoke_without_capture(&["daemon", "start"])?;
+
+    assert!(started.success());
+    let status = fixture.json(&["daemon", "status"])?;
+    assert_eq!(status["data"]["status"]["state"], "online");
     Ok(())
 }

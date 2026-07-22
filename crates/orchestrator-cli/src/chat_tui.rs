@@ -759,7 +759,10 @@ fn projection_to_snapshot(
     let connectivity = match daemon {
         DaemonStatus::Online(_) => DaemonConnectivity::Online,
         DaemonStatus::Stale(_) => DaemonConnectivity::Stale,
-        DaemonStatus::Stopped => DaemonConnectivity::Offline,
+        DaemonStatus::Booting(_)
+        | DaemonStatus::Probing(_)
+        | DaemonStatus::Failed(_)
+        | DaemonStatus::Stopped => DaemonConnectivity::Offline,
     };
     let read_only_reason = match connectivity {
         DaemonConnectivity::Online => None,

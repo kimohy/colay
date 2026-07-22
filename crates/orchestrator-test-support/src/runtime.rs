@@ -390,6 +390,11 @@ where
     let app_server_probe = args.first().is_some_and(|arg| arg == "app-server")
         && (args.iter().any(|arg| arg == "--help")
             || args.get(1).is_some_and(|arg| arg == "generate-json-schema"));
+    if args.iter().any(|arg| arg == "--version")
+        && let Some(delay) = fake_probe_delay()
+    {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     if args.iter().any(|arg| arg == "--version" || arg == "--help") || app_server_probe {
         print!("{}", fake_probe_output(&args));
         return;
@@ -477,6 +482,12 @@ where
     for line in scenario_lines(provider, scenario) {
         println!("{}", String::from_utf8_lossy(&line));
     }
+}
+
+fn fake_probe_delay() -> Option<u64> {
+    let executable = std::env::current_exe().ok()?;
+    let stem = executable.file_stem()?.to_string_lossy();
+    stem.rsplit_once("probe-delay-")?.1.parse().ok()
 }
 
 fn planning_prompt(stdin: &str) -> Option<serde_json::Value> {

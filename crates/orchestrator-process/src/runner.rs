@@ -830,6 +830,14 @@ async fn terminate_tree(
     Ok((status, tree_termination_error))
 }
 
+/// Terminates the process tree rooted at an exactly owned child and confirms that the child exited.
+pub async fn terminate_child_tree(
+    child: &mut Child,
+) -> io::Result<(std::process::ExitStatus, Option<String>)> {
+    let pid = child.id();
+    terminate_tree(child, pid).await
+}
+
 #[cfg(windows)]
 async fn terminate_platform_tree(pid: Option<u32>) -> io::Result<()> {
     let Some(pid) = pid else {
@@ -1015,14 +1023,16 @@ mod tests {
         fs,
         io::{BufRead as _, Write as _},
         path::Path,
+        process::Stdio,
         time::Duration,
     };
 
+    use tokio::process::Command;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         CommandSpec, EnvironmentPolicy, ProcessEvent, ProcessRunner, ProcessSupervisor,
-        TerminationReason,
+        TerminationReason, terminate_child_tree,
     };
     #[cfg(windows)]
     use super::{terminate_platform_tree, trusted_taskkill_path};
@@ -1183,6 +1193,34 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("process: {error}"));
         assert_eq!(result.termination, TerminationReason::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn explicit_tree_termination_reaps_the_owned_child() {
+        let executable = std::env::current_exe()
+            .unwrap_or_else(|error| panic!("current test executable: {error}"));
+        let mut command = Command::new(executable);
+        command
+            .args(["--exact", "runner::tests::fixture_child", "--nocapture"])
+            .env("ORCHESTRATOR_PROCESS_FIXTURE", "sleep")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn fixture: {error}"));
+
+        let (status, _) = terminate_child_tree(&mut child)
+            .await
+            .unwrap_or_else(|error| panic!("terminate fixture: {error}"));
+
+        assert!(!status.success());
+        assert!(
+            child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("inspect fixture: {error}"))
+                .is_some()
+        );
     }
 
     #[tokio::test]
