@@ -32,8 +32,8 @@ pub use rollback::{
 pub use startup::{CodexExecutionPolicy, StartupGuard, StartupGuardReport};
 pub use verification::{SecretFinding, SecretScanReport, VerificationEngine, VerificationInput};
 pub use worktree::{
-    FileOwnershipRegistry, GitSnapshot, GitWorktree, GitWorktreeManager, WorktreeCleanupPlan,
-    canonicalize_directory,
+    FileOwnershipRegistry, GitRepositoryReadiness, GitSnapshot, GitWorktree, GitWorktreeManager,
+    WorktreeCleanupPlan, canonicalize_directory, inspect_git_repository,
 };
 
 #[cfg(test)]
