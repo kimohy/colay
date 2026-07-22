@@ -25,8 +25,8 @@
 | `WSL-004` | high | fixed | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
 | `WSL-005` | high | fixed | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
 | `WSL-006` | medium | workaround-confirmed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
-| `WSL-007` | low | open | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
-| `WSL-008` | high | open | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
+| `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
+| `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WIN-001` | medium | workaround-confirmed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | open | Windows nightly PE에 Authenticode 서명이 없어 OS 신뢰 체인이 없음 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부가 1회 발생한 플래이크 |
@@ -368,6 +368,21 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - 명시적인 감사 이벤트와 승인 조건을 가진 `recover stale-lease` 관리 경로를 검토한다.
   owner liveness가 불명확하면 fail-closed하고 worktree와 attempt evidence를 보존한다.
 
+### 수정 구현
+
+- provider `WorkerEvent::Error`는 redacted audit event를 먼저 기록한 뒤 즉시 cancel을
+  요청하고 기존 process-tree termination 확인 경로로 진입한다. 확인된 종료는 attempt의
+  `ended_at`과 `outcome`을 확정하며, 확인되지 않은 종료만 기존대로 lease를 보존한다.
+- direct coordinator lease는 30초, child worker lease는 20초 TTL로 줄이고 활성 owner가
+  5초마다 갱신한다. owner가 사라지면 기존 원자적 expiry/takeover가 최대 30초 경계에서
+  authority를 회수하며, 살아 있는 owner는 계속 갱신되어 takeover되지 않는다.
+- 충돌 오류에 coordinator owner, `renewed_at`, `expires_at`, active worker 수, 안전한 재시도
+  시각을 포함한다.
+- fake Claude terminal credit 오류, active coordinator/worker renewal, bounded TTL, 충돌
+  diagnostics, 기존 atomic expiry/takeover 회귀가 Windows에서 통과했다.
+- 수정 커밋 `5f09ecd`와 전체 Rust 테스트 411개, npm 테스트 65개, fmt 및 전체 Clippy
+  `-D warnings` 통과로 검증했다. 실제 provider inference는 호출하지 않았다.
+
 ### 완료 조건
 
 - fake provider가 terminal credit 오류를 반환하는 회귀 테스트에서 bounded 시간 내
@@ -478,6 +493,13 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - timeout 시 daemon heartbeat, command state, claimed/completed timestamps를 출력한다.
 - CI 부하 상태에서 반복 실행하는 플래이크 검증을 추가한다.
 
+### 수정 구현
+
+- session/message projection의 고정 500ms 제한을 10ms 간격, 최대 5초의 상태 기반 bounded
+  wait로 교체했다. 성공 시 즉시 반환하므로 정상 경로를 불필요하게 지연하지 않는다.
+- 수정 커밋 `fe23303` 이후 해당 Windows 테스트를 단독 3회 연속 통과시켰고 전체
+  workspace suite도 통과했다.
+
 ## WIN-003: Windows `icacls.exe` 접근 거부 테스트 플래이크
 
 ### 증거
@@ -511,15 +533,15 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   integrity가 정상이었다.
 - Windows에서 `cargo fmt --all -- --check`, 전체 clippy `-D warnings`, npm 테스트 65개가
   통과했다. 최초 nightly QA에서는 Rust 402개, Git readiness 수정 후에는 신규 회귀를
-  포함한 Rust 407개가 통과했다.
+  포함한 Rust 407개, SQLite 수정 후 409개, provider lease 수정 후 411개가 통과했다.
 - QA 과정에서 실제 Codex, Claude, Gemini inference는 호출하지 않았다.
 
 ## Prioritized improvement queue
 
 1. `P0`: 모든 입력을 task로 시작하지 않는 conversation-first plan mode를 기본 진입점으로
    두고, Git preflight는 worktree task 승격 직전에만 수행한다.
-2. `P0`: provider terminal 오류와 CLI 중단 시 attempt/task/worker/coordinator lease를
-   finalization하고, 장기 고정 lease를 짧은 renewable lease로 교체한다.
+2. `완료`: provider terminal 오류를 finalization하고 장기 고정 lease를 짧은 renewable
+   lease로 교체했다 (`WSL-008`).
 3. `완료`: idle daemon의 불필요한 immediate transaction을 제거하고 writer starvation을
    회귀 테스트로 고정했다 (`WSL-003`).
 4. `P1`: daemon startup timeout 시 child 정리와 phase diagnostics를 보장한다.
@@ -529,7 +551,7 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 7. `P2`: Windows release Authenticode 서명 또는 명시적인 enterprise 지원 제한을
    제공한다.
 8. `P2`: `/mnt/c` mixed-Git 환경 경고와 WSL native clone 문서를 추가한다.
-9. `P2`: 500ms reconnect 테스트를 condition-based wait로 바꾼다.
+9. `완료`: 500ms reconnect 테스트를 condition-based wait로 바꿨다 (`WSL-007`).
 
 ## Update log
 
@@ -572,5 +594,11 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - idle command/scheduler poll에 read-only candidate precheck를 추가했다. Windows에서
   별도 writer가 활성인 회귀 테스트 2개와 fmt, 전체 Clippy, npm 65개, Rust 409개가
   통과해 `WSL-003`을 `fixed`로 전환했다. 전체 재검증에서 `WIN-003`은 재발하지 않았다.
+- provider terminal 오류를 즉시 cancel/confirmed-wait 경로로 연결하고 coordinator 30초,
+  worker 20초, renewal 5초의 bounded authority로 변경했다. 상세 lease 충돌 진단과 fake
+  terminal credit 회귀를 추가하고 Rust 411개 전체 suite를 통과해 `WSL-008`을 `fixed`로
+  전환했다.
+- 전체 suite에서 `WSL-007`의 500ms reconnect 플래이크가 다시 재현돼 상태 기반 최대 5초
+  대기로 교체했다. 단독 3회와 전체 suite 통과 후 `fixed`로 전환했다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
