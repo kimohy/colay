@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 pub enum FakeRuntimeScenario {
     Success,
     QuotaExceeded,
+    TerminalError,
     MalformedOutput,
     UnknownEvent,
     ProcessCrash,
@@ -34,6 +35,7 @@ struct FakeJob {
     events: VecDeque<RawEvent>,
     output: RuntimeOutput,
     cancelled: bool,
+    first_event_ready_at: Option<tokio::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +185,8 @@ impl AdapterRuntime for FakeAdapterRuntime {
                 events,
                 output,
                 cancelled: false,
+                first_event_ready_at: (self.scenario == FakeRuntimeScenario::TerminalError)
+                    .then(|| tokio::time::Instant::now() + Duration::from_secs(6)),
             },
         );
         Ok(WorkerHandle {
@@ -194,10 +198,20 @@ impl AdapterRuntime for FakeAdapterRuntime {
     }
 
     async fn next_event(&self, handle: &WorkerHandle) -> Result<Option<RawEvent>, ProviderError> {
+        let ready_at = {
+            let jobs = self.jobs.lock().await;
+            jobs.get(&handle.attempt_id)
+                .ok_or_else(|| ProviderError::Runtime("unknown fake worker".to_owned()))?
+                .first_event_ready_at
+        };
+        if let Some(ready_at) = ready_at {
+            tokio::time::sleep_until(ready_at).await;
+        }
         let mut jobs = self.jobs.lock().await;
         let job = jobs
             .get_mut(&handle.attempt_id)
             .ok_or_else(|| ProviderError::Runtime("unknown fake worker".to_owned()))?;
+        job.first_event_ready_at = None;
         Ok(job.events.pop_front())
     }
 
@@ -301,6 +315,9 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Codex, FakeRuntimeScenario::QuotaExceeded) => vec![
             r#"{"type":"error","code":"usage_limit_reached","message":"Monthly usage limit reached"}"#,
         ],
+        (ProviderId::Codex, FakeRuntimeScenario::TerminalError) => {
+            vec![r#"{"type":"error","code":"billing_error","message":"Credit balance is too low"}"#]
+        }
         (ProviderId::Codex, FakeRuntimeScenario::MalformedOutput) => vec!["{not-json}"],
         (ProviderId::Codex, FakeRuntimeScenario::UnknownEvent) => {
             vec![r#"{"type":"turn.paused"}"#]
@@ -318,6 +335,9 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Claude, FakeRuntimeScenario::QuotaExceeded) => {
             vec![r#"{"type":"result","is_error":true,"result":"Monthly usage limit reached"}"#]
         }
+        (ProviderId::Claude, FakeRuntimeScenario::TerminalError) => {
+            vec![r#"{"type":"result","is_error":true,"result":"Credit balance is too low"}"#]
+        }
         (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::MalformedOutput) => {
             vec!["not-json"]
         }
@@ -328,6 +348,9 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         ],
         (ProviderId::Gemini, FakeRuntimeScenario::QuotaExceeded) => {
             vec![r#"{"type":"error","message":"Daily quota exceeded"}"#]
+        }
+        (ProviderId::Gemini, FakeRuntimeScenario::TerminalError) => {
+            vec![r#"{"type":"error","message":"Credit balance is too low"}"#]
         }
         (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::UnknownEvent) => {
             vec![r#"{"type":"new_optional_event","payload":1}"#]
@@ -342,6 +365,7 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         ],
         (ProviderId::Agy, FakeRuntimeScenario::Success) => vec!["done"],
         (ProviderId::Agy, FakeRuntimeScenario::QuotaExceeded) => vec!["Daily quota exceeded"],
+        (ProviderId::Agy, FakeRuntimeScenario::TerminalError) => vec!["Credit balance is too low"],
         (ProviderId::Agy, FakeRuntimeScenario::MalformedOutput) => vec!["plain output"],
         (ProviderId::Agy, FakeRuntimeScenario::UnknownEvent) => vec!["optional output"],
         (ProviderId::Agy, FakeRuntimeScenario::SecretOutput) => {
