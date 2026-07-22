@@ -9,6 +9,7 @@ mod artifacts;
 mod client_commands;
 mod config;
 mod config_layers;
+mod conversations;
 mod daemon_instances;
 mod database;
 mod error;
@@ -36,6 +37,9 @@ pub use config::{
 pub use config_layers::{
     ConfigEnvironment, ConfigLayerKind, ConfigRequest, ConfigSource, EffectiveConfig,
     load_effective_config,
+};
+pub use conversations::{
+    ConversationAttemptStatus, NewConversationAttempt, StoredConversationAttempt,
 };
 pub use daemon_instances::{DaemonInstance, DaemonLeaseRequest, DaemonPhase, DaemonStatus};
 pub use database::{Database, DatabaseHealth, OutboxRecord};

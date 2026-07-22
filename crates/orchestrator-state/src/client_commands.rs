@@ -257,6 +257,7 @@ impl Database {
                 command.action,
                 ClientCommandAction::CreateSession
                     | ClientCommandAction::AppendMessage
+                    | ClientCommandAction::RequestConversationTurn
                     | ClientCommandAction::RequestPlan
                     | ClientCommandAction::ApproveGraph
                     | ClientCommandAction::RequestIntegration
@@ -415,6 +416,7 @@ const fn action_name(action: ClientCommandAction) -> &'static str {
     match action {
         ClientCommandAction::CreateSession => "create_session",
         ClientCommandAction::AppendMessage => "append_message",
+        ClientCommandAction::RequestConversationTurn => "request_conversation_turn",
         ClientCommandAction::StopDaemon => "stop_daemon",
         ClientCommandAction::RequestPlan => "request_plan",
         ClientCommandAction::ApproveGraph => "approve_graph",
@@ -430,6 +432,7 @@ fn parse_action(value: &str) -> Result<ClientCommandAction, std::io::Error> {
     match value {
         "create_session" => Ok(ClientCommandAction::CreateSession),
         "append_message" => Ok(ClientCommandAction::AppendMessage),
+        "request_conversation_turn" => Ok(ClientCommandAction::RequestConversationTurn),
         "stop_daemon" => Ok(ClientCommandAction::StopDaemon),
         "request_plan" => Ok(ClientCommandAction::RequestPlan),
         "approve_graph" => Ok(ClientCommandAction::ApproveGraph),
@@ -635,6 +638,7 @@ mod tests {
         for (action, key) in [
             (ClientCommandAction::CreateSession, "create"),
             (ClientCommandAction::AppendMessage, "append"),
+            (ClientCommandAction::RequestConversationTurn, "conversation"),
             (ClientCommandAction::StopDaemon, "stop"),
         ] {
             database.submit_client_command(&command(action, key))?;
@@ -643,7 +647,7 @@ mod tests {
 
         let recovered =
             database.recover_stale_client_commands(timestamp() + TimeDelta::seconds(1))?;
-        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered.len(), 4);
         assert_eq!(
             recovered
                 .iter()
@@ -651,7 +655,7 @@ mod tests {
                     *disposition == ClientCommandRecoveryDisposition::Requeued
                 })
                 .count(),
-            2
+            3
         );
         assert_eq!(
             recovered
