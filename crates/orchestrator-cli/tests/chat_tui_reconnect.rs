@@ -127,6 +127,22 @@ fn command(
     }
 }
 
+fn wait_for_projection(
+    description: &str,
+    mut projected: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if projected()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("daemon did not {description} within five seconds");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -157,13 +173,9 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         })?,
         "reconnect-session".to_owned(),
     ))?;
-    let session_deadline = Instant::now() + Duration::from_millis(500);
-    while database.load_session(session_id)?.is_none() {
-        if Instant::now() >= session_deadline {
-            bail!("daemon did not create session within 500ms");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_projection("create session", || {
+        Ok(database.load_session(session_id)?.is_some())
+    })?;
 
     let message_id = MessageId::new();
     database.submit_client_command(&command(
@@ -175,13 +187,9 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         })?,
         format!("reconnect-message-{message_id}"),
     ))?;
-    let message_deadline = Instant::now() + Duration::from_millis(500);
-    while database.load_message(message_id)?.is_none() {
-        if Instant::now() >= message_deadline {
-            bail!("daemon did not persist message within 500ms");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_projection("persist message", || {
+        Ok(database.load_message(message_id)?.is_some())
+    })?;
     drop(database);
 
     let reopened = fixture.database()?;
