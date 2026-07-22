@@ -2,6 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod checkpoint;
+mod conversation;
 mod coordinator;
 mod error;
 mod executor;
@@ -14,6 +15,11 @@ mod verification;
 mod worktree;
 
 pub use checkpoint::{CheckpointInput, CheckpointManager, GitCheckpointEvidence};
+pub use conversation::{
+    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
+    ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
+    collect_conversation_response,
+};
 pub use coordinator::TaskLifecycle;
 pub use error::{EngineError, EngineResult};
 pub use executor::{TaskExecutionReport, TaskExecutionRequest, TaskExecutor};
