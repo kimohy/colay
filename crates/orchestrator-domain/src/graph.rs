@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    GraphRevisionId, MessageId, ModelProfile, ProviderId, RepoPath, RiskTag, SchemaVersion,
-    SessionId, canonical_sha256,
+    GraphRevisionId, MessageId, ModelProfile, ProviderId, RepoPath, RequirementRevisionId, RiskTag,
+    SchemaVersion, SessionId, canonical_sha256,
 };
 
 pub const TASK_GRAPH_SCHEMA_VERSION: &str = SchemaVersion::V1;
@@ -54,6 +54,16 @@ pub struct GraphValidationSummary {
     pub topological_order: Vec<String>,
     pub maximum_parallel_width: usize,
     pub configured_parallel_workers: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<GraphValidationAuthority>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphValidationAuthority {
+    pub requirement_revision_id: RequirementRevisionId,
+    pub validation_hash: String,
+    pub base_commit: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +127,8 @@ pub enum GraphValidationError {
     },
     #[error("cannot seal validated graph: {message}")]
     Integrity { message: String },
+    #[error("validated graph authority contains a malformed hash or base commit")]
+    InvalidAuthority,
 }
 
 #[derive(Serialize)]
@@ -133,6 +145,37 @@ struct GraphSeal<'a> {
 pub fn validate_task_graph(
     proposal: TaskGraphProposal,
     policy: &GraphValidationPolicy,
+) -> Result<ValidatedTaskGraph, GraphValidationError> {
+    validate_task_graph_with_optional_authority(proposal, policy, None)
+}
+
+/// Validates and seals a graph against one immutable requirement and repository validation.
+///
+/// # Errors
+///
+/// Returns the same deterministic graph errors as [`validate_task_graph`] and rejects malformed
+/// validation authority.
+pub fn validate_task_graph_with_authority(
+    proposal: TaskGraphProposal,
+    policy: &GraphValidationPolicy,
+    authority: GraphValidationAuthority,
+) -> Result<ValidatedTaskGraph, GraphValidationError> {
+    if !is_sha256(&authority.validation_hash)
+        || !matches!(authority.base_commit.len(), 40 | 64)
+        || !authority
+            .base_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GraphValidationError::InvalidAuthority);
+    }
+    validate_task_graph_with_optional_authority(proposal, policy, Some(authority))
+}
+
+fn validate_task_graph_with_optional_authority(
+    proposal: TaskGraphProposal,
+    policy: &GraphValidationPolicy,
+    authority: Option<GraphValidationAuthority>,
 ) -> Result<ValidatedTaskGraph, GraphValidationError> {
     validate_policy(policy)?;
     if !proposal
@@ -221,6 +264,7 @@ pub fn validate_task_graph(
         topological_order: topological_order.clone(),
         maximum_parallel_width,
         configured_parallel_workers: policy.max_parallel_workers,
+        authority,
     };
     let proposal_hash = task_graph_proposal_hash(&proposal, &validation)?;
 
@@ -230,6 +274,10 @@ pub fn validate_task_graph(
         validation,
         proposal_hash,
     })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Recomputes the canonical seal used to bind a proposal to its validation summary.
@@ -438,9 +486,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use crate::{
-        GraphRevisionId, GraphValidationError, GraphValidationPolicy, MessageId, ModelProfile,
-        ProviderId, RepoPath, RiskTag, SchemaVersion, SessionId, TaskGraphNode, TaskGraphProposal,
-        validate_task_graph,
+        GraphRevisionId, GraphValidationAuthority, GraphValidationError, GraphValidationPolicy,
+        MessageId, ModelProfile, ProviderId, RepoPath, RequirementRevisionId, RiskTag,
+        SchemaVersion, SessionId, TaskGraphNode, TaskGraphProposal, validate_task_graph,
+        validate_task_graph_with_authority,
     };
 
     fn node(key: &str, dependencies: &[&str], scopes: &[&str]) -> TaskGraphNode {
@@ -508,6 +557,21 @@ mod tests {
         assert_eq!(graph.validation.edge_count, 4);
         assert_eq!(graph.validation.maximum_parallel_width, 2);
         assert_eq!(graph.proposal_hash.len(), 64);
+    }
+
+    #[test]
+    fn validated_authority_is_part_of_the_proposal_hash() {
+        let draft = proposal(vec![node("task", &[], &["src/task"])]);
+        let unbound = validate_task_graph(draft.clone(), &policy()).expect("unbound graph");
+        let authority = GraphValidationAuthority {
+            requirement_revision_id: RequirementRevisionId::new(),
+            validation_hash: "b".repeat(64),
+            base_commit: "a".repeat(40),
+        };
+        let bound = validate_task_graph_with_authority(draft, &policy(), authority.clone())
+            .expect("bound graph");
+        assert_ne!(unbound.proposal_hash, bound.proposal_hash);
+        assert_eq!(bound.validation.authority, Some(authority));
     }
 
     #[test]

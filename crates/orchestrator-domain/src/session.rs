@@ -9,6 +9,7 @@ use crate::{ClientCommandId, GraphRevisionId, MessageId, SchemaVersion, SessionI
 pub enum SessionState {
     Drafting,
     Planning,
+    Validating,
     AwaitingApproval,
     Running,
     NeedsAttention,
@@ -38,10 +39,21 @@ impl SessionState {
             Self::Drafting => matches!(next, Self::Planning | Self::Stopping),
             Self::Planning => matches!(
                 next,
-                Self::AwaitingApproval | Self::NeedsAttention | Self::Stopping
+                Self::Validating | Self::AwaitingApproval | Self::NeedsAttention | Self::Stopping
+            ),
+            Self::Validating => matches!(
+                next,
+                Self::AwaitingApproval
+                    | Self::NeedsAttention
+                    | Self::Planning
+                    | Self::Drafting
+                    | Self::Stopping
             ),
             Self::AwaitingApproval => {
-                matches!(next, Self::Planning | Self::Running | Self::Stopping)
+                matches!(
+                    next,
+                    Self::Drafting | Self::Planning | Self::Running | Self::Stopping
+                )
             }
             Self::Running => matches!(
                 next,
@@ -49,7 +61,11 @@ impl SessionState {
             ),
             Self::NeedsAttention => matches!(
                 next,
-                Self::Planning | Self::Running | Self::Integrating | Self::Stopping
+                Self::Drafting
+                    | Self::Planning
+                    | Self::Running
+                    | Self::Integrating
+                    | Self::Stopping
             ),
             Self::Integrating => {
                 matches!(
@@ -230,6 +246,11 @@ pub struct RequestPlanCommandPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestConversationTurnCommandPayload {
+    pub source_message_id: MessageId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApproveGraphCommandPayload {
     pub revision_id: GraphRevisionId,
     pub proposal_hash: String,
@@ -312,6 +333,7 @@ impl AppendMessageCommandPayload {
 pub enum ClientCommandAction {
     CreateSession,
     AppendMessage,
+    RequestConversationTurn,
     StopDaemon,
     RequestPlan,
     ApproveGraph,

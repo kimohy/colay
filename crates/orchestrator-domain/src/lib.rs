@@ -6,6 +6,7 @@
 
 pub mod assessment;
 pub mod checkpoint;
+pub mod conversation;
 pub mod event;
 pub mod evidence;
 pub mod graph;
@@ -26,6 +27,7 @@ pub mod verification;
 
 pub use assessment::*;
 pub use checkpoint::*;
+pub use conversation::*;
 pub use event::*;
 pub use evidence::*;
 pub use graph::*;
