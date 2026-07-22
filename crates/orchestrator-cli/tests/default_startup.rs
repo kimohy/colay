@@ -9,8 +9,49 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use rusqlite::Connection;
+use chrono::Utc;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+
+const MIGRATIONS_THROUGH_V8: &[(u32, &str, &str)] = &[
+    (1, "core", include_str!("../../../migrations/0001_core.sql")),
+    (
+        2,
+        "execution",
+        include_str!("../../../migrations/0002_execution.sql"),
+    ),
+    (
+        3,
+        "audit_and_control",
+        include_str!("../../../migrations/0003_audit_and_control.sql"),
+    ),
+    (
+        4,
+        "durable_sessions",
+        include_str!("../../../migrations/0004_durable_sessions.sql"),
+    ),
+    (
+        5,
+        "chat_workspace_state",
+        include_str!("../../../migrations/0005_chat_workspace_state.sql"),
+    ),
+    (
+        6,
+        "approved_task_graphs",
+        include_str!("../../../migrations/0006_approved_task_graphs.sql"),
+    ),
+    (
+        7,
+        "parallel_execution",
+        include_str!("../../../migrations/0007_parallel_execution.sql"),
+    ),
+    (
+        8,
+        "result_integration",
+        include_str!("../../../migrations/0008_result_integration.sql"),
+    ),
+];
 
 struct CliFixture {
     _temp: tempfile::TempDir,
@@ -65,6 +106,28 @@ impl CliFixture {
             ),
         )?;
         Ok(())
+    }
+
+    fn seed_v8_database(&self) -> Result<PathBuf> {
+        let state = self.repository.join(".colay");
+        fs::create_dir_all(&state)?;
+        let database_path = state.join("orchestrator.db");
+        let connection = Connection::open(&database_path)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        for (version, name, sql) in MIGRATIONS_THROUGH_V8 {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    version,
+                    name,
+                    format!("{:x}", Sha256::digest(sql.as_bytes())),
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        Ok(database_path)
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
@@ -219,6 +282,37 @@ fn compatibility_and_status_do_not_create_repository_state() -> Result<()> {
         String::from_utf8_lossy(&status.stderr)
     );
     assert!(!fixture.repository.join(".colay").exists());
+    Ok(())
+}
+
+#[test]
+fn migrate_apply_upgrades_existing_database_without_repository_config() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    fixture.configure_fake_codex()?;
+    let database_path = fixture.seed_v8_database()?;
+
+    let output = fixture.colay(["--json", "migrate", "apply"])?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.repository.join(".colay/config.toml").exists());
+    let connection = Connection::open(database_path)?;
+    assert_eq!(
+        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+        11
+    );
+    let applied = connection
+        .prepare("SELECT version FROM schema_migrations WHERE version >= 9 ORDER BY version")?
+        .query_map([], |row| row.get::<_, u32>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(applied, vec![9, 10, 11]);
+    let backups =
+        fs::read_dir(fixture.repository.join(".colay/backups"))?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(backups.len(), 1);
+    assert!(backups[0].file_type()?.is_file());
     Ok(())
 }
 

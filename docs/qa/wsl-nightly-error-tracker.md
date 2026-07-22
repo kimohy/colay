@@ -10,7 +10,7 @@
 - 최초 작성: 2026-07-22 (Asia/Seoul)
 - 마지막 갱신: 2026-07-23
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
-- 확인한 nightly: `0.1.1-nightly.20260721.8c7f638`
+- 확인한 nightly: `0.1.1-nightly.20260722.f693062`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -27,9 +27,10 @@
 | `WSL-006` | medium | fixed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
+| `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
-| `WIN-003` | low | closed | Windows 전체 테스트에서 `icacls.exe` 접근 거부가 1회 발생한 플래이크 |
+| `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
 
 ## WSL-001: NVM/Node 및 PATH 불일치
@@ -584,15 +585,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `C:\Windows\System32\icacls.exe: Access is denied (os error 5)`로 한 번 실패했다.
 - 동일 테스트만 연속 3회 실행했을 때 모두 통과했다.
 
-### 종료 근거
+### 재개 근거
 
-- 최초 단독 3회, 이후 여러 차례의 전체 workspace 실행, conversation-first 최종 전체
-  target/feature 실행에서 재발하지 않았다.
-- 권한 구현 변경과 인과관계가 없고 지속적으로 재현 가능한 실패 조건도 없어 제품 결함이
-  아닌 일회성 환경 플래이크로 `closed` 처리한다. 다시 발생하면 동일 ID를 재개하고 당시
-  ACL, process identity, 임시 경로 증거를 수집한다.
-- 다음 전체 workspace suite에서도 통과했으므로 현재 Git 변경과의 인과관계는 확인되지
-  않았고 간헐적 Windows 권한/프로세스 실행 플래이크로 분류한다.
+- conversation-first 최종 전체 target/feature 실행까지 재발하지 않아 한때 `closed`였으나,
+  `f693062` 기준 새 worktree의 수정 전 전체 suite에서
+  `provider_capacity_and_overlapping_resource_claims_block_admission`이 동일한
+  `C:\Windows\System32\icacls.exe: Access is denied (os error 5)`로 다시 실패했다.
+- 실패한 테스트를 즉시 단독 3회 재실행하면 모두 통과했다. 현재 Git 변경과의 인과관계는
+  확인되지 않았지만 두 번째 관찰이므로 `open`으로 재개한다.
 
 ### 다음 조사 조건
 
@@ -617,6 +617,51 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Windows 실제 source binary에서 `provider_updated { provider: agy, enabled: false }`가
   반환되고 effective provider report에도 `enabled=false`가 반영됨을 확인했다.
 - 변경 후 workspace 전체 target/feature Clippy `-D warnings`와 전체 Rust suite가 통과했다.
+
+## WSL-009: config 없는 기존 DB의 migration 진입 실패 (WSL/Windows 공통)
+
+### 재현 및 영향
+
+```text
+$ colay migrate apply
+error: I/O operation failed for <repository>/.colay/config.toml: No such file or directory (os error 2)
+```
+
+- `0.1.1-nightly.20260722.f693062`에서 schema 8 DB에 schema 9, 10, 11 migration이
+  필요하다는 안내 직후 재현됐다.
+- repository `.colay/config.toml`이 없는 것은 유효한 상태다. 자동 설정 layer는 선택
+  사항이며 기본 설정만으로도 runtime과 repository-local state를 사용할 수 있다.
+- migration이 막혀 daemon을 새 nightly로 재시작할 수 없다.
+
+### 근본 원인
+
+- 일반 runtime loader는 자동 탐색 config가 없어도 유효 기본 설정을 만든다.
+- 그러나 `migrate_inner`는 runtime load 성공 후에도 기본 편집 경로인
+  `.colay/config.toml`을 `MigratableConfigDocument::load`로 무조건 읽었다.
+- 따라서 DB migration과 무관한 선택적 config 파일 부재가 migration 진입을 차단했다.
+  명시적 `--config` 또는 `COLAY_CONFIG` 누락을 거부하는 기존 fail-closed 계약과는 별개의
+  자동 탐색 경로 결함이다.
+
+### 수정 및 검증
+
+- schema 8 DB와 config 부재를 실제 CLI subprocess로 구성하는 회귀 테스트를 추가했다.
+  수정 전에는 사용자와 같은 `os error 2`로 실패하는 RED를 확인했다.
+- 자동 config 경로가 없을 때는 이미 검증된 effective default document로 config preview를
+  만들고 config write를 생략하도록 최소 수정했다. 명시적 config 누락 오류는 유지한다.
+- 대상 테스트는 schema 11 도달과 `.colay/config.toml` 비생성을 확인하며 GREEN이다.
+- Windows source에서 대상 회귀 테스트와 기본 시작 통합 테스트 8개, workspace 전체
+  target/feature Clippy `-D warnings`, 전체 Rust suite, npm 66개가 통과했다.
+- WSL 2 Ubuntu 24.04의 Rust 1.95 Linux 컨테이너에서 source를 read-only mount하고 공식
+  fake provider만 사용해 같은 schema 8→11 회귀 테스트를 통과했다. 실제 provider
+  inference는 호출하지 않았다.
+- repository config는 생성되지 않았고 migration manifest, DB backup, append-only event
+  경로의 기존 계약을 유지한다. 상태를 `fixed`로 전환한다.
+
+### 현재 우회
+
+- 수정 nightly가 나오기 전에는 repository에서 `colay init`으로 현재 config를 생성한 뒤
+  `colay migrate apply`를 실행할 수 있다. 기존 `.colay` DB/WAL/SHM 파일은 직접 삭제하지
+  않는다.
 
 ## Confirmed healthy controls
 
@@ -654,11 +699,20 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
    문서에 명시한다.
 8. `완료`: `/mnt/c` mixed-Git 환경 경고와 WSL native clone 문서를 추가한다.
 9. `완료`: 500ms reconnect 테스트를 condition-based wait로 바꿨다 (`WSL-007`).
+10. `완료`: config 파일이 없는 기존 DB도 기본 설정으로 migration할 수 있게 하고,
+    명시적 config 누락은 계속 fail-closed로 유지한다 (`WSL-009`).
 
 ## Update log
 
 ### 2026-07-23
 
+- nightly `0.1.1-nightly.20260722.f693062`의 schema 8 사용자 DB에서 config 파일 부재로
+  `migrate apply`가 시작 전에 실패하는 `WSL-009`를 추가했다. schema 8 DB를 사용하는 CLI
+  회귀 테스트로 RED를 확인하고, effective default config로 DB migration만 수행하는 최소
+  수정 후 Windows와 WSL Linux에서 GREEN을 확인했다. workspace 전체 Clippy, Rust suite,
+  npm 66개도 통과해 `fixed`로 전환했다.
+- 수정 전 전체 Windows suite에서 `WIN-003`의 `icacls.exe` 접근 거부가 두 번째로
+  관찰돼 상태를 `open`으로 재개했다. 같은 테스트의 즉시 단독 3회는 모두 통과했다.
 - `/plan`이 요구사항 revision 없이 approval 후보를 만들던 우회 경로를 차단하고, 새 사용자
   메시지가 planning/awaiting-approval graph를 같은 transaction에서 supersede하도록 했다.
 - session의 실제 `validating` 상태, Agy provider compatibility, exact graph approval authority,

@@ -4350,6 +4350,32 @@ fn migrate_without_runtime(
     migrate_inner(repository, None, explicit_edit_path, action, json_output)
 }
 
+fn migration_config_preview(
+    effective: Option<&EffectiveConfig>,
+    explicit_edit_path: &Path,
+) -> Result<(
+    Option<MigratableConfigDocument>,
+    bool,
+    orchestrator_state::ConfigMigrationPreview,
+)> {
+    let migratable = config_source_exists(explicit_edit_path)?
+        .then(|| MigratableConfigDocument::load(explicit_edit_path))
+        .transpose()?;
+    let source_is_current = migratable.as_ref().is_none_or(|document| {
+        document.current_version() == orchestrator_state::CONFIG_SCHEMA_VERSION
+    });
+    let preview = if source_is_current {
+        let effective = effective.ok_or_else(|| anyhow!("effective config disappeared"))?;
+        MigratableConfigDocument::parse(&effective.document().document().to_string())?.dry_run()?
+    } else {
+        migratable
+            .as_ref()
+            .ok_or_else(|| anyhow!("migration config source disappeared"))?
+            .dry_run()?
+    };
+    Ok((migratable, source_is_current, preview))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn migrate_inner(
     repository: &Path,
@@ -4358,15 +4384,8 @@ fn migrate_inner(
     action: MigrationAction,
     json_output: bool,
 ) -> Result<()> {
-    let migratable = MigratableConfigDocument::load(explicit_edit_path)?;
-    let source_is_current =
-        migratable.current_version() == orchestrator_state::CONFIG_SCHEMA_VERSION;
-    let config_preview = if source_is_current && effective.is_some() {
-        let effective = effective.ok_or_else(|| anyhow!("effective config disappeared"))?;
-        MigratableConfigDocument::parse(&effective.document().document().to_string())?.dry_run()?
-    } else {
-        migratable.dry_run()?
-    };
+    let (migratable, source_is_current, config_preview) =
+        migration_config_preview(effective, explicit_edit_path)?;
     let config = effective.map_or_else(
         || config_preview.migrated().config(),
         EffectiveConfig::config,
@@ -4426,7 +4445,10 @@ fn migrate_inner(
                     backup_path: None,
                 }
             } else {
-                migratable.apply_to_file(explicit_edit_path, Utc::now())?
+                migratable
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("migration config source disappeared"))?
+                    .apply_to_file(explicit_edit_path, Utc::now())?
             };
             let database_status = database.migrate_with_backup(&state.backups)?;
             let migration_payload = json!({
