@@ -20,7 +20,7 @@
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
 | `WSL-001` | medium | workaround-confirmed | NVM/Node 버전 및 비대화형 PATH 불일치 |
-| `WSL-002` | high | open | daemon start timeout 이후 child가 살아남아 뒤늦게 lease 획득 |
+| `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
 | `WSL-004` | high | fixed | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
 | `WSL-005` | high | fixed | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
@@ -93,6 +93,26 @@ error: daemon did not publish a healthy heartbeat within five seconds
 - timeout 시 정확히 자신이 spawn한 child를 종료하고 종료 확인까지 수행한다.
 - stderr 또는 redacted startup diagnostics를 repository state에 보존한다.
 - 느린 fake provider probe를 사용하는 회귀 테스트를 추가한다.
+
+### 수정 구현
+
+- schema migration 9에서 daemon instance에 `booting`, `probing`, `online`, `failed` phase와
+  redacted `startup_error`를 추가했다. schema 8의 기존 행은 `online`으로 보존된다.
+- child는 provider probe 전에 bootstrap lease를 획득하고 별도 startup heartbeat로 lease를
+  갱신한다. 서비스 구성이 끝난 뒤에만 `online`으로 전환하며 정상 daemon loop는 같은
+  instance 소유권을 재획득하지 않고 이어받는다.
+- 부모는 `booting`과 `probing`을 진행 중 상태로 처리하고, 활성 provider 수에 따른 bounded
+  probe 예산을 사용한다. 6초 지연 fake Codex probe가 과거 5초 거짓 timeout 없이 Windows에서
+  online이 되는 회귀 테스트를 추가했다.
+- timeout과 조기 종료 경로는 부모가 보유한 정확한 child PID의 프로세스 트리를 종료하고
+  child 종료를 확인한다. 같은 PID의 lease만 `failed`로 기록·해제하며 다른 owner는 건드리지
+  않는 테스트를 추가했다.
+- child setup 오류는 configured redactor를 거친 뒤 repository DB에 보존된다. detached child의
+  장기 stderr pipe는 Windows parent 종료를 막을 수 있어 사용하지 않고 raw provider stderr도
+  영속화하지 않는다.
+- 수정 커밋 `f88d974`, `26a001d`, `de70216`, `96d8460`에서 Windows lifecycle 3개,
+  전체 Rust 418개, npm 65개, fmt와 전체 Clippy `-D warnings`가 통과했다. 실제 provider
+  inference는 호출하지 않았고 `WIN-003`의 `icacls.exe` 접근 거부도 재발하지 않았다.
 
 ### 완료 조건
 
@@ -600,5 +620,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   전환했다.
 - 전체 suite에서 `WSL-007`의 500ms reconnect 플래이크가 다시 재현돼 상태 기반 최대 5초
   대기로 교체했다. 단독 3회와 전체 suite 통과 후 `fixed`로 전환했다.
+- daemon startup phase와 bootstrap heartbeat를 schema 9에 추가하고, provider별 bounded wait,
+  exact process-tree 종료/reap, PID 일치 lease 실패·해제, redacted durable 진단을 적용했다.
+  Windows slow fake probe와 전체 Rust 418개, npm 65개, fmt/Clippy 검증이 통과해 `WSL-002`를
+  `fixed`로 전환했다. 이 전체 실행에서도 `WIN-003`은 재발하지 않았다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
