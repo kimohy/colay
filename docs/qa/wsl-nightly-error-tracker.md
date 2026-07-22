@@ -29,7 +29,7 @@
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WIN-001` | medium | workaround-confirmed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | open | Windows nightly PE에 Authenticode 서명이 없어 OS 신뢰 체인이 없음 |
-| `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부가 1회 발생한 플래이크 |
+| `WIN-003` | low | closed | Windows 전체 테스트에서 `icacls.exe` 접근 거부가 1회 발생한 플래이크 |
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 
@@ -561,6 +561,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `rollback_relative_codex_target_matches_persisted_writable_worker_worktree` 테스트가
   `C:\Windows\System32\icacls.exe: Access is denied (os error 5)`로 한 번 실패했다.
 - 동일 테스트만 연속 3회 실행했을 때 모두 통과했다.
+
+### 종료 근거
+
+- 최초 단독 3회, 이후 여러 차례의 전체 workspace 실행, conversation-first 최종 전체
+  target/feature 실행에서 재발하지 않았다.
+- 권한 구현 변경과 인과관계가 없고 지속적으로 재현 가능한 실패 조건도 없어 제품 결함이
+  아닌 일회성 환경 플래이크로 `closed` 처리한다. 다시 발생하면 동일 ID를 재개하고 당시
+  ACL, process identity, 임시 경로 증거를 수집한다.
 - 다음 전체 workspace suite에서도 통과했으므로 현재 Git 변경과의 인과관계는 확인되지
   않았고 간헐적 Windows 권한/프로세스 실행 플래이크로 분류한다.
 
