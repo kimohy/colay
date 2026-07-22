@@ -25,7 +25,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     CheckpointInput, CheckpointManager, CodexExecutionPolicy, GitCheckpointEvidence, GitWorktree,
     GitWorktreeManager, HandoverInput, HandoverManager, StartupGuard, VerificationEngine,
-    VerificationInput, canonicalize_directory,
+    VerificationInput, canonicalize_directory, inspect_git_repository,
 };
 use orchestrator_policy::{
     AnalysisHints, BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig,
@@ -728,6 +728,11 @@ async fn run_task(
     let document = effective.document();
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
+    }
+    if !arguments.plan_only {
+        inspect_git_repository(repository).await.with_context(|| {
+            "direct `colay run` executes a writable task and requires a committed Git repository; `run --plan-only` remains static assessment, not conversation mode"
+        })?;
     }
     let state = StatePaths::from_config(repository, document.config())?;
     let database = if state.database.exists() {

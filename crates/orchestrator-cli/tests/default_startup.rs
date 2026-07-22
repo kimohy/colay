@@ -1,7 +1,9 @@
 #![cfg(feature = "test-fixtures")]
 
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -44,7 +46,8 @@ impl CliFixture {
             .current_dir(&self.repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
-            .env("PATH", fake_provider_path()?)
+            .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
+            .env("PATH", test_path()?)
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
             .env("TEMP", &self.temp_root)
@@ -63,6 +66,14 @@ impl CliFixture {
         )?;
         Ok(())
     }
+
+    fn git<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        Command::new("git")
+            .args(args)
+            .current_dir(&self.repository)
+            .output()
+            .context("failed to invoke git")
+    }
 }
 
 fn fake_provider_binary() -> PathBuf {
@@ -74,6 +85,14 @@ fn fake_provider_path() -> Result<PathBuf> {
         .parent()
         .context("fake provider binary has no parent directory")
         .map(Path::to_path_buf)
+}
+
+fn test_path() -> Result<OsString> {
+    let mut paths = vec![fake_provider_path()?];
+    if let Some(host_path) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&host_path));
+    }
+    env::join_paths(paths).context("failed to construct test PATH")
 }
 
 #[cfg(windows)]
@@ -226,5 +245,45 @@ fn failed_event_reconciliation_blocks_retries_before_task_mutation() -> Result<(
     assert_eq!(tasks, 0);
     assert_eq!(events, 0);
     assert_eq!(exported, 0);
+    Ok(())
+}
+
+#[test]
+fn direct_run_rejects_non_git_before_state_mutation() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    fixture.configure_fake_codex()?;
+
+    let output = fixture.colay(["run", "hello"])?;
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires a Git repository"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.repository.join(".colay").exists());
+    Ok(())
+}
+
+#[test]
+fn direct_run_rejects_unborn_head_before_state_mutation() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    let git = fixture.git(["init", "--quiet"])?;
+    assert!(
+        git.status.success(),
+        "git stderr: {}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    fixture.configure_fake_codex()?;
+
+    let output = fixture.colay(["run", "hello"])?;
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no base commit"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.repository.join(".colay").exists());
     Ok(())
 }
