@@ -21,7 +21,7 @@
 | --- | --- | --- | --- |
 | `WSL-001` | medium | workaround-confirmed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | open | daemon start timeout 이후 child가 살아남아 뒤늦게 lease 획득 |
-| `WSL-003` | high | open | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
+| `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
 | `WSL-004` | high | fixed | WSL/Windows non-Git 위치에서 task 영속화 후 raw Git 128 오류 |
 | `WSL-005` | high | fixed | WSL/Windows unborn HEAD에서 raw `Needed a single revision` 오류 |
 | `WSL-006` | medium | workaround-confirmed | WSL Git이 `/mnt/c` Windows checkout 줄바꿈을 대량 변경으로 인식 |
@@ -142,6 +142,19 @@ error: SQLite operation failed: database is locked: database is locked: Error co
 - direct run이 daemon과 별도 writer로 경쟁하지 않고 durable command를 통해 daemon에
   제출되는 단일-writer 구조를 검토한다.
 - task 영속화와 coordinator 확보 사이 실패를 명시적인 recoverable 상태로 기록한다.
+
+### 수정 구현
+
+- `codex/fix-sqlite-writer-starvation`에서 command queue와 scheduler의 idle claim 경로에
+  read-only `SELECT EXISTS` 사전검사를 추가했다.
+- 후보가 없으면 `BEGIN IMMEDIATE` 없이 `None`을 반환한다. 후보가 보이면 기존 immediate
+  transaction에 진입해 같은 조건을 다시 조회하므로 concurrent claim의 단일 승자와
+  TOCTOU 안전성은 유지된다.
+- 별도 SQLite 연결이 `BEGIN IMMEDIATE`를 보유한 상태에서도 빈 general/session/
+  orchestration command queue와 빈 scheduler poll이 `SQLITE_BUSY` 대신 `None`을 반환하는
+  Windows 회귀 테스트 2개를 추가했다.
+- 수정 커밋 `bf49188`, 전체 Rust 테스트 409개, npm 테스트 65개, fmt와 전체 Clippy
+  `-D warnings` 통과로 수정 범위를 검증했다. 실제 provider inference는 호출하지 않았다.
 
 ### 완료 조건
 
@@ -507,8 +520,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
    두고, Git preflight는 worktree task 승격 직전에만 수행한다.
 2. `P0`: provider terminal 오류와 CLI 중단 시 attempt/task/worker/coordinator lease를
    finalization하고, 장기 고정 lease를 짧은 renewable lease로 교체한다.
-3. `P0`: idle daemon의 불필요한 immediate transaction을 제거하고 writer starvation을
-   회귀 테스트로 고정한다.
+3. `완료`: idle daemon의 불필요한 immediate transaction을 제거하고 writer starvation을
+   회귀 테스트로 고정했다 (`WSL-003`).
 4. `P1`: daemon startup timeout 시 child 정리와 phase diagnostics를 보장한다.
 5. `P1`: 실패 후 `planned` task를 중복 없이 재개하는 명시적 UX를 제공한다.
 6. `P1`: WSL/NVM과 Windows Cargo/npm 충돌을 포함한 실제 실행 binary 경로를
@@ -556,5 +569,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `WSL-004`와 `WSL-005`를 `fixed`로 전환했다.
 - 전체 suite 첫 시도에서 기존 rollback 테스트의 `icacls.exe` 접근 거부가 한 번
   발생했지만 단독 3회와 전체 재실행에서는 통과했다. 이를 `WIN-003`으로 추가했다.
+- idle command/scheduler poll에 read-only candidate precheck를 추가했다. Windows에서
+  별도 writer가 활성인 회귀 테스트 2개와 fmt, 전체 Clippy, npm 65개, Rust 409개가
+  통과해 `WSL-003`을 `fixed`로 전환했다. 전체 재검증에서 `WIN-003`은 재발하지 않았다.
 - 향후 대화에서 새 오류가 확인되면 새 ID를 추가하거나 기존 항목의 상태, 증거,
   완료 조건, update log를 갱신한다.
