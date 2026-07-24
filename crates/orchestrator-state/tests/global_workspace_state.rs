@@ -52,6 +52,21 @@ fn wsl_rejects_colay_home_on_a_windows_drive_mount() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn wsl_kernel_and_mountinfo_reject_custom_windows_mount_without_environment_hints() -> TestResult {
+    let Err(error) = StateEnvironment::for_test(StateEnvironmentTestInput {
+        colay_home: Some(PathBuf::from("/windows/c/colay")),
+        kernel_release: Some("6.6.87.2-microsoft-standard-WSL2".to_owned()),
+        mountinfo: Some("36 25 0:32 / /windows/c rw,relatime - 9p drvfs rw,dirsync".to_owned()),
+        ..StateEnvironmentTestInput::default()
+    }) else {
+        return Err("WSL drvfs mount was accepted without environment hints".into());
+    };
+
+    assert!(error.to_string().contains("separate native filesystems"));
+    Ok(())
+}
+
 #[cfg(not(windows))]
 #[test]
 fn wsl_rejects_windows_mounted_xdg_state_root() -> TestResult {
@@ -86,12 +101,13 @@ fn wsl_rejects_windows_mounted_xdg_data_root() -> TestResult {
 
 #[cfg(not(windows))]
 #[test]
-fn native_linux_allows_mnt_paths_when_not_running_under_wsl() -> TestResult {
+fn native_linux_allows_9p_mnt_paths_when_not_running_under_wsl() -> TestResult {
     let environment = StateEnvironment::for_test(StateEnvironmentTestInput {
         home: Some(PathBuf::from("/home/test")),
         xdg_state_home: Some(PathBuf::from("/mnt/c/state")),
         xdg_data_home: Some(PathBuf::from("/mnt/c/data")),
         xdg_config_home: Some(PathBuf::from("/mnt/c/config")),
+        mountinfo: Some("36 25 0:32 / /mnt/c rw,relatime - 9p server rw".to_owned()),
         is_wsl: false,
         ..StateEnvironmentTestInput::default()
     })?;
@@ -103,6 +119,88 @@ fn native_linux_allows_mnt_paths_when_not_running_under_wsl() -> TestResult {
         paths.workspaces,
         PathBuf::from("/mnt/c/data/colay/workspaces")
     );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[test]
+fn relative_xdg_roots_are_rejected_before_paths_are_joined() -> TestResult {
+    for (label, input) in [
+        (
+            "XDG_STATE_HOME",
+            StateEnvironmentTestInput {
+                xdg_state_home: Some(PathBuf::from("relative-state")),
+                ..absolute_unix_environment()
+            },
+        ),
+        (
+            "XDG_DATA_HOME",
+            StateEnvironmentTestInput {
+                xdg_data_home: Some(PathBuf::from("relative-data")),
+                ..absolute_unix_environment()
+            },
+        ),
+        (
+            "XDG_CONFIG_HOME",
+            StateEnvironmentTestInput {
+                xdg_config_home: Some(PathBuf::from("relative-config")),
+                ..absolute_unix_environment()
+            },
+        ),
+        (
+            "XDG_RUNTIME_DIR",
+            StateEnvironmentTestInput {
+                xdg_runtime_dir: Some(PathBuf::from("relative-runtime")),
+                ..absolute_unix_environment()
+            },
+        ),
+        (
+            "HOME",
+            StateEnvironmentTestInput {
+                home: Some(PathBuf::from("relative-home")),
+                xdg_state_home: None,
+                xdg_data_home: None,
+                xdg_config_home: None,
+                ..absolute_unix_environment()
+            },
+        ),
+    ] {
+        let environment = StateEnvironment::for_test(input)?;
+        let Err(error) = GlobalStatePaths::resolve(&environment) else {
+            return Err(format!("{label} created a current-directory-relative state path").into());
+        };
+        assert!(error.to_string().contains(label));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn relative_windows_roots_are_rejected_before_paths_are_joined() -> TestResult {
+    for (label, input) in [
+        (
+            "LOCALAPPDATA",
+            StateEnvironmentTestInput {
+                local_app_data: Some(PathBuf::from("relative-local")),
+                app_data: Some(PathBuf::from(r"C:\\Users\\test\\AppData\\Roaming")),
+                ..StateEnvironmentTestInput::default()
+            },
+        ),
+        (
+            "APPDATA",
+            StateEnvironmentTestInput {
+                local_app_data: Some(PathBuf::from(r"C:\\Users\\test\\AppData\\Local")),
+                app_data: Some(PathBuf::from("relative-roaming")),
+                ..StateEnvironmentTestInput::default()
+            },
+        ),
+    ] {
+        let environment = StateEnvironment::for_test(input)?;
+        let Err(error) = GlobalStatePaths::resolve(&environment) else {
+            return Err(format!("{label} created a current-directory-relative state path").into());
+        };
+        assert!(error.to_string().contains(label));
+    }
     Ok(())
 }
 
@@ -179,6 +277,18 @@ fn wsl_test_input(
         xdg_data_home,
         xdg_config_home: Some(PathBuf::from("/home/test/config")),
         is_wsl: true,
+        ..StateEnvironmentTestInput::default()
+    }
+}
+
+#[cfg(not(windows))]
+fn absolute_unix_environment() -> StateEnvironmentTestInput {
+    StateEnvironmentTestInput {
+        home: Some(PathBuf::from("/home/test")),
+        xdg_state_home: Some(PathBuf::from("/home/test/state")),
+        xdg_data_home: Some(PathBuf::from("/home/test/data")),
+        xdg_config_home: Some(PathBuf::from("/home/test/config")),
+        xdg_runtime_dir: Some(PathBuf::from("/run/test")),
         ..StateEnvironmentTestInput::default()
     }
 }
