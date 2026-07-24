@@ -19,6 +19,9 @@ use orchestrator_state::{
     Database, GraphRevisionStatus, RootConfig, TaskListFilter, WorkspaceDatabase,
 };
 
+mod support;
+use support::with_workspace;
+
 fn git(repository: &std::path::Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git")
         .current_dir(repository)
@@ -114,14 +117,7 @@ impl Fixture {
             );
         }
         let database = self.database()?;
-        database.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })?;
+        database.resolve_repository_workspace(&self.repository)?;
         let mut config = RootConfig::default();
         config.features.codex_app_server_adapter = false;
         config.orchestrator.max_parallel_workers = 2;
@@ -223,7 +219,7 @@ fn wait_command(
         }
         if Instant::now() >= deadline {
             let command = database.load_client_command(command_id)?;
-            let daemon = database.global_database().daemon_status(Utc::now())?;
+            let daemon = Database::open(database.database_path())?.daemon_status(Utc::now())?;
             bail!(
                 "client command {command_id} did not finish: {command:?}; daemon status: {daemon:?}"
             );
@@ -281,18 +277,17 @@ fn submit_and_wait(
 }
 
 fn mutation_counts(database: &WorkspaceDatabase<'_>) -> Result<(i64, i64, i64, i64)> {
-    database
-        .with_connection(|connection| {
-            Ok((
-                connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?,
-                connection.query_row("SELECT count(*) FROM worktrees", [], |row| row.get(0))?,
-                connection.query_row("SELECT count(*) FROM worker_leases", [], |row| row.get(0))?,
-                connection.query_row("SELECT count(*) FROM task_dependencies", [], |row| {
-                    row.get(0)
-                })?,
-            ))
-        })
-        .map_err(Into::into)
+    with_workspace(database, |connection| {
+        Ok((
+            connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?,
+            connection.query_row("SELECT count(*) FROM worktrees", [], |row| row.get(0))?,
+            connection.query_row("SELECT count(*) FROM worker_leases", [], |row| row.get(0))?,
+            connection.query_row("SELECT count(*) FROM task_dependencies", [], |row| {
+                row.get(0)
+            })?,
+        ))
+    })
+    .map_err(Into::into)
 }
 
 #[test]
@@ -307,7 +302,10 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     );
     fixture.wait_online()?;
     let database = fixture.database()?;
-    let workspace = database.legacy_workspace()?;
+    let workspace_id = database
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
+    let workspace = database.workspace(workspace_id);
 
     let session_id = SessionId::new();
     let create = pending_command(
@@ -417,7 +415,10 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
 
     drop(database);
     let reopened = fixture.database()?;
-    let reopened = reopened.legacy_workspace()?;
+    let reopened_id = reopened
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
+    let reopened = reopened.workspace(reopened_id);
     let approved = reopened
         .current_graph(session_id)?
         .context("reopened graph")?;

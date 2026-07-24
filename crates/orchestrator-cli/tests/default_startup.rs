@@ -130,16 +130,6 @@ impl CliFixture {
         Ok(database_path)
     }
 
-    fn register_legacy_workspace(&self) -> Result<()> {
-        let connection = Connection::open(self.repository.join(".colay/orchestrator.db"))?;
-        connection.execute(
-            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-            [Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
-    }
-
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
         Command::new("git")
             .args(args)
@@ -265,26 +255,19 @@ fn first_plan_only_run_initializes_local_state() -> Result<()> {
     let first = fixture.colay(["run", "inspect repository", "--plan-only"])?;
 
     assert!(
-        !first.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&first.stderr).contains("is not registered"),
+        first.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&first.stderr)
     );
     assert!(fixture.repository.join(".colay/orchestrator.db").is_file());
-    assert!(!fixture.repository.join(".colay/events.jsonl").exists());
-    fixture.register_legacy_workspace()?;
-
-    let retry = fixture.colay(["run", "inspect repository", "--plan-only"])?;
-    assert!(
-        retry.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&retry.stderr)
-    );
     assert!(fixture.repository.join(".colay/events.jsonl").is_file());
+    let connection = Connection::open(fixture.repository.join(".colay/orchestrator.db"))?;
+    let workspace_id: String = connection.query_row(
+        "SELECT workspace_id FROM workspaces WHERE status = 'active'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_ne!(workspace_id, "00000000-0000-0000-0000-000000000001");
     Ok(())
 }
 
@@ -344,15 +327,13 @@ fn migrate_apply_upgrades_existing_database_without_repository_config() -> Resul
 fn failed_event_reconciliation_blocks_retries_before_task_mutation() -> Result<()> {
     let fixture = CliFixture::new()?;
     let state = fixture.repository.join(".colay");
-    fs::create_dir_all(&state)?;
-    fs::write(state.join("events.jsonl"), "not valid jsonl\n")?;
     let initialized = fixture.colay(["init"])?;
     assert!(
         initialized.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&initialized.stderr)
     );
-    fixture.register_legacy_workspace()?;
+    fs::write(state.join("events.jsonl"), "not valid jsonl\n")?;
 
     for attempt in 1..=2 {
         let output = fixture.colay(["run", "inspect repository", "--plan-only"])?;

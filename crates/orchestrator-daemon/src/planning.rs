@@ -787,6 +787,7 @@ mod tests {
     };
 
     use super::{PlanningServices, process_next_orchestration_command, request_plan};
+    use crate::test_support::{fresh_database, with_workspace};
 
     #[derive(Clone, Copy)]
     enum FakeMode {
@@ -882,18 +883,10 @@ mod tests {
         }
     }
 
-    fn database() -> Result<Arc<Database>, Box<dyn std::error::Error>> {
-        let database = Database::open_in_memory()?;
-        database.migrate_with_backup(std::path::Path::new("unused"))?;
-        database.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })?;
-        Ok(Arc::new(database))
+    fn database()
+    -> Result<(Arc<Database>, orchestrator_state::WorkspaceId), Box<dyn std::error::Error>> {
+        let (database, workspace_id) = fresh_database()?;
+        Ok((Arc::new(database), workspace_id))
     }
 
     fn seed_goal(
@@ -902,7 +895,7 @@ mod tests {
         let session_id = SessionId::new();
         let message_id = MessageId::new();
         let now = Utc::now();
-        database.with_connection(|connection| {
+        with_workspace(database, |connection| {
             connection.execute(
                 "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state,
                     created_at, updated_at) VALUES (current_workspace(), ?1, '1', 0, 'planning', 'drafting', ?2, ?2)",
@@ -1014,8 +1007,8 @@ mod tests {
     #[tokio::test]
     async fn explicit_plan_without_requirement_cannot_reach_approval()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = database()?;
-        let workspace = database.legacy_workspace()?;
+        let (database, workspace_id) = database()?;
+        let workspace = database.workspace(workspace_id);
         let (session_id, goal) = seed_goal(&workspace)?;
         let command = plan_command(session_id, goal, "valid-plan");
         workspace.submit_client_command(&command)?;
@@ -1042,7 +1035,7 @@ mod tests {
                 .iter()
                 .any(|(_, message)| message.content_redacted.contains("continue the interview"))
         );
-        workspace.with_connection(|connection| {
+        with_workspace(&workspace, |connection| {
             let count: i64 =
                 connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
             assert_eq!(count, 0);
@@ -1054,8 +1047,8 @@ mod tests {
     #[tokio::test]
     async fn invalid_plan_records_redacted_attention_timeline()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = database()?;
-        let workspace = database.legacy_workspace()?;
+        let (database, workspace_id) = database()?;
+        let workspace = database.workspace(workspace_id);
         let (session_id, goal) = seed_goal(&workspace)?;
         let command = plan_command(session_id, goal, "invalid-plan");
         workspace.submit_client_command(&command)?;
@@ -1102,8 +1095,8 @@ mod tests {
     #[tokio::test]
     async fn typed_exact_approval_materializes_once_and_wrong_hash_fails()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = database()?;
-        let workspace = database.legacy_workspace()?;
+        let (database, workspace_id) = database()?;
+        let workspace = database.workspace(workspace_id);
         let (session_id, goal) = seed_goal(&workspace)?;
         seed_ready_requirement(&workspace, session_id, goal)?;
         workspace.submit_client_command(&plan_command(session_id, goal, "approval-plan"))?;
@@ -1174,8 +1167,8 @@ mod tests {
     #[tokio::test]
     async fn completed_projection_reconciles_after_command_crash_without_replanning()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = database()?;
-        let workspace = database.legacy_workspace()?;
+        let (database, workspace_id) = database()?;
+        let workspace = database.workspace(workspace_id);
         let (session_id, goal) = seed_goal(&workspace)?;
         seed_ready_requirement(&workspace, session_id, goal)?;
         let command = plan_command(session_id, goal, "crash-plan");
@@ -1201,25 +1194,27 @@ mod tests {
     #[tokio::test]
     async fn slow_planner_does_not_interrupt_daemon_heartbeats()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = database()?;
-        let workspace = database.legacy_workspace()?;
+        let (database, workspace_id) = database()?;
+        let workspace = database.workspace(workspace_id);
         let (session_id, goal) = seed_goal(&workspace)?;
         let command = plan_command(session_id, goal, "slow-plan");
         workspace.submit_client_command(&command)?;
         let (services, _) = services(FakeMode::Valid, Duration::from_millis(120));
         let cancellation = CancellationToken::new();
         let task_database = Arc::clone(&database);
+        let workspace_id = workspace.workspace_id();
         let task_cancel = cancellation.clone();
         let service = tokio::spawn(async move {
             serve_with_orchestration(
                 task_database,
+                workspace_id,
                 orchestrator_domain::DaemonInstanceId::new(),
                 42,
                 task_cancel,
                 DaemonSettings {
                     heartbeat_interval: Duration::from_millis(10),
                     command_poll_interval: Duration::from_millis(5),
-                    lease_ttl: TimeDelta::milliseconds(100),
+                    lease_ttl: TimeDelta::seconds(5),
                 },
                 Arc::new(SecretRedactor),
                 services,

@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::{Database, StateError, StateResult};
 
+const RESERVED_MIGRATION_WORKSPACE_ID: Uuid = Uuid::from_u128(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(Uuid);
 
@@ -65,6 +67,30 @@ impl std::str::FromStr for WorkspaceId {
 }
 
 impl Database {
+    /// Resolves the durable workspace for a repository directory.
+    ///
+    /// A pre-workspace database migration may contain one detached reserved workspace without a
+    /// path. The first repository resolution adopts that partition atomically so migrated rows
+    /// remain reachable. Fresh databases, and every later repository, receive `UUIDv7` identities.
+    pub fn resolve_repository_workspace(&self, path: &Path) -> StateResult<WorkspaceRegistration> {
+        let kind = WorkspaceKind::Directory;
+        let identity = WorkspacePathIdentity::resolve(path, kind)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let now = Utc::now();
+
+        let registration =
+            match load_current_by_comparison_key(&transaction, &identity.comparison_key)? {
+                Some(existing) => existing,
+                None if reserved_workspace_is_unattached(&transaction)? => {
+                    attach_reserved_workspace(&transaction, &identity, now)?
+                }
+                None => insert_workspace(&transaction, &identity, kind, now)?,
+            };
+        transaction.commit()?;
+        Ok(registration)
+    }
+
     pub fn resolve_workspace(
         &self,
         path: &Path,
@@ -169,6 +195,52 @@ impl Database {
         let connection = self.lock()?;
         load_workspace_in_connection(&connection, workspace_id)
     }
+}
+
+fn reserved_workspace_is_unattached(connection: &Connection) -> StateResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM workspaces AS w \
+                 WHERE w.workspace_id = ?1 \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM workspace_paths AS p \
+                       WHERE p.workspace_id = w.workspace_id AND p.is_current = 1 \
+                   ) \
+             )",
+            [RESERVED_MIGRATION_WORKSPACE_ID.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn attach_reserved_workspace(
+    transaction: &Transaction<'_>,
+    identity: &WorkspacePathIdentity,
+    now: DateTime<Utc>,
+) -> StateResult<WorkspaceRegistration> {
+    let workspace_id = WorkspaceId(RESERVED_MIGRATION_WORKSPACE_ID);
+    let timestamp = now.to_rfc3339();
+    transaction.execute(
+        "UPDATE workspaces \
+         SET kind = 'directory', status = 'active', last_seen_at = ?2 \
+         WHERE workspace_id = ?1",
+        params![workspace_id.to_string(), timestamp],
+    )?;
+    transaction.execute(
+        "INSERT INTO workspace_paths( \
+            workspace_id, canonical_path, comparison_key, git_common_dir, is_current, first_seen_at, last_seen_at \
+         ) VALUES (?1, ?2, ?3, NULL, 1, ?4, ?4)",
+        params![
+            workspace_id.to_string(),
+            identity.canonical_path.to_string_lossy(),
+            identity.comparison_key,
+            timestamp,
+        ],
+    )?;
+    load_workspace_in_connection(transaction, workspace_id)?.ok_or_else(|| {
+        StateError::InvalidRecord("reserved workspace disappeared while attaching".to_owned())
+    })
 }
 
 impl WorkspaceKind {

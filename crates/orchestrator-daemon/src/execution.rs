@@ -10,7 +10,7 @@ use orchestrator_engine::{
 };
 use orchestrator_state::{
     ClaimReadyTaskRequest, ClaimedTask, Database, NewTaskAttemptRecord, NewWorktreeRecord,
-    WorkspaceDatabase,
+    WorkspaceDatabase, WorkspaceId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -47,13 +47,14 @@ pub(crate) fn validate_execution_services(services: &ExecutionServices) -> Resul
 
 pub(crate) fn spawn_ready_tasks(
     database: &Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     services: &ExecutionServices,
     redactor: &Arc<dyn MessageRedactor>,
     cancellation: &CancellationToken,
     jobs: &mut Vec<tokio::task::JoinHandle<Result<(), DaemonError>>>,
 ) -> Result<(), DaemonError> {
-    let workspace = database.legacy_workspace()?;
+    let workspace = database.workspace(workspace_id);
     while jobs.len() < services.global_limit {
         let request = ClaimReadyTaskRequest {
             daemon_instance_id: instance_id,
@@ -72,6 +73,7 @@ pub(crate) fn spawn_ready_tasks(
         jobs.push(tokio::spawn(async move {
             run_claimed_task(
                 job_database,
+                workspace_id,
                 instance_id,
                 claim,
                 job_services,
@@ -116,13 +118,14 @@ pub(crate) async fn stop_execution_jobs(
 
 async fn run_claimed_task(
     database: Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     claim: ClaimedTask,
     services: ExecutionServices,
     redactor: Arc<dyn MessageRedactor>,
     cancellation: CancellationToken,
 ) -> Result<(), DaemonError> {
-    let workspace = database.legacy_workspace()?;
+    let workspace = database.workspace(workspace_id);
     let result = run_claimed_task_inner(
         &workspace,
         instance_id,
@@ -470,6 +473,7 @@ mod tests {
 
     use super::{ExecutionServices, reap_finished_tasks, spawn_ready_tasks, stop_execution_jobs};
     use crate::MessageRedactor;
+    use crate::test_support::{with_database, with_workspace, with_workspace_transaction};
 
     struct IdentityRedactor;
 
@@ -528,7 +532,7 @@ mod tests {
         let message = MessageId::new();
         let revision = GraphRevisionId::new();
         let now = Utc::now().to_rfc3339();
-        database.with_transaction(|transaction| {
+        with_workspace_transaction(database, |transaction| {
             transaction.execute(
                 "INSERT INTO main.sessions(workspace_id, session_id, schema_version, title, state, created_at, updated_at)
                  VALUES (current_workspace(), ?1, 'v1', 'parallel', 'running', ?2, ?2)",
@@ -582,7 +586,7 @@ mod tests {
             assessment: None,
             created_at: now,
         };
-        database.with_transaction(|transaction| {
+        with_workspace_transaction(database, |transaction| {
             transaction.execute(
                 "INSERT INTO main.tasks(workspace_id, task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
@@ -619,7 +623,7 @@ mod tests {
         let root = std::fs::canonicalize(directory.path())?;
         let database = Arc::new(Database::open(root.join("state.db"))?);
         database.migrate_with_backup(&root.join("backups"))?;
-        database.with_connection(|connection| {
+        with_database(&database, |connection| {
             connection.execute(
                 "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
                  VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
@@ -655,6 +659,7 @@ mod tests {
         let mut jobs = Vec::new();
         spawn_ready_tasks(
             &database,
+            workspace.workspace_id(),
             daemon,
             &services,
             &redactor,
@@ -679,7 +684,7 @@ mod tests {
             workspace.load_task(second)?.map(|task| task.state),
             Some(TaskState::Failed)
         );
-        workspace.with_connection(|connection| {
+        with_workspace(&workspace, |connection| {
             let active: i64 = connection.query_row(
                 "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
                 [],

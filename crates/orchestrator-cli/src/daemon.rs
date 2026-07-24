@@ -22,7 +22,7 @@ use orchestrator_process::{RedactionConfig, Redactor, terminate_child_tree};
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{
     DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database, EventLog, RepositoryStatePaths,
-    RootConfig,
+    RootConfig, WorkspaceId,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -78,7 +78,7 @@ pub(crate) async fn ensure_started(
     explicit_config: Option<&Path>,
 ) -> Result<DaemonStatus> {
     let paths = RepositoryStatePaths::from_config(repository, config)?;
-    let database = initialize_database(&paths)?;
+    let (database, _) = initialize_database(&paths, repository)?;
     if let DaemonStatus::Online(instance) = database.daemon_status(Utc::now())? {
         return Ok(DaemonStatus::Online(instance));
     }
@@ -210,6 +210,9 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     let paths = RepositoryStatePaths::from_config(repository, config)?;
     let repository_root = std::fs::canonicalize(repository)?;
     let database = Arc::new(open_ready_database(&paths)?);
+    let workspace_id = database
+        .resolve_repository_workspace(repository)?
+        .workspace_id;
     let settings = DaemonSettings::default();
     let instance_id = DaemonInstanceId::new();
     database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
@@ -218,6 +221,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         started_at: Utc::now(),
         ttl: settings.lease_ttl,
     })?;
+    let mut startup_lease = StartupLeaseGuard::new(Arc::clone(&database), instance_id);
     database.record_daemon_runtime_identity(
         instance_id,
         &std::env::current_exe()?.to_string_lossy(),
@@ -391,8 +395,10 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
     startup_heartbeat.abort();
     let _ = startup_heartbeat.await;
+    startup_lease.handoff();
     let result = serve_with_full_orchestration_on_owned_lease(
         database,
+        workspace_id,
         instance_id,
         cancellation,
         settings,
@@ -431,6 +437,34 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     signal_task.abort();
     result?;
     Ok(())
+}
+
+struct StartupLeaseGuard {
+    database: Arc<Database>,
+    instance_id: DaemonInstanceId,
+    armed: bool,
+}
+
+impl StartupLeaseGuard {
+    const fn new(database: Arc<Database>, instance_id: DaemonInstanceId) -> Self {
+        Self {
+            database,
+            instance_id,
+            armed: true,
+        }
+    }
+
+    const fn handoff(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupLeaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.database.release_daemon(self.instance_id, Utc::now());
+        }
+    }
 }
 
 fn fail_startup(
@@ -509,12 +543,18 @@ async fn stop(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
     }
 }
 
-pub(crate) fn initialize_database(paths: &RepositoryStatePaths) -> Result<Database> {
+pub(crate) fn initialize_database(
+    paths: &RepositoryStatePaths,
+    repository: &Path,
+) -> Result<(Database, WorkspaceId)> {
     let database = Database::open(&paths.database)?;
     database.migrate_with_backup(&paths.backups)?;
-    let workspace = database.legacy_workspace()?;
+    let workspace_id = database
+        .resolve_repository_workspace(repository)?
+        .workspace_id;
+    let workspace = database.workspace(workspace_id);
     EventLog::open(&paths.events)?.reconcile_workspace(&workspace)?;
-    Ok(database)
+    Ok((database, workspace_id))
 }
 
 pub(crate) fn open_ready_database(paths: &RepositoryStatePaths) -> Result<Database> {

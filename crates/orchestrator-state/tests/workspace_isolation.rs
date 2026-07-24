@@ -5,6 +5,9 @@ use orchestrator_domain::{
 };
 use orchestrator_state::{Database, NewTaskRecord, RoutingAuditRecord, WorkspaceKind};
 
+mod support;
+use support::{fresh_database, with_database_connection};
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const WORKSPACE_TABLES: &[&str] = &[
@@ -132,9 +135,8 @@ fn each_workspace_event_chain_starts_at_one() -> TestResult {
 
 #[test]
 fn every_workspace_table_has_a_required_partition_key() -> TestResult {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    database.with_connection(|connection| {
+    let (database, _) = fresh_database()?;
+    with_database_connection(&database, |connection| {
         for table in WORKSPACE_TABLES {
             let sql = format!(
                 "SELECT count(*) FROM pragma_table_info('{table}', 'main') \
@@ -160,9 +162,8 @@ fn every_workspace_table_has_a_required_partition_key() -> TestResult {
 
 #[test]
 fn every_workspace_foreign_key_carries_the_partition_key() -> TestResult {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    database.with_connection(|connection| {
+    let (database, _) = fresh_database()?;
+    with_database_connection(&database, |connection| {
         for table in WORKSPACE_TABLES {
             let mut statement =
                 connection.prepare(&format!("PRAGMA main.foreign_key_list('{table}')"))?;
@@ -216,7 +217,7 @@ fn global_usage_can_be_linked_to_a_workspace_routing_decision() -> TestResult {
         Utc::now(),
     );
 
-    let snapshot_id = database.record_usage_snapshot(None, &snapshot)?;
+    let snapshot_id = database.record_global_usage_snapshot(&snapshot)?;
     let task_id = TaskId::new();
     workspace.create_task(&NewTaskRecord {
         task_id,
@@ -244,7 +245,10 @@ fn global_usage_can_be_linked_to_a_workspace_routing_decision() -> TestResult {
     })?;
     workspace.link_routing_usage("routing-from-global-usage", &[snapshot_id])?;
 
-    assert_eq!(database.list_usage_snapshots(None, 10)?, vec![snapshot]);
+    assert_eq!(
+        database.list_global_usage_snapshots(None, 10)?,
+        vec![snapshot]
+    );
     assert_eq!(workspace.list_usage_snapshots(None, 10)?.len(), 1);
     Ok(())
 }

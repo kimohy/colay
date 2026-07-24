@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use chrono::{TimeDelta, Utc};
 use orchestrator_domain::DaemonInstanceId;
-use orchestrator_state::{DaemonLeaseRequest, Database, StateError};
+use orchestrator_state::{DaemonLeaseRequest, Database, StateError, WorkspaceId};
 use thiserror::Error;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,8 @@ mod conversation;
 mod execution;
 mod integration;
 mod planning;
+#[cfg(test)]
+mod test_support;
 
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
 pub use execution::ExecutionServices;
@@ -55,6 +57,7 @@ pub enum DaemonError {
 
 pub async fn serve(
     database: &Database,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     pid: u32,
     cancellation: CancellationToken,
@@ -62,6 +65,7 @@ pub async fn serve(
 ) -> Result<DaemonExit, DaemonError> {
     serve_with_commands(
         database,
+        workspace_id,
         instance_id,
         pid,
         cancellation,
@@ -81,6 +85,7 @@ impl MessageRedactor for IdentityRedactor {
 
 pub async fn serve_with_commands(
     database: &Database,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     pid: u32,
     cancellation: CancellationToken,
@@ -88,6 +93,7 @@ pub async fn serve_with_commands(
     redactor: &dyn MessageRedactor,
 ) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
+    reconcile_daemon_startup(database, workspace_id, Utc::now())?;
     let started_at = Utc::now();
     database.acquire_daemon_lease(&DaemonLeaseRequest {
         instance_id,
@@ -95,26 +101,58 @@ pub async fn serve_with_commands(
         started_at,
         ttl: settings.lease_ttl,
     })?;
-    let workspace = database.legacy_workspace()?;
-    workspace.reconcile_interrupted_conversation_attempts(
-        started_at,
-        "conversation attempt was interrupted before daemon startup",
-    )?;
-    workspace.recover_stale_client_commands(started_at)?;
-    workspace.reconcile_interrupted_integrations(started_at)?;
-    serve_with_commands_on_owned_lease(database, instance_id, cancellation, settings, redactor)
-        .await
+    let lease = OwnedLeaseGuard::new(database, instance_id);
+    let result = serve_with_commands_loop(
+        database,
+        workspace_id,
+        instance_id,
+        cancellation,
+        settings,
+        redactor,
+    )
+    .await;
+    if result.is_ok() {
+        lease.finish()?;
+    }
+    result
 }
 
+#[cfg(test)]
 async fn serve_with_commands_on_owned_lease(
     database: &Database,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     cancellation: CancellationToken,
     settings: DaemonSettings,
     redactor: &dyn MessageRedactor,
 ) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
-    let workspace = database.legacy_workspace()?;
+    let lease = OwnedLeaseGuard::new(database, instance_id);
+    reconcile_daemon_startup(database, workspace_id, Utc::now())?;
+    let result = serve_with_commands_loop(
+        database,
+        workspace_id,
+        instance_id,
+        cancellation,
+        settings,
+        redactor,
+    )
+    .await;
+    if result.is_ok() {
+        lease.finish()?;
+    }
+    result
+}
+
+async fn serve_with_commands_loop(
+    database: &Database,
+    workspace_id: WorkspaceId,
+    instance_id: DaemonInstanceId,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: &dyn MessageRedactor,
+) -> Result<DaemonExit, DaemonError> {
+    let workspace = database.workspace(workspace_id);
     database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -134,12 +172,13 @@ async fn serve_with_commands_on_owned_lease(
             }
         }
     };
-    database.release_daemon(instance_id, Utc::now())?;
     Ok(exit)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_orchestration(
     database: Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     pid: u32,
     cancellation: CancellationToken,
@@ -149,6 +188,7 @@ pub async fn serve_with_orchestration(
 ) -> Result<DaemonExit, DaemonError> {
     serve_with_runtime(
         database,
+        workspace_id,
         instance_id,
         pid,
         cancellation,
@@ -164,6 +204,7 @@ pub async fn serve_with_orchestration(
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_full_orchestration(
     database: Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     pid: u32,
     cancellation: CancellationToken,
@@ -175,6 +216,7 @@ pub async fn serve_with_full_orchestration(
     execution::validate_execution_services(&execution)?;
     serve_with_runtime(
         database,
+        workspace_id,
         instance_id,
         pid,
         cancellation,
@@ -190,6 +232,7 @@ pub async fn serve_with_full_orchestration(
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_full_orchestration_on_owned_lease(
     database: Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     cancellation: CancellationToken,
     settings: DaemonSettings,
@@ -200,6 +243,7 @@ pub async fn serve_with_full_orchestration_on_owned_lease(
     execution::validate_execution_services(&execution)?;
     serve_with_runtime(
         database,
+        workspace_id,
         instance_id,
         0,
         cancellation,
@@ -215,6 +259,7 @@ pub async fn serve_with_full_orchestration_on_owned_lease(
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_runtime(
     database: Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     pid: u32,
     cancellation: CancellationToken,
@@ -227,6 +272,8 @@ async fn serve_with_runtime(
     validate_settings(settings)?;
     let started_at = Utc::now();
     if acquire_lease {
+        reconcile_daemon_startup(&database, workspace_id, started_at)?;
+        let started_at = Utc::now();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id,
             pid,
@@ -236,13 +283,11 @@ async fn serve_with_runtime(
     } else {
         database.heartbeat_daemon(instance_id, started_at, settings.lease_ttl)?;
     }
-    let workspace = database.legacy_workspace()?;
-    workspace.reconcile_interrupted_conversation_attempts(
-        started_at,
-        "conversation attempt was interrupted before daemon startup",
-    )?;
-    workspace.recover_stale_client_commands(started_at)?;
-    workspace.reconcile_interrupted_integrations(started_at)?;
+    let lease = OwnedLeaseGuard::new(&database, instance_id);
+    if !acquire_lease {
+        reconcile_daemon_startup(&database, workspace_id, started_at)?;
+    }
+    let workspace = database.workspace(workspace_id);
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut command_interval = tokio::time::interval(settings.command_poll_interval);
@@ -278,7 +323,7 @@ async fn serve_with_runtime(
                     let job_redactor = Arc::clone(&redactor);
                     let job_services = planning.clone();
                     active_planning = Some(tokio::spawn(async move {
-                        let workspace = job_database.legacy_workspace()?;
+                        let workspace = job_database.workspace(workspace_id);
                         process_next_orchestration_command(
                             &workspace,
                             &job_services,
@@ -291,6 +336,7 @@ async fn serve_with_runtime(
                 if let Some(execution) = execution.as_ref() {
                     execution::spawn_ready_tasks(
                         &database,
+                        workspace_id,
                         instance_id,
                         execution,
                         &redactor,
@@ -310,8 +356,59 @@ async fn serve_with_runtime(
         "conversation attempt was interrupted by daemon shutdown",
     )?;
     execution::stop_execution_jobs(&execution_cancellation, execution_jobs).await?;
-    database.release_daemon(instance_id, Utc::now())?;
+    lease.finish()?;
     Ok(exit)
+}
+
+fn reconcile_daemon_startup(
+    database: &Database,
+    workspace_id: WorkspaceId,
+    started_at: chrono::DateTime<Utc>,
+) -> Result<(), DaemonError> {
+    if database.load_workspace(workspace_id)?.is_none() {
+        return Err(StateError::WorkspaceNotFound {
+            workspace_id: workspace_id.to_string(),
+        }
+        .into());
+    }
+    let workspace = database.workspace(workspace_id);
+    workspace.reconcile_interrupted_conversation_attempts(
+        started_at,
+        "conversation attempt was interrupted before daemon startup",
+    )?;
+    workspace.recover_stale_client_commands(started_at)?;
+    workspace.reconcile_interrupted_integrations(started_at)?;
+    Ok(())
+}
+
+struct OwnedLeaseGuard<'a> {
+    database: &'a Database,
+    instance_id: DaemonInstanceId,
+    armed: bool,
+}
+
+impl<'a> OwnedLeaseGuard<'a> {
+    const fn new(database: &'a Database, instance_id: DaemonInstanceId) -> Self {
+        Self {
+            database,
+            instance_id,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self) -> Result<(), StateError> {
+        self.database.release_daemon(self.instance_id, Utc::now())?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for OwnedLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.database.release_daemon(self.instance_id, Utc::now());
+        }
+    }
 }
 
 fn validate_settings(settings: DaemonSettings) -> Result<(), DaemonError> {
@@ -343,7 +440,7 @@ mod tests {
         SessionId,
     };
     use orchestrator_state::{
-        DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database, StateResult,
+        DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database, StateResult, WorkspaceId,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -351,6 +448,7 @@ mod tests {
         DaemonError, DaemonExit, DaemonSettings, MessageRedactor, serve, serve_with_commands,
         serve_with_commands_on_owned_lease,
     };
+    use crate::test_support::fresh_database;
 
     struct IdentityRedactor;
 
@@ -360,25 +458,16 @@ mod tests {
         }
     }
 
-    fn database() -> StateResult<Arc<Database>> {
-        let database = Database::open_in_memory()?;
-        database.migrate_with_backup(std::path::Path::new("unused"))?;
-        database.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })?;
-        Ok(Arc::new(database))
+    fn database() -> StateResult<(Arc<Database>, WorkspaceId)> {
+        let (database, workspace_id) = fresh_database()?;
+        Ok((Arc::new(database), workspace_id))
     }
 
     fn settings() -> DaemonSettings {
         DaemonSettings {
             heartbeat_interval: Duration::from_millis(10),
             command_poll_interval: Duration::from_millis(5),
-            lease_ttl: TimeDelta::milliseconds(100),
+            lease_ttl: TimeDelta::seconds(5),
         }
     }
 
@@ -397,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_runs_until_cancellation_and_releases_lease() -> Result<(), DaemonError> {
-        let database = database()?;
+        let (database, service_workspace_id) = database()?;
         let instance_id = DaemonInstanceId::new();
         let cancellation = CancellationToken::new();
         let service_database = Arc::clone(&database);
@@ -405,6 +494,7 @@ mod tests {
         let service = tokio::spawn(async move {
             serve(
                 &service_database,
+                service_workspace_id,
                 instance_id,
                 42,
                 service_cancellation,
@@ -439,7 +529,7 @@ mod tests {
 
     #[tokio::test]
     async fn owned_startup_lease_enters_loop_without_reacquiring() -> Result<(), DaemonError> {
-        let database = database()?;
+        let (database, service_workspace_id) = database()?;
         let instance_id = DaemonInstanceId::new();
         let now = Utc::now();
         database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
@@ -456,6 +546,7 @@ mod tests {
         let service = tokio::spawn(async move {
             serve_with_commands_on_owned_lease(
                 &service_database,
+                service_workspace_id,
                 instance_id,
                 service_cancellation,
                 settings(),
@@ -483,8 +574,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_failure_after_acquisition_releases_owned_lease()
+    -> Result<(), DaemonError> {
+        let (database, _) = database()?;
+        let instance_id = DaemonInstanceId::new();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: settings().lease_ttl,
+        })?;
+        let missing_workspace =
+            "0198f7e0-3db2-7aa2-a982-8c334805b3ad"
+                .parse()
+                .map_err(|error| {
+                    DaemonError::InvalidSettings(format!("invalid fixture UUID: {error}"))
+                })?;
+
+        let result = serve_with_commands_on_owned_lease(
+            &database,
+            missing_workspace,
+            instance_id,
+            CancellationToken::new(),
+            settings(),
+            &IdentityRedactor,
+        )
+        .await;
+
+        assert!(matches!(result, Err(DaemonError::State(_))));
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stop_request_exits_and_second_runtime_is_rejected() -> Result<(), DaemonError> {
-        let database = database()?;
+        let (database, service_workspace_id) = database()?;
         let instance_id = DaemonInstanceId::new();
         let cancellation = CancellationToken::new();
         let service_database = Arc::clone(&database);
@@ -492,6 +616,7 @@ mod tests {
         let service = tokio::spawn(async move {
             serve(
                 &service_database,
+                service_workspace_id,
                 instance_id,
                 42,
                 service_cancellation,
@@ -506,6 +631,7 @@ mod tests {
 
         let conflict = serve(
             &database,
+            service_workspace_id,
             DaemonInstanceId::new(),
             43,
             CancellationToken::new(),
@@ -527,8 +653,8 @@ mod tests {
 
     #[tokio::test]
     async fn service_loop_processes_pending_session_commands() -> Result<(), DaemonError> {
-        let database = database()?;
-        let workspace = database.legacy_workspace()?;
+        let (database, service_workspace_id) = database()?;
+        let workspace = database.workspace(service_workspace_id);
         let session_id = SessionId::new();
         let command = ClientCommand {
             command_id: ClientCommandId::new(),
@@ -554,6 +680,7 @@ mod tests {
         let service = tokio::spawn(async move {
             serve_with_commands(
                 &service_database,
+                service_workspace_id,
                 DaemonInstanceId::new(),
                 42,
                 service_cancellation,

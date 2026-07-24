@@ -3,6 +3,7 @@ use std::{error::Error, fs, path::PathBuf};
 use orchestrator_state::{
     Database, GlobalStatePaths, StateEnvironment, StateEnvironmentTestInput, WorkspaceKind,
 };
+use rusqlite::Connection;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -288,6 +289,61 @@ fn two_directories_receive_distinct_stable_workspace_ids() -> TestResult {
 
     assert_eq!(first.workspace_id, again.workspace_id);
     assert_ne!(first.workspace_id, second.workspace_id);
+    Ok(())
+}
+
+#[test]
+fn fresh_repository_resolution_creates_a_uuid_v7_workspace() -> TestResult {
+    let fixture = GlobalFixture::new()?;
+
+    let registration = fixture
+        .database
+        .resolve_repository_workspace(&fixture.first)?;
+
+    assert_eq!(registration.workspace_id.as_uuid().get_version_num(), 7);
+    assert_ne!(
+        registration.workspace_id.to_string(),
+        "00000000-0000-0000-0000-000000000001"
+    );
+    assert_eq!(
+        registration.canonical_path,
+        fs::canonicalize(&fixture.first)?
+    );
+    Ok(())
+}
+
+#[test]
+fn migrated_reserved_workspace_is_attached_once_and_never_reused() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    fs::create_dir_all(&first)?;
+    fs::create_dir_all(&second)?;
+    let database_path = root.path().join("state/state.db");
+    {
+        let database = Database::open(&database_path)?;
+        database.migrate_with_backup(&root.path().join("backups"))?;
+    }
+    let connection = Connection::open(&database_path)?;
+    connection.execute(
+        "INSERT INTO workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+         VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+        [chrono::Utc::now().to_rfc3339()],
+    )?;
+    drop(connection);
+    let database = Database::open(&database_path)?;
+
+    let adopted = database.resolve_repository_workspace(&first)?;
+    let stable = database.resolve_repository_workspace(&first)?;
+    let new_workspace = database.resolve_repository_workspace(&second)?;
+
+    assert_eq!(
+        adopted.workspace_id.to_string(),
+        "00000000-0000-0000-0000-000000000001"
+    );
+    assert_eq!(stable.workspace_id, adopted.workspace_id);
+    assert_ne!(new_workspace.workspace_id, adopted.workspace_id);
+    assert_eq!(new_workspace.workspace_id.as_uuid().get_version_num(), 7);
     Ok(())
 }
 

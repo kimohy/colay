@@ -45,11 +45,11 @@ use orchestrator_providers::{
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
     ControlAction, CoordinatorLease, CoordinatorLeaseRequest, DaemonStatus, Database,
-    EffectiveConfig, EventLog, LeaseRenewal, MigratableConfigDocument, OrchestratorConfig,
-    ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig, StateError, WorkerLease,
-    WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
+    EffectiveConfig, EventLog, LeaseRenewal, MigratableConfigDocument, NewTaskAttemptRecord,
+    NewWorktreeRecord, OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths,
+    RootConfig, StateError, TaskListFilter, WorkerLease, WorkerLeaseMode, WorkerLeaseRequest,
+    WorkspaceDatabase, load_effective_config,
 };
-use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
@@ -436,10 +436,8 @@ fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> 
     let database = initialize_repository_state(&state)?;
     let migration = database.migration_status()?;
     let events = EventLog::open(&state.events)?;
-    let reconciliation = legacy_workspace_if_present(&database)?
-        .map(|workspace| events.reconcile_workspace(&workspace))
-        .transpose()?
-        .unwrap_or_default();
+    let workspace = workspace_for_repository(&database, repository)?;
+    let reconciliation = events.reconcile_workspace(&workspace)?;
     emit(
         json_output,
         "initialized",
@@ -489,12 +487,9 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
                         &executable,
                     ));
                     if state.events.exists() {
-                        let reconciliation = legacy_workspace_if_present(&database)?
-                            .map(|workspace| {
-                                EventLog::open(&state.events)?.reconcile_workspace(&workspace)
-                            })
-                            .transpose()?
-                            .unwrap_or_default();
+                        let workspace = workspace_for_repository(&database, repository)?;
+                        let reconciliation =
+                            EventLog::open(&state.events)?.reconcile_workspace(&workspace)?;
                         checks.push(Check::with_data("event_log", true, json!(reconciliation)));
                     } else {
                         checks.push(Check::warn(
@@ -821,12 +816,12 @@ async fn run_task(
         })?;
     }
     let state = StatePaths::from_config(repository, document.config())?;
-    let database = if state.database.exists() {
+    let global_database = if state.database.exists() {
         open_ready_database(&state)?
     } else {
         initialize_repository_state(&state)?
     };
-    let database = database.legacy_workspace()?;
+    let database = workspace_for_repository(&global_database, repository)?;
     reconcile_events(&state, &database)?;
     let input = load_task_input(&arguments)?;
     let redactor = Redactor::new(&process_redaction(&document.config().orchestrator))?;
@@ -880,6 +875,7 @@ async fn run_task(
 
     let candidates = routing_candidates(
         &document.config().orchestrator,
+        &global_database,
         &database,
         &assessment,
         arguments.provider.map(ProviderId::from),
@@ -963,6 +959,7 @@ async fn run_task(
             repository,
             &state,
             document.config(),
+            &global_database,
             &database,
             plan,
             correlation_id,
@@ -992,8 +989,8 @@ async fn resume_task(
         bail!("orchestrator execution is disabled by configuration");
     }
     let state = StatePaths::from_config(repository, document.config())?;
-    let database = open_ready_database(&state)?;
-    let database = database.legacy_workspace()?;
+    let global_database = open_ready_database(&state)?;
+    let database = workspace_for_repository(&global_database, repository)?;
     let task_id = TaskId::from_str(&task.task_id)?;
     let correlation_id = CorrelationId::new();
     let stored = database
@@ -1010,6 +1007,7 @@ async fn resume_task(
             repository,
             document,
             &state,
+            &global_database,
             &database,
             task_id,
             correlation_id,
@@ -1033,6 +1031,7 @@ async fn resume_task_coordinated(
     repository: &Path,
     document: &ConfigDocument,
     state: &StatePaths,
+    global_database: &Database,
     database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     correlation_id: CorrelationId,
@@ -1231,6 +1230,7 @@ async fn resume_task_coordinated(
         .map(|bundle| bundle.recommended_next_worker);
     let candidates = routing_candidates(
         &document.config().orchestrator,
+        global_database,
         &database,
         &assessment,
         requested_provider,
@@ -1312,7 +1312,7 @@ async fn resume_task_coordinated(
             acceptance_criteria: envelope.acceptance_criteria.clone(),
             recommended_next_worker: selected_provider,
             usage_snapshots: latest_usage_snapshots(
-                database.global_database(),
+                global_database,
                 &document.config().orchestrator,
             )?,
             safe_boundary_confirmed: true,
@@ -1339,6 +1339,7 @@ async fn resume_task_coordinated(
         &repository,
         &state,
         document.config(),
+        global_database,
         database,
         PlannedTask {
             task: envelope.clone(),
@@ -1546,6 +1547,7 @@ async fn execute_planned_task(
     repository: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    global_database: &Database,
     database: &WorkspaceDatabase<'_>,
     plan: PlannedTask,
     correlation_id: CorrelationId,
@@ -1599,7 +1601,6 @@ async fn execute_planned_task(
         .min(6);
 
     let mut successful_run = None;
-    let mut attempt_ordinal = next_attempt_ordinal(&database, plan.task.task_id)?;
     for _round in 1..=max_attempts {
         let (model, configured_effort) = profile_settings(&config.orchestrator, provider, profile)?;
         effort = configured_effort.or(effort);
@@ -1663,11 +1664,9 @@ async fn execute_planned_task(
                 &database,
                 coordinator_lease_id,
                 &acknowledgement_lease,
-                attempt_ordinal,
                 correlation_id,
             )
             .await;
-            attempt_ordinal = attempt_ordinal.saturating_add(1);
             let acknowledgement_run = match acknowledgement_run {
                 Ok(run) => {
                     release_worker_lease(&database, coordinator_lease_id, &acknowledgement_lease)?;
@@ -1786,7 +1785,7 @@ async fn execute_planned_task(
             .ok_or_else(|| anyhow!("task disappeared before worker execution"))?
             .state;
         let attempt_already_persisted = if task_state == TaskState::Planned {
-            persist_attempt_started(&database, &request, attempt_ordinal, Utc::now())?;
+            persist_attempt_started(&database, &request, Utc::now())?;
             transition_task(
                 &database,
                 plan.task.task_id,
@@ -1822,11 +1821,9 @@ async fn execute_planned_task(
             &database,
             coordinator_lease_id,
             &worker_lease,
-            attempt_ordinal,
             correlation_id,
         )
         .await;
-        attempt_ordinal = attempt_ordinal.saturating_add(1);
         let run = match run {
             Ok(run) => run,
             Err(error) => return Err(error),
@@ -2066,6 +2063,7 @@ async fn execute_planned_task(
 
         let next_route = reroute_after_failure(
             &config.orchestrator,
+            global_database,
             &database,
             &assessment,
             provider,
@@ -2106,10 +2104,7 @@ async fn execute_planned_task(
             constraints: plan.task.constraints.clone(),
             acceptance_criteria: plan.task.acceptance_criteria.clone(),
             recommended_next_worker: next_provider,
-            usage_snapshots: latest_usage_snapshots(
-                database.global_database(),
-                &config.orchestrator,
-            )?,
+            usage_snapshots: latest_usage_snapshots(global_database, &config.orchestrator)?,
             safe_boundary_confirmed: true,
             created_at: Utc::now(),
         })?;
@@ -2173,6 +2168,7 @@ async fn execute_planned_task(
         repository,
         state,
         config,
+        global_database,
         &database,
         &worktrees,
         &worktree,
@@ -2199,12 +2195,11 @@ async fn run_worker(
     database: &WorkspaceDatabase<'_>,
     coordinator_lease_id: Uuid,
     worker_lease: &WorkerLease,
-    ordinal: usize,
     correlation_id: CorrelationId,
 ) -> Result<WorkerRunRecord> {
     let started_at = Utc::now();
     if !attempt_already_persisted {
-        persist_attempt_started(database, &request, ordinal, started_at)?;
+        persist_attempt_started(database, &request, started_at)?;
     }
     let handle = match adapter.start(request.clone()).await {
         Ok(handle) => handle,
@@ -2827,26 +2822,14 @@ fn profile_settings(
 fn persist_attempt_started(
     database: &WorkspaceDatabase<'_>,
     request: &WorkerRequest,
-    ordinal: usize,
     started_at: DateTime<Utc>,
 ) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO main.task_attempts(
-                workspace_id, attempt_id, task_id, ordinal, provider_id, worker_mode, started_at
-             ) VALUES (current_workspace(), ?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                request.attempt_id.to_string(),
-                request.task_id.to_string(),
-                i64::try_from(ordinal).unwrap_or(i64::MAX),
-                request.provider.as_str(),
-                enum_name(&request.sandbox).map_err(|error| {
-                    orchestrator_state::StateError::InvalidRecord(error.to_string())
-                })?,
-                started_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+    database.record_task_attempt_started(&NewTaskAttemptRecord {
+        attempt_id: request.attempt_id,
+        task_id: request.task_id,
+        provider: request.provider,
+        worker_mode: enum_name(&request.sandbox)?,
+        started_at,
     })?;
     Ok(())
 }
@@ -2868,19 +2851,12 @@ fn persist_attempt_start_failure(
     attempt_id: AttemptId,
     detail: &str,
 ) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "UPDATE main.task_attempts SET ended_at = ?1, outcome = 'failed',
-             worker_result_json = ?2
-             WHERE workspace_id = current_workspace() AND attempt_id = ?3",
-            params![
-                Utc::now().to_rfc3339(),
-                serde_json::to_string(&json!({"start_error": bounded_text(detail, 2_048)}))?,
-                attempt_id.to_string(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.finish_task_attempt(
+        attempt_id,
+        "failed",
+        &json!({"start_error": bounded_text(detail, 2_048)}),
+        Utc::now(),
+    )?;
     Ok(())
 }
 
@@ -2889,20 +2865,7 @@ fn persist_attempt_unconfirmed_termination(
     attempt_id: AttemptId,
     detail: &str,
 ) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "UPDATE main.task_attempts SET outcome = 'termination_unconfirmed',
-             worker_result_json = ?1
-             WHERE workspace_id = current_workspace() AND attempt_id = ?2",
-            params![
-                serde_json::to_string(&json!({
-                    "termination_unconfirmed": bounded_text(detail, 2_048)
-                }))?,
-                attempt_id.to_string(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.mark_task_attempt_termination_unconfirmed(attempt_id, &bounded_text(detail, 2_048))?;
     Ok(())
 }
 
@@ -2961,43 +2924,23 @@ fn persist_attempt_result(
         "process_execution".to_owned(),
         serde_json::to_value(process_execution)?,
     );
-    database.with_connection(|connection| {
-        connection.execute(
-            "UPDATE main.task_attempts SET ended_at = ?1, outcome = ?2,
-             worker_result_json = ?3
-             WHERE workspace_id = current_workspace() AND attempt_id = ?4",
-            params![
-                result.finished_at.to_rfc3339(),
-                enum_name(&result.outcome).map_err(|error| {
-                    orchestrator_state::StateError::InvalidRecord(error.to_string())
-                })?,
-                persisted.to_string(),
-                result.attempt_id.to_string(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.finish_task_attempt(
+        result.attempt_id,
+        &enum_name(&result.outcome)?,
+        &persisted,
+        result.finished_at,
+    )?;
     Ok(())
 }
 
 fn persist_worktree(database: &WorkspaceDatabase<'_>, worktree: &GitWorktree) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO main.worktrees(
-                workspace_id, worktree_id, task_id, repo_root, worktree_path, branch_name,
-                base_revision, state, created_at
-             ) VALUES (current_workspace(), ?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-            params![
-                TaskId::new().to_string(),
-                worktree.task_id.to_string(),
-                worktree.repository_root.to_string_lossy(),
-                worktree.path.to_string_lossy(),
-                worktree.branch,
-                worktree.base_revision,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+    database.record_active_worktree(&NewWorktreeRecord {
+        task_id: worktree.task_id,
+        repo_root: worktree.repository_root.clone(),
+        worktree_path: worktree.path.clone(),
+        branch_name: worktree.branch.clone(),
+        base_revision: worktree.base_revision.clone(),
+        created_at: Utc::now(),
     })?;
     Ok(())
 }
@@ -3147,34 +3090,16 @@ fn record_changed_file_ownership(
     lease: &WorkerLease,
     changed_files: &[RepoPath],
 ) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
     let worktree_id = lease
         .worktree_id
-        .ok_or_else(|| anyhow!("changed-file ownership requires a worktree-bound lease"))?
-        .to_string();
-    let lease_id = lease.lease_id.to_string();
-    database.with_connection(|connection| {
-        for path in changed_files {
-            connection.execute(
-                "INSERT INTO main.changed_files(
-                    workspace_id, task_id, worktree_id, relative_path, owner_lease_id,
-                    sha256, first_seen_at, last_seen_at
-                 ) VALUES (current_workspace(), ?1, ?2, ?3, ?4, NULL, ?5, ?5)
-                 ON CONFLICT(workspace_id, task_id, relative_path) DO UPDATE SET
-                    worktree_id = excluded.worktree_id,
-                    owner_lease_id = excluded.owner_lease_id,
-                    last_seen_at = excluded.last_seen_at",
-                params![
-                    task_id.to_string(),
-                    worktree_id,
-                    path.to_string(),
-                    &lease_id,
-                    now,
-                ],
-            )?;
-        }
-        Ok(())
-    })?;
+        .ok_or_else(|| anyhow!("changed-file ownership requires a worktree-bound lease"))?;
+    database.record_changed_file_ownership(
+        task_id,
+        worktree_id,
+        lease.lease_id,
+        changed_files,
+        Utc::now(),
+    )?;
     Ok(())
 }
 
@@ -3269,6 +3194,7 @@ fn confirmed_exhaustion(provider: ProviderId, config: &ProviderConfig) -> UsageS
 #[allow(clippy::too_many_arguments)]
 async fn reroute_after_failure(
     config: &OrchestratorConfig,
+    global_database: &Database,
     database: &WorkspaceDatabase<'_>,
     assessment: &orchestrator_domain::TaskAssessment,
     failed_provider: ProviderId,
@@ -3279,6 +3205,7 @@ async fn reroute_after_failure(
 ) -> Result<RoutingDecision> {
     let mut candidates = routing_candidates(
         config,
+        global_database,
         database,
         assessment,
         manually_requested_provider,
@@ -3408,6 +3335,7 @@ async fn verify_and_finish(
     repository: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    global_database: &Database,
     database: &WorkspaceDatabase<'_>,
     worktrees: &GitWorktreeManager,
     worktree: &GitWorktree,
@@ -3458,6 +3386,7 @@ async fn verify_and_finish(
             repository,
             state,
             config,
+            global_database,
             database,
             worktrees,
             worktree,
@@ -3621,6 +3550,7 @@ async fn perform_independent_review(
     repository: &Path,
     state: &StatePaths,
     config: &RootConfig,
+    global_database: &Database,
     database: &WorkspaceDatabase<'_>,
     worktrees: &GitWorktreeManager,
     worktree: &GitWorktree,
@@ -3636,6 +3566,7 @@ async fn perform_independent_review(
         .ok_or_else(|| anyhow!("assessment is missing"))?;
     let candidates = routing_candidates(
         &config.orchestrator,
+        global_database,
         database,
         assessment,
         None,
@@ -3684,7 +3615,6 @@ async fn perform_independent_review(
          {{\"type\":\"independent_review\",\"approved\":true|false,\
          \"acceptance_criteria_met\":true|false,\"findings\":[\"...\"]}}.\n\nDIFF:\n{diff}"
     );
-    let ordinal = next_attempt_ordinal(database, task.task_id)?;
     let reviewer_config = provider_config(&config.orchestrator, reviewer)
         .ok_or_else(|| anyhow!("reviewer provider configuration disappeared"))?;
     let reviewer_timeout = config
@@ -3728,7 +3658,6 @@ async fn perform_independent_review(
         database,
         coordinator_lease_id,
         &reviewer_lease,
-        ordinal,
         correlation_id,
     )
     .await;
@@ -3954,19 +3883,6 @@ fn store_redacted_output(
     Ok(Some(artifacts.put(path, text.as_bytes())?))
 }
 
-fn next_attempt_ordinal(database: &WorkspaceDatabase<'_>, task_id: TaskId) -> Result<usize> {
-    let value: i64 = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT coalesce(max(ordinal), 0) + 1 FROM task_attempts WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    })?;
-    usize::try_from(value).context("attempt ordinal exceeded platform range")
-}
-
 fn latest_resume_session_id(
     database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
@@ -4113,35 +4029,8 @@ fn status(
         );
     }
     let database = open_ready_database(&state)?;
-    let workspace = database.legacy_workspace()?;
-    let tasks = workspace.with_connection(|connection| {
-        let mut sql =
-            "SELECT task_id, state, objective, created_at, updated_at FROM tasks".to_owned();
-        if selector.task_id.is_some() {
-            sql.push_str(" WHERE task_id = ?1");
-        }
-        sql.push_str(" ORDER BY updated_at DESC LIMIT 100");
-        let mut statement = connection.prepare(&sql)?;
-        let mapper = |row: &rusqlite::Row<'_>| {
-            Ok(TaskStatusRow {
-                task_id: row.get(0)?,
-                state: row.get(1)?,
-                objective: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-            })
-        };
-        let rows = if let Some(task_id) = &selector.task_id {
-            statement
-                .query_map([task_id], mapper)?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            statement
-                .query_map([], mapper)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(rows)
-    })?;
+    let workspace = workspace_for_repository(&database, repository)?;
+    let tasks = task_status_rows(&workspace, selector.task_id.as_deref())?;
     let health = database.health()?;
     emit(
         json_output,
@@ -4167,7 +4056,7 @@ fn usage_override(
         bail!("--entered-by must be a non-empty audit identity");
     }
     let (_, database) = load_existing_state(repository, effective)?;
-    let workspace = database.legacy_workspace()?;
+    let workspace = workspace_for_repository(&database, repository)?;
     let provider = ProviderId::from(arguments.provider);
     let provider_config = provider_config(&effective.config().orchestrator, provider)
         .ok_or_else(|| anyhow!("provider {} is not configured", provider.as_str()))?;
@@ -4221,7 +4110,7 @@ fn usage_override(
     snapshot.source = UsageSource::ManualOverride;
     snapshot.confidence = UsageConfidence::Confirmed;
     snapshot.validate()?;
-    persist_usage(&database, &snapshot, None)?;
+    persist_global_usage(&database, &snapshot)?;
     append_event(
         &workspace,
         None,
@@ -4265,21 +4154,14 @@ fn control(
     json_output: bool,
 ) -> Result<()> {
     let (state, database) = load_existing_state(repository, effective)?;
-    let database = database.legacy_workspace()?;
+    let database = workspace_for_repository(&database, repository)?;
     let task_id = TaskId::from_str(&task.task_id)?;
-    let current_state: Option<String> = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT state FROM tasks WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    })?;
-    let current_state = current_state.ok_or_else(|| anyhow!("task {task_id} does not exist"))?;
-    if matches!(current_state.as_str(), "completed" | "failed" | "cancelled") {
-        bail!("task {task_id} is terminal ({current_state})");
+    let current_state = database
+        .load_task(task_id)?
+        .ok_or_else(|| anyhow!("task {task_id} does not exist"))?
+        .state;
+    if current_state.is_terminal() {
+        bail!("task {task_id} is terminal ({current_state:?})");
     }
     let requested_at = Utc::now();
     let control_action = match action {
@@ -4326,7 +4208,7 @@ fn explain_routing(
     json_output: bool,
 ) -> Result<()> {
     let (_, database) = load_existing_state(repository, effective)?;
-    let database = database.legacy_workspace()?;
+    let database = workspace_for_repository(&database, repository)?;
     let task_id = TaskId::from_str(task_id)?;
     let decision = database
         .list_routing_audits(task_id, 1)?
@@ -4343,7 +4225,7 @@ fn checkpoint(
     json_output: bool,
 ) -> Result<()> {
     let (_, database) = load_existing_state(repository, effective)?;
-    let database = database.legacy_workspace()?;
+    let database = workspace_for_repository(&database, repository)?;
     let task_id = TaskId::from_str(task_id)?;
     let checkpoint = database
         .latest_sealed_checkpoint(task_id)?
@@ -4429,9 +4311,7 @@ fn migrate_inner(
             }),
         ),
         MigrationAction::Plan => {
-            let database_plan = database.with_connection(|connection| {
-                orchestrator_state::MigrationManager::plan(connection)
-            })?;
+            let database_plan = database.migration_plan()?;
             emit(
                 json_output,
                 "migrate_plan",
@@ -4485,7 +4365,7 @@ fn migrate_inner(
                 },
                 "database": database_status,
             });
-            if let Some(workspace) = legacy_workspace_if_present(&database)? {
+            if let Some(workspace) = legacy_migration_workspace_if_present(&database)? {
                 append_event(
                     &workspace,
                     None,
@@ -4520,16 +4400,11 @@ fn migrate_rollback(
 ) -> Result<()> {
     match action {
         MigrationRollbackAction::Plan { backup } => {
-            if let Some(workspace) = legacy_workspace_if_present(database)? {
+            if let Some(workspace) = legacy_migration_workspace_if_present(database)? {
                 reconcile_events(state, &workspace)?;
             }
             let backup = trusted_migration_backup(&state.backups, backup.as_deref())?;
-            let plan = database.with_connection(|connection| {
-                let plan =
-                    orchestrator_state::MigrationManager::create_rollback_plan(connection, backup)?;
-                orchestrator_state::MigrationManager::validate_rollback(connection, &plan)?;
-                Ok(plan)
-            })?;
+            let plan = database.create_validated_migration_rollback_plan(backup)?;
             let relative = migration_rollback_plan_relative_path(&plan.integrity_hash)?;
             let stored = ArtifactStore::open(&state.root)?
                 .put(relative.clone(), &serde_json::to_vec_pretty(&plan)?)?;
@@ -4552,7 +4427,7 @@ fn migrate_rollback(
             ensure_migration_write_allowed(config)?;
             validate_sha256(&plan_hash)?;
             validate_approval_identity(&approved_by)?;
-            if let Some(workspace) = legacy_workspace_if_present(database)? {
+            if let Some(workspace) = legacy_migration_workspace_if_present(database)? {
                 reconcile_events(state, &workspace)?;
             }
 
@@ -4566,9 +4441,7 @@ fn migrate_rollback(
                 bail!("stored migration rollback plan does not match --plan-hash");
             }
             plan.verify_integrity_hash()?;
-            database.with_connection(|connection| {
-                orchestrator_state::MigrationManager::validate_rollback(connection, &plan)
-            })?;
+            database.validate_migration_rollback(&plan)?;
 
             let approved_at = Utc::now();
             let approval_relative =
@@ -4605,7 +4478,7 @@ fn migrate_rollback(
                 }))?,
             )?;
 
-            let audit_workspace = legacy_workspace_if_present(database)?;
+            let audit_workspace = legacy_migration_workspace_if_present(database)?;
             let audit_event_recorded = audit_workspace.is_some();
             if let Some(workspace) = audit_workspace {
                 append_event(
@@ -4736,19 +4609,18 @@ fn rollback(
                 .put(plan_relative.clone(), &serde_json::to_vec_pretty(&plan)?)?;
             if state.database.exists() {
                 let database = open_ready_database(&state)?;
-                if let Some(workspace) = legacy_workspace_if_present(&database)? {
-                    append_event(
-                        &workspace,
-                        None,
-                        EventType::RollbackPlanned,
-                        None,
-                        None,
-                        EventActor::User,
-                        CorrelationId::new(),
-                        json!({"target": to, "plan_hash": plan.integrity_hash, "artifact": stored}),
-                    )?;
-                    reconcile_events(&state, &workspace)?;
-                }
+                let workspace = workspace_for_repository(&database, repository)?;
+                append_event(
+                    &workspace,
+                    None,
+                    EventType::RollbackPlanned,
+                    None,
+                    None,
+                    EventActor::User,
+                    CorrelationId::new(),
+                    json!({"target": to, "plan_hash": plan.integrity_hash, "artifact": stored}),
+                )?;
+                reconcile_events(&state, &workspace)?;
             }
             emit(
                 json_output,
@@ -4813,26 +4685,13 @@ fn rollback(
                 orchestrator_engine::RollbackApproval::for_plan(&plan, approved_by, Utc::now());
             if state.database.exists() {
                 let database = open_ready_database(&state)?;
-                let database = database.legacy_workspace()?;
+                let database = workspace_for_repository(&database, repository)?;
                 ensure_rollback_quiescent(&database)?;
-                database.with_connection(|connection| {
-                    connection.execute(
-                        "INSERT INTO main.approval_records(
-                            workspace_id, approval_id, task_id, action, scope_json, approved_by,
-                            approved_at, expires_at, revoked_at
-                         ) VALUES (current_workspace(), ?1, NULL, 'release_rollback', ?2, ?3, ?4, NULL, NULL)",
-                        params![
-                            TaskId::new().to_string(),
-                            serde_json::to_string(&json!({
-                                "target_version": to,
-                                "plan_hash": plan_hash,
-                            }))?,
-                            approval.approved_by,
-                            approval.approved_at.to_rfc3339(),
-                        ],
-                    )?;
-                    Ok(())
-                })?;
+                database.record_release_rollback_approval(
+                    &json!({"target_version": to, "plan_hash": plan_hash}),
+                    &approval.approved_by,
+                    approval.approved_at,
+                )?;
             }
             let report = manager.apply(&plan, &approval)?;
             emit(
@@ -4929,23 +4788,7 @@ fn read_regular_file_below(root: &Path, path: &Path) -> Result<Vec<u8>> {
 }
 
 fn ensure_rollback_quiescent(database: &WorkspaceDatabase<'_>) -> Result<()> {
-    let (active_tasks, active_workers, active_coordinators): (i64, i64, i64) = database
-        .with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT
-                    (SELECT count(*) FROM tasks WHERE state IN (
-                        'running','checkpoint_requested','checkpointing',
-                        'handover_requested','handing_over','resuming','verifying'
-                    )),
-                    (SELECT count(*) FROM worker_leases WHERE released_at IS NULL),
-                    (SELECT count(*) FROM coordinator_leases WHERE released_at IS NULL)",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(Into::into)
-        })?;
-    if active_tasks > 0 || active_workers > 0 || active_coordinators > 0 {
+    if !database.is_release_rollback_quiescent()? {
         bail!(
             "rollback requires all running tasks to reach a safe checkpoint and every worker/coordinator lease to be released"
         );
@@ -4998,34 +4841,15 @@ fn rollback_resolution_context(
         );
     }
     let database = open_ready_database(state)?;
-    let database = database.legacy_workspace()?;
-    let selected = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT attempt_id, task_id, worker_result_json FROM task_attempts
-                 WHERE provider_id = 'codex' AND worker_mode = 'workspace_write'
-                   AND ended_at IS NOT NULL
-                 ORDER BY started_at DESC, ordinal DESC, attempt_id DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    })?;
-    let (attempt_id, task_id, persisted) = selected
+    let database = workspace_for_repository(&database, repository)?;
+    let selected = database
+        .latest_completed_writable_attempt(ProviderId::Codex)?
         .ok_or_else(|| anyhow!("Codex rollback has no completed writable provider attempt"))?;
-    let attempt_id = AttemptId::from_str(&attempt_id)?;
-    let task_id = TaskId::from_str(&task_id)?;
-    let persisted = persisted
+    let attempt_id = selected.attempt_id;
+    let task_id = selected.task_id;
+    let persisted = selected
+        .worker_result
         .ok_or_else(|| anyhow!("selected Codex attempt has no process execution evidence"))?;
-    let persisted: Value = serde_json::from_str(&persisted)
-        .context("selected Codex attempt has malformed persisted result JSON")?;
     let worker_result: WorkerResult = serde_json::from_value(persisted.clone())
         .context("selected Codex attempt does not contain a complete WorkerResult v1")?;
     if worker_result.attempt_id != attempt_id
@@ -5261,7 +5085,7 @@ async fn legacy_tui(
         bail!("orchestrator TUI is disabled by configuration");
     }
     let (_, database) = load_existing_state(repository, &runtime.effective)?;
-    let workspace = database.legacy_workspace()?;
+    let workspace = workspace_for_repository(&database, repository)?;
     let rows = task_status_rows(&workspace, selector.task_id.as_deref())?;
     let task = rows.first();
     let usage = latest_usage_snapshots(&database, &config.orchestrator)?;
@@ -5569,69 +5393,18 @@ fn latest_provider_health(
     database: &Database,
     provider: ProviderId,
 ) -> Result<Option<ProviderHealth>> {
-    database
-        .with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT details_json FROM provider_health
-                 WHERE provider_id = ?1 ORDER BY checked_at DESC LIMIT 1",
-                    [provider.as_str()],
-                    |row| {
-                        let value: String = row.get(0)?;
-                        serde_json::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    },
-                )
-                .optional()
-                .map_err(Into::into)
-        })
-        .map_err(Into::into)
+    Ok(database.latest_provider_health(provider)?)
 }
 
 fn latest_verification_result(
     database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
 ) -> Result<Option<orchestrator_domain::VerificationResult>> {
-    database
-        .with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT result_json FROM verification_results
-                 WHERE task_id = ?1 ORDER BY completed_at DESC LIMIT 1",
-                    [task_id.to_string()],
-                    |row| {
-                        let value: String = row.get(0)?;
-                        serde_json::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    },
-                )
-                .optional()
-                .map_err(Into::into)
-        })
-        .map_err(Into::into)
+    Ok(database.latest_verification(task_id)?)
 }
 
 fn count_handovers(database: &WorkspaceDatabase<'_>, task_id: TaskId) -> Result<u32> {
-    let count: i64 = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT count(*) FROM handovers WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    })?;
-    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    Ok(database.count_handovers(task_id)?)
 }
 
 fn routing_alternatives(value: &Value, selected: Option<ProviderId>) -> Vec<String> {
@@ -5648,6 +5421,7 @@ fn routing_alternatives(value: &Value, selected: Option<ProviderId>) -> Vec<Stri
 
 async fn routing_candidates(
     config: &OrchestratorConfig,
+    global_database: &Database,
     database: &WorkspaceDatabase<'_>,
     assessment: &orchestrator_domain::TaskAssessment,
     manually_requested: Option<ProviderId>,
@@ -5673,7 +5447,7 @@ async fn routing_candidates(
                     ProviderCapabilities::unsupported(provider),
                 ),
             };
-        persist_health(database.global_database(), &health)?;
+        persist_health(global_database, &health)?;
         if provider == ProviderId::Codex && health.status != HealthStatus::Healthy {
             append_event(
                 database,
@@ -5691,15 +5465,10 @@ async fn routing_candidates(
                 }),
             )?;
         }
-        let snapshot = collect_usage(
-            provider,
-            provider_config,
-            database.global_database(),
-            now,
-            &redaction,
-        )
-        .await?;
-        let budgets = budget_for_snapshot(config, provider_config, &snapshot, database, now)?;
+        let snapshot =
+            collect_usage(provider, provider_config, global_database, now, &redaction).await?;
+        let budgets =
+            budget_for_snapshot(config, provider_config, &snapshot, global_database, now)?;
         let calibrated_remaining_work_units =
             provider_config
                 .quota_units_per_work_unit
@@ -5787,7 +5556,7 @@ async fn collect_usage(
         .await;
         match probe_result {
             Ok(snapshot) => {
-                persist_usage(database, &snapshot, None)?;
+                persist_global_usage(database, &snapshot)?;
                 return Ok(snapshot);
             }
             Err(error) => {
@@ -5836,7 +5605,7 @@ fn budget_for_snapshot(
     config: &OrchestratorConfig,
     provider_config: &ProviderConfig,
     snapshot: &UsageSnapshot,
-    database: &WorkspaceDatabase<'_>,
+    global_database: &Database,
     now: DateTime<Utc>,
 ) -> Result<Vec<orchestrator_policy::BudgetForecast>> {
     let policy = reset_policy(provider_config)?;
@@ -5847,7 +5616,7 @@ fn budget_for_snapshot(
     } else {
         period_window(&policy, now)?
     };
-    let history = usage_history(database.global_database(), snapshot.provider)?
+    let history = usage_history(global_database, snapshot.provider)?
         .into_iter()
         .filter(|observation| observation.quota_scope == snapshot.quota_scope)
         .filter(|observation| {
@@ -6256,33 +6025,13 @@ fn persist_routing(
     Ok(())
 }
 
-fn persist_usage(
-    database: &Database,
-    snapshot: &UsageSnapshot,
-    task_id: Option<TaskId>,
-) -> Result<()> {
-    database.record_usage_snapshot(task_id, snapshot)?;
+fn persist_global_usage(database: &Database, snapshot: &UsageSnapshot) -> Result<()> {
+    database.record_global_usage_snapshot(snapshot)?;
     Ok(())
 }
 
 fn persist_health(database: &Database, health: &ProviderHealth) -> Result<()> {
-    let status = enum_name(&health.status)?;
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO provider_health(
-                health_id, provider_id, status, consecutive_failures, details_json, checked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                TaskId::new().to_string(),
-                health.provider.as_str(),
-                status,
-                health.consecutive_failures,
-                serde_json::to_string(health)?,
-                health.checked_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.record_provider_health(health)?;
     Ok(())
 }
 
@@ -6322,7 +6071,7 @@ fn append_event_if_schema_available(
     event_type: EventType,
     payload: Value,
 ) -> Result<()> {
-    if let Some(workspace) = legacy_workspace_if_present(database)? {
+    if let Some(workspace) = legacy_migration_workspace_if_present(database)? {
         append_event(
             &workspace,
             None,
@@ -6410,46 +6159,13 @@ fn latest_usage_snapshots(
 }
 
 fn usage_history(database: &Database, provider: ProviderId) -> Result<Vec<UsageSnapshot>> {
-    let snapshots = database.with_connection(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT snapshot_json FROM (
-                SELECT snapshot_json, collected_at FROM provider_usage_snapshots
-                WHERE provider_id = ?1 ORDER BY collected_at DESC LIMIT 256
-             ) ORDER BY collected_at ASC",
-        )?;
-        let values = statement
-            .query_map([provider.as_str()], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        values
-            .into_iter()
-            .map(|value| serde_json::from_str(&value).map_err(Into::into))
-            .collect()
-    })?;
+    let mut snapshots = database.list_global_usage_snapshots(Some(provider), 256)?;
+    snapshots.reverse();
     Ok(snapshots)
 }
 
 fn recent_failure_rate(database: &WorkspaceDatabase<'_>, provider: ProviderId) -> Result<f64> {
-    let (failures, total): (i64, i64) = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT
-                    coalesce(sum(CASE WHEN outcome IN ('failed','timed_out','quota_exceeded')
-                                      THEN 1 ELSE 0 END), 0),
-                    count(*)
-                 FROM (SELECT outcome FROM task_attempts WHERE provider_id = ?1
-                       AND outcome IS NOT NULL ORDER BY ended_at DESC LIMIT 20)",
-                [provider.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(Into::into)
-    })?;
-    Ok(if total == 0 {
-        0.0
-    } else {
-        let failures = u32::try_from(failures).unwrap_or(u32::MAX);
-        let total = u32::try_from(total).unwrap_or(u32::MAX);
-        f64::from(failures) / f64::from(total)
-    })
+    Ok(database.recent_attempt_failure_rate(provider)?)
 }
 
 fn load_task_input(arguments: &RunArgs) -> Result<TaskInput> {
@@ -6797,7 +6513,17 @@ fn initialize_repository_state(state: &StatePaths) -> Result<Database> {
     Ok(database)
 }
 
-fn legacy_workspace_if_present(database: &Database) -> Result<Option<WorkspaceDatabase<'_>>> {
+fn workspace_for_repository<'a>(
+    database: &'a Database,
+    repository: &Path,
+) -> Result<WorkspaceDatabase<'a>> {
+    let registration = database.resolve_repository_workspace(repository)?;
+    Ok(database.workspace(registration.workspace_id))
+}
+
+fn legacy_migration_workspace_if_present(
+    database: &Database,
+) -> Result<Option<WorkspaceDatabase<'_>>> {
     match database.legacy_workspace() {
         Ok(workspace) => Ok(Some(workspace)),
         Err(StateError::WorkspaceNotFound { .. }) => Ok(None),
@@ -6841,39 +6567,28 @@ fn task_status_rows(
     database: &WorkspaceDatabase<'_>,
     task_id: Option<&str>,
 ) -> Result<Vec<TaskStatusRow>> {
-    database
-        .with_connection(|connection| {
-            let mut statement = if task_id.is_some() {
-                connection.prepare(
-                    "SELECT task_id, state, objective, created_at, updated_at
-                     FROM tasks WHERE task_id = ?1 ORDER BY updated_at DESC LIMIT 1",
-                )?
-            } else {
-                connection.prepare(
-                    "SELECT task_id, state, objective, created_at, updated_at
-                     FROM tasks ORDER BY updated_at DESC LIMIT 100",
-                )?
-            };
-            let map = |row: &rusqlite::Row<'_>| {
-                Ok(TaskStatusRow {
-                    task_id: row.get(0)?,
-                    state: row.get(1)?,
-                    objective: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                })
-            };
-            if let Some(task_id) = task_id {
-                Ok(statement
-                    .query_map([task_id], map)?
-                    .collect::<Result<Vec<_>, _>>()?)
-            } else {
-                Ok(statement
-                    .query_map([], map)?
-                    .collect::<Result<Vec<_>, _>>()?)
-            }
+    let tasks = if let Some(task_id) = task_id {
+        let task_id = TaskId::from_str(task_id)?;
+        database.load_task(task_id)?.into_iter().collect()
+    } else {
+        database.list_tasks(&TaskListFilter {
+            state: None,
+            include_archived: false,
+            limit: 100,
+        })?
+    };
+    tasks
+        .into_iter()
+        .map(|task| {
+            Ok(TaskStatusRow {
+                task_id: task.task_id.to_string(),
+                state: enum_name(&task.state)?,
+                objective: task.objective,
+                created_at: task.created_at.to_rfc3339(),
+                updated_at: task.updated_at.to_rfc3339(),
+            })
         })
-        .map_err(Into::into)
+        .collect()
 }
 
 fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> {
@@ -7085,6 +6800,30 @@ mod tests {
         set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
 
+    fn test_with_database<T>(
+        database: &Database,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        let connection = rusqlite::Connection::open(database.path())?;
+        operation(&connection)
+    }
+
+    fn test_with_workspace<T>(
+        database: &WorkspaceDatabase<'_>,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        use rusqlite::functions::FunctionFlags;
+        let connection = rusqlite::Connection::open(database.database_path())?;
+        let workspace_id = database.workspace_id().to_string();
+        connection.create_scalar_function(
+            "current_workspace",
+            0,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            move |_| Ok(workspace_id.clone()),
+        )?;
+        operation(&connection)
+    }
+
     fn test_state(root: PathBuf) -> StatePaths {
         StatePaths {
             database: root.join("orchestrator.db"),
@@ -7126,7 +6865,7 @@ mod tests {
     }
 
     fn install_legacy_workspace(database: &Database) -> Result<()> {
-        database.with_connection(|connection| {
+        test_with_database(database, |connection| {
             connection.execute(
                 "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
                  VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
@@ -7141,7 +6880,7 @@ mod tests {
         database: &WorkspaceDatabase<'_>,
         attempt_id: AttemptId,
     ) -> Result<(Option<String>, Option<String>)> {
-        Ok(database.with_connection(|connection| {
+        Ok(test_with_workspace(database, |connection| {
             Ok(connection.query_row(
                 "SELECT ended_at, outcome FROM task_attempts WHERE attempt_id = ?1",
                 [attempt_id.to_string()],
@@ -7379,7 +7118,6 @@ mod tests {
             &database,
             coordinator.lease_id,
             &worker,
-            1,
             orchestrator_domain::CorrelationId::new(),
         )
         .await?;
@@ -7830,7 +7568,7 @@ mod tests {
                 "search_directory": null
             }
         });
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "INSERT INTO main.worktrees(
                     workspace_id, worktree_id, task_id, repo_root, worktree_path, branch_name,
@@ -7929,7 +7667,7 @@ mod tests {
 
         let mut path_persisted = serde_json::to_value(&worker_result)?;
         path_persisted["process_execution"] = serde_json::to_value(&attempt_execution)?;
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7965,7 +7703,7 @@ mod tests {
         let mut mismatched = path_persisted;
         mismatched["process_execution"]["path"] =
             serde_json::to_value(fs::canonicalize(&executable_b)?)?;
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7992,7 +7730,7 @@ mod tests {
                 .contains("invalid process execution evidence")
         );
 
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -8030,7 +7768,7 @@ mod tests {
         });
         let other_worktree = state.worktrees.join("other-writable-worker");
         fs::create_dir_all(&other_worktree)?;
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -8060,7 +7798,7 @@ mod tests {
             anyhow::bail!("relative identity bypassed its trusted active worktree");
         };
         assert!(error.to_string().contains("trusted worktree"));
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "UPDATE main.worktrees SET worktree_path = ?1
                  WHERE workspace_id = current_workspace() AND task_id = ?2 AND state = 'active'",
@@ -8079,7 +7817,7 @@ mod tests {
                 "search_directory": null
             }
         });
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -8132,7 +7870,7 @@ mod tests {
             created_at: now,
         })?;
         let attempt_id = AttemptId::new();
-        database.with_connection(|connection| {
+        test_with_workspace(&database, |connection| {
             connection.execute(
                 "INSERT INTO main.task_attempts(
                     workspace_id, attempt_id, task_id, ordinal, provider_id, worker_mode, started_at

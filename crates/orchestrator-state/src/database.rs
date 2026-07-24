@@ -10,8 +10,9 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MigrationManager, MigrationStatus, RollbackApplyResult, RollbackPlan, StateError, StateResult,
-    WorkspaceId, ensure_private_directory, ensure_private_file, reject_symlink_components,
+    MigrationManager, MigrationPlan, MigrationStatus, RollbackApplyResult, RollbackPlan,
+    StateError, StateResult, WorkspaceId, ensure_private_directory, ensure_private_file,
+    reject_symlink_components,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +173,26 @@ impl Database {
         MigrationManager::status(&connection)
     }
 
+    pub fn migration_plan(&self) -> StateResult<MigrationPlan> {
+        let connection = self.lock()?;
+        MigrationManager::plan(&connection)
+    }
+
+    pub fn create_validated_migration_rollback_plan(
+        &self,
+        backup_path: impl AsRef<Path>,
+    ) -> StateResult<RollbackPlan> {
+        let connection = self.lock()?;
+        let plan = MigrationManager::create_rollback_plan(&connection, backup_path)?;
+        MigrationManager::validate_rollback(&connection, &plan)?;
+        Ok(plan)
+    }
+
+    pub fn validate_migration_rollback(&self, plan: &RollbackPlan) -> StateResult<()> {
+        let connection = self.lock()?;
+        MigrationManager::validate_rollback(&connection, plan)
+    }
+
     pub fn migrate_with_backup(&self, backup_directory: &Path) -> StateResult<MigrationStatus> {
         let mut connection = self.raw_lock()?;
         let plan = MigrationManager::plan(&connection)?;
@@ -217,7 +238,8 @@ impl Database {
         )
     }
 
-    pub fn with_connection<T>(
+    #[cfg(test)]
+    pub(crate) fn with_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> StateResult<T>,
     ) -> StateResult<T> {
@@ -225,7 +247,8 @@ impl Database {
         operation(&connection)
     }
 
-    pub fn with_transaction<T>(
+    #[cfg(test)]
+    pub(crate) fn with_transaction<T>(
         &self,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> StateResult<T>,
     ) -> StateResult<T> {
@@ -405,13 +428,9 @@ impl WorkspaceDatabase<'_> {
         self.workspace_id
     }
 
-    /// Returns the owning database for explicitly global provider/account state.
-    ///
-    /// Workspace-scoped durable state must continue to use this bound handle; this accessor is
-    /// only for APIs that intentionally remain global, such as account usage and provider health.
     #[must_use]
-    pub const fn global_database(&self) -> &Database {
-        self.database
+    pub fn database_path(&self) -> &Path {
+        self.database.path()
     }
 
     pub(crate) fn lock(&self) -> StateResult<MutexGuard<'_, Connection>> {
@@ -419,7 +438,7 @@ impl WorkspaceDatabase<'_> {
         self.database.lock()
     }
 
-    pub fn with_connection<T>(
+    pub(crate) fn with_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> StateResult<T>,
     ) -> StateResult<T> {
@@ -427,7 +446,7 @@ impl WorkspaceDatabase<'_> {
         operation(&connection)
     }
 
-    pub fn with_transaction<T>(
+    pub(crate) fn with_transaction<T>(
         &self,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> StateResult<T>,
     ) -> StateResult<T> {

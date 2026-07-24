@@ -53,7 +53,9 @@ impl SqliteWorkspaceDriver {
         crate::daemon::ensure_started(repository, config, explicit_config).await?;
         let paths = RepositoryStatePaths::from_config(repository, config)?;
         let database = crate::daemon::open_ready_database(&paths)?;
-        let workspace_id = database.legacy_workspace()?.workspace_id();
+        let workspace_id = database
+            .resolve_repository_workspace(repository)?
+            .workspace_id;
         let workspace = database.workspace(workspace_id);
         let redactor = Redactor::new(&RedactionConfig {
             literals: Vec::new(),
@@ -127,33 +129,9 @@ impl SqliteWorkspaceDriver {
                     .map_err(|error| DriverError::new(format!("invalid task target: {error}")))?,
             ),
             ComposerTarget::AllRunning => {
-                let task_ids: Vec<TaskId> = self
+                let task_ids = self
                     .workspace()
-                    .with_connection(|connection| {
-                        let mut statement = connection.prepare(
-                            "SELECT st.task_id FROM session_tasks st
-                             JOIN session_graph_heads gh ON gh.session_id = st.session_id
-                                                        AND gh.revision_id = st.revision_id
-                             JOIN tasks t ON t.task_id = st.task_id
-                             WHERE st.session_id = ?1 AND t.state = 'running'
-                             ORDER BY st.display_order",
-                        )?;
-                        let values = statement
-                            .query_map([self.session_id.to_string()], |row| {
-                                row.get::<_, String>(0)
-                            })?
-                            .collect::<Result<Vec<_>, _>>()?;
-                        values
-                            .into_iter()
-                            .map(|value| {
-                                TaskId::from_str(&value).map_err(|error| {
-                                    orchestrator_state::StateError::InvalidRecord(format!(
-                                        "invalid running task ID: {error}"
-                                    ))
-                                })
-                            })
-                            .collect()
-                    })
+                    .running_graph_task_ids(self.session_id)
                     .map_err(driver_error)?;
                 if task_ids.is_empty() {
                     return Ok(ActionFeedback::unavailable(
@@ -1088,6 +1066,30 @@ mod tests {
 
     use super::{SqliteWorkspaceDriver, integration_to_card};
 
+    fn test_with_database<T>(
+        database: &Database,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        let connection = rusqlite::Connection::open(database.path())?;
+        operation(&connection)
+    }
+
+    fn test_with_workspace<T>(
+        database: &WorkspaceDatabase<'_>,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        use rusqlite::functions::FunctionFlags;
+        let connection = rusqlite::Connection::open(database.database_path())?;
+        let workspace_id = database.workspace_id().to_string();
+        connection.create_scalar_function(
+            "current_workspace",
+            0,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            move |_| Ok(workspace_id.clone()),
+        )?;
+        operation(&connection)
+    }
+
     struct Adapter(Redactor);
 
     impl MessageRedactor for Adapter {
@@ -1097,9 +1099,10 @@ mod tests {
     }
 
     fn database() -> anyhow::Result<Database> {
-        let database = Database::open_in_memory()?;
-        database.migrate_with_backup(std::path::Path::new("unused"))?;
-        database.with_connection(|connection| {
+        let root = tempfile::tempdir()?.keep();
+        let database = Database::open(root.join("state.db"))?;
+        database.migrate_with_backup(&root.join("backups"))?;
+        test_with_database(&database, |connection| {
             connection.execute(
                 "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
                  VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
@@ -1356,7 +1359,7 @@ mod tests {
             redactor,
         )?;
         let goal_message_id = orchestrator_domain::MessageId::new();
-        driver.workspace().with_connection(|connection| {
+        test_with_workspace(&driver.workspace(), |connection| {
             connection.execute(
                 "INSERT INTO main.conversation_messages(
                     workspace_id, message_id, session_id, ordinal, role, kind, state,
@@ -1462,7 +1465,7 @@ mod tests {
             batch_id: batch_id.to_string(),
         })?;
 
-        driver.workspace().with_connection(|connection| {
+        test_with_workspace(&driver.workspace(), |connection| {
             let mut statement = connection.prepare(
                 "SELECT action, payload_json, requested_by FROM client_commands
                  WHERE action IN ('request_plan', 'approve_graph', 'request_integration',

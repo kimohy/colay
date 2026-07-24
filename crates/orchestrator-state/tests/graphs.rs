@@ -9,9 +9,12 @@ use orchestrator_domain::{
 };
 use orchestrator_state::{
     ApprovedGraph, Database, GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt,
-    WorkspaceDatabase, WorkspaceId, WorkspaceKind,
+    WorkspaceDatabase, WorkspaceId,
 };
 use rusqlite::params;
+
+mod support;
+use support::{fresh_database, with_workspace_connection};
 
 fn timestamp(second: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 7, 21, 1, 0, second)
@@ -20,11 +23,7 @@ fn timestamp(second: u32) -> DateTime<Utc> {
 }
 
 fn database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    let registration =
-        database.resolve_workspace(&std::env::current_dir()?, WorkspaceKind::Directory)?;
-    Ok((database, registration.workspace_id))
+    fresh_database()
 }
 
 fn seed_session(
@@ -32,7 +31,7 @@ fn seed_session(
     session_id: SessionId,
     goal_id: MessageId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    database.with_connection(|connection| {
+    with_workspace_connection(database, |connection| {
         connection.execute(
             "INSERT INTO main.sessions(session_id, schema_version, revision, title, state, created_at, updated_at) VALUES (?1, '1', 0, 'graph test', 'awaiting_approval', ?2, ?2)",
             params![session_id.to_string(), timestamp(0).to_rfc3339()],
@@ -129,7 +128,7 @@ fn valid_and_invalid_attempts_are_immutable_session_scoped_and_create_no_tasks()
         Some(graph.proposal.revision_id)
     );
     assert!(database.current_graph(SessionId::new())?.is_none());
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         let task_count: i64 =
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
         assert_eq!(task_count, 0);
@@ -202,7 +201,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
     assert_eq!(replay.task_ids, approved.task_ids);
     assert!(replay.replayed);
 
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         let counts = (
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
             connection.query_row("SELECT count(*) FROM task_dependencies", [], |row| {
@@ -272,7 +271,7 @@ fn newer_session_message_invalidates_pending_graph_approval()
     record_valid(&database, &graph)?;
 
     let newer_id = MessageId::new();
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         connection.execute(
             "INSERT INTO main.conversation_messages(message_id, session_id, ordinal, role, kind, state, content_redacted, created_at, finalized_at) VALUES (?1, ?2, 2, 'user', 'user_message', 'final', 'changed requirements', ?3, ?3)",
             params![newer_id.to_string(), session_id.to_string(), timestamp(3).to_rfc3339()],
@@ -292,7 +291,7 @@ fn newer_session_message_invalidates_pending_graph_approval()
             .err()
             .is_some_and(|error| error.to_string().contains("newer user message"))
     );
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         let tasks: i64 =
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
         assert_eq!(tasks, 0);
@@ -352,9 +351,9 @@ fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::
     seed_session(&database, session_id, goal_id)?;
     let graph = validated_graph(session_id, goal_id);
     record_valid(&database, &graph)?;
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         connection.execute_batch(
-            "CREATE TEMP TRIGGER fail_dependency BEFORE INSERT ON main.task_dependencies
+            "CREATE TRIGGER fail_dependency BEFORE INSERT ON main.task_dependencies
              BEGIN
                  SELECT RAISE(FAIL, 'dependency insert failed');
              END;",
@@ -373,7 +372,7 @@ fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::
             })
             .is_err()
     );
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         for table in [
             "tasks",
             "session_tasks",

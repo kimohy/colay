@@ -12,7 +12,6 @@ use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[cfg(not(test))]
 use crate::Database;
 use crate::{
     ArtifactStore, StateError, StateResult, StoredArtifact, WorkspaceDatabase,
@@ -818,6 +817,42 @@ impl $database {
             .map_err(StateError::from)
     }
 
+    pub fn latest_completed_writable_attempt(
+        &self,
+        provider: ProviderId,
+    ) -> StateResult<Option<StoredTaskAttempt>> {
+        self.lock()?
+            .query_row(
+                "SELECT attempt_id, task_id, ordinal, provider_id, worker_mode, started_at, \
+                 ended_at, outcome, worker_result_json FROM task_attempts \
+                 WHERE provider_id = ?1 AND worker_mode = 'workspace_write' AND ended_at IS NOT NULL \
+                 ORDER BY started_at DESC, ordinal DESC, attempt_id DESC LIMIT 1",
+                [provider.as_str()],
+                map_task_attempt,
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+
+    pub fn recent_attempt_failure_rate(&self, provider: ProviderId) -> StateResult<f64> {
+        let (failures, total): (i64, i64) = self.lock()?.query_row(
+            "SELECT \
+                coalesce(sum(CASE WHEN outcome IN ('failed','timed_out','quota_exceeded') \
+                                  THEN 1 ELSE 0 END), 0), \
+                count(*) \
+             FROM (SELECT outcome FROM task_attempts WHERE provider_id = ?1 \
+                   AND outcome IS NOT NULL ORDER BY ended_at DESC LIMIT 20)",
+            [provider.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if total == 0 {
+            return Ok(0.0);
+        }
+        let failures = u32::try_from(failures).unwrap_or(u32::MAX);
+        let total = u32::try_from(total).unwrap_or(u32::MAX);
+        Ok(f64::from(failures) / f64::from(total))
+    }
+
     pub fn record_task_attempt_started(&self, attempt: &NewTaskAttemptRecord) -> StateResult<u32> {
         if attempt.worker_mode.trim().is_empty() {
             return Err(StateError::InvalidRecord(
@@ -876,6 +911,63 @@ impl $database {
                 entity: format!("unfinished task attempt {attempt_id}"),
             });
         }
+        Ok(())
+    }
+
+    pub fn mark_task_attempt_termination_unconfirmed(
+        &self,
+        attempt_id: AttemptId,
+        detail: &str,
+    ) -> StateResult<()> {
+        let changed = self.lock()?.execute(
+            "UPDATE main.task_attempts SET outcome = 'termination_unconfirmed', \
+             worker_result_json = ?1 \
+             WHERE workspace_id = current_workspace() AND attempt_id = ?2 AND ended_at IS NULL",
+            params![
+                serde_json::to_string(&serde_json::json!({
+                    "termination_unconfirmed": detail
+                }))?,
+                attempt_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("unfinished task attempt {attempt_id}"),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn record_changed_file_ownership(
+        &self,
+        task_id: TaskId,
+        worktree_id: Uuid,
+        owner_lease_id: Uuid,
+        changed_files: &[RepoPath],
+        observed_at: DateTime<Utc>,
+    ) -> StateResult<()> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let observed_at = observed_at.to_rfc3339();
+        for path in changed_files {
+            transaction.execute(
+                "INSERT INTO main.changed_files( \
+                    task_id, worktree_id, relative_path, owner_lease_id, sha256, first_seen_at, last_seen_at \
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5) \
+                 ON CONFLICT(workspace_id, task_id, relative_path) DO UPDATE SET \
+                    worktree_id = excluded.worktree_id, \
+                    owner_lease_id = excluded.owner_lease_id, \
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    task_id.to_string(),
+                    worktree_id.to_string(),
+                    path.to_string(),
+                    owner_lease_id.to_string(),
+                    observed_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1488,6 +1580,80 @@ impl $database {
         Ok(handover)
     }
 
+    pub fn count_handovers(&self, task_id: TaskId) -> StateResult<u32> {
+        let count: i64 = self.lock()?.query_row(
+            "SELECT count(*) FROM handovers WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    pub fn is_release_rollback_quiescent(&self) -> StateResult<bool> {
+        let (active_tasks, active_workers, active_coordinators): (i64, i64, i64) =
+            self.lock()?.query_row(
+                "SELECT \
+                    (SELECT count(*) FROM tasks WHERE state IN ( \
+                        'running','checkpoint_requested','checkpointing', \
+                        'handover_requested','handing_over','resuming','verifying' \
+                    )), \
+                    (SELECT count(*) FROM worker_leases WHERE released_at IS NULL), \
+                    (SELECT count(*) FROM coordinator_leases WHERE released_at IS NULL)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        Ok(active_tasks == 0 && active_workers == 0 && active_coordinators == 0)
+    }
+
+    pub fn record_release_rollback_approval(
+        &self,
+        scope: &serde_json::Value,
+        approved_by: &str,
+        approved_at: DateTime<Utc>,
+    ) -> StateResult<Uuid> {
+        if approved_by.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "release rollback approval identity must not be blank".to_owned(),
+            ));
+        }
+        let approval_id = Uuid::now_v7();
+        self.lock()?.execute(
+            "INSERT INTO main.approval_records( \
+                approval_id, task_id, action, scope_json, approved_by, approved_at, expires_at, revoked_at \
+             ) VALUES (?1, NULL, 'release_rollback', ?2, ?3, ?4, NULL, NULL)",
+            params![
+                approval_id.to_string(),
+                serde_json::to_string(scope)?,
+                approved_by.trim(),
+                approved_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(approval_id)
+    }
+
+    pub fn running_graph_task_ids(&self, session_id: orchestrator_domain::SessionId) -> StateResult<Vec<TaskId>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT st.task_id FROM session_tasks st \
+             JOIN session_graph_heads gh ON gh.session_id = st.session_id \
+                                        AND gh.revision_id = st.revision_id \
+             JOIN tasks t ON t.task_id = st.task_id \
+             WHERE st.session_id = ?1 AND t.state = 'running' \
+             ORDER BY st.display_order",
+        )?;
+        let values = statement
+            .query_map([session_id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        values
+            .into_iter()
+            .map(|value| {
+                TaskId::from_str(&value).map_err(|error| {
+                    StateError::InvalidRecord(format!("invalid running task ID: {error}"))
+                })
+            })
+            .collect()
+    }
+
     pub fn record_verification(&self, result: &VerificationResult) -> StateResult<()> {
         self.lock()?.execute(
             "INSERT INTO main.verification_results(verification_id, task_id, attempt_id, \
@@ -1526,18 +1692,8 @@ impl_workspace_database!(WorkspaceDatabase<'_>);
 #[cfg(test)]
 impl_workspace_database!(crate::Database);
 
-#[cfg(not(test))]
 impl Database {
-    pub fn record_usage_snapshot(
-        &self,
-        task_id: Option<TaskId>,
-        snapshot: &UsageSnapshot,
-    ) -> StateResult<Uuid> {
-        if task_id.is_some() {
-            return Err(StateError::InvalidRecord(
-                "task usage snapshots must be recorded through WorkspaceDatabase".to_owned(),
-            ));
-        }
+    pub fn record_global_usage_snapshot(&self, snapshot: &UsageSnapshot) -> StateResult<Uuid> {
         snapshot
             .validate()
             .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
@@ -1570,7 +1726,7 @@ impl Database {
         Ok(snapshot_id)
     }
 
-    pub fn list_usage_snapshots(
+    pub fn list_global_usage_snapshots(
         &self,
         provider: Option<ProviderId>,
         limit: usize,
@@ -1602,6 +1758,42 @@ impl Database {
             })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StateError::from)
+    }
+
+    pub fn record_provider_health(
+        &self,
+        health: &orchestrator_domain::ProviderHealth,
+    ) -> StateResult<()> {
+        self.raw_lock()?.execute(
+            "INSERT INTO provider_health( \
+                health_id, provider_id, status, consecutive_failures, details_json, checked_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::now_v7().to_string(),
+                health.provider.as_str(),
+                serde_string(&health.status)?,
+                health.consecutive_failures,
+                serde_json::to_string(health)?,
+                health.checked_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_provider_health(
+        &self,
+        provider: ProviderId,
+    ) -> StateResult<Option<orchestrator_domain::ProviderHealth>> {
+        self.raw_lock()?
+            .query_row(
+                "SELECT details_json FROM provider_health \
+                 WHERE provider_id = ?1 ORDER BY checked_at DESC LIMIT 1",
+                [provider.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| serde_json::from_str(&value).map_err(StateError::from))
+            .transpose()
     }
 }
 

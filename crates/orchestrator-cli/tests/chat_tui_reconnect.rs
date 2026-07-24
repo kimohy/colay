@@ -156,14 +156,7 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     let initialized = fixture.output(&["init"])?;
     assert!(initialized.status.success());
     let initialized_database = fixture.database()?;
-    initialized_database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-            [Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
-    })?;
+    initialized_database.resolve_repository_workspace(&fixture.repository)?;
     drop(initialized_database);
     assert!(
         fixture
@@ -173,7 +166,10 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     fixture.wait_online()?;
 
     let database = fixture.database()?;
-    let workspace = database.legacy_workspace()?;
+    let workspace_id = database
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
+    let workspace = database.workspace(workspace_id);
     let session_id = SessionId::new();
     workspace.submit_client_command(&command(
         ClientCommandAction::CreateSession,
@@ -204,7 +200,10 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     drop(database);
 
     let reopened = fixture.database()?;
-    let reopened_workspace = reopened.legacy_workspace()?;
+    let reopened_id = reopened
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
+    let reopened_workspace = reopened.workspace(reopened_id);
     let sessions = reopened_workspace.list_sessions(&orchestrator_state::SessionListFilter {
         include_archived: false,
         limit: 1,

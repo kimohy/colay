@@ -22,6 +22,9 @@ use orchestrator_state::{
 };
 use rusqlite::params;
 
+mod support;
+use support::{with_database, with_workspace};
+
 struct UnusedPlanner;
 
 struct UnusedConversation;
@@ -135,7 +138,7 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     fs::create_dir_all(&state_root)?;
     let database = Database::open(state_root.join("orchestrator.db"))?;
     database.migrate_with_backup(&state_root.join("backups"))?;
-    database.with_connection(|connection| {
+    with_database(&database, |connection| {
         connection.execute(
             "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
              VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
@@ -149,7 +152,7 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     let revision_id = GraphRevisionId::new();
     let task_ids = [TaskId::new(), TaskId::new()];
     let now = Utc::now();
-    database.with_connection(|connection| {
+    with_workspace(&database, |connection| {
         connection.execute(
             "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state,
                 created_at, updated_at, archived_at)

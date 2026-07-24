@@ -3,10 +3,11 @@ use orchestrator_domain::{
     ConversationAttemptId, ConversationOutcome, MessageId, ProviderId, RequirementRevision,
     RequirementRevisionId, RequirementSnapshot, SessionId, VerificationCommand,
 };
-use orchestrator_state::{
-    Database, NewConversationAttempt, WorkspaceDatabase, WorkspaceId, WorkspaceKind,
-};
+use orchestrator_state::{Database, NewConversationAttempt, WorkspaceDatabase, WorkspaceId};
 use rusqlite::params;
+
+mod support;
+use support::{fresh_database, with_workspace_connection};
 
 fn seed_session_message(
     database: &WorkspaceDatabase<'_>,
@@ -14,7 +15,7 @@ fn seed_session_message(
     let session_id = SessionId::new();
     let message_id = MessageId::new();
     let now = Utc::now().to_rfc3339();
-    database.with_connection(|connection| {
+    with_workspace_connection(database, |connection| {
         connection.execute(
             "INSERT INTO main.sessions(session_id, schema_version, revision, title, state, created_at, updated_at)
              VALUES (?1, '1.0', 0, 'conversation test', 'drafting', ?2, ?2)",
@@ -33,11 +34,7 @@ fn seed_session_message(
 }
 
 fn database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    let registration =
-        database.resolve_workspace(&std::env::current_dir()?, WorkspaceKind::Directory)?;
-    Ok((database, registration.workspace_id))
+    fresh_database()
 }
 
 fn ready_snapshot() -> RequirementSnapshot {
@@ -96,7 +93,7 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
     );
     database.record_requirement_revision(&revision)?;
 
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         assert!(
             connection
                 .execute(
@@ -112,11 +109,10 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
             "coordinator_leases",
             "worker_leases",
         ] {
-            let count: i64 = connection.query_row(
-                &format!("SELECT count(*) FROM {table}"),
-                [],
-                |row| row.get(0),
-            )?;
+            let count: i64 =
+                connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
             assert_eq!(count, 0, "pre-approval row in {table}");
         }
         Ok(())
@@ -139,7 +135,7 @@ fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
         provider: ProviderId::Codex,
         started_at,
     })?;
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         connection.execute(
             "INSERT INTO main.client_commands(
                 command_id, session_id, action, payload_json, idempotency_key, state,
@@ -172,7 +168,7 @@ fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
         attempt.error_redacted.as_deref(),
         Some("interrupted by daemon restart")
     );
-    database.with_connection(|connection| {
+    with_workspace_connection(&database, |connection| {
         let (state, outcome): (String, String) = connection.query_row(
             "SELECT state, outcome FROM client_commands WHERE command_id = ?1",
             [attempt_id.to_string()],

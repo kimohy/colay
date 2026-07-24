@@ -36,6 +36,9 @@ use tokio_util::sync::CancellationToken;
 
 use colay::task_executor::OfficialCliTaskExecutor;
 
+mod support;
+use support::with_workspace;
+
 fn fake_provider_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_colay-e2e-fake-provider"))
 }
@@ -279,17 +282,7 @@ async fn wait_for_completion(
                     let attempts = database
                         .list_task_attempts(task.task_id)
                         .unwrap_or_default();
-                    let verification = database
-                        .with_connection(|connection| {
-                            connection
-                                .query_row(
-                                    "SELECT result_json FROM verification_results WHERE task_id = ?1 ORDER BY completed_at DESC LIMIT 1",
-                                    [task.task_id.to_string()],
-                                    |row| row.get::<_, String>(0),
-                                )
-                                .map_err(orchestrator_state::StateError::from)
-                        })
-                        .ok();
+                    let verification = database.latest_verification(task.task_id).ok().flatten();
                     let checkpoint = database.latest_sealed_checkpoint(task.task_id).ok().flatten();
                     format!(
                         "{}={:?} attempts={attempts:?} verification={verification:?} checkpoint={checkpoint:?}",
@@ -314,15 +307,10 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     fs::create_dir_all(&paths.root)?;
     let database = Arc::new(Database::open(&paths.database)?);
     database.migrate_with_backup(&paths.backups)?;
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-            [Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
-    })?;
-    let workspace = database.legacy_workspace()?;
+    let workspace_id = database
+        .resolve_repository_workspace(&repository)?
+        .workspace_id;
+    let workspace = database.workspace(workspace_id);
     let (session_id, task_ids) = seed_approved_graph(&workspace)?;
     queue_instruction(&workspace, session_id, task_ids[0])?;
 
@@ -352,10 +340,12 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     };
     let cancellation = CancellationToken::new();
     let service_database = Arc::clone(&database);
+    let workspace_id = workspace.workspace_id();
     let service_cancellation = cancellation.clone();
     let service = tokio::spawn(async move {
         serve_with_full_orchestration(
             service_database,
+            workspace_id,
             DaemonInstanceId::new(),
             77,
             service_cancellation,
@@ -399,7 +389,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
             .iter()
             .all(|instruction| instruction.state == TaskInstructionState::Applied)
     );
-    workspace.with_connection(|connection| {
+    with_workspace(&workspace, |connection| {
         let claims: i64 =
             connection.query_row("SELECT count(*) FROM task_schedule_claims", [], |row| {
                 row.get(0)
@@ -426,9 +416,11 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     let restart_cancellation = CancellationToken::new();
     let restart_signal = restart_cancellation.clone();
     let restart_database = Arc::clone(&database);
+    let restart_workspace_id = workspace.workspace_id();
     let restart = tokio::spawn(async move {
         orchestrator_daemon::serve(
             &restart_database,
+            restart_workspace_id,
             DaemonInstanceId::new(),
             78,
             restart_signal,

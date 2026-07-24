@@ -286,6 +286,7 @@ mod tests {
     use orchestrator_state::{Database, SessionListFilter, StateResult};
 
     use super::{CommandProcessingResult, MessageRedactor, process_next_client_command};
+    use crate::test_support::{fresh_database, with_database};
 
     struct SecretRedactor;
 
@@ -302,9 +303,8 @@ mod tests {
     }
 
     fn database() -> StateResult<Database> {
-        let database = Database::open_in_memory()?;
-        database.migrate_with_backup(std::path::Path::new("unused"))?;
-        database.with_connection(|connection| {
+        let (database, _) = fresh_database()?;
+        with_database(&database, |connection| {
             connection.execute(
                 "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
                  VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",

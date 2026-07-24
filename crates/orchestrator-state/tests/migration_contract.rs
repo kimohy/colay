@@ -11,6 +11,9 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
+mod support;
+use support::with_database_connection;
+
 const CORE_MIGRATION: &str = include_str!("../../../migrations/0001_core.sql");
 const EXECUTION_MIGRATION: &str = include_str!("../../../migrations/0002_execution.sql");
 const AUDIT_MIGRATION: &str = include_str!("../../../migrations/0003_audit_and_control.sql");
@@ -61,7 +64,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     let health = database.health()?;
     assert!(health.integrity_ok);
     assert_eq!(health.foreign_key_violations, 0);
-    database.with_connection(|connection| {
+    with_database_connection(&database, |connection| {
         for table in [
             "sessions",
             "conversation_messages",
@@ -214,7 +217,7 @@ fn v8_daemon_rows_migrate_to_online_phase() -> Result<(), Box<dyn std::error::Er
 
     let database = Database::open(&database_path)?;
     database.migrate_with_backup(&root.join("backups"))?;
-    database.with_connection(|connection| {
+    with_database_connection(&database, |connection| {
         let migrated: (String, Option<String>) = connection.query_row(
             "SELECT phase, startup_error FROM daemon_instances WHERE instance_id = ?1",
             ["legacy-daemon"],
@@ -243,7 +246,7 @@ fn v5_to_current_dry_run_backup_and_command_rebuild_preserve_rows()
     assert_eq!(database.migration_status()?.current_version, 5);
     database.migrate_with_backup(&root.join("v5-backups"))?;
 
-    database.with_connection(|connection| {
+    with_database_connection(&database, |connection| {
         let preserved: (String, String) = connection.query_row(
             "SELECT action, outcome FROM main.client_commands WHERE idempotency_key = ?1",
             ["preserved-v5-command"],
@@ -302,7 +305,7 @@ fn v3_event_hash_remains_verifiable_after_current_migration()
         .as_str()
         .ok_or("event type is not a string")?
         .to_owned();
-    database.with_connection(|connection| {
+    with_database_connection(&database, |connection| {
         connection.execute(
             "INSERT INTO main.task_events( \
                 sequence, event_id, task_id, event_type, schema_version, occurred_at, event_json, \
@@ -341,7 +344,7 @@ fn checksum_tampering_and_future_schemas_fail_closed() -> Result<(), Box<dyn std
     seed_v1(&first_path)?;
     let first_database = Database::open(&first_path)?;
     first_database.migrate_with_backup(&first_root.join("backups"))?;
-    first_database.with_connection(|connection| {
+    with_database_connection(&first_database, |connection| {
         connection.execute(
             "UPDATE schema_migrations SET checksum = ?1 WHERE version = 2",
             ["0".repeat(64)],
@@ -359,7 +362,7 @@ fn checksum_tampering_and_future_schemas_fail_closed() -> Result<(), Box<dyn std
     seed_v1(&second_path)?;
     let second_database = Database::open(&second_path)?;
     second_database.migrate_with_backup(&second_root.join("backups"))?;
-    second_database.with_connection(|connection| {
+    with_database_connection(&second_database, |connection| {
         let future = STATE_SCHEMA_VERSION + 1;
         connection.execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
