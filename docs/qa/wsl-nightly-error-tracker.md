@@ -8,9 +8,9 @@
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-23
+- 마지막 갱신: 2026-07-24
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
-- 확인한 nightly: `0.1.1-nightly.20260722.f693062`
+- 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -28,10 +28,64 @@
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
+| `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
+
+## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
+
+### 관찰
+
+nightly `0.1.1-nightly.20260723.7a977cf`를 WSL 홈에서 실행했을 때 다음 순환이 발생했다.
+
+```text
+$ colay run --plan-only hello
+error: state schema migration is required ([9, 10, 11]); run `colay migrate apply`
+
+$ colay migrate apply
+error: migration apply is disabled in safe mode; run `colay compatibility` and resolve:
+Codex version is untested; writable work is disabled
+```
+
+또한 `colay run hello`는 홈 디렉터리에 별도 repository-local 상태를 전제로 하면서 plan
+대화에 진입하기 전에 committed Git repository를 요구했다. 경로마다 `.colay` DB가 생성되므로
+사용자가 작업 디렉터리를 바꿀 때마다 schema, daemon, lease, backup이 분리되고 migration이
+로컬 config 존재 여부에 영향을 받는다.
+
+### 영향
+
+- provider가 새 버전이라는 이유로 상태 유지보수까지 safe mode에 묶여 사용자가 순환에서
+  빠져나올 수 없다.
+- non-Git 위치에서 plan 대화를 시작할 수 없고 raw Git 준비 상태가 제품 진입 조건이 된다.
+- daemon과 CLI가 repository-local DB에 직접 접근해 `WSL-003`의 writer 경합이 구조적으로
+  남는다.
+- 동일 사용자의 task와 conversation을 다른 경로에서 일관되게 조회하거나 재개하기 어렵다.
+
+### 승인된 개선 방향
+
+- OS 사용자당 SQLite DB 하나를 두고 모든 workspace 상태를 `workspace_id`로 분리한다.
+- Windows와 WSL은 SQLite 파일을 공유하지 않고 각 환경의 사용자 전역 위치를 사용한다.
+- 정상 동작의 SQLite writer는 사용자당 daemon 하나로 제한하고 CLI/TUI는 IPC를 사용한다.
+- Git이 없는 디렉터리에서도 interview·validation·plan 대화를 허용하고, 정확한 최종 승인
+  뒤 writable task로 승격할 때만 committed Git repository를 요구한다.
+- schema 생성·backup·forward migration은 provider compatibility 검사 전에 실행하고 safe
+  mode가 이를 차단하지 못하게 한다.
+- 현재 workspace의 기존 `.colay` 상태만 자동으로 멱등 import하며 원본은 삭제하지 않는다.
+- 상세 결정은
+  `docs/superpowers/specs/2026-07-24-user-global-workspace-state-design.md`에서 추적한다.
+
+### 완료 조건
+
+- WSL과 Windows의 non-Git 홈에서 `colay run hello`와 `run --plan-only hello`가 task/worktree
+  없이 plan 대화를 시작한다.
+- schema 8 전역 DB와 untested provider 조합에서 daemon이 backup 후 schema 11 이상으로
+  migration하고 provider 진단 단계로 진행한다.
+- 여러 workspace와 동시 CLI stress test에서 `SQLITE_BUSY`가 발생하지 않는다.
+- 기존 repository-local 상태가 정확히 한 번 import되고 원본과 audit evidence가 보존된다.
+- active lease의 `resume`은 충돌 오류 대신 기존 실행에 연결된다.
+- fake provider만 사용한 Windows/WSL QA와 전체 Rust 품질 게이트가 통과한다.
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 
