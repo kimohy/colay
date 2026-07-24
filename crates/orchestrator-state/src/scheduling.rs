@@ -9,7 +9,7 @@ use orchestrator_domain::{
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult};
+use crate::{StateError, StateResult, WorkspaceDatabase};
 
 #[derive(Clone, Debug)]
 pub struct ClaimReadyTaskRequest {
@@ -45,7 +45,9 @@ struct CandidateRecord {
     envelope: TaskEnvelope,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn claim_next_ready_task(
         &self,
         request: &ClaimReadyTaskRequest,
@@ -113,7 +115,7 @@ impl Database {
             })?;
         let schedule_claim_id = ScheduleClaimId::new();
         transaction.execute(
-            "INSERT INTO task_schedule_claims(
+            "INSERT INTO main.task_schedule_claims(
                 schedule_claim_id, daemon_instance_id, session_id, revision_id, task_id,
                 provider_id, acquired_at, expires_at, released_at, release_reason
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
@@ -172,8 +174,9 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_daemon_owner(&transaction, daemon_instance_id, now)?;
         let changed = transaction.execute(
-            "UPDATE task_schedule_claims SET expires_at = ?1
-             WHERE schedule_claim_id = ?2 AND daemon_instance_id = ?3
+            "UPDATE main.task_schedule_claims SET expires_at = ?1
+             WHERE workspace_id = current_workspace() \
+               AND schedule_claim_id = ?2 AND daemon_instance_id = ?3
                AND released_at IS NULL AND expires_at > ?4",
             params![
                 expires_at.to_rfc3339(),
@@ -188,8 +191,9 @@ impl Database {
             });
         }
         transaction.execute(
-            "UPDATE resource_claims SET expires_at = ?1
-             WHERE schedule_claim_id = ?2 AND released_at IS NULL",
+            "UPDATE main.resource_claims SET expires_at = ?1
+             WHERE workspace_id = current_workspace() \
+               AND schedule_claim_id = ?2 AND released_at IS NULL",
             params![expires_at.to_rfc3339(), schedule_claim_id.to_string()],
         )?;
         transaction.commit()?;
@@ -212,8 +216,9 @@ impl Database {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
-            "UPDATE task_schedule_claims SET released_at = ?1, release_reason = ?2
-             WHERE schedule_claim_id = ?3 AND daemon_instance_id = ?4 AND released_at IS NULL",
+            "UPDATE main.task_schedule_claims SET released_at = ?1, release_reason = ?2
+             WHERE workspace_id = current_workspace() \
+               AND schedule_claim_id = ?3 AND daemon_instance_id = ?4 AND released_at IS NULL",
             params![
                 released_at.to_rfc3339(),
                 reason,
@@ -223,8 +228,9 @@ impl Database {
         )?;
         if changed == 1 {
             transaction.execute(
-                "UPDATE resource_claims SET released_at = ?1, release_reason = ?2
-                 WHERE schedule_claim_id = ?3 AND released_at IS NULL",
+                "UPDATE main.resource_claims SET released_at = ?1, release_reason = ?2
+                 WHERE workspace_id = current_workspace() \
+                   AND schedule_claim_id = ?3 AND released_at IS NULL",
                 params![
                     released_at.to_rfc3339(),
                     reason,
@@ -236,6 +242,12 @@ impl Database {
         Ok(changed == 1)
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 fn queued_schedule_candidate_exists(connection: &Connection) -> StateResult<bool> {
     connection
@@ -283,13 +295,13 @@ fn schedule_claim_expiry(now: DateTime<Utc>, ttl: TimeDelta) -> StateResult<Date
 fn expire_claims(transaction: &Transaction<'_>, now: DateTime<Utc>) -> StateResult<()> {
     let now = now.to_rfc3339();
     transaction.execute(
-        "UPDATE resource_claims SET released_at = ?1, release_reason = 'schedule claim expired'
-         WHERE released_at IS NULL AND expires_at <= ?1",
+        "UPDATE main.resource_claims SET released_at = ?1, release_reason = 'schedule claim expired'
+         WHERE workspace_id = current_workspace() AND released_at IS NULL AND expires_at <= ?1",
         [&now],
     )?;
     transaction.execute(
-        "UPDATE task_schedule_claims SET released_at = ?1, release_reason = 'schedule claim expired'
-         WHERE released_at IS NULL AND expires_at <= ?1",
+        "UPDATE main.task_schedule_claims SET released_at = ?1, release_reason = 'schedule claim expired'
+         WHERE workspace_id = current_workspace() AND released_at IS NULL AND expires_at <= ?1",
         [&now],
     )?;
     Ok(())
@@ -489,7 +501,7 @@ fn insert_resource_claims(
     };
     for path in paths {
         transaction.execute(
-            "INSERT INTO resource_claims(
+            "INSERT INTO main.resource_claims(
                 resource_claim_id, schedule_claim_id, session_id, revision_id, task_id,
                 path, repository_wide, acquired_at, expires_at, released_at, release_reason
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
@@ -544,8 +556,9 @@ mod tests {
     };
     use rusqlite::params;
 
-    use super::{ClaimReadyTaskRequest, Database};
+    use super::ClaimReadyTaskRequest;
     use crate::DaemonLeaseRequest;
+    use crate::Database;
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0)
@@ -614,7 +627,7 @@ mod tests {
         };
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO tasks(task_id, schema_version, state, objective,
+                "INSERT INTO main.tasks(task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
                  VALUES (?1, 'v1', 'queued', ?2, 'goal', ?3, ?4, ?4)",
                 params![
@@ -625,7 +638,7 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                "INSERT INTO main.session_tasks(session_id, revision_id, task_id, node_key,
                     display_order, provider_id, model_profile)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -642,7 +655,7 @@ mod tests {
             )?;
             for dependency in dependencies {
                 transaction.execute(
-                    "INSERT INTO task_dependencies(session_id, revision_id, task_id,
+                    "INSERT INTO main.task_dependencies(session_id, revision_id, task_id,
                         depends_on_task_id) VALUES (?1, ?2, ?3, ?4)",
                     params![
                         session.to_string(),
@@ -665,18 +678,18 @@ mod tests {
         let revision = orchestrator_domain::GraphRevisionId::new();
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO sessions(session_id, schema_version, title, state, created_at, updated_at)
+                "INSERT INTO main.sessions(session_id, schema_version, title, state, created_at, updated_at)
                  VALUES (?1, 'v1', 'test', 'running', ?2, ?2)",
                 params![session.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind,
+                "INSERT INTO main.conversation_messages(message_id, session_id, ordinal, role, kind,
                     state, content_redacted, created_at, finalized_at)
                  VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
                 params![message.to_string(), session.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+                "INSERT INTO main.graph_revisions(revision_id, session_id, goal_message_id, ordinal,
                     status, proposal_hash, validation_json, planner_provider, created_at, completed_at)
                  VALUES (?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
                 params![
@@ -688,7 +701,7 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+                "INSERT INTO main.session_graph_heads(session_id, revision_id, updated_at)
                  VALUES (?1, ?2, ?3)",
                 params![session.to_string(), revision.to_string(), now().to_rfc3339()],
             )?;
@@ -828,7 +841,8 @@ mod tests {
         )?;
         database.with_connection(|connection| {
             connection.execute(
-                "UPDATE tasks SET state = 'completed' WHERE task_id = ?1",
+                "UPDATE main.tasks SET state = 'completed' \
+                 WHERE workspace_id = current_workspace() AND task_id = ?1",
                 [dependency.to_string()],
             )?;
             Ok(())
@@ -839,7 +853,7 @@ mod tests {
 
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO verification_results(verification_id, task_id, outcome,
+                "INSERT INTO main.verification_results(verification_id, task_id, outcome,
                     schema_version, result_json, started_at, completed_at)
                  VALUES (?1, ?2, 'pass', 'v1', '{}', ?3, ?3)",
                 params![

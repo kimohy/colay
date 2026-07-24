@@ -12,8 +12,10 @@ use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(not(test))]
+use crate::Database;
 use crate::{
-    ArtifactStore, Database, StateError, StateResult, StoredArtifact,
+    ArtifactStore, StateError, StateResult, StoredArtifact, WorkspaceDatabase,
     database::append_event_in_transaction,
 };
 
@@ -226,7 +228,9 @@ pub struct RoutingAuditRecord {
     pub decided_at: DateTime<Utc>,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn create_task_envelope(&self, envelope: &TaskEnvelope) -> StateResult<()> {
         if !envelope.has_supported_schema() {
             return Err(StateError::InvalidRecord(format!(
@@ -274,7 +278,7 @@ impl Database {
         let state = serde_string(&task.state)?;
         let timestamp = task.created_at.to_rfc3339();
         self.lock()?.execute(
-            "INSERT INTO tasks( \
+            "INSERT INTO main.tasks( \
                 task_id, schema_version, revision, state, resume_state, paused, objective, \
                 original_request_redacted, task_envelope_json, created_at, updated_at, archived_at \
              ) VALUES (?1, ?2, 0, ?3, NULL, 0, ?4, ?5, ?6, ?7, ?7, NULL)",
@@ -320,7 +324,7 @@ impl Database {
         let transaction = connection.transaction()?;
         let timestamp = task.created_at.to_rfc3339();
         transaction.execute(
-            "INSERT INTO tasks( \
+            "INSERT INTO main.tasks( \
                 task_id, schema_version, revision, state, resume_state, paused, objective, \
                 original_request_redacted, task_envelope_json, created_at, updated_at, archived_at \
              ) VALUES (?1, ?2, 0, ?3, NULL, 0, ?4, ?5, ?6, ?7, ?7, NULL)",
@@ -408,8 +412,9 @@ impl Database {
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
-            "UPDATE tasks SET revision = ?1, state = ?2, resume_state = ?3, paused = ?4, \
-             updated_at = ?5 WHERE task_id = ?6 AND revision = ?7 AND state = ?8 \
+            "UPDATE main.tasks SET revision = ?1, state = ?2, resume_state = ?3, paused = ?4, \
+             updated_at = ?5 WHERE workspace_id = current_workspace() \
+             AND task_id = ?6 AND revision = ?7 AND state = ?8 \
              AND archived_at IS NULL",
             params![
                 next_revision,
@@ -469,9 +474,10 @@ impl Database {
             return Ok(false);
         }
         let changed = transaction.execute(
-            "UPDATE tasks SET revision = ?1, state = 'verifying', resume_state = NULL,
+            "UPDATE main.tasks SET revision = ?1, state = 'verifying', resume_state = NULL,
                 paused = 0, updated_at = ?2
-             WHERE task_id = ?3 AND revision = ?4 AND state = 'running'
+             WHERE workspace_id = current_workspace() \
+               AND task_id = ?3 AND revision = ?4 AND state = 'running'
                AND archived_at IS NULL",
             params![
                 next_revision,
@@ -584,19 +590,25 @@ impl Database {
         task_id: Option<TaskId>,
         snapshot: &UsageSnapshot,
     ) -> StateResult<Uuid> {
+        let task_id = task_id.ok_or_else(|| {
+            StateError::InvalidRecord(
+                "workspace usage snapshots must reference a task; record account usage on Database"
+                    .to_owned(),
+            )
+        })?;
         snapshot
             .validate()
             .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
         let snapshot_id = Uuid::now_v7();
         self.lock()?.execute(
-            "INSERT INTO provider_usage_snapshots( \
+            "INSERT INTO main.provider_usage_snapshots( \
                 snapshot_id, task_id, provider_id, quota_scope, quota_period, usage_unit, used, \
                 quota_limit, remaining, used_percent, remaining_percent, period_started_at, \
                 resets_at, source, confidence, snapshot_json, collected_at \
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 snapshot_id.to_string(),
-                task_id.map(|value| value.to_string()),
+                task_id.to_string(),
                 snapshot.provider.as_str(),
                 snapshot.quota_scope.name,
                 serde_string(&snapshot.quota_period)?,
@@ -658,7 +670,7 @@ impl Database {
             SUPPORTED_ROUTING_DECISION_SCHEMA_VERSIONS,
         )?;
         self.lock()?.execute(
-            "INSERT INTO routing_decisions( \
+            "INSERT INTO main.routing_decisions( \
                 decision_id, task_id, selected_provider, model_profile, effort, difficulty, \
                 risk_json, candidates_json, policy_json, downgraded, rationale_json, \
                 schema_version, decided_at \
@@ -731,7 +743,19 @@ impl Database {
         let transaction = connection.transaction()?;
         for snapshot_id in snapshot_ids {
             transaction.execute(
-                "INSERT INTO routing_decision_usage(decision_id, snapshot_id) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO main.provider_usage_snapshots( \
+                    workspace_id, snapshot_id, task_id, provider_id, quota_scope, quota_period, \
+                    usage_unit, used, quota_limit, remaining, used_percent, remaining_percent, \
+                    period_started_at, resets_at, source, confidence, snapshot_json, collected_at \
+                 ) SELECT current_workspace(), snapshot_id, NULL, provider_id, quota_scope, \
+                    quota_period, usage_unit, used, quota_limit, remaining, used_percent, \
+                    remaining_percent, period_started_at, resets_at, source, confidence, \
+                    snapshot_json, collected_at \
+                   FROM main.global_provider_usage_snapshots WHERE snapshot_id = ?1",
+                [snapshot_id.to_string()],
+            )?;
+            transaction.execute(
+                "INSERT INTO main.routing_decision_usage(decision_id, snapshot_id) VALUES (?1, ?2)",
                 params![decision_id, snapshot_id.to_string()],
             )?;
         }
@@ -808,7 +832,7 @@ impl Database {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, worker_mode,
+            "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, worker_mode,
                 started_at, ended_at, outcome, worker_result_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
             params![
@@ -838,8 +862,8 @@ impl Database {
             ));
         }
         let changed = self.lock()?.execute(
-            "UPDATE task_attempts SET ended_at = ?1, outcome = ?2, worker_result_json = ?3
-             WHERE attempt_id = ?4 AND ended_at IS NULL",
+            "UPDATE main.task_attempts SET ended_at = ?1, outcome = ?2, worker_result_json = ?3
+             WHERE workspace_id = current_workspace() AND attempt_id = ?4 AND ended_at IS NULL",
             params![
                 ended_at.to_rfc3339(),
                 outcome.trim(),
@@ -868,7 +892,7 @@ impl Database {
         }
         let worktree_id = Uuid::now_v7();
         self.lock()?.execute(
-            "INSERT INTO worktrees(worktree_id, task_id, repo_root, worktree_path, branch_name,
+            "INSERT INTO main.worktrees(worktree_id, task_id, repo_root, worktree_path, branch_name,
                 base_revision, state, created_at, cleanup_approved_at, archived_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, NULL, NULL)",
             params![
@@ -934,7 +958,7 @@ impl Database {
             outcome: None,
         };
         self.lock()?.execute(
-            "INSERT INTO task_controls(control_id, task_id, action, payload_json, requested_by, \
+            "INSERT INTO main.task_controls(control_id, task_id, action, payload_json, requested_by, \
              requested_at, claimed_at, completed_at, outcome) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
             params![
@@ -1021,8 +1045,9 @@ impl Database {
                 ControlRecoveryDisposition::StillClaimed
             } else if request.action.is_restart_replay_safe() {
                 let changed = transaction.execute(
-                    "UPDATE task_controls SET claimed_at = NULL \
-                     WHERE control_id = ?1 AND claimed_at = ?2 AND completed_at IS NULL",
+                    "UPDATE main.task_controls SET claimed_at = NULL \
+                     WHERE workspace_id = current_workspace() \
+                       AND control_id = ?1 AND claimed_at = ?2 AND completed_at IS NULL",
                     params![request.control_id.to_string(), claimed_at.to_rfc3339()],
                 )?;
                 if changed != 1 {
@@ -1045,8 +1070,9 @@ impl Database {
 
     pub fn claim_control(&self, control_id: Uuid, claimed_at: DateTime<Utc>) -> StateResult<bool> {
         let changed = self.lock()?.execute(
-            "UPDATE task_controls SET claimed_at = ?1 \
-             WHERE control_id = ?2 AND claimed_at IS NULL AND completed_at IS NULL",
+            "UPDATE main.task_controls SET claimed_at = ?1 \
+             WHERE workspace_id = current_workspace() \
+               AND control_id = ?2 AND claimed_at IS NULL AND completed_at IS NULL",
             params![claimed_at.to_rfc3339(), control_id.to_string()],
         )?;
         Ok(changed == 1)
@@ -1064,8 +1090,9 @@ impl Database {
             ));
         }
         let changed = self.lock()?.execute(
-            "UPDATE task_controls SET completed_at = ?1, outcome = ?2 \
-             WHERE control_id = ?3 AND claimed_at IS NOT NULL AND completed_at IS NULL",
+            "UPDATE main.task_controls SET completed_at = ?1, outcome = ?2 \
+             WHERE workspace_id = current_workspace() \
+               AND control_id = ?3 AND claimed_at IS NOT NULL AND completed_at IS NULL",
             params![completed_at.to_rfc3339(), outcome, control_id.to_string(),],
         )?;
         if changed != 1 {
@@ -1103,7 +1130,7 @@ impl Database {
             .map(|artifact| register_checkpoint_artifact(&transaction, checkpoint, artifact))
             .transpose()?;
         transaction.execute(
-            "INSERT INTO checkpoints(checkpoint_id, task_id, attempt_id, schema_version, \
+            "INSERT INTO main.checkpoints(checkpoint_id, task_id, attempt_id, schema_version, \
              checkpoint_json, integrity_hash, diff_artifact_id, git_head, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -1301,7 +1328,7 @@ impl Database {
             ));
         }
         self.lock()?.execute(
-            "INSERT INTO handovers(handover_id, task_id, checkpoint_id, schema_version, \
+            "INSERT INTO main.handovers(handover_id, task_id, checkpoint_id, schema_version, \
              from_provider, to_provider, reason, bundle_json, integrity_hash, \
              acknowledgement_json, started_at, completed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -1365,8 +1392,9 @@ impl Database {
             ));
         }
         let changed = transaction.execute(
-            "UPDATE handovers SET acknowledgement_json = ?1, completed_at = ?2 \
-             WHERE handover_id = ?3 AND acknowledgement_json IS NULL AND completed_at IS NULL",
+            "UPDATE main.handovers SET acknowledgement_json = ?1, completed_at = ?2 \
+             WHERE workspace_id = current_workspace() \
+               AND handover_id = ?3 AND acknowledgement_json IS NULL AND completed_at IS NULL",
             params![
                 serde_json::to_string(acknowledgement)?,
                 acknowledgement.acknowledged_at.to_rfc3339(),
@@ -1462,7 +1490,7 @@ impl Database {
 
     pub fn record_verification(&self, result: &VerificationResult) -> StateResult<()> {
         self.lock()?.execute(
-            "INSERT INTO verification_results(verification_id, task_id, attempt_id, \
+            "INSERT INTO main.verification_results(verification_id, task_id, attempt_id, \
              reviewer_provider, outcome, schema_version, result_json, started_at, completed_at) \
              VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?7)",
             params![
@@ -1489,6 +1517,91 @@ impl Database {
             .optional()?
             .map(|value| serde_json::from_str(&value).map_err(StateError::from))
             .transpose()
+    }
+}
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
+
+#[cfg(not(test))]
+impl Database {
+    pub fn record_usage_snapshot(
+        &self,
+        task_id: Option<TaskId>,
+        snapshot: &UsageSnapshot,
+    ) -> StateResult<Uuid> {
+        if task_id.is_some() {
+            return Err(StateError::InvalidRecord(
+                "task usage snapshots must be recorded through WorkspaceDatabase".to_owned(),
+            ));
+        }
+        snapshot
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        let snapshot_id = Uuid::now_v7();
+        self.raw_lock()?.execute(
+            "INSERT INTO global_provider_usage_snapshots( \
+                snapshot_id, provider_id, quota_scope, quota_period, usage_unit, used, \
+                quota_limit, remaining, used_percent, remaining_percent, period_started_at, \
+                resets_at, source, confidence, snapshot_json, collected_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                snapshot_id.to_string(),
+                snapshot.provider.as_str(),
+                snapshot.quota_scope.name,
+                serde_string(&snapshot.quota_period)?,
+                serde_json::to_string(&snapshot.quota_scope.unit)?,
+                snapshot.used,
+                snapshot.limit,
+                snapshot.remaining,
+                snapshot.used_percent,
+                snapshot.remaining_percent,
+                snapshot.period_started_at.map(|value| value.to_rfc3339()),
+                snapshot.resets_at.map(|value| value.to_rfc3339()),
+                serde_string(&snapshot.source)?,
+                serde_string(&snapshot.confidence)?,
+                serde_json::to_string(snapshot)?,
+                snapshot.collected_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(snapshot_id)
+    }
+
+    pub fn list_usage_snapshots(
+        &self,
+        provider: Option<ProviderId>,
+        limit: usize,
+    ) -> StateResult<Vec<UsageSnapshot>> {
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let connection = self.raw_lock()?;
+        let mut statement = connection.prepare(
+            "SELECT snapshot_json FROM global_provider_usage_snapshots \
+             WHERE (?1 IS NULL OR provider_id = ?1) ORDER BY collected_at DESC LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![provider.map(ProviderId::as_str), limit], |row| {
+                let json: String = row.get(0)?;
+                let snapshot: UsageSnapshot = serde_json::from_str(&json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                snapshot.validate().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(snapshot)
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
     }
 }
 
@@ -1592,9 +1705,9 @@ fn register_checkpoint_artifact(
         StateError::InvalidRecord("checkpoint diff exceeds SQLite length range".to_owned())
     })?;
     transaction.execute(
-        "INSERT INTO artifacts(artifact_id, task_id, kind, relative_path, sha256, byte_length, \
+        "INSERT INTO main.artifacts(artifact_id, task_id, kind, relative_path, sha256, byte_length, \
          media_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-         ON CONFLICT(relative_path) DO NOTHING",
+         ON CONFLICT(workspace_id, relative_path) DO NOTHING",
         params![
             artifact_id,
             checkpoint_task_id,
@@ -2021,7 +2134,7 @@ mod tests {
         };
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, \
+                "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, \
                  worker_mode, started_at, ended_at, outcome, worker_result_json) \
                  VALUES (?1, ?2, 1, 'codex', 'read_only', ?3, ?3, 'succeeded', ?4)",
                 params![
@@ -2045,21 +2158,23 @@ mod tests {
         future_worker_result.schema_version = SchemaVersion::new("999");
         database.with_connection(|connection| {
             connection.execute(
-                "UPDATE tasks SET schema_version = '999', task_envelope_json = ?1 \
-                 WHERE task_id = ?2",
+                "UPDATE main.tasks SET schema_version = '999', task_envelope_json = ?1 \
+                 WHERE workspace_id = current_workspace() AND task_id = ?2",
                 params![future_task.to_string(), task.task_id.to_string()],
             )?;
             connection.execute(
-                "UPDATE provider_usage_snapshots SET snapshot_json = ?1",
+                "UPDATE main.provider_usage_snapshots SET snapshot_json = ?1 \
+                 WHERE workspace_id = current_workspace()",
                 [serde_json::to_string(&future_usage)?],
             )?;
             connection.execute(
-                "UPDATE routing_decisions SET schema_version = '999' \
-                 WHERE decision_id = ?1",
+                "UPDATE main.routing_decisions SET schema_version = '999' \
+                 WHERE workspace_id = current_workspace() AND decision_id = ?1",
                 [&routing.decision_id],
             )?;
             connection.execute(
-                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                "UPDATE main.task_attempts SET worker_result_json = ?1 \
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?2",
                 params![
                     serde_json::to_string(&future_worker_result)?,
                     attempt_id.to_string(),
@@ -2161,7 +2276,7 @@ mod tests {
         let checkpoint_attempt_id = AttemptId::new();
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, \
+                "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, \
                  worker_mode, started_at) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3)",
                 params![
                     checkpoint_attempt_id.to_string(),
@@ -2386,7 +2501,7 @@ mod tests {
         let now = Utc::now();
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, \
+                "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, \
                  worker_mode, started_at, ended_at, outcome, worker_result_json) \
                  VALUES (?1, ?2, 1, 'gemini', 'read_only', ?3, ?3, 'succeeded', '{}')",
                 params![
@@ -2396,7 +2511,7 @@ mod tests {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, \
+                "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, \
                  worker_mode, started_at) VALUES (?1, ?2, 2, 'codex', 'workspace_write', ?3)",
                 params![
                     latest_attempt.to_string(),
@@ -2405,7 +2520,7 @@ mod tests {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO worktrees(worktree_id, task_id, repo_root, worktree_path, \
+                "INSERT INTO main.worktrees(worktree_id, task_id, repo_root, worktree_path, \
                  branch_name, base_revision, state, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, 'base-sha', 'active', ?6)",
                 params![
@@ -2522,7 +2637,7 @@ mod tests {
         let created_at = Utc::now();
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, \
+                "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, \
                  worker_mode, started_at) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3)",
                 params![
                     attempt_id.to_string(),

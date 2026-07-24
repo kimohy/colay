@@ -9,6 +9,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use chrono::Utc;
+use orchestrator_state::Database;
 use serde_json::Value;
 
 struct CliFixture {
@@ -86,6 +88,22 @@ impl CliFixture {
             ),
         )?;
         Ok(())
+    }
+
+    fn initialize_legacy_workspace(&self) -> Result<Output> {
+        let initialized = self.colay(["init"])?;
+        if initialized.status.success() {
+            let database = Database::open(self.repository.join(".colay/orchestrator.db"))?;
+            database.with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                     VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                    [Utc::now().to_rfc3339()],
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(initialized)
     }
 
     fn json(&self, args: &[&str]) -> Result<Value> {
@@ -207,7 +225,7 @@ fn daemon_start_status_stop_and_idempotent_start() -> Result<()> {
     assert_eq!(absent["data"]["status"]["state"], "stopped");
     assert!(!fixture.repository.join(".colay").exists());
 
-    let initialized = fixture.colay(["init"])?;
+    let initialized = fixture.initialize_legacy_workspace()?;
     assert!(
         initialized.status.success(),
         "stderr: {}",
@@ -262,6 +280,12 @@ fn daemon_help_hides_internal_serve_action() -> Result<()> {
 fn slow_fake_provider_probe_does_not_make_start_fail() -> Result<()> {
     let fixture = CliFixture::new()?;
     fixture.configure_slow_fake_codex(6_000)?;
+    let initialized = fixture.initialize_legacy_workspace()?;
+    assert!(
+        initialized.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
 
     let started = fixture.invoke_without_capture(&["daemon", "start"])?;
 

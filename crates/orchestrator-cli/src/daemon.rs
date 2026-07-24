@@ -390,6 +390,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     }
     database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
     startup_heartbeat.abort();
+    let _ = startup_heartbeat.await;
     let result = serve_with_full_orchestration_on_owned_lease(
         database,
         instance_id,
@@ -511,7 +512,8 @@ async fn stop(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
 pub(crate) fn initialize_database(paths: &RepositoryStatePaths) -> Result<Database> {
     let database = Database::open(&paths.database)?;
     database.migrate_with_backup(&paths.backups)?;
-    EventLog::open(&paths.events)?.reconcile(&database)?;
+    let workspace = database.legacy_workspace()?;
+    EventLog::open(&paths.events)?.reconcile_workspace(&workspace)?;
     Ok(database)
 }
 

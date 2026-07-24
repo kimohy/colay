@@ -44,7 +44,9 @@ pub use conversations::{
     ConversationAttemptStatus, NewConversationAttempt, StoredConversationAttempt,
 };
 pub use daemon_instances::{DaemonInstance, DaemonLeaseRequest, DaemonPhase, DaemonStatus};
-pub use database::{Database, DatabaseHealth, OutboxRecord};
+pub use database::{
+    Database, DatabaseHealth, OutboxRecord, WorkspaceDatabase, WorkspaceOutboxRecord,
+};
 pub use error::{StateError, StateResult};
 pub use event_log::{EventLog, ReconciliationReport};
 pub use global_paths::{

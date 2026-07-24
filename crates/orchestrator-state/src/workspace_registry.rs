@@ -40,6 +40,10 @@ pub struct WorkspaceRegistration {
 }
 
 impl WorkspaceId {
+    pub(crate) const fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
     #[must_use]
     pub fn as_uuid(self) -> Uuid {
         self.0
@@ -49,6 +53,14 @@ impl WorkspaceId {
 impl std::fmt::Display for WorkspaceId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for WorkspaceId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
     }
 }
 

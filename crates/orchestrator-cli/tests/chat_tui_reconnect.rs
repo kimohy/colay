@@ -155,6 +155,16 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
 
     let initialized = fixture.output(&["init"])?;
     assert!(initialized.status.success());
+    let initialized_database = fixture.database()?;
+    initialized_database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })?;
+    drop(initialized_database);
     assert!(
         fixture
             .status_without_capture(&["daemon", "start"])?
@@ -163,8 +173,9 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     fixture.wait_online()?;
 
     let database = fixture.database()?;
+    let workspace = database.legacy_workspace()?;
     let session_id = SessionId::new();
-    database.submit_client_command(&command(
+    workspace.submit_client_command(&command(
         ClientCommandAction::CreateSession,
         None,
         serde_json::to_value(CreateSessionCommandPayload {
@@ -174,11 +185,11 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         "reconnect-session".to_owned(),
     ))?;
     wait_for_projection("create session", || {
-        Ok(database.load_session(session_id)?.is_some())
+        Ok(workspace.load_session(session_id)?.is_some())
     })?;
 
     let message_id = MessageId::new();
-    database.submit_client_command(&command(
+    workspace.submit_client_command(&command(
         ClientCommandAction::AppendMessage,
         Some(session_id),
         serde_json::to_value(AppendMessageCommandPayload {
@@ -188,17 +199,18 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         format!("reconnect-message-{message_id}"),
     ))?;
     wait_for_projection("persist message", || {
-        Ok(database.load_message(message_id)?.is_some())
+        Ok(workspace.load_message(message_id)?.is_some())
     })?;
     drop(database);
 
     let reopened = fixture.database()?;
-    let sessions = reopened.list_sessions(&orchestrator_state::SessionListFilter {
+    let reopened_workspace = reopened.legacy_workspace()?;
+    let sessions = reopened_workspace.list_sessions(&orchestrator_state::SessionListFilter {
         include_archived: false,
         limit: 1,
     })?;
     assert_eq!(sessions[0].session_id, session_id);
-    let messages = reopened.messages_after(session_id, 0, 10)?;
+    let messages = reopened_workspace.messages_after(session_id, 0, 10)?;
     let stored_user_message = messages
         .iter()
         .find(|(_, message)| message.message_id == message_id)

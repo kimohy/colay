@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Database, StateError, StateResult, StoredSession, StoredTask, StoredTaskAttempt,
-    StoredTaskInstruction, StoredWorktree,
+    StateError, StateResult, StoredSession, StoredTask, StoredTaskAttempt, StoredTaskInstruction,
+    StoredWorktree, WorkspaceDatabase,
     graphs::graph_projection,
     records::{map_task, map_task_attempt, map_worktree, validate_stored_task},
     sessions::{map_message, map_session},
@@ -99,7 +99,9 @@ pub struct WorkspaceProjection {
     pub last_event_sequence: i64,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn load_workspace_selected_task(
         &self,
         session_id: SessionId,
@@ -132,9 +134,9 @@ impl Database {
     ) -> StateResult<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO session_workspace_state(session_id, selected_task_id, updated_at)
+                "INSERT INTO main.session_workspace_state(session_id, selected_task_id, updated_at)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(session_id) DO UPDATE SET selected_task_id = excluded.selected_task_id,
+                 ON CONFLICT(workspace_id, session_id) DO UPDATE SET selected_task_id = excluded.selected_task_id,
                  updated_at = excluded.updated_at",
                 params![
                     session_id.to_string(),
@@ -212,6 +214,12 @@ impl Database {
         })
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 fn bounded_limit(requested: usize, default: usize, maximum: usize) -> usize {
     if requested == 0 {
@@ -624,7 +632,7 @@ mod tests {
         database.with_transaction(|transaction| {
             for (id, title) in [(session, "primary"), (other_session, "other")] {
                 transaction.execute(
-                    "INSERT INTO sessions(session_id, schema_version, revision, title, state,
+                    "INSERT INTO main.sessions(session_id, schema_version, revision, title, state,
                      created_at, updated_at, archived_at) VALUES (?1, '1', 0, ?2, 'drafting',
                      ?3, ?3, NULL)",
                     params![id.to_string(), title, now.to_rfc3339()],
@@ -639,7 +647,7 @@ mod tests {
                 envelope.task_id = id;
                 let updated = (now + Duration::seconds(offset)).to_rfc3339();
                 transaction.execute(
-                    "INSERT INTO tasks(task_id, schema_version, revision, state, resume_state,
+                    "INSERT INTO main.tasks(task_id, schema_version, revision, state, resume_state,
                      paused, objective, original_request_redacted, task_envelope_json, created_at,
                      updated_at, archived_at) VALUES (?1, ?2, 0, ?3, NULL, 0, ?4, ?4, ?5, ?6,
                      ?7, NULL)",
@@ -657,7 +665,7 @@ mod tests {
             for ordinal in 1..=1_000_i64 {
                 let created = (now + Duration::seconds(ordinal)).to_rfc3339();
                 transaction.execute(
-                    "INSERT INTO conversation_messages(message_id, session_id, task_id, ordinal,
+                    "INSERT INTO main.conversation_messages(message_id, session_id, task_id, ordinal,
                      role, kind, state, content_redacted, created_at, finalized_at)
                      VALUES (?1, ?2, NULL, ?3, 'user', 'user_message', 'final', ?4, ?5, ?5)",
                     params![
@@ -670,19 +678,19 @@ mod tests {
                 )?;
             }
             transaction.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, task_id, ordinal,
+                "INSERT INTO main.conversation_messages(message_id, session_id, task_id, ordinal,
                  role, kind, state, content_redacted, created_at, finalized_at)
                  VALUES (?1, ?2, NULL, 1, 'user', 'user_message', 'final', 'private other', ?3, ?3)",
                 params![MessageId::new().to_string(), other_session.to_string(), now.to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO task_attempts(attempt_id, task_id, ordinal, provider_id, worker_mode,
+                "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, worker_mode,
                  started_at, ended_at, outcome, worker_result_json)
                  VALUES (?1, ?2, 1, 'claude', 'writable', ?3, NULL, NULL, NULL)",
                 params![AttemptId::new().to_string(), running.to_string(), now.to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO routing_decisions(decision_id, task_id, selected_provider,
+                "INSERT INTO main.routing_decisions(decision_id, task_id, selected_provider,
                  model_profile, effort, difficulty, risk_json, candidates_json, policy_json,
                  downgraded, rationale_json, schema_version, decided_at)
                  VALUES ('route-running', ?1, 'codex', 'principal', 'high', 'hard', '{}', '[]',
@@ -691,20 +699,20 @@ mod tests {
             )?;
             let worktree = Uuid::now_v7();
             transaction.execute(
-                "INSERT INTO worktrees(worktree_id, task_id, repo_root, worktree_path, branch_name,
+                "INSERT INTO main.worktrees(worktree_id, task_id, repo_root, worktree_path, branch_name,
                  base_revision, state, created_at, cleanup_approved_at, archived_at)
                  VALUES (?1, ?2, 'C:/repo', 'C:/repo/.worktrees/running', 'task/running', 'abc',
                  'active', ?3, NULL, NULL)",
                 params![worktree.to_string(), running.to_string(), now.to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO changed_files(task_id, worktree_id, relative_path, owner_lease_id,
+                "INSERT INTO main.changed_files(task_id, worktree_id, relative_path, owner_lease_id,
                  sha256, first_seen_at, last_seen_at) VALUES (?1, ?2, 'src/lib.rs', NULL, NULL,
                  ?3, ?3)",
                 params![running.to_string(), worktree.to_string(), now.to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO verification_results(verification_id, task_id, attempt_id,
+                "INSERT INTO main.verification_results(verification_id, task_id, attempt_id,
                  reviewer_provider, outcome, schema_version, result_json, started_at, completed_at)
                  VALUES (?1, ?2, NULL, 'gemini', 'passed', '1', '{}', ?3, ?3)",
                 params![Uuid::now_v7().to_string(), running.to_string(), now.to_rfc3339()],

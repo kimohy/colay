@@ -5,7 +5,7 @@ use orchestrator_domain::{
     EventActor, EventId, EventType, MessageKind, MessageRole, MessageState,
     RequestConversationTurnCommandPayload, SchemaVersion, SessionState, TaskEvent,
 };
-use orchestrator_state::{Database, NewSessionRecord, StateError};
+use orchestrator_state::{NewSessionRecord, StateError, WorkspaceDatabase};
 use sha2::{Digest as _, Sha256};
 
 use crate::DaemonError;
@@ -28,7 +28,7 @@ pub trait MessageRedactor: Send + Sync {
 /// client payloads are recorded as failed commands and returned as a successful
 /// failed processing outcome.
 pub fn process_next_client_command(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     redactor: &dyn MessageRedactor,
     now: DateTime<Utc>,
 ) -> Result<Option<CommandProcessingResult>, DaemonError> {
@@ -60,7 +60,7 @@ impl From<StateError> for CommandExecutionError {
 }
 
 fn execute_command(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     redactor: &dyn MessageRedactor,
     command: &ClientCommand,
 ) -> Result<String, CommandExecutionError> {
@@ -84,7 +84,7 @@ fn execute_command(
 }
 
 fn create_session(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     redactor: &dyn MessageRedactor,
     command: &ClientCommand,
 ) -> Result<String, CommandExecutionError> {
@@ -136,7 +136,7 @@ fn create_session(
 }
 
 fn append_message(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     redactor: &dyn MessageRedactor,
     command: &ClientCommand,
 ) -> Result<String, CommandExecutionError> {
@@ -304,6 +304,14 @@ mod tests {
     fn database() -> StateResult<Database> {
         let database = Database::open_in_memory()?;
         database.migrate_with_backup(std::path::Path::new("unused"))?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [timestamp().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         Ok(database)
     }
 
@@ -391,6 +399,7 @@ mod tests {
     fn create_session_and_append_message_commands_complete_with_redaction()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
+        let database = database.legacy_workspace()?;
         let session_id = SessionId::new();
         let create = create_command(session_id);
         database.submit_client_command(&create)?;
@@ -434,6 +443,7 @@ mod tests {
     fn malformed_payload_fails_command_without_persisting_projection()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
+        let database = database.legacy_workspace()?;
         let malformed = command(
             ClientCommandAction::CreateSession,
             None,
@@ -464,6 +474,7 @@ mod tests {
     fn replay_after_projection_crash_completes_without_duplicate_message()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
+        let database = database.legacy_workspace()?;
         let session_id = SessionId::new();
         database.submit_client_command(&create_command(session_id))?;
         process_next_client_command(&database, &SecretRedactor, timestamp())?;
@@ -501,6 +512,7 @@ mod tests {
     #[test]
     fn replay_with_mismatched_projection_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
+        let database = database.legacy_workspace()?;
         let session_id = SessionId::new();
         database.submit_client_command(&create_command(session_id))?;
         process_next_client_command(&database, &SecretRedactor, timestamp())?;

@@ -4,7 +4,9 @@ use chrono::Utc;
 use orchestrator_domain::{
     CorrelationId, EventActor, EventId, EventType, SchemaVersion, TaskEvent,
 };
-use orchestrator_state::{Database, MigrationManager, STATE_SCHEMA_VERSION, StateError};
+use orchestrator_state::{
+    Database, MigrationManager, STATE_SCHEMA_VERSION, StateError, WorkspaceId,
+};
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -46,7 +48,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(initial.current_version, 1);
     assert_eq!(
         initial.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
 
     let dry_run = database.dry_run_migrations()?;
@@ -112,7 +114,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(backup_status.current_version, 1);
     assert_eq!(
         backup_status.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
     Ok(())
 }
@@ -243,18 +245,22 @@ fn v5_to_current_dry_run_backup_and_command_rebuild_preserve_rows()
 
     database.with_connection(|connection| {
         let preserved: (String, String) = connection.query_row(
-            "SELECT action, outcome FROM client_commands WHERE idempotency_key = ?1",
+            "SELECT action, outcome FROM main.client_commands WHERE idempotency_key = ?1",
             ["preserved-v5-command"],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(preserved, ("stop_daemon".to_owned(), "stopped".to_owned()));
         connection.execute(
-            "INSERT INTO client_commands(
-                command_id, action, payload_json, idempotency_key, state,
+            "INSERT INTO main.client_commands(
+                workspace_id, command_id, action, payload_json, idempotency_key, state,
                 requested_by, requested_at
-             ) VALUES (?1, 'request_plan', '{}', 'new-v6-command', 'pending',
-                       'migration-test', ?2)",
-            params![uuid::Uuid::now_v7().to_string(), Utc::now().to_rfc3339()],
+             ) VALUES (?1, ?2, 'request_plan', '{}', 'new-v6-command', 'pending',
+                       'migration-test', ?3)",
+            params![
+                "00000000-0000-0000-0000-000000000001",
+                uuid::Uuid::now_v7().to_string(),
+                Utc::now().to_rfc3339()
+            ],
         )?;
         Ok(())
     })?;
@@ -273,9 +279,9 @@ fn v3_event_hash_remains_verifiable_after_current_migration()
     let database = Database::open(&database_path)?;
     let status = database.migration_status()?;
     assert_eq!(status.current_version, 3);
-    let historical = database.append_event(TaskEvent {
+    let mut historical = TaskEvent {
         schema_version: SchemaVersion::new(SchemaVersion::V3),
-        sequence: 0,
+        sequence: 1,
         event_id: EventId::new(),
         session_id: None,
         task_id: None,
@@ -290,12 +296,38 @@ fn v3_event_hash_remains_verifiable_after_current_migration()
         payload: json!({}),
         previous_hash: None,
         event_hash: String::new(),
+    };
+    historical.refresh_event_hash()?;
+    let event_type = serde_json::to_value(historical.event_type)?
+        .as_str()
+        .ok_or("event type is not a string")?
+        .to_owned();
+    database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO main.task_events( \
+                sequence, event_id, task_id, event_type, schema_version, occurred_at, event_json, \
+                previous_hash, event_hash, exported_at \
+             ) VALUES (1, ?1, NULL, ?2, ?3, ?4, ?5, NULL, ?6, NULL)",
+            params![
+                historical.event_id.to_string(),
+                event_type,
+                historical.schema_version.as_str(),
+                historical.occurred_at.to_rfc3339(),
+                serde_json::to_string(&historical)?,
+                historical.event_hash,
+            ],
+        )?;
+        Ok(())
     })?;
     assert!(historical.verify_hash()?);
 
     let migrated = database.migrate_with_backup(&root.join("backups-v4"))?;
     assert_eq!(migrated.current_version, STATE_SCHEMA_VERSION);
-    let reloaded = database.event_at(1)?.ok_or("historical event missing")?;
+    let reserved_workspace: WorkspaceId = "00000000-0000-0000-0000-000000000001".parse()?;
+    let reloaded = database
+        .workspace(reserved_workspace)
+        .event_at(1)?
+        .ok_or("historical event missing")?;
     assert_eq!(reloaded, historical);
     assert!(reloaded.verify_hash()?);
     Ok(())

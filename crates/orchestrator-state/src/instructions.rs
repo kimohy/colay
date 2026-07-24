@@ -5,7 +5,7 @@ use orchestrator_domain::{
 use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult};
+use crate::{StateError, StateResult, WorkspaceDatabase};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredTaskInstruction {
@@ -22,7 +22,9 @@ pub struct StoredTaskInstruction {
     pub outcome_redacted: Option<String>,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn list_task_instructions(
         &self,
         task_id: TaskId,
@@ -73,9 +75,10 @@ impl Database {
             return Ok(None);
         };
         let changed = transaction.execute(
-            "UPDATE task_instructions SET state = 'applying', claimed_at = ?1,
+            "UPDATE main.task_instructions SET state = 'applying', claimed_at = ?1,
                 completed_at = NULL, outcome_redacted = NULL
-             WHERE instruction_id = ?2 AND state IN ('queued', 'interrupted')",
+             WHERE workspace_id = current_workspace() \
+             AND instruction_id = ?2 AND state IN ('queued', 'interrupted')",
             params![claimed_at.to_rfc3339(), instruction_id],
         )?;
         if changed != 1 {
@@ -115,8 +118,8 @@ impl Database {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
-            "UPDATE task_instructions SET state = ?1, completed_at = ?2, outcome_redacted = ?3
-             WHERE instruction_id = ?4 AND state = 'applying'",
+            "UPDATE main.task_instructions SET state = ?1, completed_at = ?2, outcome_redacted = ?3
+             WHERE workspace_id = current_workspace() AND instruction_id = ?4 AND state = 'applying'",
             params![
                 enum_text(&state)?,
                 completed_at.to_rfc3339(),
@@ -152,14 +155,21 @@ impl Database {
         self.with_connection(|connection| {
             connection
                 .execute(
-                    "UPDATE task_instructions SET state = 'interrupted', completed_at = ?1,
-                        outcome_redacted = ?2 WHERE state = 'applying'",
+                    "UPDATE main.task_instructions SET state = 'interrupted', completed_at = ?1,
+                        outcome_redacted = ?2 WHERE workspace_id = current_workspace() \
+                        AND state = 'applying'",
                     params![interrupted_at.to_rfc3339(), outcome],
                 )
                 .map_err(StateError::from)
         })
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 pub(crate) fn queue_instruction_in_transaction(
     transaction: &Transaction<'_>,
@@ -202,7 +212,7 @@ pub(crate) fn queue_instruction_in_transaction(
     )?;
     let instruction_id = InstructionId::new();
     transaction.execute(
-        "INSERT INTO task_instructions(instruction_id, session_id, task_id, message_id,
+        "INSERT INTO main.task_instructions(instruction_id, session_id, task_id, message_id,
             ordinal, state, content_redacted, queued_at, claimed_at, completed_at,
             outcome_redacted)
          VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, NULL, NULL, NULL)",
@@ -365,18 +375,18 @@ mod tests {
         let task_id = TaskId::new();
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO sessions(session_id, schema_version, title, state, created_at, updated_at)
+                "INSERT INTO main.sessions(session_id, schema_version, title, state, created_at, updated_at)
                  VALUES (?1, 'v1', 'test', 'running', ?2, ?2)",
                 params![session_id.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind,
+                "INSERT INTO main.conversation_messages(message_id, session_id, ordinal, role, kind,
                     state, content_redacted, created_at, finalized_at)
                  VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
                 params![goal_message_id.to_string(), session_id.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+                "INSERT INTO main.graph_revisions(revision_id, session_id, goal_message_id, ordinal,
                     status, proposal_hash, validation_json, planner_provider, created_at, completed_at)
                  VALUES (?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
                 params![
@@ -388,18 +398,18 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+                "INSERT INTO main.session_graph_heads(session_id, revision_id, updated_at)
                  VALUES (?1, ?2, ?3)",
                 params![session_id.to_string(), revision_id.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO tasks(task_id, schema_version, state, objective,
+                "INSERT INTO main.tasks(task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
                  VALUES (?1, 'v1', 'queued', 'task', 'goal', '{}', ?2, ?2)",
                 params![task_id.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                "INSERT INTO main.session_tasks(session_id, revision_id, task_id, node_key,
                     display_order, provider_id, model_profile)
                  VALUES (?1, ?2, ?3, 'task', 1, 'codex', 'standard')",
                 params![session_id.to_string(), revision_id.to_string(), task_id.to_string()],
@@ -504,7 +514,8 @@ mod tests {
         let (session_id, task_id) = seed_target(&database)?;
         database.with_connection(|connection| {
             connection.execute(
-                "UPDATE tasks SET state = 'completed' WHERE task_id = ?1",
+                "UPDATE main.tasks SET state = 'completed' \
+                 WHERE workspace_id = current_workspace() AND task_id = ?1",
                 [task_id.to_string()],
             )?;
             Ok(())

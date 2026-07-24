@@ -23,6 +23,7 @@ use orchestrator_engine::{
 };
 use orchestrator_state::{
     ConversationAttemptStatus, Database, GraphRevisionStatus, NewConversationAttempt,
+    WorkspaceDatabase,
 };
 use rusqlite::params;
 use tokio_util::sync::CancellationToken;
@@ -130,16 +131,24 @@ impl TaskPlanner for FakePlanner {
 fn database() -> Result<Database, Box<dyn std::error::Error>> {
     let database = Database::open_in_memory()?;
     database.migrate_with_backup(std::path::Path::new("unused"))?;
+    database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })?;
     Ok(database)
 }
 
-fn seed_session(database: &Database) -> Result<SessionId, Box<dyn std::error::Error>> {
+fn seed_session(database: &WorkspaceDatabase<'_>) -> Result<SessionId, Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     let now = Utc::now().to_rfc3339();
     database.with_connection(|connection| {
         connection.execute(
-            "INSERT INTO sessions(session_id, schema_version, revision, title, state, created_at, updated_at)
-             VALUES (?1, '1', 0, 'conversation', 'drafting', ?2, ?2)",
+            "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state, created_at, updated_at)
+             VALUES (current_workspace(), ?1, '1', 0, 'conversation', 'drafting', ?2, ?2)",
             params![session_id.to_string(), now],
         )?;
         Ok(())
@@ -192,7 +201,9 @@ fn services(repository_root: std::path::PathBuf, outcome: ConversationOutcome) -
     services_with_conversation(repository_root, Arc::new(FakeConversation { outcome }))
 }
 
-fn assert_zero_writable_rows(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+fn assert_zero_writable_rows(
+    database: &WorkspaceDatabase<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     database.with_connection(|connection| {
         for table in [
             "tasks",
@@ -244,6 +255,7 @@ fn git_repository() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
 async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "Why is Git needed?"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?
@@ -272,6 +284,7 @@ async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
 async fn interview_records_partial_requirements_without_starting_a_plan()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "please improve the flow"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
@@ -315,6 +328,7 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
 async fn provider_failure_is_redacted_and_preserves_the_session()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "hello"))?;
     process_next_client_command(&database, &SecretRedactor, Utc::now())?;
@@ -351,6 +365,7 @@ async fn provider_failure_is_redacted_and_preserves_the_session()
 async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_approval()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
@@ -390,6 +405,7 @@ async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_appro
 async fn validated_candidate_materializes_once_only_after_exact_approval()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
@@ -486,6 +502,7 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
 async fn new_user_message_atomically_supersedes_approval_candidate()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
@@ -537,14 +554,15 @@ async fn new_user_message_atomically_supersedes_approval_candidate()
 async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = Arc::new(database()?);
-    let session_id = seed_session(&database)?;
-    database.submit_client_command(&append_command(session_id, "hello"))?;
-    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
-    let claimed = database
+    let workspace = database.legacy_workspace()?;
+    let session_id = seed_session(&workspace)?;
+    workspace.submit_client_command(&append_command(session_id, "hello"))?;
+    process_next_client_command(&workspace, &IdentityRedactor, Utc::now())?;
+    let claimed = workspace
         .claim_next_orchestration_client_command(Utc::now())?
         .ok_or("missing conversation command")?;
     let attempt_id = ConversationAttemptId::from_uuid(claimed.command_id.into_uuid());
-    database.begin_conversation_attempt(&NewConversationAttempt {
+    workspace.begin_conversation_attempt(&NewConversationAttempt {
         attempt_id,
         session_id,
         source_message_id: claimed
@@ -580,18 +598,18 @@ async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
     .await?;
 
     assert_eq!(
-        database
+        workspace
             .load_conversation_attempt(attempt_id)?
             .map(|attempt| attempt.status),
         Some(ConversationAttemptStatus::Failed)
     );
     assert_eq!(
-        database
+        workspace
             .load_client_command(claimed.command_id)?
             .map(|command| command.state),
         Some(ClientCommandState::Failed)
     );
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&workspace)?;
     Ok(())
 }
 
@@ -599,6 +617,7 @@ async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
 async fn repository_head_drift_rejects_approval_without_materializing_tasks()
 -> Result<(), Box<dyn std::error::Error>> {
     let database = database()?;
+    let database = database.legacy_workspace()?;
     let session_id = seed_session(&database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;

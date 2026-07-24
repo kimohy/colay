@@ -30,7 +30,7 @@ use orchestrator_process::RedactionConfig;
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{
     Database, GraphApprovalRequest, NewGraphAttempt, NewSessionRecord, RepositoryStatePaths,
-    RootConfig, TaskListFilter,
+    RootConfig, TaskListFilter, WorkspaceDatabase,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -128,7 +128,7 @@ fn event(
 }
 
 fn seed_approved_graph(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
 ) -> Result<(SessionId, Vec<orchestrator_domain::TaskId>), Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     database.create_session_with_event(
@@ -203,7 +203,7 @@ fn seed_approved_graph(
 }
 
 fn queue_instruction(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     session_id: SessionId,
     task_id: orchestrator_domain::TaskId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -260,7 +260,9 @@ impl MessageRedactor for IdentityRedactor {
     }
 }
 
-async fn wait_for_completion(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+async fn wait_for_completion(
+    database: &WorkspaceDatabase<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..400 {
         let tasks = database.list_tasks(&TaskListFilter {
             state: None,
@@ -312,8 +314,17 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     fs::create_dir_all(&paths.root)?;
     let database = Arc::new(Database::open(&paths.database)?);
     database.migrate_with_backup(&paths.backups)?;
-    let (session_id, task_ids) = seed_approved_graph(&database)?;
-    queue_instruction(&database, session_id, task_ids[0])?;
+    database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })?;
+    let workspace = database.legacy_workspace()?;
+    let (session_id, task_ids) = seed_approved_graph(&workspace)?;
+    queue_instruction(&workspace, session_id, task_ids[0])?;
 
     let runtime: Arc<dyn AdapterRuntime> =
         Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
@@ -360,7 +371,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         .await
     });
     for _ in 0..100 {
-        if database
+        if workspace
             .load_task(task_ids[0])?
             .is_some_and(|task| task.state == TaskState::Running)
         {
@@ -369,26 +380,26 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    queue_instruction(&database, session_id, task_ids[0])?;
-    wait_for_completion(&database).await?;
+    queue_instruction(&workspace, session_id, task_ids[0])?;
+    wait_for_completion(&workspace).await?;
     cancellation.cancel();
     service.await??;
 
     for (index, task_id) in task_ids.iter().enumerate() {
-        assert!(database.latest_sealed_checkpoint(*task_id)?.is_some());
-        assert!(database.active_worktree(*task_id)?.is_some());
+        assert!(workspace.latest_sealed_checkpoint(*task_id)?.is_some());
+        assert!(workspace.active_worktree(*task_id)?.is_some());
         assert_eq!(
-            database.list_task_attempts(*task_id)?.len(),
+            workspace.list_task_attempts(*task_id)?.len(),
             if index == 0 { 2 } else { 1 }
         );
     }
     assert!(
-        database
+        workspace
             .list_task_instructions(task_ids[0])?
             .iter()
             .all(|instruction| instruction.state == TaskInstructionState::Applied)
     );
-    database.with_connection(|connection| {
+    workspace.with_connection(|connection| {
         let claims: i64 =
             connection.query_row("SELECT count(*) FROM task_schedule_claims", [], |row| {
                 row.get(0)
@@ -434,7 +445,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     restart.await??;
     for (index, task_id) in task_ids.into_iter().enumerate() {
         assert_eq!(
-            database.list_task_attempts(task_id)?.len(),
+            workspace.list_task_attempts(task_id)?.len(),
             if index == 0 { 2 } else { 1 }
         );
     }

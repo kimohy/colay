@@ -6,7 +6,7 @@ use orchestrator_domain::{
 };
 use rusqlite::{Connection, OptionalExtension as _, Row, Transaction, TransactionBehavior, params};
 
-use crate::{Database, StateError, StateResult};
+use crate::{StateError, StateResult, WorkspaceDatabase};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientCommandRecoveryDisposition {
@@ -15,7 +15,9 @@ pub enum ClientCommandRecoveryDisposition {
     ManualReconciliationRequired,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn load_client_command(
         &self,
         command_id: ClientCommandId,
@@ -73,7 +75,7 @@ impl Database {
         }
 
         transaction.execute(
-            "INSERT INTO client_commands(
+            "INSERT INTO main.client_commands(
                 command_id, session_id, task_id, action, payload_json, idempotency_key, state,
                 requested_by, requested_at, claimed_at, completed_at, outcome
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, NULL, NULL, NULL)",
@@ -142,8 +144,8 @@ impl Database {
             return Ok(None);
         };
         let changed = transaction.execute(
-            "UPDATE client_commands SET state = 'claimed', claimed_at = ?1
-             WHERE command_id = ?2 AND state = 'pending'",
+            "UPDATE main.client_commands SET state = 'claimed', claimed_at = ?1
+             WHERE workspace_id = current_workspace() AND command_id = ?2 AND state = 'pending'",
             params![claimed_at.to_rfc3339(), command.command_id.to_string()],
         )?;
         if changed != 1 {
@@ -183,8 +185,8 @@ impl Database {
             return Ok(None);
         };
         let changed = transaction.execute(
-            "UPDATE client_commands SET state = 'claimed', claimed_at = ?1
-             WHERE command_id = ?2 AND state = 'pending'",
+            "UPDATE main.client_commands SET state = 'claimed', claimed_at = ?1
+             WHERE workspace_id = current_workspace() AND command_id = ?2 AND state = 'pending'",
             params![claimed_at.to_rfc3339(), command.command_id.to_string()],
         )?;
         if changed != 1 {
@@ -263,8 +265,9 @@ impl Database {
                     | ClientCommandAction::RequestIntegration
             ) {
                 let changed = transaction.execute(
-                    "UPDATE client_commands SET state = 'pending', claimed_at = NULL
-                     WHERE command_id = ?1 AND state = 'claimed' AND claimed_at = ?2",
+                    "UPDATE main.client_commands SET state = 'pending', claimed_at = NULL
+                     WHERE workspace_id = current_workspace() \
+                       AND command_id = ?1 AND state = 'claimed' AND claimed_at = ?2",
                     params![command.command_id.to_string(), claimed_at.to_rfc3339()],
                 )?;
                 if changed != 1 {
@@ -295,8 +298,8 @@ impl Database {
             ));
         }
         let changed = self.lock()?.execute(
-            "UPDATE client_commands SET state = ?1, completed_at = ?2, outcome = ?3
-             WHERE command_id = ?4 AND state = 'claimed'",
+            "UPDATE main.client_commands SET state = ?1, completed_at = ?2, outcome = ?3
+             WHERE workspace_id = current_workspace() AND command_id = ?4 AND state = 'claimed'",
             params![
                 state_name(state),
                 completed_at.to_rfc3339(),
@@ -312,6 +315,12 @@ impl Database {
         Ok(())
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 #[derive(Clone, Copy)]
 enum ClientCommandQueue {
@@ -591,6 +600,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || -> StateResult<_> {
                     let database = Database::open(path)?;
+                    database.migrate_with_backup(std::path::Path::new("unused"))?;
                     barrier.wait();
                     database.claim_next_client_command(timestamp())
                 })

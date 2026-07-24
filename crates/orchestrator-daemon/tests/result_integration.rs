@@ -135,6 +135,15 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     fs::create_dir_all(&state_root)?;
     let database = Database::open(state_root.join("orchestrator.db"))?;
     database.migrate_with_backup(&state_root.join("backups"))?;
+    database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    })?;
+    let database = database.legacy_workspace()?;
     let session_id = SessionId::new();
     let message_id = MessageId::new();
     let revision_id = GraphRevisionId::new();
@@ -142,15 +151,15 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     let now = Utc::now();
     database.with_connection(|connection| {
         connection.execute(
-            "INSERT INTO sessions(session_id, schema_version, revision, title, state,
+            "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state,
                 created_at, updated_at, archived_at)
-             VALUES (?1, ?2, 0, 'integration e2e', 'running', ?3, ?3, NULL)",
+             VALUES (current_workspace(), ?1, ?2, 0, 'integration e2e', 'running', ?3, ?3, NULL)",
             params![session_id.to_string(), SchemaVersion::V1, now.to_rfc3339()],
         )?;
         connection.execute(
-            "INSERT INTO conversation_messages(message_id, session_id, task_id, ordinal, role,
+            "INSERT INTO main.conversation_messages(workspace_id, message_id, session_id, task_id, ordinal, role,
                 kind, state, content_redacted, created_at, finalized_at)
-             VALUES (?1, ?2, NULL, 1, 'user', 'user_message', 'final', 'integrate', ?3, ?3)",
+             VALUES (current_workspace(), ?1, ?2, NULL, 1, 'user', 'user_message', 'final', 'integrate', ?3, ?3)",
             params![
                 message_id.to_string(),
                 session_id.to_string(),
@@ -158,10 +167,10 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
             ],
         )?;
         connection.execute(
-            "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+            "INSERT INTO main.graph_revisions(workspace_id, revision_id, session_id, goal_message_id, ordinal,
                 status, proposal_hash, proposal_json, validation_json, planner_provider,
                 created_at, completed_at)
-             VALUES (?1, ?2, ?3, 1, 'approved', NULL, NULL, '{}', 'codex', ?4, ?4)",
+             VALUES (current_workspace(), ?1, ?2, ?3, 1, 'approved', NULL, NULL, '{}', 'codex', ?4, ?4)",
             params![
                 revision_id.to_string(),
                 session_id.to_string(),
@@ -170,8 +179,8 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
             ],
         )?;
         connection.execute(
-            "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO main.session_graph_heads(workspace_id, session_id, revision_id, updated_at)
+             VALUES (current_workspace(), ?1, ?2, ?3)",
             params![
                 session_id.to_string(),
                 revision_id.to_string(),
@@ -182,10 +191,10 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
             let mut envelope = TaskEnvelope::new(format!("source {index}"), "integrate", now);
             envelope.task_id = *task_id;
             connection.execute(
-                "INSERT INTO tasks(task_id, schema_version, revision, state, resume_state, paused,
+                "INSERT INTO main.tasks(workspace_id, task_id, schema_version, revision, state, resume_state, paused,
                     objective, original_request_redacted, task_envelope_json, created_at,
                     updated_at, archived_at)
-                 VALUES (?1, ?2, 0, 'completed', NULL, 0, ?3, 'integrate', ?4, ?5, ?5, NULL)",
+                 VALUES (current_workspace(), ?1, ?2, 0, 'completed', NULL, 0, ?3, 'integrate', ?4, ?5, ?5, NULL)",
                 params![
                     task_id.to_string(),
                     SchemaVersion::V1,
@@ -195,9 +204,9 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
                 ],
             )?;
             connection.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                "INSERT INTO main.session_tasks(workspace_id, session_id, revision_id, task_id, node_key,
                     display_order, provider_id, model_profile)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
+                 VALUES (current_workspace(), ?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
                 params![
                     session_id.to_string(),
                     revision_id.to_string(),

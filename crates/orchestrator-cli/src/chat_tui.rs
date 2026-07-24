@@ -17,7 +17,8 @@ use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{
     ControlAction as StateControlAction, DaemonStatus, Database, IntegrationBatchStatus,
     RepositoryStatePaths, RootConfig, SessionListFilter, StoredIntegrationBatch,
-    WorkspaceAttentionKind, WorkspaceProjection, WorkspaceReadRequest,
+    WorkspaceAttentionKind, WorkspaceDatabase, WorkspaceId, WorkspaceProjection,
+    WorkspaceReadRequest,
 };
 use orchestrator_tui::chat::{
     ActionFeedback, AttentionItem, AttentionSeverity, ComposerTarget, DaemonConnectivity,
@@ -36,6 +37,7 @@ pub(crate) struct SqliteWorkspaceDriver {
     repository: PathBuf,
     state_root: PathBuf,
     database: Database,
+    workspace_id: WorkspaceId,
     session_id: SessionId,
     selected_task_id: Option<TaskId>,
     redactor: Redactor,
@@ -51,23 +53,26 @@ impl SqliteWorkspaceDriver {
         crate::daemon::ensure_started(repository, config, explicit_config).await?;
         let paths = RepositoryStatePaths::from_config(repository, config)?;
         let database = crate::daemon::open_ready_database(&paths)?;
+        let workspace_id = database.legacy_workspace()?.workspace_id();
+        let workspace = database.workspace(workspace_id);
         let redactor = Redactor::new(&RedactionConfig {
             literals: Vec::new(),
             patterns: config.orchestrator.redaction.patterns.clone(),
         })?;
-        let session_id = ensure_default_session(&database, &redactor).await?;
+        let session_id = ensure_default_session(&workspace, &redactor).await?;
         let selected_task_id = match selected_task {
             Some(task_id) => {
                 let task_id = TaskId::from_str(task_id)?;
-                database.save_workspace_selected_task(session_id, Some(task_id), Utc::now())?;
+                workspace.save_workspace_selected_task(session_id, Some(task_id), Utc::now())?;
                 Some(task_id)
             }
-            None => database.load_workspace_selected_task(session_id)?,
+            None => workspace.load_workspace_selected_task(session_id)?,
         };
         Ok(Self {
             repository: repository.to_path_buf(),
             state_root: paths.root,
             database,
+            workspace_id,
             session_id,
             selected_task_id,
             redactor,
@@ -81,15 +86,17 @@ impl SqliteWorkspaceDriver {
         session_id: SessionId,
         selected_task_id: Option<TaskId>,
         redactor: Redactor,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let workspace_id = database.legacy_workspace()?.workspace_id();
+        Ok(Self {
             state_root: repository.join(".colay"),
             repository,
             database,
+            workspace_id,
             session_id,
             selected_task_id,
             redactor,
-        }
+        })
     }
 
     fn online(&self) -> Result<bool, DriverError> {
@@ -97,6 +104,10 @@ impl SqliteWorkspaceDriver {
             .daemon_status(Utc::now())
             .map(|status| matches!(status, DaemonStatus::Online(_)))
             .map_err(driver_error)
+    }
+
+    fn workspace(&self) -> WorkspaceDatabase<'_> {
+        self.database.workspace(self.workspace_id)
     }
 
     fn submit_message(
@@ -117,7 +128,7 @@ impl SqliteWorkspaceDriver {
             ),
             ComposerTarget::AllRunning => {
                 let task_ids: Vec<TaskId> = self
-                    .database
+                    .workspace()
                     .with_connection(|connection| {
                         let mut statement = connection.prepare(
                             "SELECT st.task_id FROM session_tasks st
@@ -186,7 +197,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
+        self.workspace()
             .submit_client_command(&command)
             .map_err(driver_error)?;
         Ok(())
@@ -222,7 +233,7 @@ impl SqliteWorkspaceDriver {
                 return Ok(ActionFeedback::unavailable("chat provider selection"));
             }
         };
-        self.database
+        self.workspace()
             .request_control(task_id, action, payload, "local-tui", Utc::now())
             .map_err(driver_error)?;
         Ok(ActionFeedback::info("task control accepted"))
@@ -252,7 +263,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
+        self.workspace()
             .submit_client_command(&command)
             .map_err(driver_error)?;
         Ok(ActionFeedback::info("task graph planning requested"))
@@ -272,7 +283,7 @@ impl SqliteWorkspaceDriver {
         let revision_id = GraphRevisionId::from_str(revision_id)
             .map_err(|error| DriverError::new(format!("invalid graph revision ID: {error}")))?;
         let revision = self
-            .database
+            .workspace()
             .load_graph_revision(revision_id)
             .map_err(driver_error)?
             .ok_or_else(|| DriverError::new("graph revision no longer exists"))?;
@@ -315,7 +326,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
+        self.workspace()
             .submit_client_command(&command)
             .map_err(driver_error)?;
         Ok(ActionFeedback::info("exact task graph approval accepted"))
@@ -414,7 +425,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
+        self.workspace()
             .submit_client_command(&command)
             .map(|_| ())
             .map_err(driver_error)
@@ -424,7 +435,7 @@ impl SqliteWorkspaceDriver {
 impl WorkspaceDriver for SqliteWorkspaceDriver {
     fn refresh(&mut self, _cursor: &WorkspaceCursor) -> Result<WorkspaceSnapshot, DriverError> {
         let projection = self
-            .database
+            .workspace()
             .read_workspace_projection(WorkspaceReadRequest {
                 session_id: self.session_id,
                 selected_task_id: self.selected_task_id,
@@ -441,7 +452,7 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             projection_to_snapshot(&self.repository, projection, &daemon).map_err(driver_error)?;
         if let Some(plan) = snapshot.plan_approval.as_mut() {
             let requirement = self
-                .database
+                .workspace()
                 .current_requirement_revision(self.session_id)
                 .map_err(driver_error)?;
             if let Some(requirement) = requirement.filter(|requirement| {
@@ -484,7 +495,7 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             }
         }
         snapshot.integration_approval = self
-            .database
+            .workspace()
             .current_integration_batch(self.session_id)
             .map_err(driver_error)?
             .as_ref()
@@ -528,7 +539,7 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             .map(TaskId::from_str)
             .transpose()
             .map_err(driver_error)?;
-        self.database
+        self.workspace()
             .save_workspace_selected_task(self.session_id, task_id, Utc::now())
             .map_err(driver_error)?;
         self.selected_task_id = task_id;
@@ -536,7 +547,10 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
     }
 }
 
-async fn ensure_default_session(database: &Database, redactor: &Redactor) -> Result<SessionId> {
+async fn ensure_default_session(
+    database: &WorkspaceDatabase<'_>,
+    redactor: &Redactor,
+) -> Result<SessionId> {
     if let Some(session) = database
         .list_sessions(&SessionListFilter {
             include_archived: false,
@@ -1066,7 +1080,7 @@ mod tests {
     use orchestrator_process::{RedactionConfig, Redactor};
     use orchestrator_state::{
         DaemonLeaseRequest, Database, GraphApprovalRequest, IntegrationBatchStatus,
-        NewGraphAttempt, StoredIntegrationBatch, WorkspaceReadRequest,
+        NewGraphAttempt, StoredIntegrationBatch, WorkspaceDatabase, WorkspaceReadRequest,
     };
     use orchestrator_tui::chat::{
         ComposerTarget, DaemonConnectivity, WorkspaceAction, WorkspaceCursor, WorkspaceDriver,
@@ -1085,10 +1099,21 @@ mod tests {
     fn database() -> anyhow::Result<Database> {
         let database = Database::open_in_memory()?;
         database.migrate_with_backup(std::path::Path::new("unused"))?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         Ok(database)
     }
 
-    fn create_session(database: &Database, redactor: &Adapter) -> anyhow::Result<SessionId> {
+    fn create_session(
+        database: &WorkspaceDatabase<'_>,
+        redactor: &Adapter,
+    ) -> anyhow::Result<SessionId> {
         let session_id = SessionId::new();
         let command = ClientCommand {
             command_id: ClientCommandId::new(),
@@ -1115,9 +1140,10 @@ mod tests {
     #[test]
     fn chat_tui_driver_redacts_persists_and_becomes_read_only_offline() -> anyhow::Result<()> {
         let database = database()?;
+        let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
-        let session_id = create_session(&database, &adapter)?;
+        let session_id = create_session(&workspace, &adapter)?;
         let instance = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: instance,
@@ -1131,14 +1157,14 @@ mod tests {
             session_id,
             None,
             redactor,
-        );
+        )?;
         let initial = driver.refresh(&WorkspaceCursor::default())?;
         assert_eq!(initial.daemon, DaemonConnectivity::Online);
         driver.dispatch(WorkspaceAction::SubmitMessage {
             target: ComposerTarget::Orchestrator,
             content: "api_key=secret-value".to_owned(),
         })?;
-        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        process_next_client_command(&driver.workspace(), &adapter, chrono::Utc::now())?;
         let refreshed = driver.refresh(&WorkspaceCursor::default())?;
         assert_eq!(refreshed.messages.len(), 1);
         assert!(!refreshed.messages[0].content.contains("secret-value"));
@@ -1164,9 +1190,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn chat_tui_projects_full_plan_card_and_dependency_labels() -> anyhow::Result<()> {
         let database = database()?;
+        let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
-        let session_id = create_session(&database, &adapter)?;
+        let session_id = create_session(&workspace, &adapter)?;
         let instance = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: instance,
@@ -1180,14 +1207,14 @@ mod tests {
             session_id,
             None,
             redactor,
-        );
+        )?;
         driver.dispatch(WorkspaceAction::SubmitMessage {
             target: ComposerTarget::Orchestrator,
             content: "build graph".to_owned(),
         })?;
-        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        process_next_client_command(&driver.workspace(), &adapter, chrono::Utc::now())?;
         let goal_id = driver
-            .database
+            .workspace()
             .read_workspace_projection(WorkspaceReadRequest {
                 session_id,
                 selected_task_id: None,
@@ -1238,7 +1265,7 @@ mod tests {
             },
         )?;
         driver
-            .database
+            .workspace()
             .record_graph_attempt(&NewGraphAttempt::from_validated(
                 PlanningAttemptId::new(),
                 graph.clone(),
@@ -1264,7 +1291,7 @@ mod tests {
         proposed.validate()?;
 
         driver
-            .database
+            .workspace()
             .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
@@ -1290,7 +1317,7 @@ mod tests {
             target: ComposerTarget::Task(target.clone()),
             content: "also update the focused tests".to_owned(),
         })?;
-        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        process_next_client_command(&driver.workspace(), &adapter, chrono::Utc::now())?;
         driver.selection_changed(Some(&target))?;
         let instructed = driver.refresh(&WorkspaceCursor::default())?;
         assert!(
@@ -1311,9 +1338,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn chat_tui_submits_typed_plan_and_exact_approval_commands() -> anyhow::Result<()> {
         let database = database()?;
+        let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
-        let session_id = create_session(&database, &adapter)?;
+        let session_id = create_session(&workspace, &adapter)?;
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: DaemonInstanceId::new(),
             pid: 42,
@@ -1326,14 +1354,14 @@ mod tests {
             session_id,
             None,
             redactor,
-        );
+        )?;
         let goal_message_id = orchestrator_domain::MessageId::new();
-        driver.database.with_connection(|connection| {
+        driver.workspace().with_connection(|connection| {
             connection.execute(
-                "INSERT INTO conversation_messages(
-                    message_id, session_id, ordinal, role, kind, state,
+                "INSERT INTO main.conversation_messages(
+                    workspace_id, message_id, session_id, ordinal, role, kind, state,
                     content_redacted, created_at, finalized_at
-                 ) VALUES (?1, ?2, 1, 'user', 'user_message', 'final', ?3, ?4, ?4)",
+                 ) VALUES (current_workspace(), ?1, ?2, 1, 'user', 'user_message', 'final', ?3, ?4, ?4)",
                 rusqlite::params![
                     goal_message_id.to_string(),
                     session_id.to_string(),
@@ -1363,7 +1391,9 @@ mod tests {
             },
             chrono::Utc::now(),
         )?;
-        driver.database.record_requirement_revision(&requirement)?;
+        driver
+            .workspace()
+            .record_requirement_revision(&requirement)?;
         let authority = GraphValidationAuthority {
             requirement_revision_id: requirement.requirement_revision_id,
             validation_hash: "b".repeat(64),
@@ -1403,7 +1433,7 @@ mod tests {
             authority.clone(),
         )?;
         driver
-            .database
+            .workspace()
             .record_graph_attempt(&NewGraphAttempt::from_validated(
                 PlanningAttemptId::new(),
                 graph.clone(),
@@ -1432,7 +1462,7 @@ mod tests {
             batch_id: batch_id.to_string(),
         })?;
 
-        driver.database.with_connection(|connection| {
+        driver.workspace().with_connection(|connection| {
             let mut statement = connection.prepare(
                 "SELECT action, payload_json, requested_by FROM client_commands
                  WHERE action IN ('request_plan', 'approve_graph', 'request_integration',

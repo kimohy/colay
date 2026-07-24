@@ -9,9 +9,37 @@ use orchestrator_domain::TaskEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Database, StateError, StateResult, ensure_private_directory, ensure_private_file,
-    reject_symlink_components,
+    OutboxRecord, StateError, StateResult, WorkspaceDatabase, ensure_private_directory,
+    ensure_private_file, reject_symlink_components,
 };
+
+trait AuditStore {
+    fn event_at(&self, sequence: i64) -> StateResult<Option<TaskEvent>>;
+    fn outbox_after(&self, sequence: i64, limit: usize) -> StateResult<Vec<OutboxRecord>>;
+    fn mark_exported(&self, sequence: i64, event_hash: &str) -> StateResult<()>;
+}
+
+impl AuditStore for WorkspaceDatabase<'_> {
+    fn event_at(&self, sequence: i64) -> StateResult<Option<TaskEvent>> {
+        self.event_at(sequence)
+    }
+
+    fn outbox_after(&self, sequence: i64, limit: usize) -> StateResult<Vec<OutboxRecord>> {
+        WorkspaceDatabase::outbox_after(self, sequence, limit).map(|records| {
+            records
+                .into_iter()
+                .map(|record| OutboxRecord {
+                    sequence: record.sequence,
+                    event: record.event,
+                })
+                .collect()
+        })
+    }
+
+    fn mark_exported(&self, sequence: i64, event_hash: &str) -> StateResult<()> {
+        self.mark_exported(sequence, event_hash)
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconciliationReport {
@@ -53,9 +81,15 @@ impl EventLog {
         &self.path
     }
 
-    /// Reconciles the append-only JSONL replica against `SQLite`, which is the source of
-    /// truth. It never truncates or rewrites an invalid log.
-    pub fn reconcile(&self, database: &Database) -> StateResult<ReconciliationReport> {
+    /// Reconciles one workspace's independent outbox and hash chain.
+    pub fn reconcile_workspace(
+        &self,
+        database: &WorkspaceDatabase<'_>,
+    ) -> StateResult<ReconciliationReport> {
+        self.reconcile_store(database)
+    }
+
+    fn reconcile_store(&self, database: &impl AuditStore) -> StateResult<ReconciliationReport> {
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -74,7 +108,7 @@ impl EventLog {
     #[allow(clippy::too_many_lines)]
     fn reconcile_locked(
         &self,
-        database: &Database,
+        database: &impl AuditStore,
         file: &mut fs::File,
     ) -> StateResult<ReconciliationReport> {
         file.seek(SeekFrom::Start(0))
@@ -201,7 +235,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::{Database, EventLog};
+    use crate::{Database, EventLog, WorkspaceKind};
 
     #[test]
     fn reconciles_missing_outbox_events_idempotently() {
@@ -212,6 +246,11 @@ mod tests {
         database
             .migrate_with_backup(directory.path())
             .unwrap_or_else(|error| panic!("migration: {error}"));
+        let workspace_id = database
+            .resolve_workspace(directory.path(), WorkspaceKind::Directory)
+            .unwrap_or_else(|error| panic!("workspace: {error}"))
+            .workspace_id;
+        let database = database.workspace(workspace_id);
         let event = TaskEvent {
             schema_version: SchemaVersion::state_current(),
             sequence: 0,
@@ -236,11 +275,11 @@ mod tests {
         let log = EventLog::open(directory.path().join("events.jsonl"))
             .unwrap_or_else(|error| panic!("log: {error}"));
         let first = log
-            .reconcile(&database)
+            .reconcile_workspace(&database)
             .unwrap_or_else(|error| panic!("first reconcile: {error}"));
         assert_eq!(first.appended_events, 1);
         let second = log
-            .reconcile(&database)
+            .reconcile_workspace(&database)
             .unwrap_or_else(|error| panic!("second reconcile: {error}"));
         assert_eq!(second.appended_events, 0);
         assert_eq!(second.verified_events, 1);

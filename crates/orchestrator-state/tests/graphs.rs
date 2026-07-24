@@ -9,6 +9,7 @@ use orchestrator_domain::{
 };
 use orchestrator_state::{
     ApprovedGraph, Database, GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt,
+    WorkspaceDatabase, WorkspaceId, WorkspaceKind,
 };
 use rusqlite::params;
 
@@ -18,24 +19,26 @@ fn timestamp(second: u32) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-fn database() -> Result<Database, Box<dyn std::error::Error>> {
+fn database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
     let database = Database::open_in_memory()?;
     database.migrate_with_backup(std::path::Path::new("unused"))?;
-    Ok(database)
+    let registration =
+        database.resolve_workspace(&std::env::current_dir()?, WorkspaceKind::Directory)?;
+    Ok((database, registration.workspace_id))
 }
 
 fn seed_session(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     session_id: SessionId,
     goal_id: MessageId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     database.with_connection(|connection| {
         connection.execute(
-            "INSERT INTO sessions(session_id, schema_version, revision, title, state, created_at, updated_at) VALUES (?1, '1', 0, 'graph test', 'awaiting_approval', ?2, ?2)",
+            "INSERT INTO main.sessions(session_id, schema_version, revision, title, state, created_at, updated_at) VALUES (?1, '1', 0, 'graph test', 'awaiting_approval', ?2, ?2)",
             params![session_id.to_string(), timestamp(0).to_rfc3339()],
         )?;
         connection.execute(
-            "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind, state, content_redacted, created_at, finalized_at) VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'build the graph', ?3, ?3)",
+            "INSERT INTO main.conversation_messages(message_id, session_id, ordinal, role, kind, state, content_redacted, created_at, finalized_at) VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'build the graph', ?3, ?3)",
             params![goal_id.to_string(), session_id.to_string(), timestamp(0).to_rfc3339()],
         )?;
         Ok(())
@@ -88,7 +91,7 @@ fn validated_graph(
 }
 
 fn record_valid(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     graph: &orchestrator_domain::ValidatedTaskGraph,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let attempt = NewGraphAttempt::from_validated(
@@ -105,7 +108,8 @@ fn record_valid(
 #[test]
 fn valid_and_invalid_attempts_are_immutable_session_scoped_and_create_no_tasks()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
+    let (database, workspace_id) = database()?;
+    let database = database.workspace(workspace_id);
     let session_id = SessionId::new();
     let goal_id = MessageId::new();
     seed_session(&database, session_id, goal_id)?;
@@ -130,7 +134,7 @@ fn valid_and_invalid_attempts_are_immutable_session_scoped_and_create_no_tasks()
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
         assert_eq!(task_count, 0);
         let mutation = connection.execute(
-            "UPDATE graph_revisions SET proposal_json = '{}' WHERE revision_id = ?1",
+            "UPDATE main.graph_revisions SET proposal_json = '{}' WHERE revision_id = ?1",
             [graph.proposal.revision_id.to_string()],
         );
         assert!(mutation.is_err());
@@ -161,7 +165,8 @@ fn valid_and_invalid_attempts_are_immutable_session_scoped_and_create_no_tasks()
 #[test]
 fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_closed()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
+    let (database, workspace_id) = database()?;
+    let database = database.workspace(workspace_id);
     let session_id = SessionId::new();
     let goal_id = MessageId::new();
     seed_session(&database, session_id, goal_id)?;
@@ -258,7 +263,8 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
 #[test]
 fn newer_session_message_invalidates_pending_graph_approval()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
+    let (database, workspace_id) = database()?;
+    let database = database.workspace(workspace_id);
     let session_id = SessionId::new();
     let goal_id = MessageId::new();
     seed_session(&database, session_id, goal_id)?;
@@ -268,7 +274,7 @@ fn newer_session_message_invalidates_pending_graph_approval()
     let newer_id = MessageId::new();
     database.with_connection(|connection| {
         connection.execute(
-            "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind, state, content_redacted, created_at, finalized_at) VALUES (?1, ?2, 2, 'user', 'user_message', 'final', 'changed requirements', ?3, ?3)",
+            "INSERT INTO main.conversation_messages(message_id, session_id, ordinal, role, kind, state, content_redacted, created_at, finalized_at) VALUES (?1, ?2, 2, 'user', 'user_message', 'final', 'changed requirements', ?3, ?3)",
             params![newer_id.to_string(), session_id.to_string(), timestamp(3).to_rfc3339()],
         )?;
         Ok(())
@@ -298,7 +304,8 @@ fn newer_session_message_invalidates_pending_graph_approval()
 #[test]
 fn agy_planner_and_worker_provider_round_trip_through_graph_materialization()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
+    let (database, workspace_id) = database()?;
+    let database = database.workspace(workspace_id);
     let session_id = SessionId::new();
     let goal_id = MessageId::new();
     seed_session(&database, session_id, goal_id)?;
@@ -338,7 +345,8 @@ fn agy_planner_and_worker_provider_round_trip_through_graph_materialization()
 
 #[test]
 fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
+    let (database, workspace_id) = database()?;
+    let database = database.workspace(workspace_id);
     let session_id = SessionId::new();
     let goal_id = MessageId::new();
     seed_session(&database, session_id, goal_id)?;
@@ -346,14 +354,9 @@ fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::
     record_valid(&database, &graph)?;
     database.with_connection(|connection| {
         connection.execute_batch(
-            "CREATE TRIGGER fail_dependency BEFORE INSERT ON task_dependencies
+            "CREATE TEMP TRIGGER fail_dependency BEFORE INSERT ON main.task_dependencies
              BEGIN
-                 INSERT INTO task_dependencies(
-                     session_id, revision_id, task_id, depends_on_task_id
-                 ) VALUES (
-                     NEW.session_id, NEW.revision_id, NEW.task_id,
-                     '00000000-0000-0000-0000-000000000000'
-                 );
+                 SELECT RAISE(FAIL, 'dependency insert failed');
              END;",
         )?;
         Ok(())

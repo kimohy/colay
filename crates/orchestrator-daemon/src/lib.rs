@@ -95,12 +95,13 @@ pub async fn serve_with_commands(
         started_at,
         ttl: settings.lease_ttl,
     })?;
-    database.reconcile_interrupted_conversation_attempts(
+    let workspace = database.legacy_workspace()?;
+    workspace.reconcile_interrupted_conversation_attempts(
         started_at,
         "conversation attempt was interrupted before daemon startup",
     )?;
-    database.recover_stale_client_commands(started_at)?;
-    database.reconcile_interrupted_integrations(started_at)?;
+    workspace.recover_stale_client_commands(started_at)?;
+    workspace.reconcile_interrupted_integrations(started_at)?;
     serve_with_commands_on_owned_lease(database, instance_id, cancellation, settings, redactor)
         .await
 }
@@ -113,6 +114,7 @@ async fn serve_with_commands_on_owned_lease(
     redactor: &dyn MessageRedactor,
 ) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
+    let workspace = database.legacy_workspace()?;
     database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -128,7 +130,7 @@ async fn serve_with_commands_on_owned_lease(
                 database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
             }
             _ = command_interval.tick() => {
-                process_next_client_command(database, redactor, Utc::now())?;
+                process_next_client_command(&workspace, redactor, Utc::now())?;
             }
         }
     };
@@ -234,12 +236,13 @@ async fn serve_with_runtime(
     } else {
         database.heartbeat_daemon(instance_id, started_at, settings.lease_ttl)?;
     }
-    database.reconcile_interrupted_conversation_attempts(
+    let workspace = database.legacy_workspace()?;
+    workspace.reconcile_interrupted_conversation_attempts(
         started_at,
         "conversation attempt was interrupted before daemon startup",
     )?;
-    database.recover_stale_client_commands(started_at)?;
-    database.reconcile_interrupted_integrations(started_at)?;
+    workspace.recover_stale_client_commands(started_at)?;
+    workspace.reconcile_interrupted_integrations(started_at)?;
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut command_interval = tokio::time::interval(settings.command_poll_interval);
@@ -257,7 +260,7 @@ async fn serve_with_runtime(
                 database.heartbeat_daemon(instance_id, Utc::now(), settings.lease_ttl)?;
             }
             _ = command_interval.tick() => {
-                process_next_client_command(&database, redactor.as_ref(), Utc::now())?;
+                process_next_client_command(&workspace, redactor.as_ref(), Utc::now())?;
                 execution::reap_finished_tasks(&mut execution_jobs).await?;
                 if active_planning
                     .as_ref()
@@ -275,8 +278,9 @@ async fn serve_with_runtime(
                     let job_redactor = Arc::clone(&redactor);
                     let job_services = planning.clone();
                     active_planning = Some(tokio::spawn(async move {
+                        let workspace = job_database.legacy_workspace()?;
                         process_next_orchestration_command(
-                            &job_database,
+                            &workspace,
                             &job_services,
                             job_redactor.as_ref(),
                             Utc::now(),
@@ -301,7 +305,7 @@ async fn serve_with_runtime(
         job.abort();
         let _ = job.await;
     }
-    database.reconcile_interrupted_conversation_attempts(
+    workspace.reconcile_interrupted_conversation_attempts(
         Utc::now(),
         "conversation attempt was interrupted by daemon shutdown",
     )?;
@@ -359,6 +363,14 @@ mod tests {
     fn database() -> StateResult<Arc<Database>> {
         let database = Database::open_in_memory()?;
         database.migrate_with_backup(std::path::Path::new("unused"))?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         Ok(Arc::new(database))
     }
 
@@ -516,6 +528,7 @@ mod tests {
     #[tokio::test]
     async fn service_loop_processes_pending_session_commands() -> Result<(), DaemonError> {
         let database = database()?;
+        let workspace = database.legacy_workspace()?;
         let session_id = SessionId::new();
         let command = ClientCommand {
             command_id: ClientCommandId::new(),
@@ -534,7 +547,7 @@ mod tests {
             completed_at: None,
             outcome: None,
         };
-        database.submit_client_command(&command)?;
+        workspace.submit_client_command(&command)?;
         let cancellation = CancellationToken::new();
         let service_database = Arc::clone(&database);
         let service_cancellation = cancellation.clone();
@@ -550,14 +563,14 @@ mod tests {
             .await
         });
         for _ in 0..100 {
-            if database.load_session(session_id)?.is_some() {
+            if workspace.load_session(session_id)?.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert!(database.load_session(session_id)?.is_some());
+        assert!(workspace.load_session(session_id)?.is_some());
         assert_eq!(
-            database
+            workspace
                 .load_client_command(command.command_id)?
                 .map(|value| value.state),
             Some(ClientCommandState::Completed)

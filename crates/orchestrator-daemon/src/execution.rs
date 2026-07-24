@@ -10,6 +10,7 @@ use orchestrator_engine::{
 };
 use orchestrator_state::{
     ClaimReadyTaskRequest, ClaimedTask, Database, NewTaskAttemptRecord, NewWorktreeRecord,
+    WorkspaceDatabase,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +53,7 @@ pub(crate) fn spawn_ready_tasks(
     cancellation: &CancellationToken,
     jobs: &mut Vec<tokio::task::JoinHandle<Result<(), DaemonError>>>,
 ) -> Result<(), DaemonError> {
+    let workspace = database.legacy_workspace()?;
     while jobs.len() < services.global_limit {
         let request = ClaimReadyTaskRequest {
             daemon_instance_id: instance_id,
@@ -60,7 +62,7 @@ pub(crate) fn spawn_ready_tasks(
             now: Utc::now(),
             ttl: services.claim_ttl,
         };
-        let Some(claim) = database.claim_next_ready_task(&request)? else {
+        let Some(claim) = workspace.claim_next_ready_task(&request)? else {
             break;
         };
         let job_database = Arc::clone(database);
@@ -120,8 +122,9 @@ async fn run_claimed_task(
     redactor: Arc<dyn MessageRedactor>,
     cancellation: CancellationToken,
 ) -> Result<(), DaemonError> {
+    let workspace = database.legacy_workspace()?;
     let result = run_claimed_task_inner(
-        &database,
+        &workspace,
         instance_id,
         &claim,
         &services,
@@ -134,13 +137,13 @@ async fn run_claimed_task(
     } else {
         "task execution failed"
     };
-    database.release_schedule_claim(claim.schedule_claim_id, instance_id, Utc::now(), reason)?;
+    workspace.release_schedule_claim(claim.schedule_claim_id, instance_id, Utc::now(), reason)?;
     result
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_claimed_task_inner(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     instance_id: DaemonInstanceId,
     claim: &ClaimedTask,
     services: &ExecutionServices,
@@ -275,7 +278,7 @@ async fn run_claimed_task_inner(
 }
 
 fn persist_report(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     claim: &ClaimedTask,
     report: &TaskExecutionReport,
     repository_root: &std::path::Path,
@@ -339,7 +342,7 @@ fn persist_report(
 }
 
 fn finish_instructions(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     instructions: &[orchestrator_state::StoredTaskInstruction],
     applied: bool,
 ) -> Result<(), DaemonError> {
@@ -363,7 +366,7 @@ fn finish_instructions(
 }
 
 fn transition(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     claim: &ClaimedTask,
     expected: TaskState,
     next: TaskState,
@@ -461,7 +464,7 @@ mod tests {
     use orchestrator_engine::{
         EngineResult, TaskExecutionReport, TaskExecutionRequest, TaskExecutor,
     };
-    use orchestrator_state::{DaemonLeaseRequest, Database};
+    use orchestrator_state::{DaemonLeaseRequest, Database, WorkspaceDatabase};
     use rusqlite::params;
     use tokio_util::sync::CancellationToken;
 
@@ -519,7 +522,7 @@ mod tests {
     }
 
     fn seed_graph(
-        database: &Database,
+        database: &WorkspaceDatabase<'_>,
     ) -> Result<(SessionId, GraphRevisionId), Box<dyn std::error::Error>> {
         let session = SessionId::new();
         let message = MessageId::new();
@@ -527,20 +530,20 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO sessions(session_id, schema_version, title, state, created_at, updated_at)
-                 VALUES (?1, 'v1', 'parallel', 'running', ?2, ?2)",
+                "INSERT INTO main.sessions(workspace_id, session_id, schema_version, title, state, created_at, updated_at)
+                 VALUES (current_workspace(), ?1, 'v1', 'parallel', 'running', ?2, ?2)",
                 params![session.to_string(), now],
             )?;
             transaction.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind,
+                "INSERT INTO main.conversation_messages(workspace_id, message_id, session_id, ordinal, role, kind,
                     state, content_redacted, created_at, finalized_at)
-                 VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
+                 VALUES (current_workspace(), ?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
                 params![message.to_string(), session.to_string(), now],
             )?;
             transaction.execute(
-                "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+                "INSERT INTO main.graph_revisions(workspace_id, revision_id, session_id, goal_message_id, ordinal,
                     status, proposal_hash, validation_json, planner_provider, created_at, completed_at)
-                 VALUES (?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
+                 VALUES (current_workspace(), ?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
                 params![
                     revision.to_string(),
                     session.to_string(),
@@ -550,8 +553,8 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO main.session_graph_heads(workspace_id, session_id, revision_id, updated_at)
+                 VALUES (current_workspace(), ?1, ?2, ?3)",
                 params![session.to_string(), revision.to_string(), now],
             )?;
             Ok(())
@@ -560,7 +563,7 @@ mod tests {
     }
 
     fn seed_task(
-        database: &Database,
+        database: &WorkspaceDatabase<'_>,
         session: SessionId,
         revision: GraphRevisionId,
         order: i64,
@@ -581,9 +584,9 @@ mod tests {
         };
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO tasks(task_id, schema_version, state, objective,
+                "INSERT INTO main.tasks(workspace_id, task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
-                 VALUES (?1, ?2, 'queued', ?3, 'goal', ?4, ?5, ?5)",
+                 VALUES (current_workspace(), ?1, ?2, 'queued', ?3, 'goal', ?4, ?5, ?5)",
                 params![
                     task_id.to_string(),
                     SchemaVersion::V1,
@@ -593,9 +596,9 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                "INSERT INTO main.session_tasks(workspace_id, session_id, revision_id, task_id, node_key,
                     display_order, provider_id, model_profile)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
+                 VALUES (current_workspace(), ?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
                 params![
                     session.to_string(),
                     revision.to_string(),
@@ -616,6 +619,15 @@ mod tests {
         let root = std::fs::canonicalize(directory.path())?;
         let database = Arc::new(Database::open(root.join("state.db"))?);
         database.migrate_with_backup(&root.join("backups"))?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
+        let workspace = database.legacy_workspace()?;
         let daemon = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: daemon,
@@ -623,9 +635,9 @@ mod tests {
             started_at: Utc::now(),
             ttl: TimeDelta::minutes(2),
         })?;
-        let (session, revision) = seed_graph(&database)?;
-        let first = seed_task(&database, session, revision, 1)?;
-        let second = seed_task(&database, session, revision, 2)?;
+        let (session, revision) = seed_graph(&workspace)?;
+        let first = seed_task(&workspace, session, revision, 1)?;
+        let second = seed_task(&workspace, session, revision, 2)?;
         let executor = Arc::new(FakeExecutor {
             active: AtomicUsize::new(0),
             maximum: AtomicUsize::new(0),
@@ -660,14 +672,14 @@ mod tests {
         assert!(jobs.is_empty());
         assert_eq!(executor.maximum.load(Ordering::SeqCst), 2);
         assert_eq!(
-            database.load_task(first)?.map(|task| task.state),
+            workspace.load_task(first)?.map(|task| task.state),
             Some(TaskState::Failed)
         );
         assert_eq!(
-            database.load_task(second)?.map(|task| task.state),
+            workspace.load_task(second)?.map(|task| task.state),
             Some(TaskState::Failed)
         );
-        database.with_connection(|connection| {
+        workspace.with_connection(|connection| {
             let active: i64 = connection.query_row(
                 "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
                 [],

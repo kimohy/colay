@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context as _, Result, bail};
+use chrono::Utc;
 use orchestrator_domain::{
     Checkpoint, EventType, HandoverAcknowledgement, HandoverBundle, ProviderId, TaskEvent, TaskId,
 };
@@ -120,6 +121,12 @@ fn initialize_repository(repository: &Path) -> Result<PathBuf> {
             OsString::from("--repository"),
             OsString::from("."),
         ],
+    )?;
+    let database = Connection::open(repository.join(".colay/orchestrator.db"))?;
+    database.execute(
+        "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+         VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+        [Utc::now().to_rfc3339()],
     )?;
     install_fake_provider_config(&config)?;
     Ok(config)

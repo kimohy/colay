@@ -9,7 +9,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     ConversationOrchestrator, ConversationRequest, collect_conversation_response,
 };
-use orchestrator_state::{Database, NewConversationAttempt, StateError};
+use orchestrator_state::{NewConversationAttempt, StateError, WorkspaceDatabase};
 
 use crate::MessageRedactor;
 
@@ -22,7 +22,7 @@ pub(crate) enum ConversationCommandError {
 }
 
 pub(crate) async fn request_conversation_turn(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     orchestrator: &dyn ConversationOrchestrator,
     provider: orchestrator_domain::ProviderId,
     redactor: &dyn MessageRedactor,
@@ -113,7 +113,7 @@ pub(crate) async fn request_conversation_turn(
 }
 
 fn reconcile_outcome(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     source_message_id: MessageId,
@@ -169,7 +169,7 @@ fn reconcile_outcome(
 }
 
 fn append_response(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     content: &str,

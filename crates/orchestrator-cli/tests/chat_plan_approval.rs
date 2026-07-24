@@ -15,7 +15,9 @@ use orchestrator_domain::{
     ClientCommandId, ClientCommandState, CreateSessionCommandPayload, GraphValidationSummary,
     MessageId, SessionId, TaskState,
 };
-use orchestrator_state::{Database, GraphRevisionStatus, RootConfig, TaskListFilter};
+use orchestrator_state::{
+    Database, GraphRevisionStatus, RootConfig, TaskListFilter, WorkspaceDatabase,
+};
 
 fn git(repository: &std::path::Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git")
@@ -111,6 +113,15 @@ impl Fixture {
                 String::from_utf8_lossy(&initialized.stderr)
             );
         }
+        let database = self.database()?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         let mut config = RootConfig::default();
         config.features.codex_app_server_adapter = false;
         config.orchestrator.max_parallel_workers = 2;
@@ -196,7 +207,10 @@ fn pending_command(
     }
 }
 
-fn wait_command(database: &Database, command_id: ClientCommandId) -> Result<ClientCommand> {
+fn wait_command(
+    database: &WorkspaceDatabase<'_>,
+    command_id: ClientCommandId,
+) -> Result<ClientCommand> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(command) = database.load_client_command(command_id)?
@@ -208,13 +222,20 @@ fn wait_command(database: &Database, command_id: ClientCommandId) -> Result<Clie
             return Ok(command);
         }
         if Instant::now() >= deadline {
-            bail!("client command {command_id} did not finish");
+            let command = database.load_client_command(command_id)?;
+            let daemon = database.global_database().daemon_status(Utc::now())?;
+            bail!(
+                "client command {command_id} did not finish: {command:?}; daemon status: {daemon:?}"
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn wait_for_approval_candidate(database: &Database, session_id: SessionId) -> Result<()> {
+fn wait_for_approval_candidate(
+    database: &WorkspaceDatabase<'_>,
+    session_id: SessionId,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if database
@@ -230,7 +251,7 @@ fn wait_for_approval_candidate(database: &Database, session_id: SessionId) -> Re
     }
 }
 
-fn wait_for_task_completion(database: &Database) -> Result<()> {
+fn wait_for_task_completion(database: &WorkspaceDatabase<'_>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let tasks = database.list_tasks(&TaskListFilter {
@@ -251,12 +272,15 @@ fn wait_for_task_completion(database: &Database) -> Result<()> {
     }
 }
 
-fn submit_and_wait(database: &Database, command: &ClientCommand) -> Result<ClientCommand> {
+fn submit_and_wait(
+    database: &WorkspaceDatabase<'_>,
+    command: &ClientCommand,
+) -> Result<ClientCommand> {
     database.submit_client_command(command)?;
     wait_command(database, command.command_id)
 }
 
-fn mutation_counts(database: &Database) -> Result<(i64, i64, i64, i64)> {
+fn mutation_counts(database: &WorkspaceDatabase<'_>) -> Result<(i64, i64, i64, i64)> {
     database
         .with_connection(|connection| {
             Ok((
@@ -283,6 +307,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     );
     fixture.wait_online()?;
     let database = fixture.database()?;
+    let workspace = database.legacy_workspace()?;
 
     let session_id = SessionId::new();
     let create = pending_command(
@@ -295,7 +320,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-session",
     );
     assert_eq!(
-        submit_and_wait(&database, &create)?.state,
+        submit_and_wait(&workspace, &create)?.state,
         ClientCommandState::Completed
     );
 
@@ -310,12 +335,12 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-goal",
     );
     assert_eq!(
-        submit_and_wait(&database, &goal)?.state,
+        submit_and_wait(&workspace, &goal)?.state,
         ClientCommandState::Completed
     );
 
-    wait_for_approval_candidate(&database, session_id)?;
-    let graph = database
+    wait_for_approval_candidate(&workspace, session_id)?;
+    let graph = workspace
         .current_graph(session_id)?
         .context("current graph after successful planning")?;
     let proposal_hash = graph
@@ -327,7 +352,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         serde_json::from_value::<GraphValidationSummary>(graph.revision.validation.clone())?
             .authority
             .context("validated graph authority")?;
-    assert_eq!(mutation_counts(&database)?, (0, 0, 0, 0));
+    assert_eq!(mutation_counts(&workspace)?, (0, 0, 0, 0));
     assert!(!fixture.repository.join(".colay/worktrees").exists());
 
     let wrong = pending_command(
@@ -343,9 +368,9 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         })?,
         "plan-e2e-wrong-approval",
     );
-    let wrong = submit_and_wait(&database, &wrong)?;
+    let wrong = submit_and_wait(&workspace, &wrong)?;
     assert_eq!(wrong.state, ClientCommandState::Failed);
-    assert_eq!(mutation_counts(&database)?, (0, 0, 0, 0));
+    assert_eq!(mutation_counts(&workspace)?, (0, 0, 0, 0));
 
     let exact_payload = ApproveGraphCommandPayload {
         revision_id: graph.revision.revision_id,
@@ -362,11 +387,11 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-exact-approval",
     );
     assert_eq!(
-        submit_and_wait(&database, &exact)?.state,
+        submit_and_wait(&workspace, &exact)?.state,
         ClientCommandState::Completed
     );
     assert_eq!(
-        database
+        workspace
             .list_tasks(&TaskListFilter {
                 state: None,
                 include_archived: false,
@@ -382,16 +407,17 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         serde_json::to_value(&exact_payload)?,
         "plan-e2e-exact-approval",
     );
-    let stored = database.submit_client_command(&replay)?;
+    let stored = workspace.submit_client_command(&replay)?;
     assert_eq!(stored.command_id, exact.command_id);
-    wait_for_task_completion(&database)?;
-    let completed_counts = mutation_counts(&database)?;
+    wait_for_task_completion(&workspace)?;
+    let completed_counts = mutation_counts(&workspace)?;
     assert_eq!(completed_counts.0, 2);
     assert_eq!(completed_counts.1, 2);
     assert_eq!(completed_counts.3, 1);
 
     drop(database);
     let reopened = fixture.database()?;
+    let reopened = reopened.legacy_workspace()?;
     let approved = reopened
         .current_graph(session_id)?
         .context("reopened graph")?;

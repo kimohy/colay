@@ -13,8 +13,8 @@ use orchestrator_engine::{
     inspect_git_repository,
 };
 use orchestrator_state::{
-    Database, GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt, NewPlanningAttempt,
-    StateError,
+    GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt, NewPlanningAttempt, StateError,
+    WorkspaceDatabase,
 };
 
 use crate::{CommandProcessingResult, DaemonError, MessageRedactor};
@@ -30,7 +30,7 @@ pub struct PlanningServices {
 }
 
 pub async fn process_next_orchestration_command(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
     redactor: &dyn MessageRedactor,
     now: DateTime<Utc>,
@@ -140,7 +140,7 @@ impl From<StateError> for ExecutionError {
 }
 
 async fn request_plan(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
     redactor: &dyn MessageRedactor,
     command: &ClientCommand,
@@ -231,7 +231,7 @@ async fn request_plan(
 }
 
 fn planning_goal(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
 ) -> Result<(SessionId, RequestPlanCommandPayload, ConversationMessage), ExecutionError> {
     let session_id = command.session_id.ok_or_else(|| {
@@ -261,7 +261,7 @@ fn planning_goal(
 }
 
 async fn propose_validated_graph(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
     redactor: &dyn MessageRedactor,
     command: &ClientCommand,
@@ -289,7 +289,7 @@ async fn propose_validated_graph(
 }
 
 async fn validate_candidate_authority(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
     redactor: &dyn MessageRedactor,
     goal_message_id: MessageId,
@@ -397,7 +397,7 @@ async fn validate_candidate_authority(
 }
 
 async fn approve_graph(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
     command: &ClientCommand,
     now: DateTime<Utc>,
@@ -484,7 +484,7 @@ async fn approve_graph(
 }
 
 fn transition_approved_session(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     now: DateTime<Utc>,
@@ -514,7 +514,7 @@ fn transition_approved_session(
 }
 
 fn transition_to_planning(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     now: DateTime<Utc>,
@@ -549,7 +549,7 @@ fn transition_to_planning(
 }
 
 fn transition_from_planning(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     next: SessionState,
@@ -585,7 +585,7 @@ fn transition_from_planning(
 }
 
 fn transition_to_validating(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     now: DateTime<Utc>,
@@ -617,7 +617,7 @@ fn transition_to_validating(
 }
 
 fn reconcile_completed_plan(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     revision: &orchestrator_state::StoredGraphRevision,
     now: DateTime<Utc>,
@@ -685,7 +685,7 @@ fn reconcile_completed_plan(
 }
 
 fn append_timeline(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     kind: MessageKind,
@@ -776,7 +776,7 @@ mod tests {
         ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
         PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
     };
-    use orchestrator_state::{DaemonStatus, Database, GraphRevisionStatus};
+    use orchestrator_state::{DaemonStatus, Database, GraphRevisionStatus, WorkspaceDatabase};
     use rusqlite::params;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -885,25 +885,33 @@ mod tests {
     fn database() -> Result<Arc<Database>, Box<dyn std::error::Error>> {
         let database = Database::open_in_memory()?;
         database.migrate_with_backup(std::path::Path::new("unused"))?;
+        database.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         Ok(Arc::new(database))
     }
 
     fn seed_goal(
-        database: &Database,
+        database: &WorkspaceDatabase<'_>,
     ) -> Result<(SessionId, MessageId), Box<dyn std::error::Error>> {
         let session_id = SessionId::new();
         let message_id = MessageId::new();
         let now = Utc::now();
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO sessions(session_id, schema_version, revision, title, state,
-                    created_at, updated_at) VALUES (?1, '1', 0, 'planning', 'drafting', ?2, ?2)",
+                "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state,
+                    created_at, updated_at) VALUES (current_workspace(), ?1, '1', 0, 'planning', 'drafting', ?2, ?2)",
                 params![session_id.to_string(), now.to_rfc3339()],
             )?;
             connection.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind,
+                "INSERT INTO main.conversation_messages(workspace_id, message_id, session_id, ordinal, role, kind,
                     state, content_redacted, created_at, finalized_at)
-                 VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'build it', ?3, ?3)",
+                 VALUES (current_workspace(), ?1, ?2, 1, 'user', 'user_message', 'final', 'build it', ?3, ?3)",
                 params![
                     message_id.to_string(),
                     session_id.to_string(),
@@ -938,7 +946,7 @@ mod tests {
     }
 
     fn seed_ready_requirement(
-        database: &Database,
+        database: &WorkspaceDatabase<'_>,
         session_id: SessionId,
         message_id: MessageId,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1007,31 +1015,34 @@ mod tests {
     async fn explicit_plan_without_requirement_cannot_reach_approval()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
-        let (session_id, goal) = seed_goal(&database)?;
+        let workspace = database.legacy_workspace()?;
+        let (session_id, goal) = seed_goal(&workspace)?;
         let command = plan_command(session_id, goal, "valid-plan");
-        database.submit_client_command(&command)?;
+        workspace.submit_client_command(&command)?;
         let (services, _) = services(FakeMode::Valid, Duration::ZERO);
         assert_eq!(
-            process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+            process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
                 .await?,
             Some(CommandProcessingResult::Completed(command.command_id))
         );
         assert_eq!(
-            database
+            workspace
                 .load_session(session_id)?
                 .map(|session| session.state),
             Some(orchestrator_domain::SessionState::NeedsAttention)
         );
-        let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
+        let graph = workspace
+            .current_graph(session_id)?
+            .ok_or("missing graph")?;
         assert_eq!(graph.revision.status, GraphRevisionStatus::Invalid);
         assert!(graph.revision.proposal_hash.is_none());
         assert!(
-            database
+            workspace
                 .messages_after(session_id, 1, 10)?
                 .iter()
                 .any(|(_, message)| message.content_redacted.contains("continue the interview"))
         );
-        database.with_connection(|connection| {
+        workspace.with_connection(|connection| {
             let count: i64 =
                 connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
             assert_eq!(count, 0);
@@ -1044,40 +1055,43 @@ mod tests {
     async fn invalid_plan_records_redacted_attention_timeline()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
-        let (session_id, goal) = seed_goal(&database)?;
+        let workspace = database.legacy_workspace()?;
+        let (session_id, goal) = seed_goal(&workspace)?;
         let command = plan_command(session_id, goal, "invalid-plan");
-        database.submit_client_command(&command)?;
+        workspace.submit_client_command(&command)?;
         let (invalid_services, _) = services(FakeMode::Malformed, Duration::ZERO);
         process_next_orchestration_command(
-            &database,
+            &workspace,
             &invalid_services,
             &SecretRedactor,
             Utc::now(),
         )
         .await?;
         assert_eq!(
-            database
+            workspace
                 .load_session(session_id)?
                 .map(|session| session.state),
             Some(orchestrator_domain::SessionState::NeedsAttention)
         );
-        let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
+        let graph = workspace
+            .current_graph(session_id)?
+            .ok_or("missing graph")?;
         assert_eq!(graph.revision.status, GraphRevisionStatus::Invalid);
         assert!(graph.revision.proposal_hash.is_none());
-        assert!(!database.messages_after(session_id, 1, 10)?.is_empty());
+        assert!(!workspace.messages_after(session_id, 1, 10)?.is_empty());
 
-        let (secret_session, secret_goal) = seed_goal(&database)?;
+        let (secret_session, secret_goal) = seed_goal(&workspace)?;
         let secret_command = plan_command(secret_session, secret_goal, "secret-plan");
-        database.submit_client_command(&secret_command)?;
+        workspace.submit_client_command(&secret_command)?;
         let (secret_services, _) = services(FakeMode::SecretError, Duration::ZERO);
         process_next_orchestration_command(
-            &database,
+            &workspace,
             &secret_services,
             &SecretRedactor,
             Utc::now(),
         )
         .await?;
-        let messages = database.messages_after(secret_session, 1, 10)?;
+        let messages = workspace.messages_after(secret_session, 1, 10)?;
         assert!(messages.iter().any(|(_, message)| {
             message.content_redacted.contains("[REDACTED]")
                 && !message.content_redacted.contains("secret")
@@ -1089,13 +1103,16 @@ mod tests {
     async fn typed_exact_approval_materializes_once_and_wrong_hash_fails()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
-        let (session_id, goal) = seed_goal(&database)?;
-        seed_ready_requirement(&database, session_id, goal)?;
-        database.submit_client_command(&plan_command(session_id, goal, "approval-plan"))?;
+        let workspace = database.legacy_workspace()?;
+        let (session_id, goal) = seed_goal(&workspace)?;
+        seed_ready_requirement(&workspace, session_id, goal)?;
+        workspace.submit_client_command(&plan_command(session_id, goal, "approval-plan"))?;
         let (services, _) = services(FakeMode::Valid, Duration::ZERO);
-        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+        process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
             .await?;
-        let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
+        let graph = workspace
+            .current_graph(session_id)?
+            .ok_or("missing graph")?;
         let hash = graph.revision.proposal_hash.clone().ok_or("missing hash")?;
         let authority = serde_json::from_value::<orchestrator_domain::GraphValidationSummary>(
             graph.revision.validation.clone(),
@@ -1115,9 +1132,9 @@ mod tests {
             })?,
             "wrong-approval",
         );
-        database.submit_client_command(&wrong)?;
+        workspace.submit_client_command(&wrong)?;
         assert_eq!(
-            process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+            process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
                 .await?,
             Some(CommandProcessingResult::Failed(wrong.command_id))
         );
@@ -1134,17 +1151,17 @@ mod tests {
             })?,
             "exact-approval",
         );
-        database.submit_client_command(&approve)?;
-        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+        workspace.submit_client_command(&approve)?;
+        process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
             .await?;
         assert_eq!(
-            database
+            workspace
                 .load_session(session_id)?
                 .map(|session| session.state),
             Some(orchestrator_domain::SessionState::Running)
         );
         assert_eq!(
-            database
+            workspace
                 .current_graph(session_id)?
                 .ok_or("graph")?
                 .tasks
@@ -1158,21 +1175,22 @@ mod tests {
     async fn completed_projection_reconciles_after_command_crash_without_replanning()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
-        let (session_id, goal) = seed_goal(&database)?;
-        seed_ready_requirement(&database, session_id, goal)?;
+        let workspace = database.legacy_workspace()?;
+        let (session_id, goal) = seed_goal(&workspace)?;
+        seed_ready_requirement(&workspace, session_id, goal)?;
         let command = plan_command(session_id, goal, "crash-plan");
-        database.submit_client_command(&command)?;
-        let claimed = database
+        workspace.submit_client_command(&command)?;
+        let claimed = workspace
             .claim_next_orchestration_client_command(Utc::now())?
             .ok_or("command not claimed")?;
         let (services, planner) = services(FakeMode::Valid, Duration::ZERO);
-        request_plan(&database, &services, &SecretRedactor, &claimed, Utc::now()).await?;
-        database.recover_stale_client_commands(Utc::now() + TimeDelta::seconds(1))?;
-        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+        request_plan(&workspace, &services, &SecretRedactor, &claimed, Utc::now()).await?;
+        workspace.recover_stale_client_commands(Utc::now() + TimeDelta::seconds(1))?;
+        process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
             .await?;
         assert_eq!(planner.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            database
+            workspace
                 .load_client_command(command.command_id)?
                 .map(|value| value.state),
             Some(ClientCommandState::Completed)
@@ -1184,9 +1202,10 @@ mod tests {
     async fn slow_planner_does_not_interrupt_daemon_heartbeats()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = database()?;
-        let (session_id, goal) = seed_goal(&database)?;
+        let workspace = database.legacy_workspace()?;
+        let (session_id, goal) = seed_goal(&workspace)?;
         let command = plan_command(session_id, goal, "slow-plan");
-        database.submit_client_command(&command)?;
+        workspace.submit_client_command(&command)?;
         let (services, _) = services(FakeMode::Valid, Duration::from_millis(120));
         let cancellation = CancellationToken::new();
         let task_database = Arc::clone(&database);
@@ -1216,7 +1235,7 @@ mod tests {
         };
         assert!(second.heartbeat_at > first.heartbeat_at);
         for _ in 0..80 {
-            if database
+            if workspace
                 .load_client_command(command.command_id)?
                 .is_some_and(|value| value.state == ClientCommandState::Completed)
             {
@@ -1225,7 +1244,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
-            database
+            workspace
                 .load_client_command(command.command_id)?
                 .map(|value| value.state),
             Some(ClientCommandState::Completed)

@@ -6,7 +6,7 @@ use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params}
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Database, StateError, StateResult};
+use crate::{StateError, StateResult, WorkspaceDatabase};
 
 /// One orchestrator process' exclusive authority to coordinate a task.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +85,9 @@ pub struct WorkerLeaseRequest {
     pub ttl: TimeDelta,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     /// Acquires exclusive task coordination authority.
     ///
     /// Stale rows are expired in the same immediate transaction as conflict detection. An
@@ -127,7 +129,7 @@ impl Database {
 
         let lease_id = Uuid::now_v7();
         transaction.execute(
-            "INSERT INTO coordinator_leases( \
+            "INSERT INTO main.coordinator_leases( \
                 lease_id, task_id, worktree_id, owner_id, acquired_at, renewed_at, \
                 expires_at, released_at \
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, NULL)",
@@ -181,8 +183,9 @@ impl Database {
         }
 
         let changed = transaction.execute(
-            "UPDATE coordinator_leases SET renewed_at = ?1, expires_at = ?2 \
-             WHERE lease_id = ?3 AND owner_id = ?4 AND released_at IS NULL",
+            "UPDATE main.coordinator_leases SET renewed_at = ?1, expires_at = ?2 \
+             WHERE workspace_id = current_workspace() \
+             AND lease_id = ?3 AND owner_id = ?4 AND released_at IS NULL",
             params![
                 renewal.renewed_at.to_rfc3339(),
                 expires_at.to_rfc3339(),
@@ -233,8 +236,9 @@ impl Database {
             ));
         }
         let changed = transaction.execute(
-            "UPDATE coordinator_leases SET released_at = ?1 \
-             WHERE lease_id = ?2 AND owner_id = ?3 AND released_at IS NULL",
+            "UPDATE main.coordinator_leases SET released_at = ?1 \
+             WHERE workspace_id = current_workspace() \
+             AND lease_id = ?2 AND owner_id = ?3 AND released_at IS NULL",
             params![
                 released_at.to_rfc3339(),
                 lease_id.to_string(),
@@ -313,7 +317,7 @@ impl Database {
 
         let lease_id = Uuid::now_v7();
         transaction.execute(
-            "INSERT INTO worker_leases( \
+            "INSERT INTO main.worker_leases( \
                 lease_id, task_id, worktree_id, coordinator_lease_id, provider_id, mode, \
                 acquired_at, expires_at, released_at \
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
@@ -362,8 +366,9 @@ impl Database {
             ));
         }
         let changed = transaction.execute(
-            "UPDATE worker_leases SET expires_at = ?1 \
-             WHERE lease_id = ?2 AND coordinator_lease_id = ?3 AND released_at IS NULL",
+            "UPDATE main.worker_leases SET expires_at = ?1 \
+             WHERE workspace_id = current_workspace() \
+             AND lease_id = ?2 AND coordinator_lease_id = ?3 AND released_at IS NULL",
             params![
                 expires_at.to_rfc3339(),
                 lease_id.to_string(),
@@ -400,8 +405,9 @@ impl Database {
             return Ok(false);
         }
         let changed = transaction.execute(
-            "UPDATE worker_leases SET released_at = ?1 \
-             WHERE lease_id = ?2 AND coordinator_lease_id = ?3 AND released_at IS NULL",
+            "UPDATE main.worker_leases SET released_at = ?1 \
+             WHERE workspace_id = current_workspace() \
+             AND lease_id = ?2 AND coordinator_lease_id = ?3 AND released_at IS NULL",
             params![
                 released_at.to_rfc3339(),
                 lease_id.to_string(),
@@ -437,6 +443,12 @@ impl Database {
         Ok(leases)
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 fn validate_owner(owner_id: Uuid) -> StateResult<()> {
     if owner_id.is_nil() {
@@ -461,13 +473,13 @@ fn checked_expiry(started_at: DateTime<Utc>, ttl: TimeDelta) -> StateResult<Date
 fn expire_stale_leases(transaction: &Transaction<'_>, now: DateTime<Utc>) -> StateResult<()> {
     let timestamp = now.to_rfc3339();
     transaction.execute(
-        "UPDATE coordinator_leases SET released_at = ?1 \
-         WHERE released_at IS NULL AND expires_at <= ?1",
+        "UPDATE main.coordinator_leases SET released_at = ?1 \
+         WHERE workspace_id = current_workspace() AND released_at IS NULL AND expires_at <= ?1",
         [&timestamp],
     )?;
     transaction.execute(
-        "UPDATE worker_leases SET released_at = ?1 \
-         WHERE released_at IS NULL AND ( \
+        "UPDATE main.worker_leases SET released_at = ?1 \
+         WHERE workspace_id = current_workspace() AND released_at IS NULL AND ( \
             expires_at <= ?1 OR coordinator_lease_id IN ( \
                 SELECT lease_id FROM coordinator_leases WHERE released_at IS NOT NULL \
             ) \
@@ -629,7 +641,7 @@ mod tests {
         let now = timestamp().to_rfc3339();
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO tasks( \
+                "INSERT INTO main.tasks( \
                     task_id, schema_version, revision, state, resume_state, paused, objective, \
                     original_request_redacted, task_envelope_json, created_at, updated_at, \
                     archived_at \
@@ -821,7 +833,7 @@ mod tests {
         database
             .with_connection(|connection| {
                 connection.execute(
-                    "INSERT INTO worker_leases( \
+                    "INSERT INTO main.worker_leases( \
                         lease_id, task_id, worktree_id, coordinator_lease_id, provider_id, mode, \
                         acquired_at, expires_at, released_at \
                      ) VALUES (?1, ?2, NULL, NULL, 'codex', 'writable', ?3, ?4, NULL)",
@@ -871,6 +883,9 @@ mod tests {
             std::thread::spawn(move || {
                 let database =
                     Database::open(path).unwrap_or_else(|error| panic!("database: {error}"));
+                database
+                    .migrate_with_backup(std::path::Path::new("unused"))
+                    .unwrap_or_else(|error| panic!("migrations: {error}"));
                 barrier.wait();
                 database.acquire_coordinator_lease(&coordinator_request(
                     task_id,
