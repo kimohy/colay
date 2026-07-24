@@ -47,7 +47,9 @@ pub use daemon_instances::{DaemonInstance, DaemonLeaseRequest, DaemonPhase, Daem
 pub use database::{Database, DatabaseHealth, OutboxRecord};
 pub use error::{StateError, StateResult};
 pub use event_log::{EventLog, ReconciliationReport};
-pub use global_paths::{GlobalStatePaths, StateEnvironment, WorkspaceStatePaths};
+pub use global_paths::{
+    GlobalStatePaths, StateEnvironment, StateEnvironmentTestInput, WorkspaceStatePaths,
+};
 pub use graphs::{
     ApprovedGraph, GraphApprovalRequest, GraphProjection, GraphRevisionStatus, GraphTaskDependency,
     GraphTaskProjection, NewGraphAttempt, NewPlanningAttempt, StoredGraphRevision,
