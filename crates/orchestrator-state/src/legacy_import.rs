@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read as _,
+    ops::Deref,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -25,7 +25,8 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     Database, GlobalStatePaths, MigrationManager, RepositoryStatePaths, StateError, StateResult,
     WorkspaceId, artifacts::LegacyImportStaging, database::append_workspace_event_in_transaction,
-    ensure_private_directory, ensure_private_file, reject_symlink_components,
+    ensure_private_directory, ensure_private_file, import_scratch::LegacyImportScratch,
+    reject_symlink_components, source_guard::SourceOpenGuard,
 };
 
 const LAST_LEGACY_SCHEMA_VERSION: u32 = 13;
@@ -213,16 +214,38 @@ pub struct LegacyImportResult {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LegacyImporter;
 
+struct GuardedSourceConnection {
+    connection: Connection,
+    guard: SourceOpenGuard,
+}
+
+impl GuardedSourceConnection {
+    fn revalidate(&self) -> StateResult<()> {
+        self.guard.revalidate()
+    }
+}
+
+impl Deref for GuardedSourceConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
 impl LegacyImporter {
     /// Inspects only the explicitly supplied repository-local state store. The source connection
     /// is read-only; migration and validation operate against online-backup copies.
-    pub fn inspect(source: &RepositoryStatePaths) -> StateResult<Option<LegacyImportPlan>> {
+    pub fn inspect(
+        source: &RepositoryStatePaths,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<Option<LegacyImportPlan>> {
         if !source.database.exists() {
             return Ok(None);
         }
-        validate_source_paths(source)?;
         let connection = open_source_read_only(&source.root, &source.database)?;
         let status = MigrationManager::status(&connection)?;
+        connection.revalidate()?;
         if status.current_version == 0 {
             return Err(StateError::InvalidRecord(
                 "legacy database has no migration history".to_owned(),
@@ -235,15 +258,22 @@ impl LegacyImporter {
             });
         }
         validate_integrity(&connection, "legacy source")?;
+        connection.revalidate()?;
         reject_live_legacy_daemon(&connection, status.current_version)?;
+        connection.revalidate()?;
         let source_identity_hash = source_identity_hash(&connection)?;
+        connection.revalidate()?;
 
-        let temporary = crate::CanonicalTempDir::new("legacy-import-inspection")?;
-        let raw_snapshot = temporary.path().join(SOURCE_SNAPSHOT_NAME);
+        let scratch_fingerprint =
+            inspection_scratch_fingerprint(status.current_version, &source_identity_hash);
+        let scratch = LegacyImportScratch::acquire(paths, &scratch_fingerprint)?;
+        let raw_snapshot = scratch.path().join("source.db");
+        connection.revalidate()?;
         backup_stable_source(&connection, &raw_snapshot)?;
+        connection.revalidate()?;
         let database_sha256 = sha256_file(&raw_snapshot)?;
         let database_length = file_length(&raw_snapshot)?;
-        let migrated_path = temporary.path().join("migrated.db");
+        let migrated_path = scratch.path().join("migrated.db");
         let migrated = migrate_snapshot(&raw_snapshot, &migrated_path)?;
         if !legacy_workspace_exists(&migrated)? {
             if workspace_row_count(&migrated)? == 0 {
@@ -259,13 +289,16 @@ impl LegacyImporter {
         validate_jsonl_evidence(&source.root, &source.events, &migrated, &events)?;
         let event_evidence = event_evidence(&events)?;
         let files = collect_manifest_files(source, &migrated)?;
+        connection.revalidate()?;
         let manifest_hash = manifest_hash(&database_sha256, database_length, &files);
         let logical_content_hash = logical_workspace_hash(&migrated)?;
-        let canonical_root =
-            fs::canonicalize(&source.root).map_err(|error| StateError::io(&source.root, error))?;
         let source_root_hash = hash_domain(
             b"colay/legacy-source-root/v1\0",
-            canonical_root.to_string_lossy().as_bytes(),
+            connection
+                .guard
+                .canonical_root()
+                .to_string_lossy()
+                .as_bytes(),
         );
         let source_fingerprint = source_fingerprint(
             status.current_version,
@@ -305,7 +338,8 @@ impl LegacyImporter {
             validate_published_import(&existing, target, paths)?;
             return Ok(existing);
         }
-        let inspected = Self::inspect(&plan.source)?.ok_or_else(|| {
+        let scratch = LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?;
+        let inspected = Self::inspect(&plan.source, paths)?.ok_or_else(|| {
             StateError::InvalidRecord("legacy source disappeared before import".to_owned())
         })?;
         ensure_plan_unchanged(plan, &inspected)?;
@@ -320,17 +354,23 @@ impl LegacyImporter {
         staging.prepare()?;
         let source = open_source_read_only(&plan.source.root, &plan.source.database)?;
         let staged_database = staging.root().join(SOURCE_SNAPSHOT_NAME);
+        source.revalidate()?;
         backup_stable_source(&source, &staged_database)?;
+        source.revalidate()?;
         verify_file(
             &staged_database,
             &plan.database_sha256,
             plan.database_length,
         )?;
         for file in &plan.files {
-            staging.stage_file(
+            let source_file = SourceOpenGuard::open(
                 &plan.source.root,
                 &plan.source.root.join(&file.relative_path),
+            )?;
+            let bytes = source_file.read_all()?;
+            staging.stage_verified_bytes(
                 &file.relative_path,
+                &bytes,
                 &file.sha256,
                 file.byte_length,
             )?;
@@ -344,13 +384,12 @@ impl LegacyImporter {
             ));
         }
 
-        let temporary = crate::CanonicalTempDir::new("legacy-import-migration")?;
-        let migrated_path = temporary.path().join("migrated.db");
+        let migrated_path = scratch.path().join("migrated.db");
         let migrated = migrate_snapshot(&staged_database, &migrated_path)?;
         validate_event_chain(&migrated)?;
         validate_source_documents(&migrated)?;
         drop(migrated);
-        let rewrite_path = temporary.path().join("rewrite.db");
+        let rewrite_path = scratch.path().join("rewrite.db");
         prepare_rewrite_scratch(&migrated_path, &rewrite_path)?;
 
         let published_path = staging.published_path().to_path_buf();
@@ -2362,28 +2401,18 @@ fn ensure_plan_unchanged(
     Ok(())
 }
 
-fn validate_source_paths(source: &RepositoryStatePaths) -> StateResult<()> {
-    let (_, database) = canonical_contained_source(&source.root, &source.database)?;
-    let metadata =
-        fs::symlink_metadata(&database).map_err(|error| StateError::io(&database, error))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(StateError::InvalidRecord(
-            "legacy database is not a regular file".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn open_source_read_only(root: &Path, path: &Path) -> StateResult<Connection> {
-    let (canonical_root, canonical_path) = canonical_contained_source(root, path)?;
+fn open_source_read_only(root: &Path, path: &Path) -> StateResult<GuardedSourceConnection> {
+    let guard = SourceOpenGuard::open(root, path)?;
+    let sqlite_path = guard.sqlite_path()?;
     let connection = Connection::open_with_flags(
-        path,
+        &sqlite_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    recheck_contained_source(root, path, &canonical_root, &canonical_path)?;
+    guard.revalidate()?;
     connection.busy_timeout(Duration::ZERO)?;
     connection.pragma_update(None, "query_only", true)?;
-    Ok(connection)
+    guard.revalidate()?;
+    Ok(GuardedSourceConnection { connection, guard })
 }
 
 fn validate_integrity(connection: &Connection, label: &str) -> StateResult<()> {
@@ -2880,60 +2909,8 @@ fn manifest_file(root: &Path, relative_path: PathBuf) -> StateResult<ManifestFil
     })
 }
 
-fn canonical_contained_source(root: &Path, path: &Path) -> StateResult<(PathBuf, PathBuf)> {
-    if !path.starts_with(root) {
-        return Err(StateError::InvalidRecord(format!(
-            "legacy source path escapes state root: {}",
-            path.display()
-        )));
-    }
-    reject_symlink_components(root)?;
-    reject_symlink_components(path)?;
-    let canonical_root = fs::canonicalize(root).map_err(|error| StateError::io(root, error))?;
-    let canonical_path = fs::canonicalize(path).map_err(|error| StateError::io(path, error))?;
-    reject_symlink_components(&canonical_root)?;
-    reject_symlink_components(&canonical_path)?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err(StateError::SymlinkEscape(path.to_path_buf()));
-    }
-    Ok((canonical_root, canonical_path))
-}
-
-fn recheck_contained_source(
-    root: &Path,
-    path: &Path,
-    expected_root: &Path,
-    expected_path: &Path,
-) -> StateResult<()> {
-    let (canonical_root, canonical_path) = canonical_contained_source(root, path)?;
-    if canonical_root != expected_root || canonical_path != expected_path {
-        return Err(StateError::SymlinkEscape(path.to_path_buf()));
-    }
-    Ok(())
-}
-
 fn read_contained_source(root: &Path, path: &Path) -> StateResult<Vec<u8>> {
-    let (canonical_root, canonical_path) = canonical_contained_source(root, path)?;
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|error| StateError::io(path, error))?;
-    recheck_contained_source(root, path, &canonical_root, &canonical_path)?;
-    if !file
-        .metadata()
-        .map_err(|error| StateError::io(path, error))?
-        .is_file()
-    {
-        return Err(StateError::InvalidRecord(format!(
-            "legacy source is not a regular file: {}",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| StateError::io(path, error))?;
-    recheck_contained_source(root, path, &canonical_root, &canonical_path)?;
-    Ok(bytes)
+    SourceOpenGuard::open(root, path)?.read_all()
 }
 
 fn manifest_files_below(root: &Path, excluded: Option<&str>) -> StateResult<Vec<ManifestFile>> {
@@ -3062,6 +3039,14 @@ fn update_digest_length(digest: &mut Sha256, length: usize) {
     digest.update(u64::try_from(length).unwrap_or(u64::MAX).to_le_bytes());
 }
 
+fn inspection_scratch_fingerprint(schema_version: u32, source_identity_hash: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"colay/legacy-import-inspection-scratch/v1\0");
+    digest.update(schema_version.to_le_bytes());
+    digest.update(source_identity_hash.as_bytes());
+    hex::encode(digest.finalize())
+}
+
 fn hash_domain(domain: &[u8], bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(domain);
@@ -3096,4 +3081,137 @@ fn table_exists(connection: &Connection, name: &str) -> StateResult<bool> {
             |row| row.get(0),
         )
         .map_err(StateError::from)
+}
+
+#[cfg(test)]
+mod final_hardening_tests {
+    use std::fs;
+
+    use rusqlite::Connection;
+
+    use crate::{
+        Database, GlobalStatePaths, RepositoryStatePaths, RootConfig, StateEnvironment,
+        source_guard::{SourceOpenHookPhase, clear_source_open_hook, set_source_open_hook},
+    };
+
+    use super::{LegacyEventEvidence, LegacyImportPlan, LegacyImporter, sha256_file};
+
+    #[test]
+    fn source_parent_aba_refuses_import_without_source_or_target_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
+        fs::create_dir_all(&source.root)?;
+        drop(Connection::open(&source.database)?);
+
+        let environment = StateEnvironment::with_colay_home(temporary.path().join("global"))?;
+        let paths = GlobalStatePaths::resolve(&environment)?;
+        let global = Database::open(&paths.database)?;
+        global.migrate_with_backup(&paths.backups)?;
+        let workspace_id = global
+            .resolve_repository_workspace(&repository)?
+            .workspace_id;
+        let plan = LegacyImportPlan {
+            source: source.clone(),
+            source_schema_version: 3,
+            source_fingerprint: "a".repeat(64),
+            source_root_hash: "b".repeat(64),
+            manifest_hash: "c".repeat(64),
+            event_evidence: LegacyEventEvidence {
+                count: 0,
+                root_hash: None,
+                tip_hash: None,
+            },
+            database_sha256: "d".repeat(64),
+            database_length: 0,
+            files: Vec::new(),
+        };
+        let source_hash = sha256_file(&source.database)?;
+        let target_before = target_import_counts(&global, workspace_id)?;
+
+        let saved = source.root.with_extension("saved");
+        let alternate = source.root.with_extension("alternate");
+        fs::create_dir_all(&alternate)?;
+        drop(Connection::open(
+            alternate.join(
+                source
+                    .database
+                    .file_name()
+                    .ok_or("source database has no file name")?,
+            ),
+        )?);
+        let source_root = source.root.clone();
+        let saved_for_hook = saved.clone();
+        let alternate_for_hook = alternate.clone();
+        set_source_open_hook(move |phase, path| {
+            if path.file_name() != source_root.file_name() {
+                return Ok(());
+            }
+            match phase {
+                SourceOpenHookPhase::BeforeRetainedOpen => {
+                    fs::rename(&source_root, &saved_for_hook)
+                        .map_err(|error| crate::StateError::io(&source_root, error))?;
+                    fs::rename(&alternate_for_hook, &source_root)
+                        .map_err(|error| crate::StateError::io(&source_root, error))?;
+                }
+                SourceOpenHookPhase::BeforePostOpenCheck => {
+                    fs::rename(&source_root, &alternate_for_hook)
+                        .map_err(|error| crate::StateError::io(&source_root, error))?;
+                    fs::rename(&saved_for_hook, &source_root)
+                        .map_err(|error| crate::StateError::io(&source_root, error))?;
+                }
+            }
+            Ok(())
+        });
+
+        let result = LegacyImporter::apply(&global, workspace_id, &plan, &paths);
+        clear_source_open_hook();
+
+        assert!(result.is_err());
+        assert_eq!(sha256_file(&source.database)?, source_hash);
+        assert!(alternate.is_dir());
+        assert!(!saved.exists());
+        let target_after = target_import_counts(&global, workspace_id)?;
+        assert_eq!(target_before, target_after);
+        assert!(
+            !paths
+                .for_workspace(workspace_id)
+                .root
+                .join("imports")
+                .exists()
+        );
+        Ok(())
+    }
+
+    fn target_import_counts(
+        global: &Database,
+        workspace_id: crate::WorkspaceId,
+    ) -> Result<(i64, i64, i64, i64), Box<dyn std::error::Error>> {
+        let connection = global.raw_lock()?;
+        let workspace_id = workspace_id.to_string();
+        Ok((
+            connection.query_row(
+                "SELECT count(*) FROM tasks WHERE workspace_id = ?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )?,
+            connection.query_row(
+                "SELECT count(*) FROM task_events WHERE workspace_id = ?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )?,
+            connection.query_row(
+                "SELECT count(*) FROM legacy_imports WHERE workspace_id = ?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )?,
+            connection.query_row(
+                "SELECT count(*) FROM legacy_import_id_mappings WHERE workspace_id = ?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )?,
+        ))
+    }
 }

@@ -229,59 +229,18 @@ impl LegacyImportStaging {
         &self.published
     }
 
-    pub(crate) fn stage_file(
+    pub(crate) fn stage_verified_bytes(
         &self,
-        source_root: &Path,
-        source: &Path,
         relative: &Path,
+        bytes: &[u8],
         expected_sha256: &str,
         expected_length: u64,
     ) -> StateResult<()> {
         validate_relative_path(relative)?;
-        if !source.starts_with(source_root) {
-            return Err(StateError::SymlinkEscape(source.to_path_buf()));
-        }
-        reject_symlink_components(source_root)?;
-        reject_symlink_components(source)?;
-        let canonical_root =
-            fs::canonicalize(source_root).map_err(|error| StateError::io(source_root, error))?;
-        let canonical_source =
-            fs::canonicalize(source).map_err(|error| StateError::io(source, error))?;
-        if !canonical_source.starts_with(&canonical_root) {
-            return Err(StateError::SymlinkEscape(source.to_path_buf()));
-        }
-        let mut source_file = OpenOptions::new()
-            .read(true)
-            .open(source)
-            .map_err(|error| StateError::io(source, error))?;
-        reject_symlink_components(source)?;
-        let after_open = fs::canonicalize(source).map_err(|error| StateError::io(source, error))?;
-        if after_open != canonical_source || !after_open.starts_with(&canonical_root) {
-            return Err(StateError::SymlinkEscape(source.to_path_buf()));
-        }
-        if !source_file
-            .metadata()
-            .map_err(|error| StateError::io(source, error))?
-            .is_file()
-        {
-            return Err(StateError::InvalidRecord(format!(
-                "legacy import source is not a regular file: {}",
-                source.display()
-            )));
-        }
-        let mut bytes = Vec::new();
-        source_file
-            .read_to_end(&mut bytes)
-            .map_err(|error| StateError::io(source, error))?;
-        reject_symlink_components(source)?;
-        let after_read = fs::canonicalize(source).map_err(|error| StateError::io(source, error))?;
-        if after_read != canonical_source || !after_read.starts_with(&canonical_root) {
-            return Err(StateError::SymlinkEscape(source.to_path_buf()));
-        }
         if bytes.len() as u64 != expected_length
-            || hex::encode(Sha256::digest(&bytes)) != expected_sha256
+            || hex::encode(Sha256::digest(bytes)) != expected_sha256
         {
-            return Err(StateError::ArtifactConflict(source.to_path_buf()));
+            return Err(StateError::ArtifactConflict(relative.to_path_buf()));
         }
         let destination = self.staging.join(relative);
         let parent = destination
@@ -294,7 +253,7 @@ impl LegacyImportStaging {
             .create_new(true)
             .open(&destination)
             .map_err(|error| StateError::io(&destination, error))?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(|error| StateError::io(&destination, error))?;
         Ok(())

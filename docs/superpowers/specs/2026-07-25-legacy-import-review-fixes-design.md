@@ -45,4 +45,4 @@ Focused tests first demonstrate each failure:
 - mismatched requirement snapshot hashes and inconsistent row/snapshot completeness are rejected before target mutation;
 - a nested symbolic-link or junction artifact path is refused on supported platforms.
 
-The graph and integration tests also compare source bytes and the published `legacy.db` hash with their pre-apply values, proving evidence immutability.
+The graph and integration tests hash source evidence files before and after apply. They also open the published `legacy.db` and verify that its graph proposal and integration preview retain the original identities and sealed hashes. Existing import/replay tests independently verify the published manifest seal.

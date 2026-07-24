@@ -1,17 +1,18 @@
 use std::{
     collections::BTreeMap,
     error::Error,
-    fs,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
 };
 
 use chrono::Utc;
+use fs2::FileExt as _;
 use orchestrator_domain::{
     AttemptId, Checkpoint, CheckpointId, CorrelationId, EventActor, EventId, EventType,
-    GraphRevisionId, GraphValidationSummary, IntegrationApplicationId, IntegrationBatchId,
-    IntegrationPreview, IntegrationSource, MessageId, ModelProfile, ProviderId, RepoPath,
-    RequirementRevision, RequirementRevisionId, RequirementSnapshot, SchemaVersion, SessionId,
-    TaskEnvelope, TaskEvent, TaskGraphNode, TaskGraphProposal, TaskId, TaskState,
+    GraphRevisionId, GraphValidationAuthority, GraphValidationSummary, IntegrationApplicationId,
+    IntegrationBatchId, IntegrationPreview, IntegrationSource, MessageId, ModelProfile, ProviderId,
+    RepoPath, RequirementRevision, RequirementRevisionId, RequirementSnapshot, SchemaVersion,
+    SessionId, TaskEnvelope, TaskEvent, TaskGraphNode, TaskGraphProposal, TaskId, TaskState,
     VerificationCommand, VerificationId, VerificationResult, VerificationStatus, WorkerOutcome,
     WorkerResult, task_graph_proposal_hash,
 };
@@ -45,7 +46,8 @@ const DURABLE_SESSIONS_MIGRATION: &str =
 fn legacy_repository_state_imports_once_without_source_mutation() -> TestResult {
     let fixture = ImportFixture::new()?;
     let before = fixture.source_hashes()?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
 
     let first =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
@@ -103,7 +105,7 @@ fn corrupt_legacy_event_chain_is_refused_without_target_or_source_mutation() -> 
     )?;
     let corrupted = fixture.source_hashes()?;
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("corrupt event chain was accepted")?;
 
@@ -134,7 +136,7 @@ fn artifact_metadata_that_disagrees_with_source_bytes_is_refused() -> TestResult
     Connection::open(&fixture.source.database)?
         .execute("UPDATE artifacts SET sha256 = ?1", ["f".repeat(64)])?;
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("artifact metadata mismatch was accepted")?;
 
@@ -165,7 +167,7 @@ fn nested_link_in_artifact_path_is_refused_before_source_read() -> TestResult {
     )?;
     let before = target_mutation_counts(&fixture)?;
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("nested link in artifact path was accepted")?;
 
@@ -200,7 +202,7 @@ fn live_legacy_daemon_lease_blocks_import_inspection() -> TestResult {
     )?;
     drop(connection);
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("live legacy daemon lease was accepted")?;
 
@@ -224,7 +226,8 @@ fn schema_v13_reserved_workspace_source_is_supported() -> TestResult {
     )?;
     drop(connection);
 
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("v13 source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("v13 source was not found")?;
     assert_eq!(plan.source_schema_version, 13);
 
     let result =
@@ -239,7 +242,8 @@ fn existing_workspace_chain_receives_one_import_anchor() -> TestResult {
     let fixture = ImportFixture::new()?;
     let workspace = fixture.global.workspace(fixture.workspace_id);
     workspace.append_event(audit_event(None, "existing target evidence"))?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
 
     let result =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
@@ -298,7 +302,8 @@ fn colliding_ids_are_replaced_deterministically_and_recorded() -> TestResult {
         Some(fixture.task_id),
         "existing target evidence",
     ))?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
 
     let result =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
@@ -372,7 +377,8 @@ fn approved_graph_collision_rewrites_only_scratch_and_propagates_hash() -> TestR
         .workspace(fixture.workspace_id)
         .append_event(audit_event(None, "existing graph collision evidence"))?;
     let source_before = fixture.source_evidence_hashes()?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
 
     let result =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
@@ -398,18 +404,38 @@ fn approved_graph_collision_rewrites_only_scratch_and_propagates_hash() -> TestR
         )?;
     let proposal: TaskGraphProposal = serde_json::from_str(&proposal_json)?;
     let validation: GraphValidationSummary = serde_json::from_str(&validation_json)?;
+    let expected_requirement = graph
+        .requirement_revision_id
+        .ok_or("approved graph fixture has no requirement authority")?;
+    let authority = validation
+        .authority
+        .as_ref()
+        .ok_or("imported approved graph has no validation authority")?;
+    assert_eq!(authority.requirement_revision_id, expected_requirement);
+    assert_eq!(authority.validation_hash, "e".repeat(64));
+    assert_eq!(authority.base_commit, "a".repeat(40));
+    assert_eq!(authority.validation_checks, ["git_ready", "graph_valid"]);
     assert_eq!(proposal.revision_id.to_string(), mapped_revision);
     assert_eq!(
         proposal_hash,
         task_graph_proposal_hash(&proposal, &validation)?
     );
-    let approval_hash: String = connection.query_row(
-        "SELECT proposal_hash FROM graph_approvals \
+    let (approval_hash, approval_requirement, approval_validation, approval_base): (
+        String,
+        String,
+        String,
+        String,
+    ) = connection.query_row(
+        "SELECT proposal_hash, requirement_revision_id, validation_hash, base_commit \
+         FROM graph_approvals \
          WHERE workspace_id = ?1 AND revision_id = ?2",
         params![fixture.workspace_id.to_string(), mapped_revision],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     assert_eq!(approval_hash, proposal_hash);
+    assert_eq!(approval_requirement, expected_requirement.to_string());
+    assert_eq!(approval_validation, authority.validation_hash);
+    assert_eq!(approval_base, authority.base_commit);
     assert_ne!(proposal_hash, graph.proposal_hash);
     assert_eq!(source_before, fixture.source_evidence_hashes()?);
 
@@ -441,7 +467,8 @@ fn integration_collision_rewrites_only_scratch_and_propagates_preview_hash() -> 
             "existing integration collision evidence",
         ))?;
     let source_before = fixture.source_evidence_hashes()?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
 
     let result =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
@@ -517,7 +544,7 @@ fn declared_jsonl_export_without_exact_file_is_refused() -> TestResult {
     )?;
     drop(connection);
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("missing declared JSONL export was accepted")?;
 
@@ -528,7 +555,8 @@ fn declared_jsonl_export_without_exact_file_is_refused() -> TestResult {
 #[test]
 fn stale_scoped_staging_is_recovered_before_retry() -> TestResult {
     let fixture = ImportFixture::new()?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
     let staging = fixture
         .paths
         .for_workspace(fixture.workspace_id)
@@ -547,13 +575,69 @@ fn stale_scoped_staging_is_recovered_before_retry() -> TestResult {
 }
 
 #[test]
+fn scratch_crash_residue_is_scavenged_while_active_attempt_and_outside_files_survive() -> TestResult
+{
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let database_parent = fixture
+        .paths
+        .database
+        .parent()
+        .ok_or("global database has no parent")?;
+    let scratch_root = database_parent.join("import-scratch");
+    let fingerprint_root = scratch_root.join(&plan.source_fingerprint);
+    fs::create_dir_all(&fingerprint_root)?;
+
+    let stale = fingerprint_root.join(format!("attempt-{}", uuid::Uuid::now_v7()));
+    fs::create_dir(&stale)?;
+    fs::write(stale.join("owner.lock"), b"")?;
+    fs::write(stale.join("migrated.db"), b"crash residue")?;
+    fs::write(stale.join("migrated.db-wal"), b"stale wal")?;
+    fs::write(stale.join("migrated.db-shm"), b"stale shm")?;
+
+    let active = fingerprint_root.join(format!("attempt-{}", uuid::Uuid::now_v7()));
+    fs::create_dir(&active)?;
+    let active_lock_path = active.join("owner.lock");
+    let active_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&active_lock_path)?;
+    active_lock.try_lock_exclusive()?;
+    fs::write(active.join("rewrite.db-wal"), b"active wal")?;
+    fs::write(active.join("rewrite.db-shm"), b"active shm")?;
+
+    let outside = database_parent.join("legacy-import-outside-sentinel");
+    fs::write(&outside, b"outside")?;
+
+    let result =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+
+    assert!(result.imported);
+    assert!(!stale.exists());
+    assert!(active.is_dir());
+    assert_eq!(fs::read(active.join("rewrite.db-wal"))?, b"active wal");
+    assert_eq!(fs::read(active.join("rewrite.db-shm"))?, b"active shm");
+    assert_eq!(fs::read(&outside)?, b"outside");
+    let attempts = fs::read_dir(&fingerprint_root)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("attempt-"))
+        .count();
+    assert_eq!(attempts, 1);
+    active_lock.unlock()?;
+    Ok(())
+}
+
+#[test]
 fn fingerprint_is_stable_across_vacuum_and_source_relocation() -> TestResult {
     let fixture = ImportFixture::new()?;
-    let before = LegacyImporter::inspect(&fixture.source)?
+    let before = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
         .ok_or("legacy source was not found")?
         .source_fingerprint;
     Connection::open(&fixture.source.database)?.execute_batch("VACUUM;")?;
-    let after_vacuum = LegacyImporter::inspect(&fixture.source)?
+    let after_vacuum = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
         .ok_or("vacuumed legacy source was not found")?
         .source_fingerprint;
 
@@ -567,7 +651,7 @@ fn fingerprint_is_stable_across_vacuum_and_source_relocation() -> TestResult {
     let relocated =
         RepositoryStatePaths::from_config(&relocated_repository, &RootConfig::default())?;
     copy_tree(&fixture.source.root, &relocated.root)?;
-    let after_relocation = LegacyImporter::inspect(&relocated)?
+    let after_relocation = LegacyImporter::inspect(&relocated, &fixture.paths)?
         .ok_or("relocated legacy source was not found")?
         .source_fingerprint;
 
@@ -585,7 +669,8 @@ fn target_projections_without_audit_events_are_refused() -> TestResult {
         "invalid pre-existing target state",
         Utc::now(),
     ))?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
 
     let error = LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
         .err()
@@ -614,7 +699,8 @@ fn corrupt_earlier_target_event_is_refused_before_any_target_mutation() -> TestR
         "DELETE FROM task_events WHERE workspace_id = ?1 AND sequence = 1",
         [fixture.workspace_id.to_string()],
     )?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
     let before = target_mutation_counts(&fixture)?;
 
     let error = LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
@@ -642,7 +728,8 @@ fn inconsistent_target_event_cursor_is_refused_before_any_target_mutation() -> T
             Utc::now().to_rfc3339()
         ],
     )?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
     let before = target_mutation_counts(&fixture)?;
 
     let error = LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
@@ -662,7 +749,7 @@ fn mismatched_requirement_snapshot_hash_is_refused_before_target_mutation() -> T
     seed_source_requirement(&fixture, Some("f".repeat(64)), None)?;
     let before = target_mutation_counts(&fixture)?;
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("mismatched requirement snapshot hash was accepted")?;
 
@@ -678,7 +765,7 @@ fn inconsistent_requirement_row_and_snapshot_is_refused_before_target_mutation()
     seed_source_requirement(&fixture, None, Some(false))?;
     let before = target_mutation_counts(&fixture)?;
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("inconsistent requirement row and snapshot were accepted")?;
 
@@ -690,7 +777,8 @@ fn inconsistent_requirement_row_and_snapshot_is_refused_before_target_mutation()
 #[test]
 fn replay_refuses_a_published_snapshot_that_no_longer_matches_its_manifest() -> TestResult {
     let fixture = ImportFixture::new()?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
     let first =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
     fs::write(
@@ -768,7 +856,7 @@ fn tampered_checkpoint_is_refused_instead_of_resealed() -> TestResult {
     )?;
     drop(connection);
 
-    let error = LegacyImporter::inspect(&fixture.source)
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
         .err()
         .ok_or("tampered checkpoint was accepted")?;
 
@@ -779,7 +867,8 @@ fn tampered_checkpoint_is_refused_instead_of_resealed() -> TestResult {
 #[test]
 fn replay_refuses_corruption_in_the_imported_target_event_chain() -> TestResult {
     let fixture = ImportFixture::new()?;
-    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
     LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
     Connection::open(fixture.global.path())?.execute(
         "UPDATE task_events SET event_hash = ?1 WHERE workspace_id = ?2 AND sequence = 1",
@@ -810,6 +899,7 @@ struct GraphSeed {
     message_id: MessageId,
     revision_id: GraphRevisionId,
     proposal_hash: String,
+    requirement_revision_id: Option<RequirementRevisionId>,
 }
 
 struct IntegrationSeed {
@@ -1014,6 +1104,9 @@ fn seed_source_graph(
     let session_id = SessionId::new();
     let message_id = MessageId::new();
     let revision_id = GraphRevisionId::new();
+    let requirement = include_approval
+        .then(|| build_requirement_revision(session_id, message_id, now))
+        .transpose()?;
     let proposal = TaskGraphProposal {
         schema_version: SchemaVersion::v1(),
         revision_id,
@@ -1036,13 +1129,22 @@ fn seed_source_graph(
             parallel_safety: "isolated".to_owned(),
         }],
     };
+    let authority = requirement
+        .as_ref()
+        .map(|revision| GraphValidationAuthority {
+            requirement_revision_id: revision.requirement_revision_id,
+            validation_hash: "e".repeat(64),
+            base_commit: "a".repeat(40),
+            git_root_redacted: "<repository>".to_owned(),
+            validation_checks: vec!["git_ready".to_owned(), "graph_valid".to_owned()],
+        });
     let validation = GraphValidationSummary {
         node_count: 1,
         edge_count: 0,
         topological_order: vec!["legacy-node".to_owned()],
         maximum_parallel_width: 1,
         configured_parallel_workers: 1,
-        authority: None,
+        authority: authority.clone(),
     };
     let proposal_hash = task_graph_proposal_hash(&proposal, &validation)?;
     let connection = Connection::open(&fixture.source.database)?;
@@ -1067,11 +1169,15 @@ fn seed_source_graph(
             now.to_rfc3339()
         ],
     )?;
+    if let Some(revision) = &requirement {
+        insert_requirement_revision(&connection, revision, None, None)?;
+    }
     connection.execute(
         "INSERT INTO graph_revisions(workspace_id, revision_id, session_id, goal_message_id, \
             ordinal, status, proposal_hash, proposal_json, validation_json, planner_provider, \
-            created_at, completed_at, planner_provider_v2) \
-         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, 'codex', ?9, ?9, 'codex')",
+            created_at, completed_at, planner_provider_v2, requirement_revision_id, \
+            validation_hash, base_commit) \
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, 'codex', ?9, ?9, 'codex', ?10, ?11, ?12)",
         params![
             RESERVED_LEGACY_WORKSPACE,
             revision_id.to_string(),
@@ -1081,7 +1187,14 @@ fn seed_source_graph(
             proposal_hash,
             serde_json::to_string(&proposal)?,
             serde_json::to_string(&validation)?,
-            now.to_rfc3339()
+            now.to_rfc3339(),
+            authority
+                .as_ref()
+                .map(|value| value.requirement_revision_id.to_string()),
+            authority
+                .as_ref()
+                .map(|value| value.validation_hash.as_str()),
+            authority.as_ref().map(|value| value.base_commit.as_str())
         ],
     )?;
     connection.execute(
@@ -1097,13 +1210,21 @@ fn seed_source_graph(
     if include_approval {
         connection.execute(
             "INSERT INTO graph_approvals(workspace_id, revision_id, proposal_hash, approved_by, \
-                approved_at, session_id) VALUES (?1, ?2, ?3, 'fixture', ?4, ?5)",
+                approved_at, session_id, requirement_revision_id, validation_hash, base_commit) \
+             VALUES (?1, ?2, ?3, 'fixture', ?4, ?5, ?6, ?7, ?8)",
             params![
                 RESERVED_LEGACY_WORKSPACE,
                 revision_id.to_string(),
                 proposal_hash,
                 now.to_rfc3339(),
-                session_id.to_string()
+                session_id.to_string(),
+                authority
+                    .as_ref()
+                    .map(|value| value.requirement_revision_id.to_string()),
+                authority
+                    .as_ref()
+                    .map(|value| value.validation_hash.as_str()),
+                authority.as_ref().map(|value| value.base_commit.as_str())
             ],
         )?;
     }
@@ -1112,6 +1233,7 @@ fn seed_source_graph(
         message_id,
         revision_id,
         proposal_hash,
+        requirement_revision_id: requirement.map(|value| value.requirement_revision_id),
     })
 }
 
@@ -1405,28 +1527,7 @@ fn seed_source_requirement(
     let now = Utc::now();
     let session_id = SessionId::new();
     let message_id = MessageId::new();
-    let revision = RequirementRevision::seal(
-        RequirementRevisionId::new(),
-        session_id,
-        message_id,
-        1,
-        RequirementSnapshot {
-            objective: "Validate legacy requirements".to_owned(),
-            in_scope: vec!["legacy import".to_owned()],
-            out_of_scope: Vec::new(),
-            constraints: vec!["local only".to_owned()],
-            acceptance_criteria: vec!["validation passes".to_owned()],
-            verification_plan: vec![VerificationCommand {
-                executable: "cargo".to_owned(),
-                args: vec!["test".to_owned()],
-            }],
-            risks: Vec::new(),
-            open_questions: Vec::new(),
-        },
-        now,
-    )?;
-    let snapshot_hash = snapshot_hash_override.unwrap_or_else(|| revision.snapshot_hash.clone());
-    let complete = complete_override.unwrap_or_else(|| revision.snapshot.is_complete());
+    let revision = build_requirement_revision(session_id, message_id, now)?;
     let connection = Connection::open(&fixture.source.database)?;
     connection.execute(
         "INSERT INTO sessions(workspace_id, session_id, schema_version, revision, title, state, \
@@ -1449,6 +1550,50 @@ fn seed_source_requirement(
             now.to_rfc3339()
         ],
     )?;
+    insert_requirement_revision(
+        &connection,
+        &revision,
+        snapshot_hash_override,
+        complete_override,
+    )?;
+    Ok(revision.requirement_revision_id)
+}
+
+fn build_requirement_revision(
+    session_id: SessionId,
+    message_id: MessageId,
+    now: chrono::DateTime<Utc>,
+) -> TestResult<RequirementRevision> {
+    Ok(RequirementRevision::seal(
+        RequirementRevisionId::new(),
+        session_id,
+        message_id,
+        1,
+        RequirementSnapshot {
+            objective: "Validate legacy requirements".to_owned(),
+            in_scope: vec!["legacy import".to_owned()],
+            out_of_scope: Vec::new(),
+            constraints: vec!["local only".to_owned()],
+            acceptance_criteria: vec!["validation passes".to_owned()],
+            verification_plan: vec![VerificationCommand {
+                executable: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+            }],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        },
+        now,
+    )?)
+}
+
+fn insert_requirement_revision(
+    connection: &Connection,
+    revision: &RequirementRevision,
+    snapshot_hash_override: Option<String>,
+    complete_override: Option<bool>,
+) -> TestResult {
+    let snapshot_hash = snapshot_hash_override.unwrap_or_else(|| revision.snapshot_hash.clone());
+    let complete = complete_override.unwrap_or_else(|| revision.snapshot.is_complete());
     connection.execute(
         "INSERT INTO requirement_revisions(workspace_id, requirement_revision_id, session_id, \
             source_message_id, ordinal, schema_version, snapshot_hash, snapshot_json, complete, \
@@ -1471,12 +1616,12 @@ fn seed_source_requirement(
             updated_at) VALUES (?1, ?2, ?3, ?4)",
         params![
             RESERVED_LEGACY_WORKSPACE,
-            session_id.to_string(),
+            revision.session_id.to_string(),
             revision.requirement_revision_id.to_string(),
-            now.to_rfc3339()
+            revision.created_at.to_rfc3339()
         ],
     )?;
-    Ok(revision.requirement_revision_id)
+    Ok(())
 }
 
 fn seed_target_graph_collision(fixture: &ImportFixture, graph: &GraphSeed) -> TestResult {

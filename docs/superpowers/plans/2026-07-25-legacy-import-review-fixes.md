@@ -26,13 +26,13 @@
 - Modify: `crates/orchestrator-state/src/legacy_import.rs`
 
 **Interfaces:**
-- Produces: `prepare_rewrite_scratch(validated: &Path, scratch: &Path) -> StateResult<Connection>`.
+- Produces: `prepare_rewrite_scratch(validated: &Path, scratch: &Path) -> StateResult<()>`.
 - Produces: `validate_and_drop_rewrite_triggers(connection: &Connection) -> StateResult<()>`.
 - Consumes: existing collision mapping and typed rewrite functions unchanged.
 
 - [ ] **Step 1: Write failing approved-graph collision regression**
 
-Seed a schema-13 source with a completed, non-planning `TaskGraphProposal`, validation authority, and `graph_approvals` row. Seed the target with the same graph revision ID. Import and assert the mapped revision is present, `proposal_hash` equals a fresh `task_graph_proposal_hash`, the approval carries that new hash, the source tree hash is unchanged, and published `legacy.db` equals the inspected backup hash.
+Seed a schema-13 source with a completed, non-planning `TaskGraphProposal`, a sealed requirement revision, validation authority, and `graph_approvals` row. Seed the target with the same graph revision ID. Import and assert the mapped revision is present, `proposal_hash` equals a fresh `task_graph_proposal_hash`, the graph and approval retain complete validation authority, the approval carries the new proposal hash, source evidence hashes are unchanged, and published `legacy.db` retains the original proposal identity and sealed hash.
 
 - [ ] **Step 2: Run the graph regression and verify RED**
 

@@ -34,6 +34,7 @@ libc = "0.2"
 ratatui = "0.29"
 regex = "1"
 rusqlite = { version = "0.37", features = ["backup", "bundled", "chrono", "functions", "uuid"] }
+same-file = "1"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

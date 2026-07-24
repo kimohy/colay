@@ -16,6 +16,7 @@ mod error;
 mod event_log;
 mod global_paths;
 mod graphs;
+mod import_scratch;
 mod instructions;
 mod integrations;
 mod leases;
@@ -26,6 +27,7 @@ mod permissions;
 mod records;
 mod scheduling;
 mod sessions;
+mod source_guard;
 mod workspace;
 mod workspace_registry;
 
