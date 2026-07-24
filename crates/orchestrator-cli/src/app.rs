@@ -6804,16 +6804,17 @@ mod tests {
         database: &Database,
         operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
     ) -> orchestrator_state::StateResult<T> {
-        let connection = rusqlite::Connection::open(database.path())?;
+        let connection = open_test_connection(database.path())?;
         operation(&connection)
     }
 
     fn test_with_workspace<T>(
+        database_path: &Path,
         database: &WorkspaceDatabase<'_>,
         operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
     ) -> orchestrator_state::StateResult<T> {
         use rusqlite::functions::FunctionFlags;
-        let connection = rusqlite::Connection::open(database.database_path())?;
+        let connection = open_test_connection(database_path)?;
         let workspace_id = database.workspace_id().to_string();
         connection.create_scalar_function(
             "current_workspace",
@@ -6822,6 +6823,18 @@ mod tests {
             move |_| Ok(workspace_id.clone()),
         )?;
         operation(&connection)
+    }
+
+    fn open_test_connection(path: &Path) -> orchestrator_state::StateResult<rusqlite::Connection> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;\
+             PRAGMA journal_mode = WAL;\
+             PRAGMA synchronous = FULL;\
+             PRAGMA temp_store = MEMORY;\
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(connection)
     }
 
     fn test_state(root: PathBuf) -> StatePaths {
@@ -6877,16 +6890,21 @@ mod tests {
     }
 
     fn attempt_completion(
+        database_path: &Path,
         database: &WorkspaceDatabase<'_>,
         attempt_id: AttemptId,
     ) -> Result<(Option<String>, Option<String>)> {
-        Ok(test_with_workspace(database, |connection| {
-            Ok(connection.query_row(
-                "SELECT ended_at, outcome FROM task_attempts WHERE attempt_id = ?1",
-                [attempt_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?)
-        })?)
+        Ok(test_with_workspace(
+            database_path,
+            database,
+            |connection| {
+                Ok(connection.query_row(
+                    "SELECT ended_at, outcome FROM task_attempts WHERE attempt_id = ?1",
+                    [attempt_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            },
+        )?)
     }
 
     #[test]
@@ -7130,7 +7148,8 @@ mod tests {
             .find(|lease| lease.lease_id == worker.lease_id)
             .ok_or_else(|| anyhow::anyhow!("worker lease disappeared before release"))?;
         assert!(renewed_worker.expires_at > worker.expires_at);
-        let (ended_at, outcome) = attempt_completion(&database, request.attempt_id)?;
+        let (ended_at, outcome) =
+            attempt_completion(&state.database, &database, request.attempt_id)?;
         assert!(ended_at.is_some());
         assert_eq!(outcome.as_deref(), Some("cancelled"));
         database.release_worker_lease(coordinator.lease_id, worker.lease_id, Utc::now())?;
@@ -7568,7 +7587,7 @@ mod tests {
                 "search_directory": null
             }
         });
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "INSERT INTO main.worktrees(
                     workspace_id, worktree_id, task_id, repo_root, worktree_path, branch_name,
@@ -7667,7 +7686,7 @@ mod tests {
 
         let mut path_persisted = serde_json::to_value(&worker_result)?;
         path_persisted["process_execution"] = serde_json::to_value(&attempt_execution)?;
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7703,7 +7722,7 @@ mod tests {
         let mut mismatched = path_persisted;
         mismatched["process_execution"]["path"] =
             serde_json::to_value(fs::canonicalize(&executable_b)?)?;
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7730,7 +7749,7 @@ mod tests {
                 .contains("invalid process execution evidence")
         );
 
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7768,7 +7787,7 @@ mod tests {
         });
         let other_worktree = state.worktrees.join("other-writable-worker");
         fs::create_dir_all(&other_worktree)?;
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7798,7 +7817,7 @@ mod tests {
             anyhow::bail!("relative identity bypassed its trusted active worktree");
         };
         assert!(error.to_string().contains("trusted worktree"));
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "UPDATE main.worktrees SET worktree_path = ?1
                  WHERE workspace_id = current_workspace() AND task_id = ?2 AND state = 'active'",
@@ -7817,7 +7836,7 @@ mod tests {
                 "search_directory": null
             }
         });
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "UPDATE main.task_attempts SET worker_result_json = ?1
                  WHERE workspace_id = current_workspace() AND attempt_id = ?2",
@@ -7870,7 +7889,7 @@ mod tests {
             created_at: now,
         })?;
         let attempt_id = AttemptId::new();
-        test_with_workspace(&database, |connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
                 "INSERT INTO main.task_attempts(
                     workspace_id, attempt_id, task_id, ordinal, provider_id, worker_mode, started_at

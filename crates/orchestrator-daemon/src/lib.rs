@@ -187,7 +187,7 @@ pub async fn serve_with_orchestration(
     planning: PlanningServices,
 ) -> Result<DaemonExit, DaemonError> {
     serve_with_runtime(
-        database,
+        &database,
         workspace_id,
         instance_id,
         pid,
@@ -196,7 +196,7 @@ pub async fn serve_with_orchestration(
         redactor,
         planning,
         None,
-        true,
+        None,
     )
     .await
 }
@@ -215,7 +215,7 @@ pub async fn serve_with_full_orchestration(
 ) -> Result<DaemonExit, DaemonError> {
     execution::validate_execution_services(&execution)?;
     serve_with_runtime(
-        database,
+        &database,
         workspace_id,
         instance_id,
         pid,
@@ -224,7 +224,7 @@ pub async fn serve_with_full_orchestration(
         redactor,
         planning,
         Some(execution),
-        true,
+        None,
     )
     .await
 }
@@ -240,9 +240,10 @@ pub async fn serve_with_full_orchestration_on_owned_lease(
     planning: PlanningServices,
     execution: ExecutionServices,
 ) -> Result<DaemonExit, DaemonError> {
+    let lease = OwnedLeaseGuard::new(&database, instance_id);
     execution::validate_execution_services(&execution)?;
     serve_with_runtime(
-        database,
+        &database,
         workspace_id,
         instance_id,
         0,
@@ -251,14 +252,14 @@ pub async fn serve_with_full_orchestration_on_owned_lease(
         redactor,
         planning,
         Some(execution),
-        false,
+        Some(lease),
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn serve_with_runtime(
-    database: Arc<Database>,
+async fn serve_with_runtime<'a>(
+    database: &'a Arc<Database>,
     workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     pid: u32,
@@ -267,12 +268,16 @@ async fn serve_with_runtime(
     redactor: Arc<dyn MessageRedactor>,
     planning: PlanningServices,
     execution: Option<ExecutionServices>,
-    acquire_lease: bool,
+    owned_lease: Option<OwnedLeaseGuard<'a>>,
 ) -> Result<DaemonExit, DaemonError> {
     validate_settings(settings)?;
     let started_at = Utc::now();
-    if acquire_lease {
-        reconcile_daemon_startup(&database, workspace_id, started_at)?;
+    let lease = if let Some(lease) = owned_lease {
+        database.heartbeat_daemon(instance_id, started_at, settings.lease_ttl)?;
+        reconcile_daemon_startup(database, workspace_id, started_at)?;
+        lease
+    } else {
+        reconcile_daemon_startup(database, workspace_id, started_at)?;
         let started_at = Utc::now();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id,
@@ -280,13 +285,8 @@ async fn serve_with_runtime(
             started_at,
             ttl: settings.lease_ttl,
         })?;
-    } else {
-        database.heartbeat_daemon(instance_id, started_at, settings.lease_ttl)?;
-    }
-    let lease = OwnedLeaseGuard::new(&database, instance_id);
-    if !acquire_lease {
-        reconcile_daemon_startup(&database, workspace_id, started_at)?;
-    }
+        OwnedLeaseGuard::new(database, instance_id)
+    };
     let workspace = database.workspace(workspace_id);
     let mut heartbeat_interval = tokio::time::interval(settings.heartbeat_interval);
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -319,7 +319,7 @@ async fn serve_with_runtime(
                     })??;
                 }
                 if active_planning.is_none() {
-                    let job_database = Arc::clone(&database);
+                    let job_database = Arc::clone(database);
                     let job_redactor = Arc::clone(&redactor);
                     let job_services = planning.clone();
                     active_planning = Some(tokio::spawn(async move {
@@ -335,7 +335,7 @@ async fn serve_with_runtime(
                 }
                 if let Some(execution) = execution.as_ref() {
                     execution::spawn_ready_tasks(
-                        &database,
+                        database,
                         workspace_id,
                         instance_id,
                         execution,
@@ -432,12 +432,23 @@ fn validate_settings(settings: DaemonSettings) -> Result<(), DaemonError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+        sync::Arc,
+        time::Duration,
+    };
 
+    use async_trait::async_trait;
     use chrono::{TimeDelta, Utc};
     use orchestrator_domain::{
         ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState, DaemonInstanceId,
-        SessionId,
+        GraphValidationPolicy, ModelProfile, ProviderId, SessionId,
+    };
+    use orchestrator_engine::{
+        ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
+        EngineResult, PlannerFailure, PlannerRequest, PlannerResponse, TaskExecutionReport,
+        TaskExecutionRequest, TaskExecutor, TaskPlanner,
     };
     use orchestrator_state::{
         DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database, StateResult, WorkspaceId,
@@ -446,15 +457,85 @@ mod tests {
 
     use super::{
         DaemonError, DaemonExit, DaemonSettings, MessageRedactor, serve, serve_with_commands,
-        serve_with_commands_on_owned_lease,
+        serve_with_commands_on_owned_lease, serve_with_full_orchestration_on_owned_lease,
     };
-    use crate::test_support::fresh_database;
+    use crate::{ExecutionServices, PlanningServices, test_support::fresh_database};
 
     struct IdentityRedactor;
 
     impl MessageRedactor for IdentityRedactor {
         fn redact(&self, value: &str) -> String {
             value.to_owned()
+        }
+    }
+
+    struct UnusedExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for UnusedExecutor {
+        async fn execute(
+            &self,
+            _request: TaskExecutionRequest,
+            _cancellation: CancellationToken,
+        ) -> EngineResult<TaskExecutionReport> {
+            panic!("invalid startup settings must be rejected before execution")
+        }
+    }
+
+    struct UnusedPlanner;
+
+    #[async_trait]
+    impl TaskPlanner for UnusedPlanner {
+        async fn propose(
+            &self,
+            _request: PlannerRequest,
+        ) -> Result<PlannerResponse, PlannerFailure> {
+            Err(PlannerFailure::Invocation {
+                reason: "unused planner".to_owned(),
+                evidence_redacted: "unused planner".to_owned(),
+            })
+        }
+    }
+
+    struct UnusedConversation;
+
+    #[async_trait]
+    impl ConversationOrchestrator for UnusedConversation {
+        async fn converse(
+            &self,
+            _request: ConversationRequest,
+        ) -> Result<ConversationResponse, ConversationFailure> {
+            Err(ConversationFailure::Invocation {
+                reason: "unused conversation".to_owned(),
+                evidence_redacted: "unused conversation".to_owned(),
+            })
+        }
+    }
+
+    fn planning_services() -> PlanningServices {
+        PlanningServices {
+            conversation: Arc::new(UnusedConversation),
+            repository_root: PathBuf::from("."),
+            planner: Arc::new(UnusedPlanner),
+            planner_provider: ProviderId::Codex,
+            validation_policy: GraphValidationPolicy {
+                eligible_providers: BTreeSet::from([ProviderId::Codex]),
+                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                max_parallel_workers: 1,
+                per_provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+            },
+            integration: None,
+        }
+    }
+
+    fn execution_services(global_limit: usize) -> ExecutionServices {
+        ExecutionServices {
+            executor: Arc::new(UnusedExecutor),
+            repository_root: PathBuf::from("."),
+            state_root: PathBuf::from("."),
+            global_limit,
+            provider_limits: BTreeMap::new(),
+            claim_ttl: TimeDelta::seconds(5),
         }
     }
 
@@ -602,6 +683,65 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(DaemonError::State(_))));
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_execution_services_release_an_already_owned_lease() -> Result<(), DaemonError>
+    {
+        let (database, workspace_id) = database()?;
+        let instance_id = DaemonInstanceId::new();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: settings().lease_ttl,
+        })?;
+
+        let result = serve_with_full_orchestration_on_owned_lease(
+            Arc::clone(&database),
+            workspace_id,
+            instance_id,
+            CancellationToken::new(),
+            settings(),
+            Arc::new(IdentityRedactor),
+            planning_services(),
+            execution_services(0),
+        )
+        .await;
+
+        assert!(matches!(result, Err(DaemonError::InvalidSettings(_))));
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_runtime_settings_release_an_already_owned_lease() -> Result<(), DaemonError> {
+        let (database, workspace_id) = database()?;
+        let instance_id = DaemonInstanceId::new();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: settings().lease_ttl,
+        })?;
+        let mut invalid_settings = settings();
+        invalid_settings.heartbeat_interval = Duration::ZERO;
+
+        let result = serve_with_full_orchestration_on_owned_lease(
+            Arc::clone(&database),
+            workspace_id,
+            instance_id,
+            CancellationToken::new(),
+            invalid_settings,
+            Arc::new(IdentityRedactor),
+            planning_services(),
+            execution_services(1),
+        )
+        .await;
+
+        assert!(matches!(result, Err(DaemonError::InvalidSettings(_))));
         assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
         Ok(())
     }

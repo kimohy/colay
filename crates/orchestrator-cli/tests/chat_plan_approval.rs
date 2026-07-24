@@ -204,6 +204,7 @@ fn pending_command(
 }
 
 fn wait_command(
+    database_path: &std::path::Path,
     database: &WorkspaceDatabase<'_>,
     command_id: ClientCommandId,
 ) -> Result<ClientCommand> {
@@ -219,7 +220,7 @@ fn wait_command(
         }
         if Instant::now() >= deadline {
             let command = database.load_client_command(command_id)?;
-            let daemon = Database::open(database.database_path())?.daemon_status(Utc::now())?;
+            let daemon = Database::open(database_path)?.daemon_status(Utc::now())?;
             bail!(
                 "client command {command_id} did not finish: {command:?}; daemon status: {daemon:?}"
             );
@@ -269,15 +270,19 @@ fn wait_for_task_completion(database: &WorkspaceDatabase<'_>) -> Result<()> {
 }
 
 fn submit_and_wait(
+    database_path: &std::path::Path,
     database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
 ) -> Result<ClientCommand> {
     database.submit_client_command(command)?;
-    wait_command(database, command.command_id)
+    wait_command(database_path, database, command.command_id)
 }
 
-fn mutation_counts(database: &WorkspaceDatabase<'_>) -> Result<(i64, i64, i64, i64)> {
-    with_workspace(database, |connection| {
+fn mutation_counts(
+    database_path: &std::path::Path,
+    database: &WorkspaceDatabase<'_>,
+) -> Result<(i64, i64, i64, i64)> {
+    with_workspace(database_path, database, |connection| {
         Ok((
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?,
             connection.query_row("SELECT count(*) FROM worktrees", [], |row| row.get(0))?,
@@ -302,6 +307,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     );
     fixture.wait_online()?;
     let database = fixture.database()?;
+    let database_path = database.path().to_path_buf();
     let workspace_id = database
         .resolve_repository_workspace(&fixture.repository)?
         .workspace_id;
@@ -318,7 +324,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-session",
     );
     assert_eq!(
-        submit_and_wait(&workspace, &create)?.state,
+        submit_and_wait(&database_path, &workspace, &create)?.state,
         ClientCommandState::Completed
     );
 
@@ -333,7 +339,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-goal",
     );
     assert_eq!(
-        submit_and_wait(&workspace, &goal)?.state,
+        submit_and_wait(&database_path, &workspace, &goal)?.state,
         ClientCommandState::Completed
     );
 
@@ -350,7 +356,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         serde_json::from_value::<GraphValidationSummary>(graph.revision.validation.clone())?
             .authority
             .context("validated graph authority")?;
-    assert_eq!(mutation_counts(&workspace)?, (0, 0, 0, 0));
+    assert_eq!(mutation_counts(&database_path, &workspace)?, (0, 0, 0, 0));
     assert!(!fixture.repository.join(".colay/worktrees").exists());
 
     let wrong = pending_command(
@@ -366,9 +372,9 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         })?,
         "plan-e2e-wrong-approval",
     );
-    let wrong = submit_and_wait(&workspace, &wrong)?;
+    let wrong = submit_and_wait(&database_path, &workspace, &wrong)?;
     assert_eq!(wrong.state, ClientCommandState::Failed);
-    assert_eq!(mutation_counts(&workspace)?, (0, 0, 0, 0));
+    assert_eq!(mutation_counts(&database_path, &workspace)?, (0, 0, 0, 0));
 
     let exact_payload = ApproveGraphCommandPayload {
         revision_id: graph.revision.revision_id,
@@ -385,7 +391,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-exact-approval",
     );
     assert_eq!(
-        submit_and_wait(&workspace, &exact)?.state,
+        submit_and_wait(&database_path, &workspace, &exact)?.state,
         ClientCommandState::Completed
     );
     assert_eq!(
@@ -408,7 +414,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     let stored = workspace.submit_client_command(&replay)?;
     assert_eq!(stored.command_id, exact.command_id);
     wait_for_task_completion(&workspace)?;
-    let completed_counts = mutation_counts(&workspace)?;
+    let completed_counts = mutation_counts(&database_path, &workspace)?;
     assert_eq!(completed_counts.0, 2);
     assert_eq!(completed_counts.1, 2);
     assert_eq!(completed_counts.3, 1);

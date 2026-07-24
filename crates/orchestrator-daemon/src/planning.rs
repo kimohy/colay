@@ -890,12 +890,13 @@ mod tests {
     }
 
     fn seed_goal(
+        database_path: &std::path::Path,
         database: &WorkspaceDatabase<'_>,
     ) -> Result<(SessionId, MessageId), Box<dyn std::error::Error>> {
         let session_id = SessionId::new();
         let message_id = MessageId::new();
         let now = Utc::now();
-        with_workspace(database, |connection| {
+        with_workspace(database_path, database, |connection| {
             connection.execute(
                 "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state,
                     created_at, updated_at) VALUES (current_workspace(), ?1, '1', 0, 'planning', 'drafting', ?2, ?2)",
@@ -1008,8 +1009,9 @@ mod tests {
     async fn explicit_plan_without_requirement_cannot_reach_approval()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, workspace_id) = database()?;
+        let database_path = database.path().to_path_buf();
         let workspace = database.workspace(workspace_id);
-        let (session_id, goal) = seed_goal(&workspace)?;
+        let (session_id, goal) = seed_goal(&database_path, &workspace)?;
         let command = plan_command(session_id, goal, "valid-plan");
         workspace.submit_client_command(&command)?;
         let (services, _) = services(FakeMode::Valid, Duration::ZERO);
@@ -1035,7 +1037,7 @@ mod tests {
                 .iter()
                 .any(|(_, message)| message.content_redacted.contains("continue the interview"))
         );
-        with_workspace(&workspace, |connection| {
+        with_workspace(&database_path, &workspace, |connection| {
             let count: i64 =
                 connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
             assert_eq!(count, 0);
@@ -1048,8 +1050,9 @@ mod tests {
     async fn invalid_plan_records_redacted_attention_timeline()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, workspace_id) = database()?;
+        let database_path = database.path().to_path_buf();
         let workspace = database.workspace(workspace_id);
-        let (session_id, goal) = seed_goal(&workspace)?;
+        let (session_id, goal) = seed_goal(&database_path, &workspace)?;
         let command = plan_command(session_id, goal, "invalid-plan");
         workspace.submit_client_command(&command)?;
         let (invalid_services, _) = services(FakeMode::Malformed, Duration::ZERO);
@@ -1073,7 +1076,7 @@ mod tests {
         assert!(graph.revision.proposal_hash.is_none());
         assert!(!workspace.messages_after(session_id, 1, 10)?.is_empty());
 
-        let (secret_session, secret_goal) = seed_goal(&workspace)?;
+        let (secret_session, secret_goal) = seed_goal(&database_path, &workspace)?;
         let secret_command = plan_command(secret_session, secret_goal, "secret-plan");
         workspace.submit_client_command(&secret_command)?;
         let (secret_services, _) = services(FakeMode::SecretError, Duration::ZERO);
@@ -1096,8 +1099,9 @@ mod tests {
     async fn typed_exact_approval_materializes_once_and_wrong_hash_fails()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, workspace_id) = database()?;
+        let database_path = database.path().to_path_buf();
         let workspace = database.workspace(workspace_id);
-        let (session_id, goal) = seed_goal(&workspace)?;
+        let (session_id, goal) = seed_goal(&database_path, &workspace)?;
         seed_ready_requirement(&workspace, session_id, goal)?;
         workspace.submit_client_command(&plan_command(session_id, goal, "approval-plan"))?;
         let (services, _) = services(FakeMode::Valid, Duration::ZERO);
@@ -1168,8 +1172,9 @@ mod tests {
     async fn completed_projection_reconciles_after_command_crash_without_replanning()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, workspace_id) = database()?;
+        let database_path = database.path().to_path_buf();
         let workspace = database.workspace(workspace_id);
-        let (session_id, goal) = seed_goal(&workspace)?;
+        let (session_id, goal) = seed_goal(&database_path, &workspace)?;
         seed_ready_requirement(&workspace, session_id, goal)?;
         let command = plan_command(session_id, goal, "crash-plan");
         workspace.submit_client_command(&command)?;
@@ -1195,8 +1200,9 @@ mod tests {
     async fn slow_planner_does_not_interrupt_daemon_heartbeats()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, workspace_id) = database()?;
+        let database_path = database.path().to_path_buf();
         let workspace = database.workspace(workspace_id);
-        let (session_id, goal) = seed_goal(&workspace)?;
+        let (session_id, goal) = seed_goal(&database_path, &workspace)?;
         let command = plan_command(session_id, goal, "slow-plan");
         workspace.submit_client_command(&command)?;
         let (services, _) = services(FakeMode::Valid, Duration::from_millis(120));

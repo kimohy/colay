@@ -136,7 +136,8 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     let repository = canonicalize_directory(&repository)?;
     let state_root = repository.join(".colay");
     fs::create_dir_all(&state_root)?;
-    let database = Database::open(state_root.join("orchestrator.db"))?;
+    let database_path = state_root.join("orchestrator.db");
+    let database = Database::open(&database_path)?;
     database.migrate_with_backup(&state_root.join("backups"))?;
     with_database(&database, |connection| {
         connection.execute(
@@ -152,7 +153,7 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
     let revision_id = GraphRevisionId::new();
     let task_ids = [TaskId::new(), TaskId::new()];
     let now = Utc::now();
-    with_workspace(&database, |connection| {
+    with_workspace(&database_path, &database, |connection| {
         connection.execute(
             "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state,
                 created_at, updated_at, archived_at)

@@ -526,13 +526,14 @@ mod tests {
     }
 
     fn seed_graph(
+        database_path: &std::path::Path,
         database: &WorkspaceDatabase<'_>,
     ) -> Result<(SessionId, GraphRevisionId), Box<dyn std::error::Error>> {
         let session = SessionId::new();
         let message = MessageId::new();
         let revision = GraphRevisionId::new();
         let now = Utc::now().to_rfc3339();
-        with_workspace_transaction(database, |transaction| {
+        with_workspace_transaction(database_path, database, |transaction| {
             transaction.execute(
                 "INSERT INTO main.sessions(workspace_id, session_id, schema_version, title, state, created_at, updated_at)
                  VALUES (current_workspace(), ?1, 'v1', 'parallel', 'running', ?2, ?2)",
@@ -567,6 +568,7 @@ mod tests {
     }
 
     fn seed_task(
+        database_path: &std::path::Path,
         database: &WorkspaceDatabase<'_>,
         session: SessionId,
         revision: GraphRevisionId,
@@ -586,7 +588,7 @@ mod tests {
             assessment: None,
             created_at: now,
         };
-        with_workspace_transaction(database, |transaction| {
+        with_workspace_transaction(database_path, database, |transaction| {
             transaction.execute(
                 "INSERT INTO main.tasks(workspace_id, task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
@@ -621,7 +623,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = std::fs::canonicalize(directory.path())?;
-        let database = Arc::new(Database::open(root.join("state.db"))?);
+        let database_path = root.join("state.db");
+        let database = Arc::new(Database::open(&database_path)?);
         database.migrate_with_backup(&root.join("backups"))?;
         with_database(&database, |connection| {
             connection.execute(
@@ -639,9 +642,9 @@ mod tests {
             started_at: Utc::now(),
             ttl: TimeDelta::minutes(2),
         })?;
-        let (session, revision) = seed_graph(&workspace)?;
-        let first = seed_task(&workspace, session, revision, 1)?;
-        let second = seed_task(&workspace, session, revision, 2)?;
+        let (session, revision) = seed_graph(&database_path, &workspace)?;
+        let first = seed_task(&database_path, &workspace, session, revision, 1)?;
+        let second = seed_task(&database_path, &workspace, session, revision, 2)?;
         let executor = Arc::new(FakeExecutor {
             active: AtomicUsize::new(0),
             maximum: AtomicUsize::new(0),
@@ -684,7 +687,7 @@ mod tests {
             workspace.load_task(second)?.map(|task| task.state),
             Some(TaskState::Failed)
         );
-        with_workspace(&workspace, |connection| {
+        with_workspace(&database_path, &workspace, |connection| {
             let active: i64 = connection.query_row(
                 "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
                 [],

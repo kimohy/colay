@@ -200,6 +200,42 @@ fn every_workspace_foreign_key_carries_the_partition_key() -> TestResult {
 }
 
 #[test]
+fn direct_test_connections_match_production_pragmas_and_enforce_foreign_keys() -> TestResult {
+    let (database, _) = fresh_database()?;
+    with_database_connection(&database, |connection| {
+        let foreign_keys: i64 =
+            connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        let temp_store: i64 = connection.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
+        let busy_timeout: i64 =
+            connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 2, "FULL synchronous mode");
+        assert_eq!(temp_store, 2, "MEMORY temporary storage");
+        assert_eq!(busy_timeout, 5_000);
+
+        let missing_workspace = uuid::Uuid::now_v7().to_string();
+        let foreign_key_violation = connection.execute(
+            "INSERT INTO workspace_paths(
+                workspace_id, canonical_path, comparison_key, git_common_dir,
+                is_current, first_seen_at, last_seen_at
+             ) VALUES (?1, 'missing', 'missing', NULL, 1, ?2, ?2)",
+            rusqlite::params![missing_workspace, Utc::now().to_rfc3339()],
+        );
+        assert!(
+            foreign_key_violation.is_err(),
+            "test helpers must reject invalid foreign keys"
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
 fn global_usage_can_be_linked_to_a_workspace_routing_decision() -> TestResult {
     let root = tempfile::tempdir()?;
     let workspace_path = root.path().join("workspace");

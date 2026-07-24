@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::{Database, StateError, StateResult};
 
 const RESERVED_MIGRATION_WORKSPACE_ID: Uuid = Uuid::from_u128(1);
+const REPOSITORY_WORKSPACE_TOUCH_INTERVAL: TimeDelta = TimeDelta::minutes(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkspaceId(Uuid);
@@ -73,15 +74,27 @@ impl Database {
     /// path. The first repository resolution adopts that partition atomically so migrated rows
     /// remain reachable. Fresh databases, and every later repository, receive `UUIDv7` identities.
     pub fn resolve_repository_workspace(&self, path: &Path) -> StateResult<WorkspaceRegistration> {
+        self.resolve_repository_workspace_at(path, Utc::now())
+    }
+
+    fn resolve_repository_workspace_at(
+        &self,
+        path: &Path,
+        now: DateTime<Utc>,
+    ) -> StateResult<WorkspaceRegistration> {
         let kind = WorkspaceKind::Directory;
         let identity = WorkspacePathIdentity::resolve(path, kind)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction()?;
-        let now = Utc::now();
 
         let registration =
             match load_current_by_comparison_key(&transaction, &identity.comparison_key)? {
-                Some(existing) => existing,
+                Some(existing) => refresh_repository_registration_if_stale(
+                    &transaction,
+                    existing,
+                    &identity.comparison_key,
+                    now,
+                )?,
                 None if reserved_workspace_is_unattached(&transaction)? => {
                     attach_reserved_workspace(&transaction, &identity, now)?
                 }
@@ -195,6 +208,21 @@ impl Database {
         let connection = self.lock()?;
         load_workspace_in_connection(&connection, workspace_id)
     }
+}
+
+fn refresh_repository_registration_if_stale(
+    transaction: &Transaction<'_>,
+    existing: WorkspaceRegistration,
+    comparison_key: &str,
+    now: DateTime<Utc>,
+) -> StateResult<WorkspaceRegistration> {
+    if now.signed_duration_since(existing.last_seen_at) < REPOSITORY_WORKSPACE_TOUCH_INTERVAL {
+        return Ok(existing);
+    }
+    touch_registration(transaction, existing.workspace_id, comparison_key, now)?;
+    load_workspace_in_connection(transaction, existing.workspace_id)?.ok_or_else(|| {
+        StateError::InvalidRecord("workspace disappeared during liveness refresh".to_owned())
+    })
 }
 
 fn reserved_workspace_is_unattached(connection: &Connection) -> StateResult<bool> {
@@ -509,4 +537,77 @@ fn git_common_dir(workspace: &Path) -> StateResult<PathBuf> {
         gitdir.join(common_dir)
     };
     fs::canonicalize(&common_dir).map_err(|error| StateError::io(&common_dir, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeDelta, TimeZone as _, Utc};
+
+    use super::{Database, REPOSITORY_WORKSPACE_TOUCH_INTERVAL};
+
+    fn fixture() -> Result<(tempfile::TempDir, Database, std::path::PathBuf), crate::StateError> {
+        let root = tempfile::tempdir().map_err(|error| {
+            crate::StateError::InvalidRecord(format!("test tempdir failed: {error}"))
+        })?;
+        let repository = root.path().join("repository");
+        std::fs::create_dir_all(&repository)
+            .map_err(|error| crate::StateError::io(&repository, error))?;
+        let database = Database::open(root.path().join("state.db"))?;
+        database.migrate_with_backup(&root.path().join("backups"))?;
+        Ok((root, database, repository))
+    }
+
+    fn timestamp(minute: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 25, 1, minute, 0)
+            .single()
+            .unwrap_or_else(Utc::now)
+    }
+
+    fn path_last_seen(
+        database: &Database,
+        workspace_id: super::WorkspaceId,
+    ) -> crate::StateResult<chrono::DateTime<Utc>> {
+        database.with_connection(|connection| {
+            let value: String = connection.query_row(
+                "SELECT last_seen_at FROM main.workspace_paths \
+                 WHERE workspace_id = ?1 AND is_current = 1",
+                [workspace_id.to_string()],
+                |row| row.get(0),
+            )?;
+            super::parse_timestamp("workspace_paths.last_seen_at", &value)
+        })
+    }
+
+    #[test]
+    fn repository_resolution_skips_recent_liveness_touch() -> crate::StateResult<()> {
+        let (_root, database, repository) = fixture()?;
+        let initial = database.resolve_repository_workspace_at(&repository, timestamp(0))?;
+        let recent = database.resolve_repository_workspace_at(
+            &repository,
+            timestamp(0) + REPOSITORY_WORKSPACE_TOUCH_INTERVAL - TimeDelta::seconds(1),
+        )?;
+
+        assert_eq!(recent.last_seen_at, initial.last_seen_at);
+        assert_eq!(
+            path_last_seen(&database, initial.workspace_id)?,
+            initial.last_seen_at
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_resolution_refreshes_stale_liveness() -> crate::StateResult<()> {
+        let (_root, database, repository) = fixture()?;
+        let initial = database.resolve_repository_workspace_at(&repository, timestamp(0))?;
+        let refreshed_at = timestamp(0) + REPOSITORY_WORKSPACE_TOUCH_INTERVAL;
+        let refreshed = database.resolve_repository_workspace_at(&repository, refreshed_at)?;
+
+        assert_eq!(refreshed.workspace_id, initial.workspace_id);
+        assert_eq!(refreshed.last_seen_at, refreshed_at);
+        assert_eq!(
+            path_last_seen(&database, initial.workspace_id)?,
+            refreshed_at
+        );
+        Ok(())
+    }
 }

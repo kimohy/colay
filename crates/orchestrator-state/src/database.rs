@@ -10,9 +10,9 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MigrationManager, MigrationPlan, MigrationStatus, RollbackApplyResult, RollbackPlan,
-    StateError, StateResult, WorkspaceId, ensure_private_directory, ensure_private_file,
-    reject_symlink_components,
+    ArtifactStore, MigrationManager, MigrationPlan, MigrationStatus, RollbackApplyResult,
+    RollbackPlan, StateError, StateResult, WorkspaceId, ensure_private_directory,
+    ensure_private_file, reject_symlink_components,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +131,11 @@ impl Database {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn artifact_store(&self) -> StateResult<ArtifactStore> {
+        artifact_store_for_database_path(self.path())
     }
 
     #[must_use]
@@ -428,9 +433,8 @@ impl WorkspaceDatabase<'_> {
         self.workspace_id
     }
 
-    #[must_use]
-    pub fn database_path(&self) -> &Path {
-        self.database.path()
+    pub(crate) fn artifact_store(&self) -> StateResult<ArtifactStore> {
+        artifact_store_for_database_path(self.database.path())
     }
 
     pub(crate) fn lock(&self) -> StateResult<MutexGuard<'_, Connection>> {
@@ -455,11 +459,6 @@ impl WorkspaceDatabase<'_> {
         let result = operation(&transaction)?;
         transaction.commit()?;
         Ok(result)
-    }
-
-    #[must_use]
-    pub(crate) fn path(&self) -> &Path {
-        self.database.path()
     }
 
     /// Assigns the next sequence within this workspace and seals the event hash.
@@ -552,6 +551,18 @@ impl WorkspaceDatabase<'_> {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn artifact_store_for_database_path(path: &Path) -> StateResult<ArtifactStore> {
+    if path == Path::new(":memory:") {
+        return Err(StateError::InvalidRecord(
+            "an in-memory database cannot verify external checkpoint artifacts".to_owned(),
+        ));
+    }
+    let root = path.parent().ok_or_else(|| {
+        StateError::InvalidRecord("database path has no artifact root".to_owned())
+    })?;
+    ArtifactStore::open(root)
 }
 
 fn install_workspace_scope(connection: &Connection, workspace_id: WorkspaceId) -> StateResult<()> {

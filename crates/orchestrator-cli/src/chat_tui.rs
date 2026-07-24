@@ -1070,16 +1070,17 @@ mod tests {
         database: &Database,
         operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
     ) -> orchestrator_state::StateResult<T> {
-        let connection = rusqlite::Connection::open(database.path())?;
+        let connection = open_test_connection(database.path())?;
         operation(&connection)
     }
 
     fn test_with_workspace<T>(
+        database_path: &std::path::Path,
         database: &WorkspaceDatabase<'_>,
         operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
     ) -> orchestrator_state::StateResult<T> {
         use rusqlite::functions::FunctionFlags;
-        let connection = rusqlite::Connection::open(database.database_path())?;
+        let connection = open_test_connection(database_path)?;
         let workspace_id = database.workspace_id().to_string();
         connection.create_scalar_function(
             "current_workspace",
@@ -1088,6 +1089,20 @@ mod tests {
             move |_| Ok(workspace_id.clone()),
         )?;
         operation(&connection)
+    }
+
+    fn open_test_connection(
+        path: &std::path::Path,
+    ) -> orchestrator_state::StateResult<rusqlite::Connection> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;\
+             PRAGMA journal_mode = WAL;\
+             PRAGMA synchronous = FULL;\
+             PRAGMA temp_store = MEMORY;\
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(connection)
     }
 
     struct Adapter(Redactor);
@@ -1341,6 +1356,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn chat_tui_submits_typed_plan_and_exact_approval_commands() -> anyhow::Result<()> {
         let database = database()?;
+        let database_path = database.path().to_path_buf();
         let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
@@ -1359,7 +1375,7 @@ mod tests {
             redactor,
         )?;
         let goal_message_id = orchestrator_domain::MessageId::new();
-        test_with_workspace(&driver.workspace(), |connection| {
+        test_with_workspace(&database_path, &driver.workspace(), |connection| {
             connection.execute(
                 "INSERT INTO main.conversation_messages(
                     workspace_id, message_id, session_id, ordinal, role, kind, state,
@@ -1465,7 +1481,7 @@ mod tests {
             batch_id: batch_id.to_string(),
         })?;
 
-        test_with_workspace(&driver.workspace(), |connection| {
+        test_with_workspace(&database_path, &driver.workspace(), |connection| {
             let mut statement = connection.prepare(
                 "SELECT action, payload_json, requested_by FROM client_commands
                  WHERE action IN ('request_plan', 'approve_graph', 'request_integration',

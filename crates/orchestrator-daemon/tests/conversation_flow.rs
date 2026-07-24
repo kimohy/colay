@@ -131,22 +131,26 @@ impl TaskPlanner for FakePlanner {
     }
 }
 
-fn database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
+fn database() -> Result<(Database, WorkspaceId, std::path::PathBuf), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?.keep();
-    let database = Database::open(root.join("state.db"))?;
+    let database_path = root.join("state.db");
+    let database = Database::open(&database_path)?;
     database.migrate_with_backup(&root.join("backups"))?;
     let workspace_path = root.join("workspace");
     std::fs::create_dir_all(&workspace_path)?;
     let workspace_id = database
         .resolve_repository_workspace(&workspace_path)?
         .workspace_id;
-    Ok((database, workspace_id))
+    Ok((database, workspace_id, database_path))
 }
 
-fn seed_session(database: &WorkspaceDatabase<'_>) -> Result<SessionId, Box<dyn std::error::Error>> {
+fn seed_session(
+    database_path: &std::path::Path,
+    database: &WorkspaceDatabase<'_>,
+) -> Result<SessionId, Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     let now = Utc::now().to_rfc3339();
-    with_workspace(database, |connection| {
+    with_workspace(database_path, database, |connection| {
         connection.execute(
             "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state, created_at, updated_at)
              VALUES (current_workspace(), ?1, '1', 0, 'conversation', 'drafting', ?2, ?2)",
@@ -203,9 +207,10 @@ fn services(repository_root: std::path::PathBuf, outcome: ConversationOutcome) -
 }
 
 fn assert_zero_writable_rows(
+    database_path: &std::path::Path,
     database: &WorkspaceDatabase<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    with_workspace(database, |connection| {
+    with_workspace(database_path, database, |connection| {
         for table in [
             "tasks",
             "task_attempts",
@@ -255,13 +260,13 @@ fn git_repository() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "Why is Git needed?"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?
         .ok_or("append command was not processed")?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
 
     let directory = tempfile::tempdir()?;
     let services = services(
@@ -277,16 +282,16 @@ async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
     assert_eq!(messages.len(), 2);
     assert!(messages[1].1.content_redacted.contains("approved writable"));
     assert!(database.current_requirement_revision(session_id)?.is_none());
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn interview_records_partial_requirements_without_starting_a_plan()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "please improve the flow"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let directory = tempfile::tempdir()?;
@@ -312,7 +317,7 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
         .current_requirement_revision(session_id)?
         .ok_or("missing partial requirement revision")?;
     assert!(!requirement.snapshot.is_complete());
-    with_workspace(&database, |connection| {
+    with_workspace(&database_path, &database, |connection| {
         let plan_commands: i64 = connection.query_row(
             "SELECT count(*) FROM client_commands WHERE action = 'request_plan'",
             [],
@@ -321,16 +326,16 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
         assert_eq!(plan_commands, 0);
         Ok(())
     })?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn provider_failure_is_redacted_and_preserves_the_session()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "hello"))?;
     process_next_client_command(&database, &SecretRedactor, Utc::now())?;
     let directory = tempfile::tempdir()?;
@@ -348,7 +353,7 @@ async fn provider_failure_is_redacted_and_preserves_the_session()
             .content_redacted
             .contains("session were preserved")
     );
-    with_workspace(&database, |connection| {
+    with_workspace(&database_path, &database, |connection| {
         let outcome: String = connection.query_row(
             "SELECT outcome_json FROM conversation_attempts LIMIT 1",
             [],
@@ -358,16 +363,16 @@ async fn provider_failure_is_redacted_and_preserves_the_session()
         assert!(outcome.contains("[REDACTED]"));
         Ok(())
     })?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_approval()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let directory = tempfile::tempdir()?;
@@ -398,16 +403,16 @@ async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_appro
             .iter()
             .any(|(_, message)| { message.content_redacted.contains("Initialize Git") })
     );
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn validated_candidate_materializes_once_only_after_exact_approval()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
@@ -447,7 +452,7 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
     let summary: orchestrator_domain::GraphValidationSummary =
         serde_json::from_value(graph.revision.validation.clone())?;
     let authority = summary.authority.ok_or("missing graph authority")?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
 
     let approval = ClientCommand {
         command_id: ClientCommandId::new(),
@@ -474,7 +479,7 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     database.submit_client_command(&approval)?;
 
-    with_workspace(&database, |connection| {
+    with_workspace(&database_path, &database, |connection| {
         let tasks: i64 =
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
         let worktrees: i64 =
@@ -502,9 +507,9 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
 #[tokio::test]
 async fn new_user_message_atomically_supersedes_approval_candidate()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
@@ -547,17 +552,17 @@ async fn new_user_message_atomically_supersedes_approval_candidate()
             .map(|session| session.state),
         Some(SessionState::Drafting)
     );
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = Arc::new(database);
     let workspace = database.workspace(workspace_id);
-    let session_id = seed_session(&workspace)?;
+    let session_id = seed_session(&database_path, &workspace)?;
     workspace.submit_client_command(&append_command(session_id, "hello"))?;
     process_next_client_command(&workspace, &IdentityRedactor, Utc::now())?;
     let claimed = workspace
@@ -612,16 +617,16 @@ async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
             .map(|command| command.state),
         Some(ClientCommandState::Failed)
     );
-    assert_zero_writable_rows(&workspace)?;
+    assert_zero_writable_rows(&database_path, &workspace)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn repository_head_drift_rejects_approval_without_materializing_tasks()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id) = database()?;
+    let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database)?;
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
@@ -688,6 +693,6 @@ async fn repository_head_drift_rejects_approval_without_materializing_tasks()
         .ok_or("missing approval command")?;
     assert_eq!(stored.state, ClientCommandState::Failed);
     assert!(stored.outcome.unwrap_or_default().contains("HEAD changed"));
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }

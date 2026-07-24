@@ -19,17 +19,16 @@ pub fn with_database_connection<T>(
     database: &Database,
     operation: impl FnOnce(&Connection) -> StateResult<T>,
 ) -> StateResult<T> {
-    let connection = Connection::open(database.path())?;
-    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let connection = open_test_connection(database.path())?;
     operation(&connection)
 }
 
 pub fn with_workspace_connection<T>(
+    database_path: &Path,
     database: &WorkspaceDatabase<'_>,
     operation: impl FnOnce(&Connection) -> StateResult<T>,
 ) -> StateResult<T> {
-    let connection = Connection::open(database.database_path())?;
-    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let connection = open_test_connection(database_path)?;
     let workspace_id = database.workspace_id().to_string();
     connection.create_scalar_function(
         "current_workspace",
@@ -42,5 +41,17 @@ pub fn with_workspace_connection<T>(
 
 #[allow(dead_code)]
 pub fn database_at(path: &Path) -> Result<Connection, rusqlite::Error> {
-    Connection::open(path)
+    open_test_connection(path)
+}
+
+fn open_test_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;\
+         PRAGMA journal_mode = WAL;\
+         PRAGMA synchronous = FULL;\
+         PRAGMA temp_store = MEMORY;\
+         PRAGMA busy_timeout = 5000;",
+    )?;
+    Ok(connection)
 }

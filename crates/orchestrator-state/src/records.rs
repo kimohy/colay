@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::Database;
 use crate::{
-    ArtifactStore, StateError, StateResult, StoredArtifact, WorkspaceDatabase,
+    StateError, StateResult, StoredArtifact, WorkspaceDatabase,
     database::append_event_in_transaction,
 };
 
@@ -1368,18 +1368,6 @@ impl $database {
             }
         }
         Ok(checkpoint)
-    }
-
-    fn artifact_store(&self) -> StateResult<ArtifactStore> {
-        if self.path() == std::path::Path::new(":memory:") {
-            return Err(StateError::InvalidRecord(
-                "an in-memory database cannot verify external checkpoint artifacts".to_owned(),
-            ));
-        }
-        let root = self.path().parent().ok_or_else(|| {
-            StateError::InvalidRecord("database path has no artifact root".to_owned())
-        })?;
-        ArtifactStore::open(root)
     }
 
     pub fn record_handover(

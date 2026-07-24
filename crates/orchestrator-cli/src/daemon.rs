@@ -395,7 +395,6 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
     startup_heartbeat.abort();
     let _ = startup_heartbeat.await;
-    startup_lease.handoff();
     let result = serve_with_full_orchestration_on_owned_lease(
         database,
         workspace_id,
@@ -434,6 +433,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         },
     )
     .await;
+    startup_lease.handoff();
     signal_task.abort();
     result?;
     Ok(())

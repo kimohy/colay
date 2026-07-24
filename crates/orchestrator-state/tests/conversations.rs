@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use chrono::Utc;
 use orchestrator_domain::{
     ConversationAttemptId, ConversationOutcome, MessageId, ProviderId, RequirementRevision,
@@ -10,12 +12,13 @@ mod support;
 use support::{fresh_database, with_workspace_connection};
 
 fn seed_session_message(
+    database_path: &Path,
     database: &WorkspaceDatabase<'_>,
 ) -> Result<(SessionId, MessageId), Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     let message_id = MessageId::new();
     let now = Utc::now().to_rfc3339();
-    with_workspace_connection(database, |connection| {
+    with_workspace_connection(database_path, database, |connection| {
         connection.execute(
             "INSERT INTO main.sessions(session_id, schema_version, revision, title, state, created_at, updated_at)
              VALUES (?1, '1.0', 0, 'conversation test', 'drafting', ?2, ?2)",
@@ -61,8 +64,9 @@ fn ready_snapshot() -> RequirementSnapshot {
 fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, workspace_id) = database()?;
+    let database_path = database.path().to_path_buf();
     let database = database.workspace(workspace_id);
-    let (session_id, message_id) = seed_session_message(&database)?;
+    let (session_id, message_id) = seed_session_message(&database_path, &database)?;
     let attempt_id = ConversationAttemptId::new();
     database.begin_conversation_attempt(&NewConversationAttempt {
         attempt_id,
@@ -93,7 +97,7 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
     );
     database.record_requirement_revision(&revision)?;
 
-    with_workspace_connection(&database, |connection| {
+    with_workspace_connection(&database_path, &database, |connection| {
         assert!(
             connection
                 .execute(
@@ -124,8 +128,9 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
 fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, workspace_id) = database()?;
+    let database_path = database.path().to_path_buf();
     let database = database.workspace(workspace_id);
-    let (session_id, message_id) = seed_session_message(&database)?;
+    let (session_id, message_id) = seed_session_message(&database_path, &database)?;
     let attempt_id = ConversationAttemptId::new();
     let started_at = Utc::now();
     database.begin_conversation_attempt(&NewConversationAttempt {
@@ -135,7 +140,7 @@ fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
         provider: ProviderId::Codex,
         started_at,
     })?;
-    with_workspace_connection(&database, |connection| {
+    with_workspace_connection(&database_path, &database, |connection| {
         connection.execute(
             "INSERT INTO main.client_commands(
                 command_id, session_id, action, payload_json, idempotency_key, state,
@@ -168,7 +173,7 @@ fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
         attempt.error_redacted.as_deref(),
         Some("interrupted by daemon restart")
     );
-    with_workspace_connection(&database, |connection| {
+    with_workspace_connection(&database_path, &database, |connection| {
         let (state, outcome): (String, String) = connection.query_row(
             "SELECT state, outcome FROM client_commands WHERE command_id = ?1",
             [attempt_id.to_string()],

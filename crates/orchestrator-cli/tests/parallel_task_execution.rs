@@ -389,7 +389,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
             .iter()
             .all(|instruction| instruction.state == TaskInstructionState::Applied)
     );
-    with_workspace(&workspace, |connection| {
+    with_workspace(&paths.database, &workspace, |connection| {
         let claims: i64 =
             connection.query_row("SELECT count(*) FROM task_schedule_claims", [], |row| {
                 row.get(0)
