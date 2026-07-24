@@ -18,6 +18,7 @@ pub struct StateEnvironment {
     user_profile: Option<PathBuf>,
     is_wsl: bool,
     kernel_release: Option<String>,
+    kernel_version: Option<String>,
     mountinfo: Option<String>,
 }
 
@@ -34,6 +35,7 @@ pub struct StateEnvironmentTestInput {
     pub user_profile: Option<PathBuf>,
     pub is_wsl: bool,
     pub kernel_release: Option<String>,
+    pub kernel_version: Option<String>,
     pub mountinfo: Option<String>,
 }
 
@@ -72,6 +74,7 @@ impl StateEnvironment {
             user_profile: captured_path("USERPROFILE"),
             is_wsl: environment_is_set("WSL_DISTRO_NAME") || environment_is_set("WSL_INTEROP"),
             kernel_release: read_optional_text("/proc/sys/kernel/osrelease"),
+            kernel_version: read_optional_text("/proc/version"),
             mountinfo: read_optional_text("/proc/self/mountinfo"),
         }
     }
@@ -98,6 +101,7 @@ impl StateEnvironment {
             user_profile: input.user_profile,
             is_wsl: input.is_wsl,
             kernel_release: input.kernel_release,
+            kernel_version: input.kernel_version,
             mountinfo: input.mountinfo,
         };
         environment.validate_colay_home()?;
@@ -123,29 +127,44 @@ impl StateEnvironment {
         Ok(())
     }
 
-    fn reject_wsl_windows_mount(&self, label: &str, path: &std::path::Path) -> StateResult<()> {
-        if !self.is_wsl() {
-            return Ok(());
-        }
-        let windows_backed = self.mountinfo.as_deref().map_or_else(
-            || is_windows_drive_mount(path),
-            |mountinfo| has_windows_backed_mount(path, mountinfo),
-        );
-        if windows_backed {
+    fn reject_wsl_windows_mount(&self, label: &str, path: &Path) -> StateResult<()> {
+        if self.is_wsl() && is_windows_drive_mount(path) {
             return Err(StateError::InvalidConfig(format!(
                 "{label} is on a Windows-backed mount ({}); Windows and WSL must use separate native filesystems. Choose a Linux-native state directory.",
                 path.display()
             )));
+        }
+        let selected = self
+            .mountinfo
+            .as_deref()
+            .and_then(|mountinfo| selected_mount_backing(path, mountinfo));
+        if selected == Some(MountBacking::Windows) {
+            return Err(StateError::InvalidConfig(format!(
+                "{label} is on a Windows-backed mount ({}); Windows and WSL must use separate native filesystems. Choose a Linux-native state directory.",
+                path.display()
+            )));
+        }
+        if self.is_wsl() {
+            if selected == Some(MountBacking::Generic9p) {
+                return Err(StateError::InvalidConfig(format!(
+                    "{label} is on a 9p mount while WSL is detected ({}); Windows and WSL must use separate native filesystems. Choose a Linux-native state directory.",
+                    path.display()
+                )));
+            }
+            if selected.is_none() {
+                return Err(StateError::InvalidConfig(format!(
+                    "cannot classify the mount for {label} ({}): mount information is unavailable or does not describe the selected root; Windows and WSL must use separate native filesystems. Choose a Linux-native state directory.",
+                    path.display()
+                )));
+            }
         }
         Ok(())
     }
 
     fn is_wsl(&self) -> bool {
         self.is_wsl
-            || self.kernel_release.as_deref().is_some_and(|release| {
-                let release = release.to_ascii_lowercase();
-                release.contains("microsoft") || release.contains("wsl")
-            })
+            || kernel_indicates_wsl(self.kernel_release.as_deref())
+            || kernel_indicates_wsl(self.kernel_version.as_deref())
     }
 }
 
@@ -193,21 +212,17 @@ impl GlobalStatePaths {
             &environment.app_data,
             &environment.user_profile,
         );
-        let home = home_directory(environment)?;
-        let state_home = configured_or_default(
-            environment.xdg_state_home.as_ref(),
-            "XDG_STATE_HOME",
-            || home.join(".local/state"),
-        )?;
-        let data_home =
-            configured_or_default(environment.xdg_data_home.as_ref(), "XDG_DATA_HOME", || {
-                home.join(".local/share")
-            })?;
-        let config_home = configured_or_default(
-            environment.xdg_config_home.as_ref(),
-            "XDG_CONFIG_HOME",
-            || home.join(".config"),
-        )?;
+        let state_home = configured_path(environment.xdg_state_home.as_ref(), "XDG_STATE_HOME")?;
+        let data_home = configured_path(environment.xdg_data_home.as_ref(), "XDG_DATA_HOME")?;
+        let config_home = configured_path(environment.xdg_config_home.as_ref(), "XDG_CONFIG_HOME")?;
+        let home = if state_home.is_none() || data_home.is_none() || config_home.is_none() {
+            Some(home_directory(environment)?)
+        } else {
+            None
+        };
+        let state_home = xdg_or_home(state_home, home.as_deref(), ".local/state")?;
+        let data_home = xdg_or_home(data_home, home.as_deref(), ".local/share")?;
+        let config_home = xdg_or_home(config_home, home.as_deref(), ".config")?;
         let root = state_home.join("colay");
         let runtime = configured_path(environment.xdg_runtime_dir.as_ref(), "XDG_RUNTIME_DIR")?
             .map(|directory| directory.join("colay"))
@@ -254,21 +269,18 @@ fn home_directory(environment: &StateEnvironment) -> StateResult<PathBuf> {
     required_configured_path(environment.home.as_ref(), "HOME")
 }
 
-#[cfg(not(windows))]
-fn configured_or_default(
-    path: Option<&PathBuf>,
-    label: &str,
-    fallback: impl FnOnce() -> PathBuf,
-) -> StateResult<PathBuf> {
-    Ok(configured_path(path, label)?.unwrap_or_else(fallback))
-}
-
 fn configured_path(path: Option<&PathBuf>, label: &str) -> StateResult<Option<PathBuf>> {
     let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
         return Ok(None);
     };
     validate_absolute_path(path, label)?;
     Ok(Some(path.clone()))
+}
+
+#[cfg(not(windows))]
+fn xdg_or_home(path: Option<PathBuf>, home: Option<&Path>, suffix: &str) -> StateResult<PathBuf> {
+    path.or_else(|| home.map(|home| home.join(suffix)))
+        .ok_or_else(|| StateError::InvalidConfig(format!("missing HOME fallback for {suffix}")))
 }
 
 fn required_configured_path(path: Option<&PathBuf>, label: &str) -> StateResult<PathBuf> {
@@ -298,18 +310,33 @@ fn read_optional_text(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+#[cfg(test)]
 fn has_windows_backed_mount(path: &Path, mountinfo: &str) -> bool {
+    matches!(
+        selected_mount_backing(path, mountinfo),
+        Some(MountBacking::Windows)
+    )
+}
+
+fn selected_mount_backing(path: &Path, mountinfo: &str) -> Option<MountBacking> {
     mountinfo
         .lines()
         .filter_map(parse_mountinfo_entry)
         .filter(|entry| path.starts_with(&entry.mount_point))
         .max_by_key(|entry| entry.mount_point.components().count())
-        .is_some_and(|entry| entry.windows_backed)
+        .map(|entry| entry.backing)
 }
 
 struct MountinfoEntry {
     mount_point: PathBuf,
-    windows_backed: bool,
+    backing: MountBacking,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountBacking {
+    Native,
+    Generic9p,
+    Windows,
 }
 
 fn parse_mountinfo_entry(line: &str) -> Option<MountinfoEntry> {
@@ -318,9 +345,39 @@ fn parse_mountinfo_entry(line: &str) -> Option<MountinfoEntry> {
     let mut filesystem = after_separator.split_whitespace();
     let kind = filesystem.next()?;
     let source = filesystem.next()?;
+    let super_options = filesystem.next().unwrap_or_default();
     Some(MountinfoEntry {
         mount_point: unescape_mountinfo_path(mount_point),
-        windows_backed: kind == "drvfs" || kind == "9p" || source == "drvfs",
+        backing: classify_mount_backing(kind, source, super_options),
+    })
+}
+
+fn classify_mount_backing(kind: &str, source: &str, super_options: &str) -> MountBacking {
+    if kind == "drvfs"
+        || source.eq_ignore_ascii_case("drvfs")
+        || (kind == "9p"
+            && (source_is_windows_drive(source)
+                || super_options
+                    .split(',')
+                    .any(|option| option == "aname=drvfs")))
+    {
+        MountBacking::Windows
+    } else if kind == "9p" {
+        MountBacking::Generic9p
+    } else {
+        MountBacking::Native
+    }
+}
+
+fn source_is_windows_drive(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn kernel_indicates_wsl(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("microsoft") || value.contains("wsl")
     })
 }
 

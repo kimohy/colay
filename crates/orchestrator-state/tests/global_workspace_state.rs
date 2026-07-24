@@ -67,6 +67,54 @@ fn wsl_kernel_and_mountinfo_reject_custom_windows_mount_without_environment_hint
     Ok(())
 }
 
+#[test]
+fn explicit_drvfs_mount_is_rejected_without_wsl_evidence() -> TestResult {
+    let Err(error) = StateEnvironment::for_test(StateEnvironmentTestInput {
+        colay_home: Some(PathBuf::from("/windows/c/colay")),
+        mountinfo: Some("36 25 0:32 / /windows/c rw,relatime - drvfs C: rw".to_owned()),
+        ..StateEnvironmentTestInput::default()
+    }) else {
+        return Err("explicit drvfs mount was accepted without WSL evidence".into());
+    };
+
+    assert!(error.to_string().contains("Windows-backed mount"));
+    Ok(())
+}
+
+#[test]
+fn drvfs_9p_evidence_is_rejected_without_wsl_evidence() -> TestResult {
+    let Err(error) = StateEnvironment::for_test(StateEnvironmentTestInput {
+        colay_home: Some(PathBuf::from("/windows/c/colay")),
+        mountinfo: Some(
+            "36 25 0:32 / /windows/c rw,relatime - 9p server rw,aname=drvfs".to_owned(),
+        ),
+        ..StateEnvironmentTestInput::default()
+    }) else {
+        return Err("9p drvfs evidence was accepted without WSL evidence".into());
+    };
+
+    assert!(error.to_string().contains("Windows-backed mount"));
+    Ok(())
+}
+
+#[test]
+fn wsl_kernel_version_rejects_unknown_custom_mount_when_mountinfo_is_unavailable() -> TestResult {
+    let Err(error) = StateEnvironment::for_test(StateEnvironmentTestInput {
+        colay_home: Some(PathBuf::from("/linux/state/colay")),
+        kernel_version: Some("Linux version 6.6.87.2-microsoft-standard-WSL2".to_owned()),
+        ..StateEnvironmentTestInput::default()
+    }) else {
+        return Err("WSL state without mountinfo was accepted".into());
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("mount information is unavailable")
+    );
+    Ok(())
+}
+
 #[cfg(not(windows))]
 #[test]
 fn wsl_rejects_windows_mounted_xdg_state_root() -> TestResult {
@@ -119,6 +167,26 @@ fn native_linux_allows_9p_mnt_paths_when_not_running_under_wsl() -> TestResult {
         paths.workspaces,
         PathBuf::from("/mnt/c/data/colay/workspaces")
     );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[test]
+fn complete_xdg_paths_do_not_require_home() -> TestResult {
+    let environment = StateEnvironment::for_test(StateEnvironmentTestInput {
+        xdg_state_home: Some(PathBuf::from("/state")),
+        xdg_data_home: Some(PathBuf::from("/data")),
+        xdg_config_home: Some(PathBuf::from("/config")),
+        xdg_runtime_dir: Some(PathBuf::from("/runtime")),
+        ..StateEnvironmentTestInput::default()
+    })?;
+
+    let paths = GlobalStatePaths::resolve(&environment)?;
+
+    assert_eq!(paths.database, PathBuf::from("/state/colay/state.db"));
+    assert_eq!(paths.workspaces, PathBuf::from("/data/colay/workspaces"));
+    assert_eq!(paths.config, PathBuf::from("/config/colay/config.toml"));
+    assert_eq!(paths.runtime, PathBuf::from("/runtime/colay"));
     Ok(())
 }
 
