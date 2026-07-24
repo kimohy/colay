@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read as _,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -11,9 +12,10 @@ use orchestrator_domain::{
     Checkpoint, CommandEvidence, CorrelationId, CreateResolutionTaskCommandPayload,
     CreateSessionCommandPayload, EventActor, EventId, EventType, GraphValidationSummary,
     HandoverAcknowledgement, HandoverBundle, IntegrationBlocker, IntegrationPreview,
-    IntegrationSource, RepoPath, RequestConversationTurnCommandPayload, RequestPlanCommandPayload,
-    SchemaVersion, TaskEnvelope, TaskEvent, TaskGraphProposal, VerificationResult, WorkerResult,
-    task_graph_proposal_hash,
+    IntegrationSource, MessageId, RepoPath, RequestConversationTurnCommandPayload,
+    RequestPlanCommandPayload, RequirementRevisionId, RequirementSnapshot, SchemaVersion,
+    SessionId, TaskEnvelope, TaskEvent, TaskGraphProposal, VerificationResult, WorkerResult,
+    canonical_sha256, task_graph_proposal_hash,
 };
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,46 @@ use crate::{
 const LAST_LEGACY_SCHEMA_VERSION: u32 = 13;
 const RESERVED_LEGACY_WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
 const SOURCE_SNAPSHOT_NAME: &str = "legacy.db";
+
+const REWRITE_TRIGGERS: &[(&str, &str)] = &[
+    (
+        "graph_revisions_immutable_payload",
+        "CREATE TRIGGER graph_revisions_immutable_payload \
+         BEFORE UPDATE OF workspace_id, session_id, goal_message_id, ordinal, proposal_hash, \
+         proposal_json, validation_json, planner_provider, created_at ON graph_revisions \
+         WHEN OLD.status <> 'planning' \
+         BEGIN SELECT RAISE(ABORT, 'graph revision payload is immutable'); END",
+    ),
+    (
+        "graph_revision_authority_immutable",
+        "CREATE TRIGGER graph_revision_authority_immutable \
+         BEFORE UPDATE OF requirement_revision_id, validation_hash, base_commit ON graph_revisions \
+         WHEN OLD.status <> 'planning' \
+         BEGIN SELECT RAISE(ABORT, 'graph validation authority is immutable'); END",
+    ),
+    (
+        "graph_approvals_no_update",
+        "CREATE TRIGGER graph_approvals_no_update BEFORE UPDATE ON graph_approvals \
+         BEGIN SELECT RAISE(ABORT, 'graph approvals are immutable'); END",
+    ),
+    (
+        "integration_batches_payload_immutable",
+        "CREATE TRIGGER integration_batches_payload_immutable \
+         BEFORE UPDATE OF workspace_id, batch_id, session_id, revision_id, ordinal, base_revision, \
+         preview_hash, preview_json, created_at ON integration_batches \
+         BEGIN SELECT RAISE(ABORT, 'integration preview payload is immutable'); END",
+    ),
+    (
+        "integration_sources_no_update",
+        "CREATE TRIGGER integration_sources_no_update BEFORE UPDATE ON integration_sources \
+         BEGIN SELECT RAISE(ABORT, 'integration sources are immutable'); END",
+    ),
+    (
+        "integration_approvals_no_update",
+        "CREATE TRIGGER integration_approvals_no_update BEFORE UPDATE ON integration_approvals \
+         BEGIN SELECT RAISE(ABORT, 'integration approvals are immutable'); END",
+    ),
+];
 
 const IMPORT_TABLES: &[&str] = &[
     "tasks",
@@ -179,7 +221,7 @@ impl LegacyImporter {
             return Ok(None);
         }
         validate_source_paths(source)?;
-        let connection = open_source_read_only(&source.database)?;
+        let connection = open_source_read_only(&source.root, &source.database)?;
         let status = MigrationManager::status(&connection)?;
         if status.current_version == 0 {
             return Err(StateError::InvalidRecord(
@@ -214,7 +256,7 @@ impl LegacyImporter {
         }
         let events = validate_event_chain(&migrated)?;
         validate_source_documents(&migrated)?;
-        validate_jsonl_evidence(&source.events, &migrated, &events)?;
+        validate_jsonl_evidence(&source.root, &source.events, &migrated, &events)?;
         let event_evidence = event_evidence(&events)?;
         let files = collect_manifest_files(source, &migrated)?;
         let manifest_hash = manifest_hash(&database_sha256, database_length, &files);
@@ -276,7 +318,7 @@ impl LegacyImporter {
             return Ok(existing);
         }
         staging.prepare()?;
-        let source = open_source_read_only(&plan.source.database)?;
+        let source = open_source_read_only(&plan.source.root, &plan.source.database)?;
         let staged_database = staging.root().join(SOURCE_SNAPSHOT_NAME);
         backup_stable_source(&source, &staged_database)?;
         verify_file(
@@ -286,6 +328,7 @@ impl LegacyImporter {
         )?;
         for file in &plan.files {
             staging.stage_file(
+                &plan.source.root,
                 &plan.source.root.join(&file.relative_path),
                 &file.relative_path,
                 &file.sha256,
@@ -305,26 +348,22 @@ impl LegacyImporter {
         let migrated_path = temporary.path().join("migrated.db");
         let migrated = migrate_snapshot(&staged_database, &migrated_path)?;
         validate_event_chain(&migrated)?;
+        validate_source_documents(&migrated)?;
         drop(migrated);
+        let rewrite_path = temporary.path().join("rewrite.db");
+        prepare_rewrite_scratch(&migrated_path, &rewrite_path)?;
 
         let published_path = staging.published_path().to_path_buf();
         let imported_at = Utc::now();
         let mut connection = global.raw_lock()?;
-        ensure_private_directory(&paths.backups)?;
-        let backup_path = paths.backups.join(format!(
-            "legacy-import-{}-{}.before.db",
-            plan.source_fingerprint,
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        MigrationManager::backup(&connection, &backup_path)?;
-        let migrated_path_text = migrated_path.to_str().ok_or_else(|| {
+        let rewrite_path_text = rewrite_path.to_str().ok_or_else(|| {
             StateError::InvalidRecord(
-                "legacy import snapshot path is not valid Unicode for SQLite ATTACH".to_owned(),
+                "legacy import rewrite path is not valid Unicode for SQLite ATTACH".to_owned(),
             )
         })?;
         connection.execute(
             "ATTACH DATABASE ?1 AS legacy_import_source",
-            [migrated_path_text],
+            [rewrite_path_text],
         )?;
         let transaction_result = apply_transaction(
             &mut connection,
@@ -333,6 +372,7 @@ impl LegacyImporter {
             &published_path,
             imported_at,
             &mut staging,
+            &paths.backups,
         );
         let detach_result = connection.execute_batch("DETACH DATABASE legacy_import_source;");
         let result = transaction_result?;
@@ -351,6 +391,7 @@ fn apply_transaction(
     published_path: &Path,
     imported_at: DateTime<Utc>,
     staging: &mut LegacyImportStaging,
+    backups: &Path,
 ) -> StateResult<LegacyImportResult> {
     let transaction = connection.transaction()?;
     if let Some(existing) = load_existing_result_in(&transaction, target, plan)? {
@@ -367,8 +408,19 @@ fn apply_transaction(
             workspace_id: target_string,
         });
     }
+    let target_events = validate_event_chain_for_workspace(&transaction, &target_string)?;
+    validate_event_log_cursor(&transaction, &target_string, &target_events)?;
+    ensure_private_directory(backups)?;
+    let backup_path = backups.join(format!(
+        "legacy-import-{}-{}.before.db",
+        plan.source_fingerprint,
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    MigrationManager::backup(&transaction, &backup_path)?;
+    let target_event_count = i64::try_from(target_events.len())
+        .map_err(|_| StateError::InvalidRecord("target event count overflow".to_owned()))?;
     let (imported_rows, target_events, id_mappings) =
-        import_workspace_rows(&transaction, &target_string, plan)?;
+        import_workspace_rows(&transaction, &target_string, plan, target_event_count)?;
     let id_mapping_manifest_hash = id_mapping_manifest_hash(&id_mappings);
     let anchor_sequence = append_import_anchor(
         &transaction,
@@ -409,12 +461,8 @@ fn import_workspace_rows(
     transaction: &Transaction<'_>,
     target_workspace: &str,
     plan: &LegacyImportPlan,
+    target_events: i64,
 ) -> StateResult<(u64, i64, Vec<IdMapping>)> {
-    let target_events: i64 = transaction.query_row(
-        "SELECT count(*) FROM main.task_events WHERE workspace_id = ?1",
-        [target_workspace],
-        |row| row.get(0),
-    )?;
     if target_events == 0 {
         reject_unaudited_target_rows(transaction, target_workspace)?;
     }
@@ -983,8 +1031,71 @@ fn validate_source_documents(connection: &Connection) -> StateResult<()> {
     validate_source_checkpoints(connection)?;
     validate_source_handovers(connection)?;
     validate_source_verifications(connection)?;
+    validate_source_requirements(connection)?;
     validate_source_graphs(connection)?;
     validate_source_integrations(connection)
+}
+
+fn validate_source_requirements(connection: &Connection) -> StateResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT requirement_revision_id, session_id, source_message_id, ordinal, \
+                schema_version, snapshot_hash, snapshot_json, complete \
+         FROM requirement_revisions WHERE workspace_id = ?1",
+    )?;
+    let rows = statement.query_map([RESERVED_LEGACY_WORKSPACE], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    })?;
+    for row in rows {
+        let (revision_id, session_id, message_id, ordinal, schema, stored_hash, json, complete) =
+            row?;
+        let invalid = |reason: &str| {
+            StateError::InvalidRecord(format!(
+                "legacy requirement revision {revision_id} is invalid: {reason}"
+            ))
+        };
+        parse_source_id::<RequirementRevisionId>("requirement_revision_id", &revision_id)
+            .map_err(|_| invalid("revision identity is malformed"))?;
+        parse_source_id::<SessionId>("session_id", &session_id)
+            .map_err(|_| invalid("session identity is malformed"))?;
+        parse_source_id::<MessageId>("source_message_id", &message_id)
+            .map_err(|_| invalid("source-message identity is malformed"))?;
+        let ordinal = u64::try_from(ordinal).map_err(|_| invalid("ordinal is negative"))?;
+        if ordinal == 0 || schema != SchemaVersion::V1 {
+            return Err(invalid("schema version or ordinal is unsupported"));
+        }
+        let snapshot: RequirementSnapshot =
+            serde_json::from_str(&json).map_err(|_| invalid("snapshot JSON is not typed"))?;
+        if i64::from(snapshot.is_complete()) != complete {
+            return Err(invalid("complete flag does not match the typed snapshot"));
+        }
+        let expected_hash =
+            canonical_sha256(&snapshot).map_err(|_| invalid("snapshot cannot be sealed"))?;
+        if expected_hash != stored_hash {
+            return Err(invalid("snapshot hash does not match canonical content"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_source_id<T>(field: &str, value: &str) -> StateResult<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value.parse().map_err(|error| {
+        StateError::InvalidRecord(format!(
+            "legacy source {field} identifier `{value}` is invalid: {error}"
+        ))
+    })
 }
 
 fn validate_source_tasks_and_attempts(connection: &Connection) -> StateResult<()> {
@@ -2252,16 +2363,7 @@ fn ensure_plan_unchanged(
 }
 
 fn validate_source_paths(source: &RepositoryStatePaths) -> StateResult<()> {
-    reject_symlink_components(&source.database)?;
-    let root =
-        fs::canonicalize(&source.root).map_err(|error| StateError::io(&source.root, error))?;
-    let database = fs::canonicalize(&source.database)
-        .map_err(|error| StateError::io(&source.database, error))?;
-    if !database.starts_with(&root) {
-        return Err(StateError::InvalidRecord(
-            "legacy database escapes its repository state root".to_owned(),
-        ));
-    }
+    let (_, database) = canonical_contained_source(&source.root, &source.database)?;
     let metadata =
         fs::symlink_metadata(&database).map_err(|error| StateError::io(&database, error))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -2272,11 +2374,13 @@ fn validate_source_paths(source: &RepositoryStatePaths) -> StateResult<()> {
     Ok(())
 }
 
-fn open_source_read_only(path: &Path) -> StateResult<Connection> {
+fn open_source_read_only(root: &Path, path: &Path) -> StateResult<Connection> {
+    let (canonical_root, canonical_path) = canonical_contained_source(root, path)?;
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    recheck_contained_source(root, path, &canonical_root, &canonical_path)?;
     connection.busy_timeout(Duration::ZERO)?;
     connection.pragma_update(None, "query_only", true)?;
     Ok(connection)
@@ -2354,6 +2458,54 @@ fn migrate_snapshot(source: &Path, destination: &Path) -> StateResult<Connection
     validate_integrity(&connection, "migrated legacy snapshot")?;
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(connection)
+}
+
+fn prepare_rewrite_scratch(validated: &Path, scratch: &Path) -> StateResult<()> {
+    if scratch.exists() {
+        return Err(StateError::ArtifactConflict(scratch.to_path_buf()));
+    }
+    fs::copy(validated, scratch).map_err(|error| StateError::io(scratch, error))?;
+    ensure_private_file(scratch)?;
+    let connection = Connection::open(scratch)?;
+    connection.execute_batch("PRAGMA journal_mode = DELETE;")?;
+    validate_integrity(&connection, "legacy rewrite scratch before trigger removal")?;
+    validate_and_drop_rewrite_triggers(&connection)?;
+    validate_integrity(&connection, "legacy rewrite scratch after trigger removal")?;
+    connection.execute_batch("PRAGMA journal_mode = DELETE;")?;
+    drop(connection);
+    ensure_private_file(scratch)
+}
+
+fn validate_and_drop_rewrite_triggers(connection: &Connection) -> StateResult<()> {
+    for (name, expected_sql) in REWRITE_TRIGGERS {
+        let observed: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let observed = observed.ok_or_else(|| {
+            StateError::InvalidRecord(format!(
+                "legacy rewrite scratch is missing required immutable trigger {name}"
+            ))
+        })?;
+        if normalize_sql(&observed) != normalize_sql(expected_sql) {
+            return Err(StateError::InvalidRecord(format!(
+                "legacy rewrite scratch immutable trigger {name} does not match migration 13"
+            )));
+        }
+    }
+    let transaction = connection.unchecked_transaction()?;
+    for (name, _) in REWRITE_TRIGGERS {
+        transaction.execute_batch(&format!("DROP TRIGGER \"{name}\";"))?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn legacy_workspace_exists(connection: &Connection) -> StateResult<bool> {
@@ -2475,7 +2627,7 @@ fn validate_event_chain_for_workspace(
     if task_count > 0 && events.is_empty() {
         return Err(StateError::InvalidEventChain {
             sequence: 0,
-            reason: "legacy tasks exist without audit events".to_owned(),
+            reason: "workspace projections exist without an audit event chain".to_owned(),
         });
     }
     Ok(events)
@@ -2490,7 +2642,43 @@ fn event_evidence(events: &[TaskEvent]) -> StateResult<LegacyEventEvidence> {
     })
 }
 
+fn validate_event_log_cursor(
+    connection: &Connection,
+    workspace_id: &str,
+    events: &[TaskEvent],
+) -> StateResult<()> {
+    let cursor: Option<(i64, Option<String>)> = connection
+        .query_row(
+            "SELECT last_exported_sequence, last_exported_hash FROM event_log_state \
+             WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((sequence, stored_hash)) = cursor else {
+        return Ok(());
+    };
+    let index = usize::try_from(sequence).map_err(|_| StateError::InvalidEventChain {
+        sequence,
+        reason: "workspace event cursor sequence is negative".to_owned(),
+    })?;
+    let expected_hash = index
+        .checked_sub(1)
+        .and_then(|event_index| events.get(event_index))
+        .map(|event| event.event_hash.clone());
+    if index > events.len() || (index == 0) != stored_hash.is_none() || stored_hash != expected_hash
+    {
+        return Err(StateError::InvalidEventChain {
+            sequence,
+            reason: "workspace event cursor does not identify an exact event-chain prefix"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_jsonl_evidence(
+    root: &Path,
     path: &Path,
     connection: &Connection,
     database_events: &[TaskEvent],
@@ -2526,11 +2714,7 @@ fn validate_jsonl_evidence(
             reason: "JSONL export state declares evidence but the JSONL file is missing".to_owned(),
         });
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| StateError::io(path, error))?;
-    if metadata.file_type().is_symlink() {
-        return Err(StateError::SymlinkEscape(path.to_path_buf()));
-    }
-    let bytes = fs::read(path).map_err(|error| StateError::io(path, error))?;
+    let bytes = read_contained_source(root, path)?;
     if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
         return Err(StateError::TornEventLogTail);
     }
@@ -2616,6 +2800,8 @@ fn collect_relative_files(
     directory: &Path,
     paths: &mut BTreeSet<PathBuf>,
 ) -> StateResult<()> {
+    reject_symlink_components(root)?;
+    reject_symlink_components(directory)?;
     let metadata =
         fs::symlink_metadata(directory).map_err(|error| StateError::io(directory, error))?;
     if metadata.file_type().is_symlink() {
@@ -2634,6 +2820,7 @@ fn collect_relative_files(
     entries.sort_by_key(fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
+        reject_symlink_components(&path)?;
         let metadata = fs::symlink_metadata(&path).map_err(|error| StateError::io(&path, error))?;
         if metadata.file_type().is_symlink() {
             return Err(StateError::SymlinkEscape(path));
@@ -2684,21 +2871,69 @@ fn validate_relative(path: &Path) -> StateResult<()> {
 fn manifest_file(root: &Path, relative_path: PathBuf) -> StateResult<ManifestFile> {
     validate_relative(&relative_path)?;
     let path = root.join(&relative_path);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| StateError::io(&path, error))?;
-    if metadata.file_type().is_symlink() {
-        return Err(StateError::SymlinkEscape(path));
-    }
-    if !metadata.is_file() {
+    let bytes = read_contained_source(root, &path)?;
+    Ok(ManifestFile {
+        relative_path,
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        byte_length: u64::try_from(bytes.len())
+            .map_err(|_| StateError::InvalidRecord("legacy artifact is too large".to_owned()))?,
+    })
+}
+
+fn canonical_contained_source(root: &Path, path: &Path) -> StateResult<(PathBuf, PathBuf)> {
+    if !path.starts_with(root) {
         return Err(StateError::InvalidRecord(format!(
-            "legacy artifact is not a regular file: {}",
+            "legacy source path escapes state root: {}",
             path.display()
         )));
     }
-    Ok(ManifestFile {
-        relative_path,
-        sha256: sha256_file(&path)?,
-        byte_length: metadata.len(),
-    })
+    reject_symlink_components(root)?;
+    reject_symlink_components(path)?;
+    let canonical_root = fs::canonicalize(root).map_err(|error| StateError::io(root, error))?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| StateError::io(path, error))?;
+    reject_symlink_components(&canonical_root)?;
+    reject_symlink_components(&canonical_path)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(StateError::SymlinkEscape(path.to_path_buf()));
+    }
+    Ok((canonical_root, canonical_path))
+}
+
+fn recheck_contained_source(
+    root: &Path,
+    path: &Path,
+    expected_root: &Path,
+    expected_path: &Path,
+) -> StateResult<()> {
+    let (canonical_root, canonical_path) = canonical_contained_source(root, path)?;
+    if canonical_root != expected_root || canonical_path != expected_path {
+        return Err(StateError::SymlinkEscape(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn read_contained_source(root: &Path, path: &Path) -> StateResult<Vec<u8>> {
+    let (canonical_root, canonical_path) = canonical_contained_source(root, path)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| StateError::io(path, error))?;
+    recheck_contained_source(root, path, &canonical_root, &canonical_path)?;
+    if !file
+        .metadata()
+        .map_err(|error| StateError::io(path, error))?
+        .is_file()
+    {
+        return Err(StateError::InvalidRecord(format!(
+            "legacy source is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| StateError::io(path, error))?;
+    recheck_contained_source(root, path, &canonical_root, &canonical_path)?;
+    Ok(bytes)
 }
 
 fn manifest_files_below(root: &Path, excluded: Option<&str>) -> StateResult<Vec<ManifestFile>> {

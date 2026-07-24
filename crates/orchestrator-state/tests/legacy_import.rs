@@ -7,9 +7,13 @@ use std::{
 
 use chrono::Utc;
 use orchestrator_domain::{
-    AttemptId, Checkpoint, CheckpointId, CorrelationId, EventActor, EventId, EventType, ProviderId,
-    RepoPath, SchemaVersion, TaskEnvelope, TaskEvent, TaskId, TaskState, WorkerOutcome,
-    WorkerResult,
+    AttemptId, Checkpoint, CheckpointId, CorrelationId, EventActor, EventId, EventType,
+    GraphRevisionId, GraphValidationSummary, IntegrationApplicationId, IntegrationBatchId,
+    IntegrationPreview, IntegrationSource, MessageId, ModelProfile, ProviderId, RepoPath,
+    RequirementRevision, RequirementRevisionId, RequirementSnapshot, SchemaVersion, SessionId,
+    TaskEnvelope, TaskEvent, TaskGraphNode, TaskGraphProposal, TaskId, TaskState,
+    VerificationCommand, VerificationId, VerificationResult, VerificationStatus, WorkerOutcome,
+    WorkerResult, task_graph_proposal_hash,
 };
 use orchestrator_state::{
     ArtifactStore, Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig,
@@ -142,6 +146,31 @@ fn artifact_metadata_that_disagrees_with_source_bytes_is_refused() -> TestResult
             .list_tasks(&TaskListFilter::default())?
             .is_empty()
     );
+    Ok(())
+}
+
+#[test]
+fn nested_link_in_artifact_path_is_refused_before_source_read() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let outside = fixture.root.path().join("outside-artifacts");
+    fs::create_dir_all(&outside)?;
+    fs::write(outside.join("evidence.txt"), b"legacy artifact evidence")?;
+    let linked_parent = fixture.source.root.join("linked");
+    fs::create_dir_all(&linked_parent)?;
+    let nested_link = linked_parent.join("nested");
+    create_directory_link(&outside, &nested_link)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE artifacts SET relative_path = 'linked/nested/evidence.txt'",
+        [],
+    )?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source)
+        .err()
+        .ok_or("nested link in artifact path was accepted")?;
+
+    assert!(error.to_string().contains("symbolic-link traversal"));
+    assert_eq!(before, target_mutation_counts(&fixture)?);
     Ok(())
 }
 
@@ -333,6 +362,147 @@ fn colliding_ids_are_replaced_deterministically_and_recorded() -> TestResult {
 }
 
 #[test]
+fn approved_graph_collision_rewrites_only_scratch_and_propagates_hash() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_approved_source_graph(&fixture)?;
+    seed_target_graph_collision(&fixture, &graph)?;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .append_event(audit_event(None, "existing graph collision evidence"))?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+
+    let result =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+
+    let connection = Connection::open(fixture.global.path())?;
+    let mapped_revision: String = connection.query_row(
+        "SELECT target_id FROM legacy_import_id_mappings \
+         WHERE source_fingerprint = ?1 AND workspace_id = ?2 \
+           AND entity_type = 'graph_revisions.revision_id' AND source_id = ?3",
+        params![
+            result.source_fingerprint,
+            fixture.workspace_id.to_string(),
+            graph.revision_id.to_string()
+        ],
+        |row| row.get(0),
+    )?;
+    let (proposal_hash, proposal_json, validation_json): (String, String, String) = connection
+        .query_row(
+            "SELECT proposal_hash, proposal_json, validation_json FROM graph_revisions \
+             WHERE workspace_id = ?1 AND revision_id = ?2",
+            params![fixture.workspace_id.to_string(), mapped_revision],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let proposal: TaskGraphProposal = serde_json::from_str(&proposal_json)?;
+    let validation: GraphValidationSummary = serde_json::from_str(&validation_json)?;
+    assert_eq!(proposal.revision_id.to_string(), mapped_revision);
+    assert_eq!(
+        proposal_hash,
+        task_graph_proposal_hash(&proposal, &validation)?
+    );
+    let approval_hash: String = connection.query_row(
+        "SELECT proposal_hash FROM graph_approvals \
+         WHERE workspace_id = ?1 AND revision_id = ?2",
+        params![fixture.workspace_id.to_string(), mapped_revision],
+        |row| row.get(0),
+    )?;
+    assert_eq!(approval_hash, proposal_hash);
+    assert_ne!(proposal_hash, graph.proposal_hash);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+
+    let published = Connection::open(result.published_path.join("legacy.db"))?;
+    let (evidence_hash, evidence_json): (String, String) = published.query_row(
+        "SELECT proposal_hash, proposal_json FROM graph_revisions \
+         WHERE workspace_id = ?1 AND revision_id = ?2",
+        params![RESERVED_LEGACY_WORKSPACE, graph.revision_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let evidence_proposal: TaskGraphProposal = serde_json::from_str(&evidence_json)?;
+    assert_eq!(evidence_hash, graph.proposal_hash);
+    assert_eq!(evidence_proposal.revision_id, graph.revision_id);
+    Ok(())
+}
+
+#[test]
+fn integration_collision_rewrites_only_scratch_and_propagates_preview_hash() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_source_graph(&fixture, "planning", false)?;
+    let integration = seed_source_integration(&fixture, &graph)?;
+    seed_target_integration_collisions(&fixture, &graph, &integration)?;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .append_event(audit_event(
+            Some(fixture.task_id),
+            "existing integration collision evidence",
+        ))?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+
+    let result =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+
+    let connection = Connection::open(fixture.global.path())?;
+    let mapped_batch: String = connection.query_row(
+        "SELECT target_id FROM legacy_import_id_mappings \
+         WHERE source_fingerprint = ?1 AND workspace_id = ?2 \
+           AND entity_type = 'integration_batches.batch_id' AND source_id = ?3",
+        params![
+            result.source_fingerprint,
+            fixture.workspace_id.to_string(),
+            integration.batch_id.to_string()
+        ],
+        |row| row.get(0),
+    )?;
+    let (preview_hash, preview_json): (String, String) = connection.query_row(
+        "SELECT preview_hash, preview_json FROM integration_batches \
+         WHERE workspace_id = ?1 AND batch_id = ?2",
+        params![fixture.workspace_id.to_string(), mapped_batch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let preview: IntegrationPreview = serde_json::from_str(&preview_json)?;
+    assert!(preview.verify_integrity());
+    assert_eq!(preview.batch_id.to_string(), mapped_batch);
+    assert_eq!(preview.preview_hash, preview_hash);
+    assert_ne!(preview_hash, integration.preview_hash);
+    let source_json: String = connection.query_row(
+        "SELECT source_json FROM integration_sources \
+         WHERE workspace_id = ?1 AND batch_id = ?2",
+        params![fixture.workspace_id.to_string(), mapped_batch],
+        |row| row.get(0),
+    )?;
+    let imported_source: IntegrationSource = serde_json::from_str(&source_json)?;
+    assert_eq!(preview.sources, vec![imported_source]);
+    for table in ["integration_approvals", "integration_applications"] {
+        let sql =
+            format!("SELECT preview_hash FROM {table} WHERE workspace_id = ?1 AND batch_id = ?2");
+        let dependent_hash: String = connection.query_row(
+            &sql,
+            params![fixture.workspace_id.to_string(), mapped_batch],
+            |row| row.get(0),
+        )?;
+        assert_eq!(dependent_hash, preview_hash);
+    }
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+
+    let published = Connection::open(result.published_path.join("legacy.db"))?;
+    let (evidence_hash, evidence_json): (String, String) = published.query_row(
+        "SELECT preview_hash, preview_json FROM integration_batches \
+         WHERE workspace_id = ?1 AND batch_id = ?2",
+        params![RESERVED_LEGACY_WORKSPACE, integration.batch_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let evidence_preview: IntegrationPreview = serde_json::from_str(&evidence_json)?;
+    assert_eq!(evidence_hash, integration.preview_hash);
+    assert_eq!(evidence_preview.batch_id, integration.batch_id);
+    Ok(())
+}
+
+#[test]
 fn declared_jsonl_export_without_exact_file_is_refused() -> TestResult {
     let fixture = ImportFixture::new()?;
     let connection = Connection::open(&fixture.source.database)?;
@@ -431,6 +601,89 @@ fn target_projections_without_audit_events_are_refused() -> TestResult {
             .join(plan.source_fingerprint)
             .exists()
     );
+    Ok(())
+}
+
+#[test]
+fn corrupt_earlier_target_event_is_refused_before_any_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let workspace = fixture.global.workspace(fixture.workspace_id);
+    workspace.append_event(audit_event(None, "target event one"))?;
+    workspace.append_event(audit_event(None, "target event two"))?;
+    Connection::open(fixture.global.path())?.execute(
+        "DELETE FROM task_events WHERE workspace_id = ?1 AND sequence = 1",
+        [fixture.workspace_id.to_string()],
+    )?;
+    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
+        .err()
+        .ok_or("gapped target event chain was accepted")?;
+
+    assert!(error.to_string().contains("audit event chain is invalid"));
+    assert_eq!(before, target_mutation_counts(&fixture)?);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    Ok(())
+}
+
+#[test]
+fn inconsistent_target_event_cursor_is_refused_before_any_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let workspace = fixture.global.workspace(fixture.workspace_id);
+    workspace.append_event(audit_event(None, "target event one"))?;
+    let second = workspace.append_event(audit_event(None, "target event two"))?;
+    Connection::open(fixture.global.path())?.execute(
+        "INSERT INTO event_log_state(workspace_id, last_exported_sequence, last_exported_hash, \
+            updated_at) VALUES (?1, 1, ?2, ?3)",
+        params![
+            fixture.workspace_id.to_string(),
+            second.event_hash,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    let plan = LegacyImporter::inspect(&fixture.source)?.ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
+        .err()
+        .ok_or("inconsistent target event cursor was accepted")?;
+
+    assert!(error.to_string().contains("event cursor"));
+    assert_eq!(before, target_mutation_counts(&fixture)?);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    Ok(())
+}
+
+#[test]
+fn mismatched_requirement_snapshot_hash_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    seed_source_requirement(&fixture, Some("f".repeat(64)), None)?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source)
+        .err()
+        .ok_or("mismatched requirement snapshot hash was accepted")?;
+
+    assert!(error.to_string().contains("requirement revision"));
+    assert_eq!(before, target_mutation_counts(&fixture)?);
+    Ok(())
+}
+
+#[test]
+fn inconsistent_requirement_row_and_snapshot_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    seed_source_requirement(&fixture, None, Some(false))?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source)
+        .err()
+        .ok_or("inconsistent requirement row and snapshot were accepted")?;
+
+    assert!(error.to_string().contains("requirement revision"));
+    assert_eq!(before, target_mutation_counts(&fixture)?);
     Ok(())
 }
 
@@ -542,12 +795,29 @@ fn replay_refuses_corruption_in_the_imported_target_event_chain() -> TestResult 
 }
 
 struct ImportFixture {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     source: RepositoryStatePaths,
     paths: GlobalStatePaths,
     global: Database,
     workspace_id: orchestrator_state::WorkspaceId,
     task_id: TaskId,
+}
+
+const RESERVED_LEGACY_WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
+
+struct GraphSeed {
+    session_id: SessionId,
+    message_id: MessageId,
+    revision_id: GraphRevisionId,
+    proposal_hash: String,
+}
+
+struct IntegrationSeed {
+    batch_id: IntegrationBatchId,
+    application_id: IntegrationApplicationId,
+    checkpoint: Checkpoint,
+    verification: VerificationResult,
+    preview_hash: String,
 }
 
 impl ImportFixture {
@@ -567,7 +837,7 @@ impl ImportFixture {
             .resolve_repository_workspace(&repository)?
             .workspace_id;
         Ok(Self {
-            _root: root,
+            root,
             source,
             paths,
             global,
@@ -578,6 +848,17 @@ impl ImportFixture {
 
     fn source_hashes(&self) -> TestResult<BTreeMap<PathBuf, String>> {
         hash_tree(&self.source.root)
+    }
+
+    fn source_evidence_hashes(&self) -> TestResult<BTreeMap<PathBuf, String>> {
+        Ok(self
+            .source_hashes()?
+            .into_iter()
+            .filter(|(path, _)| {
+                let text = path.to_string_lossy();
+                !text.ends_with(".db-wal") && !text.ends_with(".db-shm")
+            })
+            .collect())
     }
 }
 
@@ -705,6 +986,539 @@ fn seed_worker_result(paths: &RepositoryStatePaths, task_id: TaskId) -> TestResu
     Ok(attempt_id)
 }
 
+fn migrate_source_to_v13(fixture: &ImportFixture) -> TestResult {
+    {
+        let source = Database::open(&fixture.source.database)?;
+        source.migrate_with_backup(&fixture.source.backups)?;
+    }
+    Connection::open(&fixture.source.database)?.execute_batch(
+        "DROP TABLE legacy_import_id_mappings; \
+         DROP TABLE legacy_imports; \
+         DELETE FROM schema_migrations WHERE version = 14; \
+         PRAGMA user_version = 13;",
+    )?;
+    Ok(())
+}
+
+fn seed_approved_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
+    seed_source_graph(fixture, "approved", true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn seed_source_graph(
+    fixture: &ImportFixture,
+    status: &str,
+    include_approval: bool,
+) -> TestResult<GraphSeed> {
+    let now = Utc::now();
+    let session_id = SessionId::new();
+    let message_id = MessageId::new();
+    let revision_id = GraphRevisionId::new();
+    let proposal = TaskGraphProposal {
+        schema_version: SchemaVersion::v1(),
+        revision_id,
+        session_id,
+        goal_message_id: message_id,
+        planner_provider: ProviderId::Codex,
+        proposed_at: now,
+        nodes: vec![TaskGraphNode {
+            key: "legacy-node".to_owned(),
+            title: "Legacy node".to_owned(),
+            objective: "Import an approved graph".to_owned(),
+            dependencies: Vec::new(),
+            constraints: vec!["local only".to_owned()],
+            acceptance_criteria: vec!["imported".to_owned()],
+            provider: Some(ProviderId::Codex),
+            profile: ModelProfile::Standard,
+            write_scopes: vec![RepoPath::try_from("src/legacy.rs")?],
+            repository_wide_write_scope: false,
+            risks: Vec::new(),
+            parallel_safety: "isolated".to_owned(),
+        }],
+    };
+    let validation = GraphValidationSummary {
+        node_count: 1,
+        edge_count: 0,
+        topological_order: vec!["legacy-node".to_owned()],
+        maximum_parallel_width: 1,
+        configured_parallel_workers: 1,
+        authority: None,
+    };
+    let proposal_hash = task_graph_proposal_hash(&proposal, &validation)?;
+    let connection = Connection::open(&fixture.source.database)?;
+    connection.execute(
+        "INSERT INTO sessions(workspace_id, session_id, schema_version, revision, title, state, \
+            created_at, updated_at, archived_at, state_v2) \
+         VALUES (?1, ?2, '1', 0, 'legacy graph', 'running', ?3, ?3, NULL, 'running')",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            session_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO conversation_messages(workspace_id, message_id, session_id, task_id, ordinal, \
+            role, kind, state, content_redacted, created_at, finalized_at) \
+         VALUES (?1, ?2, ?3, NULL, 1, 'user', 'user_message', 'final', 'build graph', ?4, ?4)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            message_id.to_string(),
+            session_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO graph_revisions(workspace_id, revision_id, session_id, goal_message_id, \
+            ordinal, status, proposal_hash, proposal_json, validation_json, planner_provider, \
+            created_at, completed_at, planner_provider_v2) \
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, 'codex', ?9, ?9, 'codex')",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            revision_id.to_string(),
+            session_id.to_string(),
+            message_id.to_string(),
+            status,
+            proposal_hash,
+            serde_json::to_string(&proposal)?,
+            serde_json::to_string(&validation)?,
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO session_graph_heads(workspace_id, session_id, revision_id, updated_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            session_id.to_string(),
+            revision_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    if include_approval {
+        connection.execute(
+            "INSERT INTO graph_approvals(workspace_id, revision_id, proposal_hash, approved_by, \
+                approved_at, session_id) VALUES (?1, ?2, ?3, 'fixture', ?4, ?5)",
+            params![
+                RESERVED_LEGACY_WORKSPACE,
+                revision_id.to_string(),
+                proposal_hash,
+                now.to_rfc3339(),
+                session_id.to_string()
+            ],
+        )?;
+    }
+    Ok(GraphSeed {
+        session_id,
+        message_id,
+        revision_id,
+        proposal_hash,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn seed_source_integration(
+    fixture: &ImportFixture,
+    graph: &GraphSeed,
+) -> TestResult<IntegrationSeed> {
+    let now = Utc::now();
+    let checkpoint = Checkpoint {
+        schema_version: SchemaVersion::v1(),
+        checkpoint_id: CheckpointId::new(),
+        task_id: fixture.task_id,
+        attempt_id: AttemptId::new(),
+        objective: "integration evidence".to_owned(),
+        current_plan: Vec::new(),
+        completed_steps: Vec::new(),
+        pending_steps: Vec::new(),
+        files_read: Vec::new(),
+        files_changed: Vec::new(),
+        git_base: None,
+        diff_path: None,
+        commands_run: Vec::new(),
+        tests: Vec::new(),
+        decisions: Vec::new(),
+        unresolved_questions: Vec::new(),
+        known_failures: Vec::new(),
+        worker_claim: None,
+        current_worker: ProviderId::Codex,
+        concise_context_summary: "integration evidence".to_owned(),
+        created_at: now,
+        integrity_hash: String::new(),
+    }
+    .seal()?;
+    let verification = VerificationResult {
+        schema_version: SchemaVersion::v1(),
+        verification_id: VerificationId::new(),
+        task_id: fixture.task_id,
+        implementation_provider: ProviderId::Codex,
+        reviewer_provider: None,
+        status: VerificationStatus::Pass,
+        checks: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        changed_files: vec![RepoPath::try_from("src/legacy.rs")?],
+        out_of_scope_files: Vec::new(),
+        unresolved_todos: Vec::new(),
+        requires_approval: false,
+        verified_at: now,
+    };
+    let batch_id = IntegrationBatchId::new();
+    let application_id = IntegrationApplicationId::new();
+    let source = IntegrationSource {
+        task_id: fixture.task_id,
+        checkpoint_id: checkpoint.checkpoint_id,
+        verification_id: verification.verification_id,
+        base_revision: "a".repeat(40),
+        diff_sha256: "b".repeat(64),
+        changed_files: vec![RepoPath::try_from("src/legacy.rs")?],
+    };
+    let preview = IntegrationPreview::seal(
+        batch_id,
+        graph.session_id,
+        graph.revision_id,
+        "a".repeat(40),
+        vec![source.clone()],
+        Vec::new(),
+        now,
+    )?;
+    let connection = Connection::open(&fixture.source.database)?;
+    connection.execute(
+        "INSERT INTO task_attempts(workspace_id, attempt_id, task_id, ordinal, provider_id, \
+            worker_mode, started_at) \
+         VALUES (?1, ?2, ?3, 1, 'codex', 'writable', ?4)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            checkpoint.attempt_id.to_string(),
+            fixture.task_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO checkpoints(workspace_id, checkpoint_id, task_id, attempt_id, \
+            schema_version, checkpoint_json, integrity_hash, diff_artifact_id, git_head, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            checkpoint.checkpoint_id.to_string(),
+            fixture.task_id.to_string(),
+            checkpoint.attempt_id.to_string(),
+            checkpoint.schema_version.as_str(),
+            serde_json::to_string(&checkpoint)?,
+            checkpoint.integrity_hash,
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO verification_results(workspace_id, verification_id, task_id, attempt_id, \
+            reviewer_provider, outcome, schema_version, result_json, started_at, completed_at) \
+         VALUES (?1, ?2, ?3, NULL, NULL, 'pass', ?4, ?5, ?6, ?6)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            verification.verification_id.to_string(),
+            fixture.task_id.to_string(),
+            verification.schema_version.as_str(),
+            serde_json::to_string(&verification)?,
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO integration_batches(workspace_id, batch_id, session_id, revision_id, ordinal, \
+            status, base_revision, preview_hash, preview_json, created_at, completed_at) \
+         VALUES (?1, ?2, ?3, ?4, 1, 'applying', ?5, ?6, ?7, ?8, NULL)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            batch_id.to_string(),
+            graph.session_id.to_string(),
+            graph.revision_id.to_string(),
+            preview.base_revision,
+            preview.preview_hash,
+            serde_json::to_string(&preview)?,
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO integration_sources(workspace_id, batch_id, source_order, task_id, \
+            checkpoint_id, verification_id, diff_sha256, source_json) \
+         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            batch_id.to_string(),
+            fixture.task_id.to_string(),
+            checkpoint.checkpoint_id.to_string(),
+            verification.verification_id.to_string(),
+            source.diff_sha256,
+            serde_json::to_string(&source)?
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO integration_approvals(workspace_id, batch_id, preview_hash, approved_by, \
+            approved_at) VALUES (?1, ?2, ?3, 'fixture', ?4)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            batch_id.to_string(),
+            preview.preview_hash,
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO integration_applications(workspace_id, application_id, batch_id, \
+            preview_hash, state, worktree_path, branch_name, resulting_tree, detail_redacted, \
+            started_at, completed_at) \
+         VALUES (?1, ?2, ?3, ?4, 'applying', '.colay/integration/source', \
+            'source-integration', NULL, '', ?5, NULL)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            application_id.to_string(),
+            batch_id.to_string(),
+            preview.preview_hash,
+            now.to_rfc3339()
+        ],
+    )?;
+    Ok(IntegrationSeed {
+        batch_id,
+        application_id,
+        checkpoint,
+        verification,
+        preview_hash: preview.preview_hash,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn seed_target_integration_collisions(
+    fixture: &ImportFixture,
+    graph: &GraphSeed,
+    integration: &IntegrationSeed,
+) -> TestResult {
+    seed_target_graph_collision(fixture, graph)?;
+    let workspace = fixture.global.workspace(fixture.workspace_id);
+    let mut task = TaskEnvelope::new("target collision", "target collision", Utc::now());
+    task.task_id = fixture.task_id;
+    workspace.create_task_envelope(&task)?;
+    let now = Utc::now().to_rfc3339();
+    let connection = Connection::open(fixture.global.path())?;
+    connection.execute(
+        "INSERT INTO task_attempts(workspace_id, attempt_id, task_id, ordinal, provider_id, \
+            worker_mode, started_at) \
+         VALUES (?1, ?2, ?3, 1, 'codex', 'writable', ?4)",
+        params![
+            fixture.workspace_id.to_string(),
+            integration.checkpoint.attempt_id.to_string(),
+            fixture.task_id.to_string(),
+            now
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO checkpoints(workspace_id, checkpoint_id, task_id, attempt_id, \
+            schema_version, checkpoint_json, integrity_hash, diff_artifact_id, git_head, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8)",
+        params![
+            fixture.workspace_id.to_string(),
+            integration.checkpoint.checkpoint_id.to_string(),
+            fixture.task_id.to_string(),
+            integration.checkpoint.attempt_id.to_string(),
+            integration.checkpoint.schema_version.as_str(),
+            serde_json::to_string(&integration.checkpoint)?,
+            integration.checkpoint.integrity_hash,
+            now
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO verification_results(workspace_id, verification_id, task_id, attempt_id, \
+            reviewer_provider, outcome, schema_version, result_json, started_at, completed_at) \
+         VALUES (?1, ?2, ?3, NULL, NULL, 'pass', ?4, ?5, ?6, ?6)",
+        params![
+            fixture.workspace_id.to_string(),
+            integration.verification.verification_id.to_string(),
+            fixture.task_id.to_string(),
+            integration.verification.schema_version.as_str(),
+            serde_json::to_string(&integration.verification)?,
+            now
+        ],
+    )?;
+    let target_source = IntegrationSource {
+        task_id: fixture.task_id,
+        checkpoint_id: integration.checkpoint.checkpoint_id,
+        verification_id: integration.verification.verification_id,
+        base_revision: "c".repeat(40),
+        diff_sha256: "d".repeat(64),
+        changed_files: vec![RepoPath::try_from("src/target.rs")?],
+    };
+    let target_preview = IntegrationPreview::seal(
+        integration.batch_id,
+        graph.session_id,
+        graph.revision_id,
+        "c".repeat(40),
+        vec![target_source.clone()],
+        Vec::new(),
+        Utc::now(),
+    )?;
+    connection.execute(
+        "INSERT INTO integration_batches(workspace_id, batch_id, session_id, revision_id, ordinal, \
+            status, base_revision, preview_hash, preview_json, created_at, completed_at) \
+         VALUES (?1, ?2, ?3, ?4, 1, 'applying', ?5, ?6, ?7, ?8, NULL)",
+        params![
+            fixture.workspace_id.to_string(),
+            integration.batch_id.to_string(),
+            graph.session_id.to_string(),
+            graph.revision_id.to_string(),
+            target_preview.base_revision,
+            target_preview.preview_hash,
+            serde_json::to_string(&target_preview)?,
+            now
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO integration_sources(workspace_id, batch_id, source_order, task_id, \
+            checkpoint_id, verification_id, diff_sha256, source_json) \
+         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            fixture.workspace_id.to_string(),
+            integration.batch_id.to_string(),
+            fixture.task_id.to_string(),
+            integration.checkpoint.checkpoint_id.to_string(),
+            integration.verification.verification_id.to_string(),
+            target_source.diff_sha256,
+            serde_json::to_string(&target_source)?
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO integration_applications(workspace_id, application_id, batch_id, \
+            preview_hash, state, worktree_path, branch_name, resulting_tree, detail_redacted, \
+            started_at, completed_at) \
+         VALUES (?1, ?2, ?3, ?4, 'applying', '.colay/integration/target', \
+            'target-integration', NULL, '', ?5, NULL)",
+        params![
+            fixture.workspace_id.to_string(),
+            integration.application_id.to_string(),
+            integration.batch_id.to_string(),
+            target_preview.preview_hash,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn seed_source_requirement(
+    fixture: &ImportFixture,
+    snapshot_hash_override: Option<String>,
+    complete_override: Option<bool>,
+) -> TestResult<RequirementRevisionId> {
+    let now = Utc::now();
+    let session_id = SessionId::new();
+    let message_id = MessageId::new();
+    let revision = RequirementRevision::seal(
+        RequirementRevisionId::new(),
+        session_id,
+        message_id,
+        1,
+        RequirementSnapshot {
+            objective: "Validate legacy requirements".to_owned(),
+            in_scope: vec!["legacy import".to_owned()],
+            out_of_scope: Vec::new(),
+            constraints: vec!["local only".to_owned()],
+            acceptance_criteria: vec!["validation passes".to_owned()],
+            verification_plan: vec![VerificationCommand {
+                executable: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+            }],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        },
+        now,
+    )?;
+    let snapshot_hash = snapshot_hash_override.unwrap_or_else(|| revision.snapshot_hash.clone());
+    let complete = complete_override.unwrap_or_else(|| revision.snapshot.is_complete());
+    let connection = Connection::open(&fixture.source.database)?;
+    connection.execute(
+        "INSERT INTO sessions(workspace_id, session_id, schema_version, revision, title, state, \
+            created_at, updated_at, archived_at, state_v2) \
+         VALUES (?1, ?2, '1', 0, 'legacy requirement', 'planning', ?3, ?3, NULL, 'planning')",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            session_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO conversation_messages(workspace_id, message_id, session_id, task_id, ordinal, \
+            role, kind, state, content_redacted, created_at, finalized_at) \
+         VALUES (?1, ?2, ?3, NULL, 1, 'user', 'user_message', 'final', 'requirements', ?4, ?4)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            message_id.to_string(),
+            session_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO requirement_revisions(workspace_id, requirement_revision_id, session_id, \
+            source_message_id, ordinal, schema_version, snapshot_hash, snapshot_json, complete, \
+            created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            revision.requirement_revision_id.to_string(),
+            revision.session_id.to_string(),
+            revision.source_message_id.to_string(),
+            i64::try_from(revision.ordinal)?,
+            revision.schema_version.as_str(),
+            snapshot_hash,
+            serde_json::to_string(&revision.snapshot)?,
+            i64::from(complete),
+            revision.created_at.to_rfc3339()
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO session_requirement_heads(workspace_id, session_id, requirement_revision_id, \
+            updated_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            session_id.to_string(),
+            revision.requirement_revision_id.to_string(),
+            now.to_rfc3339()
+        ],
+    )?;
+    Ok(revision.requirement_revision_id)
+}
+
+fn seed_target_graph_collision(fixture: &ImportFixture, graph: &GraphSeed) -> TestResult {
+    let now = Utc::now().to_rfc3339();
+    let connection = Connection::open(fixture.global.path())?;
+    connection.execute(
+        "INSERT INTO sessions(workspace_id, session_id, schema_version, revision, title, state, \
+            created_at, updated_at, archived_at, state_v2) \
+         VALUES (?1, ?2, '1', 0, 'target graph', 'running', ?3, ?3, NULL, 'running')",
+        params![
+            fixture.workspace_id.to_string(),
+            graph.session_id.to_string(),
+            now
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO conversation_messages(workspace_id, message_id, session_id, task_id, ordinal, \
+            role, kind, state, content_redacted, created_at, finalized_at) \
+         VALUES (?1, ?2, ?3, NULL, 1, 'user', 'user_message', 'final', 'target graph', ?4, ?4)",
+        params![
+            fixture.workspace_id.to_string(),
+            graph.message_id.to_string(),
+            graph.session_id.to_string(),
+            now
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO graph_revisions(workspace_id, revision_id, session_id, goal_message_id, \
+            ordinal, status, proposal_hash, proposal_json, validation_json, planner_provider, \
+            created_at, completed_at, planner_provider_v2) \
+         VALUES (?1, ?2, ?3, ?4, 1, 'invalid', NULL, NULL, '{}', 'codex', ?5, ?5, 'codex')",
+        params![
+            fixture.workspace_id.to_string(),
+            graph.revision_id.to_string(),
+            graph.session_id.to_string(),
+            graph.message_id.to_string(),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 fn audit_event(task_id: Option<TaskId>, reason: &str) -> TaskEvent {
     TaskEvent {
         schema_version: SchemaVersion::state_current(),
@@ -759,6 +1573,62 @@ fn regular_file_count(root: &Path) -> TestResult<usize> {
         .into_iter()
         .filter(|entry| entry.path().is_file())
         .count())
+}
+
+fn target_mutation_counts(fixture: &ImportFixture) -> TestResult<(i64, i64, i64, i64, usize)> {
+    let connection = Connection::open(fixture.global.path())?;
+    Ok((
+        connection.query_row(
+            "SELECT count(*) FROM tasks WHERE workspace_id = ?1",
+            [fixture.workspace_id.to_string()],
+            |row| row.get(0),
+        )?,
+        connection.query_row(
+            "SELECT count(*) FROM task_events WHERE workspace_id = ?1",
+            [fixture.workspace_id.to_string()],
+            |row| row.get(0),
+        )?,
+        connection.query_row(
+            "SELECT count(*) FROM legacy_imports WHERE workspace_id = ?1",
+            [fixture.workspace_id.to_string()],
+            |row| row.get(0),
+        )?,
+        connection.query_row(
+            "SELECT count(*) FROM legacy_import_id_mappings WHERE workspace_id = ?1",
+            [fixture.workspace_id.to_string()],
+            |row| row.get(0),
+        )?,
+        regular_file_count(&fixture.paths.backups)?,
+    ))
+}
+
+fn assert_no_published_import(fixture: &ImportFixture, fingerprint: &str) {
+    let imports = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports");
+    assert!(!imports.join(fingerprint).exists());
+    assert!(!imports.join(format!("{fingerprint}.staging")).exists());
+}
+
+#[cfg(unix)]
+fn create_directory_link(target: &Path, link: &Path) -> TestResult {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &Path, link: &Path) -> TestResult {
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()?;
+    if !status.success() {
+        return Err(format!("could not create test junction: {status}").into());
+    }
+    Ok(())
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> TestResult {

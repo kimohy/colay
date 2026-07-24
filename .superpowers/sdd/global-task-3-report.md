@@ -72,3 +72,105 @@ PASS
 - `crates/orchestrator-state/tests/legacy_import.rs`
 - `crates/orchestrator-state/tests/migration_contract.rs`
 - `migrations/0014_legacy_imports.sql`
+
+## Reviewer-Gate Follow-up
+
+The reviewer gate identified four additional audit-boundary findings. The follow-up is limited to those findings.
+
+### Immutable transform scratch
+
+- The inspected source, staged `legacy.db`, and fully validated migrated image are never rewritten.
+- Apply copies the validated migrated image to a private temporary `rewrite.db`.
+- Before transformation, the importer compares normalized SQLite definitions for exactly six migration-13 immutable UPDATE triggers: graph payload, graph authority, graph approval, integration batch, integration source, and integration approval.
+- Only those six exact triggers are removed from `rewrite.db`. A missing or changed definition fails closed, and every other trigger remains active.
+- Collision remapping, typed JSON rewrites, resealing, and graph/integration dependent-hash propagation operate only against the attached scratch image.
+
+TDD evidence:
+
+```text
+cargo test -p orchestrator-state --test legacy_import approved_graph_collision -- --nocapture
+RED: SQLite `graph revision payload is immutable`
+
+cargo test -p orchestrator-state --test legacy_import integration_collision -- --nocapture
+RED: SQLite `integration preview payload is immutable`
+
+cargo test -p orchestrator-state --test legacy_import collision -- --nocapture
+GREEN: 2 passed, 0 failed
+```
+
+The GREEN fixtures verify an approved non-planning graph collision and a colliding integration batch/source/approval/application. They recompute the imported proposal/preview seals, verify propagated approval/application hashes, and verify the source and published `legacy.db` retain the original IDs and hashes.
+
+### Transaction-local target audit gate
+
+- The import transaction validates the complete target workspace chain before creating a backup or mutating rows, ledger data, anchors, or published files.
+- Validation covers sequence continuity, row/JSON agreement, predecessor hashes, canonical event hashes, and an optional `event_log_state` cursor that must identify an exact chain prefix.
+- The validated event count is passed into import logic; untrusted rows are not recounted after the gate.
+
+TDD evidence:
+
+```text
+cargo test -p orchestrator-state --test legacy_import before_any_target_mutation -- --nocapture
+RED: gapped target chain and inconsistent cursor were both accepted
+GREEN: 2 passed, 0 failed
+```
+
+Both GREEN fixtures compare task/event/ledger/mapping/backup counts before and after refusal and verify neither staging nor final fingerprint directories remain.
+
+### Requirement revision validation
+
+- Every source requirement row now parses exact revision, session, and source-message domain IDs.
+- Schema version and positive ordinal are required.
+- `snapshot_json` must decode as the deny-unknown-fields `RequirementSnapshot` contract.
+- The stored completeness bit must equal `RequirementSnapshot::is_complete`.
+- The stored hash must equal the provider-neutral canonical SHA-256 of the typed snapshot.
+
+TDD evidence:
+
+```text
+cargo test -p orchestrator-state --test legacy_import requirement_ -- --nocapture
+RED: canonical hash mismatch and row/snapshot completeness mismatch were both accepted
+GREEN: 2 passed, 0 failed
+```
+
+### Source-open containment
+
+- Database, JSONL, manifest, directory traversal, and final staging-copy reads now rerun component-wise symbolic-link/reparse-point checks immediately before open.
+- Canonical source paths must remain below the canonical source root.
+- Paths are canonicalized again after open and after file reads where feasible, while hashing bytes from the already-opened handle.
+
+TDD evidence on Windows:
+
+```text
+cargo test -p orchestrator-state --test legacy_import nested_link -- --nocapture
+RED: nested directory junction to matching external artifact bytes was accepted
+GREEN: 1 passed, 0 failed
+```
+
+### Final follow-up verification
+
+All requested final commands passed on the follow-up code:
+
+```text
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+PASS: 21 passed, 0 failed
+
+cargo test -p orchestrator-state --test migration_contract -- --nocapture
+PASS: 5 passed, 0 failed
+
+cargo test -p orchestrator-state --all-features
+PASS
+
+cargo fmt --all -- --check
+PASS
+
+cargo check --workspace --all-targets --all-features
+PASS
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS
+
+cargo test --workspace --all-features
+PASS: exit 0; 504.8 seconds
+```
+
+No environmental flake occurred in the final follow-up state or workspace suites.
