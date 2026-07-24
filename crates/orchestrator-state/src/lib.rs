@@ -19,6 +19,7 @@ mod graphs;
 mod instructions;
 mod integrations;
 mod leases;
+mod legacy_import;
 mod migrations;
 mod paths;
 mod permissions;
@@ -62,6 +63,7 @@ pub use leases::{
     CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, WorkerLease, WorkerLeaseMode,
     WorkerLeaseRequest,
 };
+pub use legacy_import::{LegacyImportPlan, LegacyImportResult, LegacyImporter};
 pub use migrations::{
     AppliedMigration, MigrationManager, MigrationPlan, MigrationStatus,
     ROLLBACK_PLAN_SCHEMA_VERSION, RollbackApplyResult, RollbackPlan, STATE_SCHEMA_VERSION,

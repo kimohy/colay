@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use chrono::Utc;
+use orchestrator_state::STATE_SCHEMA_VERSION;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -309,13 +310,13 @@ fn migrate_apply_upgrades_existing_database_without_repository_config() -> Resul
     let connection = Connection::open(database_path)?;
     assert_eq!(
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-        13
+        STATE_SCHEMA_VERSION
     );
     let applied = connection
         .prepare("SELECT version FROM schema_migrations WHERE version >= 9 ORDER BY version")?
         .query_map([], |row| row.get::<_, u32>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(applied, vec![9, 10, 11, 12, 13]);
+    assert_eq!(applied, (9..=STATE_SCHEMA_VERSION).collect::<Vec<_>>());
     let backups =
         fs::read_dir(fixture.repository.join(".colay/backups"))?.collect::<Result<Vec<_>, _>>()?;
     assert_eq!(backups.len(), 1);
