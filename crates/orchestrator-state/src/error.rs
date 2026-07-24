@@ -36,6 +36,14 @@ pub enum StateError {
     SymlinkEscape(PathBuf),
     #[error("artifact already exists with different content: {0}")]
     ArtifactConflict(PathBuf),
+    #[error("global state environment is incomplete: {0}")]
+    StateEnvironment(String),
+    #[error("workspace path is invalid: {path}: {reason}")]
+    InvalidWorkspacePath { path: PathBuf, reason: String },
+    #[error("workspace {workspace_id} is not registered")]
+    WorkspaceNotFound { workspace_id: String },
+    #[error("workspace path is already attached to another active workspace: {path}")]
+    WorkspacePathConflict { path: PathBuf },
     #[error("migration checksum mismatch for version {version}")]
     MigrationChecksum { version: u32 },
     #[error("database schema version {found} is newer than supported version {supported}")]

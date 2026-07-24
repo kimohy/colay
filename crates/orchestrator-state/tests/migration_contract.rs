@@ -46,7 +46,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(initial.current_version, 1);
     assert_eq!(
         initial.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
 
     let dry_run = database.dry_run_migrations()?;
@@ -83,6 +83,8 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
             "conversation_attempts",
             "requirement_revisions",
             "session_requirement_heads",
+            "workspaces",
+            "workspace_paths",
         ] {
             let count: i64 = connection.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -110,7 +112,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(backup_status.current_version, 1);
     assert_eq!(
         backup_status.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
     Ok(())
 }
