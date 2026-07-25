@@ -41,6 +41,21 @@ impl ArtifactStore {
         Self::open(&paths.root)
     }
 
+    /// Opens an existing workspace artifact root without creating it or changing permissions.
+    pub fn open_workspace_read_only(paths: &WorkspaceStatePaths) -> StateResult<Self> {
+        reject_symlink_components(&paths.root)?;
+        let metadata = fs::symlink_metadata(&paths.root)
+            .map_err(|error| StateError::io(&paths.root, error))?;
+        if !metadata.is_dir() {
+            return Err(StateError::UnsafeArtifactPath(
+                paths.root.display().to_string(),
+            ));
+        }
+        let root =
+            fs::canonicalize(&paths.root).map_err(|error| StateError::io(&paths.root, error))?;
+        Ok(Self { root })
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root

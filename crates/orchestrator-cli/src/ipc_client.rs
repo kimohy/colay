@@ -50,9 +50,16 @@ impl DaemonClient {
     }
 
     pub async fn connect(repository: &Path) -> Result<Self> {
+        Self::connect_with_config(repository, None).await
+    }
+
+    pub async fn connect_with_config(
+        repository: &Path,
+        explicit_config: Option<&Path>,
+    ) -> Result<Self> {
         let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
         ping(&paths).await?;
-        let workspace_id = register_workspace(&paths, repository, None).await?;
+        let workspace_id = register_workspace(&paths, repository, explicit_config).await?;
         Ok(Self {
             paths,
             workspace_id,

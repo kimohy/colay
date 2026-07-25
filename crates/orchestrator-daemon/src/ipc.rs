@@ -14,10 +14,10 @@ use orchestrator_domain::{
     ProviderHealth, SchemaVersion, SessionId, TaskEvent, TaskId, UsageSnapshot, UsageSource,
 };
 use orchestrator_state::{
-    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths,
-    ResumeDisposition, RootConfig, SessionListFilter, StateError, TaskListFilter,
-    WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord, WorkspaceReadRequest,
-    WorkspaceStatePaths, ensure_private_directory, ensure_private_file,
+    ArtifactStore, Database, DatabaseHealth, GlobalStatePaths, LegacyImporter,
+    RepositoryStatePaths, ResumeDisposition, RootConfig, SessionListFilter, StateError,
+    TaskListFilter, WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord, WorkspaceReadRequest,
+    WorkspaceRegistration, WorkspaceStatePaths, ensure_private_directory, ensure_private_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +34,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 pub const IPC_SCHEMA_VERSION: u32 = 1;
+pub const WORKSPACE_DOCTOR_SCHEMA_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TASK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -86,6 +87,87 @@ pub struct IpcResponse {
     pub schema_version: u32,
     pub request_id: String,
     pub outcome: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDoctorDiagnostics {
+    pub schema_version: u32,
+    pub database: DatabaseHealth,
+    pub daemon: orchestrator_state::DaemonStatus,
+    pub workspace: WorkspaceRegistration,
+    pub audit: WorkspaceAuditDiagnostics,
+    pub artifacts: WorkspaceArtifactDiagnostics,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceAuditDiagnostics {
+    pub workspace_id: WorkspaceId,
+    pub verified_events: i64,
+    pub last_sequence: i64,
+    pub last_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceArtifactScope {
+    PersistedReferences,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceArtifactDiagnostics {
+    pub root: PathBuf,
+    pub verified_references: usize,
+    pub scope: WorkspaceArtifactScope,
+}
+
+impl WorkspaceDoctorDiagnostics {
+    pub fn validate(
+        &self,
+        expected_workspace_id: WorkspaceId,
+        expected_repository: &Path,
+        expected_artifact_root: &Path,
+    ) -> Result<(), IpcError> {
+        if self.schema_version != WORKSPACE_DOCTOR_SCHEMA_VERSION {
+            return Err(IpcError::Protocol(format!(
+                "workspace doctor schema {} is unsupported; expected {WORKSPACE_DOCTOR_SCHEMA_VERSION}",
+                self.schema_version
+            )));
+        }
+        if self.workspace.workspace_id != expected_workspace_id
+            || self.audit.workspace_id != expected_workspace_id
+        {
+            return Err(IpcError::Protocol(
+                "workspace doctor response identity does not match the request".to_owned(),
+            ));
+        }
+        let expected_repository = std::fs::canonicalize(expected_repository).map_err(|error| {
+            IpcError::Protocol(format!(
+                "workspace doctor request repository could not be canonicalized: {error}"
+            ))
+        })?;
+        if self.workspace.canonical_path != expected_repository {
+            return Err(IpcError::Protocol(
+                "workspace doctor response path does not match the request".to_owned(),
+            ));
+        }
+        if self.audit.verified_events < 0
+            || self.audit.last_sequence != self.audit.verified_events
+            || (self.audit.last_sequence == 0) != self.audit.last_hash.is_none()
+        {
+            return Err(IpcError::Protocol(
+                "workspace doctor audit summary is internally inconsistent".to_owned(),
+            ));
+        }
+        if self.artifacts.root != expected_artifact_root {
+            return Err(IpcError::Protocol(
+                "workspace doctor artifact root does not match the registered workspace".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl IpcResponse {
@@ -682,16 +764,26 @@ fn workspace_doctor(
         IpcError::Protocol("workspace.doctor targets an unknown workspace".to_owned())
     })?;
     let workspace = database.workspace(workspace_id);
-    Ok(json!({
-        "database": database.health()?,
-        "daemon": database.daemon_status(Utc::now())?,
-        "workspace": registration,
-        "audit": verify_workspace_audit(&workspace)?,
-        "artifacts": verify_workspace_artifacts(&workspace, &paths.for_workspace(workspace_id))?,
-    }))
+    let workspace_paths = paths.for_workspace(workspace_id);
+    let diagnostics = WorkspaceDoctorDiagnostics {
+        schema_version: WORKSPACE_DOCTOR_SCHEMA_VERSION,
+        database: database.health()?,
+        daemon: database.daemon_status(Utc::now())?,
+        workspace: registration,
+        audit: verify_workspace_audit(&workspace)?,
+        artifacts: verify_workspace_artifacts(&workspace, &workspace_paths)?,
+    };
+    diagnostics.validate(
+        workspace_id,
+        &diagnostics.workspace.canonical_path,
+        &workspace_paths.root,
+    )?;
+    serde_json::to_value(diagnostics).map_err(IpcError::from)
 }
 
-fn verify_workspace_audit(workspace: &WorkspaceDatabase<'_>) -> Result<Value, IpcError> {
+fn verify_workspace_audit(
+    workspace: &WorkspaceDatabase<'_>,
+) -> Result<WorkspaceAuditDiagnostics, IpcError> {
     let head = workspace.latest_outbox_sequence()?;
     if head < 0 {
         return Err(IpcError::Protocol(
@@ -720,28 +812,28 @@ fn verify_workspace_audit(workspace: &WorkspaceDatabase<'_>) -> Result<Value, Ip
         }
         previous_hash = Some(event.event_hash);
     }
-    Ok(json!({
-        "workspace_id": workspace.workspace_id(),
-        "verified_events": head,
-        "last_sequence": head,
-        "last_hash": previous_hash,
-    }))
+    Ok(WorkspaceAuditDiagnostics {
+        workspace_id: workspace.workspace_id(),
+        verified_events: head,
+        last_sequence: head,
+        last_hash: previous_hash,
+    })
 }
 
 fn verify_workspace_artifacts(
     workspace: &WorkspaceDatabase<'_>,
     paths: &WorkspaceStatePaths,
-) -> Result<Value, IpcError> {
+) -> Result<WorkspaceArtifactDiagnostics, IpcError> {
     let store = ArtifactStore::open_workspace(paths)?;
     let artifacts = workspace.list_artifacts()?;
     for artifact in &artifacts {
         let _ = store.read_verified(artifact)?;
     }
-    Ok(json!({
-        "root": store.root(),
-        "verified_references": artifacts.len(),
-        "scope": "persisted_references",
-    }))
+    Ok(WorkspaceArtifactDiagnostics {
+        root: store.root().to_path_buf(),
+        verified_references: artifacts.len(),
+        scope: WorkspaceArtifactScope::PersistedReferences,
+    })
 }
 
 #[derive(Deserialize)]

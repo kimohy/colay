@@ -1,18 +1,20 @@
 use std::{
     cell::Cell,
+    fs,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
 use chrono::Utc;
 use orchestrator_domain::TaskEvent;
-use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactStore, MigrationManager, MigrationPlan, MigrationStatus, RollbackApplyResult,
-    RollbackPlan, StateError, StateResult, WorkspaceId, ensure_private_directory,
-    ensure_private_file, reject_symlink_components,
+    RollbackPlan, STATE_SCHEMA_VERSION, StateError, StateResult, WorkspaceId,
+    ensure_private_directory, ensure_private_file, reject_symlink_components,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,9 +101,98 @@ const WORKSPACE_TABLES: &[&str] = &[
     "worktrees",
 ];
 
+fn read_database_header_schema(path: &Path, byte_length: u64) -> StateResult<u32> {
+    if byte_length == 0 {
+        return Ok(0);
+    }
+    if byte_length < 64 {
+        return Err(StateError::InvalidRecord(format!(
+            "database header is truncated: {}",
+            path.display()
+        )));
+    }
+    let mut file = fs::File::open(path).map_err(|error| StateError::io(path, error))?;
+    let mut header = [0_u8; 64];
+    file.read_exact(&mut header)
+        .map_err(|error| StateError::io(path, error))?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(StateError::InvalidRecord(format!(
+            "database header is not SQLite format 3: {}",
+            path.display()
+        )));
+    }
+    Ok(u32::from_be_bytes(header[60..64].try_into().map_err(
+        |_| StateError::InvalidRecord("database user_version is truncated".into()),
+    )?))
+}
+
+fn sqlite_recovery_sidecar_exists(path: &Path) -> StateResult<bool> {
+    for suffix in ["-wal", "-journal"] {
+        let sidecar = sqlite_sidecar(path, suffix);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => {
+                reject_symlink_components(&sidecar)?;
+                if !metadata.is_file() {
+                    return Err(StateError::InvalidRecord(format!(
+                        "database sidecar is not a regular file: {}",
+                        sidecar.display()
+                    )));
+                }
+                return Ok(true);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StateError::io(&sidecar, error)),
+        }
+    }
+    Ok(false)
+}
+
+fn snapshot_schema(path: &Path) -> StateResult<u32> {
+    let temporary = crate::CanonicalTempDir::new("database-schema-preflight")?;
+    let snapshot = temporary.path().join("state.db");
+    copy_database_component(path, &snapshot, false)?;
+    for suffix in ["-wal", "-journal"] {
+        let source = sqlite_sidecar(path, suffix);
+        let destination = sqlite_sidecar(&snapshot, suffix);
+        copy_database_component(&source, &destination, true)?;
+    }
+    let connection = Connection::open_with_flags(
+        &snapshot,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn copy_database_component(source: &Path, destination: &Path, optional: bool) -> StateResult<()> {
+    let metadata = match fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::io(source, error)),
+    };
+    reject_symlink_components(source)?;
+    if !metadata.is_file() {
+        return Err(StateError::InvalidRecord(format!(
+            "database component is not a regular file: {}",
+            source.display()
+        )));
+    }
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| StateError::io(destination, error))
+}
+
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 impl Database {
     pub fn open(path: impl Into<PathBuf>) -> StateResult<Self> {
         let path = path.into();
+        Self::preflight_schema(&path)?;
         let parent = path.parent().ok_or_else(|| {
             StateError::RollbackGuard(format!("database path has no parent: {}", path.display()))
         })?;
@@ -110,6 +201,61 @@ impl Database {
         let connection = Connection::open(&path)?;
         crate::migrations::configure_connection(&connection)?;
         ensure_private_file(&path)?;
+        Ok(Self {
+            path,
+            connection: Mutex::new(connection),
+            #[cfg(test)]
+            test_workspace: Mutex::new(None),
+        })
+    }
+
+    /// Refuses an existing future-schema database from raw bytes or a private sidecar snapshot
+    /// before normal open can change persistent `SQLite` settings such as journal mode.
+    pub fn preflight_schema(path: &Path) -> StateResult<Option<u32>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StateError::io(path, error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::UnsafeArtifactPath(path.display().to_string()));
+        }
+        reject_symlink_components(path)?;
+        let mut found = read_database_header_schema(path, metadata.len())?;
+        if found <= STATE_SCHEMA_VERSION && sqlite_recovery_sidecar_exists(path)? {
+            found = snapshot_schema(path)?;
+        }
+        if found > STATE_SCHEMA_VERSION {
+            return Err(StateError::FutureSchema {
+                found,
+                supported: STATE_SCHEMA_VERSION,
+            });
+        }
+        Ok(Some(found))
+    }
+
+    /// Opens an existing current-schema database without creating files, changing permissions,
+    /// or applying persistent connection settings. Callers must remain read-only.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> StateResult<Self> {
+        let path = path.into();
+        let found = Self::preflight_schema(&path)?.ok_or_else(|| {
+            StateError::InvalidRecord(format!("database does not exist: {}", path.display()))
+        })?;
+        if found != STATE_SCHEMA_VERSION {
+            return Err(StateError::InvalidRecord(format!(
+                "database schema version {found} requires migration to {STATE_SCHEMA_VERSION}"
+            )));
+        }
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        register_workspace_function(&connection)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;\
+             PRAGMA temp_store = MEMORY;\
+             PRAGMA busy_timeout = 5000;",
+        )?;
         Ok(Self {
             path,
             connection: Mutex::new(connection),

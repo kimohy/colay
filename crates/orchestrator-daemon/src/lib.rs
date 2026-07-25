@@ -26,7 +26,9 @@ pub use integration::IntegrationServices;
 #[cfg(windows)]
 pub use ipc::windows_named_pipe_security_descriptor;
 pub use ipc::{
-    DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, IpcServer, ipc_endpoint,
+    DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, IpcServer,
+    WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceArtifactDiagnostics, WorkspaceArtifactScope,
+    WorkspaceAuditDiagnostics, WorkspaceDoctorDiagnostics, ipc_endpoint,
 };
 pub use planning::{PlanningServices, process_next_orchestration_command};
 

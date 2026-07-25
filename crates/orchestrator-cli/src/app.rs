@@ -271,7 +271,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             Some(DoctorAction::Providers) => {
                 doctor_providers(&runtime.effective, "doctor_providers", cli.json).await
             }
-            None => doctor(&repository, &runtime.effective, cli.json).await,
+            None => {
+                doctor(
+                    &repository,
+                    &runtime.effective,
+                    cli.config.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
         },
         Command::Compatibility => {
             doctor_providers(&runtime.effective, "compatibility", cli.json).await
@@ -510,7 +518,12 @@ fn initialize(_repository: &Path, runtime: &ConfigRuntime, json_output: bool) ->
     )
 }
 
-async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+async fn doctor(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
+    json_output: bool,
+) -> Result<()> {
     let mut checks = vec![Check::pass("config", "schema and values are valid")];
     let executable = std::env::current_exe()?;
     checks.push(Check::with_data(
@@ -527,7 +540,7 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
     if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
         checks.push(Check::warn("wsl_mixed_git_checkout", warning));
     }
-    doctor_state_checks(repository, &executable, &mut checks).await;
+    doctor_state_checks(repository, explicit_config, &executable, &mut checks).await;
     checks.push(git_health_check(repository));
     for report in collect_provider_reports(effective).await {
         let status = match report.health.status {
@@ -586,7 +599,12 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
 }
 
 #[allow(clippy::too_many_lines)]
-async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut Vec<Check>) {
+async fn doctor_state_checks(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    executable: &Path,
+    checks: &mut Vec<Check>,
+) {
     let paths = match GlobalStatePaths::resolve(&StateEnvironment::from_process()) {
         Ok(paths) => paths,
         Err(error) => {
@@ -596,10 +614,57 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
     };
     match crate::daemon::acquire_maintenance() {
         Ok(maintenance) => {
-            let database = match Database::open(&maintenance.paths.database).and_then(|database| {
-                database.migrate_with_backup(&maintenance.paths.backups)?;
-                Ok(database)
-            }) {
+            let schema_version = match Database::preflight_schema(&maintenance.paths.database) {
+                Ok(version) => version,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let Some(schema_version) = schema_version else {
+                checks.push(Check::with_status_data(
+                    "state",
+                    CheckStatus::Warn,
+                    "user-global database does not exist; run a writable command or `colay migrate apply` to create it",
+                    json!({
+                        "root": maintenance.paths.root,
+                        "database": maintenance.paths.database,
+                        "backups": maintenance.paths.backups,
+                        "current_schema_version": Value::Null,
+                        "target_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                    }),
+                ));
+                checks.push(daemon_runtime_check(&DaemonStatus::Stopped, executable));
+                push_unavailable_workspace_checks(
+                    checks,
+                    "user-global database is not initialized",
+                );
+                return;
+            };
+            if schema_version != orchestrator_state::STATE_SCHEMA_VERSION {
+                checks.push(Check::with_status_data(
+                    "state",
+                    CheckStatus::Warn,
+                    format!(
+                        "database schema {schema_version} requires explicit `colay migrate apply` to reach {}",
+                        orchestrator_state::STATE_SCHEMA_VERSION
+                    ),
+                    json!({
+                        "root": maintenance.paths.root,
+                        "database": maintenance.paths.database,
+                        "backups": maintenance.paths.backups,
+                        "current_schema_version": schema_version,
+                        "target_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                    }),
+                ));
+                checks.push(daemon_runtime_check(&DaemonStatus::Stopped, executable));
+                push_unavailable_workspace_checks(
+                    checks,
+                    "workspace integrity requires explicit database migration",
+                );
+                return;
+            }
+            let database = match Database::open_read_only(&maintenance.paths.database) {
                 Ok(database) => database,
                 Err(error) => {
                     checks.push(Check::fail("state", error.to_string()));
@@ -632,8 +697,23 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
                     .unwrap_or(DaemonStatus::Stopped),
                 executable,
             ));
-            let registration = match database.resolve_repository_workspace(repository) {
-                Ok(registration) => registration,
+            let registration = match database.find_repository_workspace(repository) {
+                Ok(Some(registration)) => registration,
+                Ok(None) => {
+                    checks.push(Check::warn(
+                        "workspace",
+                        "current repository is not registered; run a writable command to register it",
+                    ));
+                    checks.push(Check::warn(
+                        "audit",
+                        "workspace audit is unavailable until the repository is registered",
+                    ));
+                    checks.push(Check::warn(
+                        "artifacts",
+                        "workspace artifacts are unavailable until the repository is registered",
+                    ));
+                    return;
+                }
                 Err(error) => {
                     checks.push(Check::fail("workspace", error.to_string()));
                     return;
@@ -654,7 +734,12 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
             );
         }
         Err(lock_error) => {
-            let client = match crate::ipc_client::DaemonClient::connect(repository).await {
+            let client = match crate::ipc_client::DaemonClient::connect_with_config(
+                repository,
+                explicit_config,
+            )
+            .await
+            {
                 Ok(client) => client,
                 Err(ipc_error) => {
                     checks.push(Check::fail(
@@ -673,45 +758,88 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
                     return;
                 }
             };
-            let health = &diagnostics.outcome["data"]["database"];
-            let healthy = health["integrity_ok"] == true
-                && health["foreign_key_violations"] == 0
-                && health["current_schema_version"]
-                    == json!(orchestrator_state::STATE_SCHEMA_VERSION);
-            checks.push(Check::with_data(
-                "state",
-                healthy,
-                json!({
-                    "root": paths.root,
-                    "database": paths.database,
-                    "backups": paths.backups,
-                    "health": health,
-                    "via": "daemon_ipc",
-                }),
-            ));
-            match serde_json::from_value::<DaemonStatus>(
-                diagnostics.outcome["data"]["daemon"].clone(),
-            ) {
-                Ok(status) => checks.push(daemon_runtime_check(&status, executable)),
-                Err(error) => checks.push(Check::fail("daemon", error.to_string())),
-            }
-            checks.push(Check::with_data(
-                "workspace",
-                true,
-                diagnostics.outcome["data"]["workspace"].clone(),
-            ));
-            checks.push(Check::with_data(
-                "audit",
-                true,
-                diagnostics.outcome["data"]["audit"].clone(),
-            ));
-            checks.push(Check::with_data(
-                "artifacts",
-                true,
-                diagnostics.outcome["data"]["artifacts"].clone(),
-            ));
+            append_live_doctor_checks(
+                checks,
+                &diagnostics,
+                &paths,
+                client.workspace_id(),
+                repository,
+                executable,
+            );
         }
     }
+}
+
+fn append_live_doctor_checks(
+    checks: &mut Vec<Check>,
+    diagnostics: &orchestrator_daemon::IpcResponse,
+    paths: &GlobalStatePaths,
+    expected_workspace_id: orchestrator_state::WorkspaceId,
+    expected_repository: &Path,
+    executable: &Path,
+) {
+    let parsed = diagnostics
+        .outcome
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow!("workspace doctor response omitted data"))
+        .and_then(|data| {
+            serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorDiagnostics>(data)
+                .context("workspace doctor response is malformed")
+        })
+        .and_then(|parsed| {
+            parsed
+                .validate(
+                    expected_workspace_id,
+                    expected_repository,
+                    &paths.for_workspace(expected_workspace_id).root,
+                )
+                .map_err(anyhow::Error::from)?;
+            Ok(parsed)
+        });
+    let diagnostics = match parsed {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => {
+            let detail = format!("invalid workspace doctor IPC response: {error}");
+            for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+                checks.push(Check::fail(name, &detail));
+            }
+            return;
+        }
+    };
+    let health = &diagnostics.database;
+    let healthy = health.integrity_ok
+        && health.foreign_key_violations == 0
+        && health.current_schema_version == orchestrator_state::STATE_SCHEMA_VERSION;
+    checks.push(Check::with_data(
+        "state",
+        healthy,
+        json!({
+            "root": paths.root,
+            "database": paths.database,
+            "backups": paths.backups,
+            "health": &diagnostics.database,
+            "via": "daemon_ipc",
+        }),
+    ));
+    checks.push(daemon_runtime_check(&diagnostics.daemon, executable));
+    checks.push(Check::with_data(
+        "workspace",
+        true,
+        json!(diagnostics.workspace),
+    ));
+    checks.push(Check::with_data("audit", true, json!(diagnostics.audit)));
+    checks.push(Check::with_data(
+        "artifacts",
+        true,
+        json!(diagnostics.artifacts),
+    ));
+}
+
+fn push_unavailable_workspace_checks(checks: &mut Vec<Check>, detail: &str) {
+    checks.push(Check::warn("workspace", detail));
+    checks.push(Check::warn("audit", detail));
+    checks.push(Check::warn("artifacts", detail));
 }
 
 fn verify_workspace_audit(database: &WorkspaceDatabase<'_>) -> Result<Value> {
@@ -744,8 +872,15 @@ fn verify_workspace_artifacts(
     database: &WorkspaceDatabase<'_>,
     paths: &orchestrator_state::WorkspaceStatePaths,
 ) -> Result<Value> {
-    let store = ArtifactStore::open_workspace(paths)?;
     let artifacts = database.list_artifacts()?;
+    if artifacts.is_empty() {
+        return Ok(json!({
+            "root": paths.root,
+            "verified_references": 0,
+            "scope": "persisted_references",
+        }));
+    }
+    let store = ArtifactStore::open_workspace_read_only(paths)?;
     for artifact in &artifacts {
         let _ = store.read_verified(artifact)?;
     }
@@ -6905,7 +7040,7 @@ mod tests {
     };
 
     use crate::args::{EffortName, ProfileName, ProviderName};
-    use anyhow::Result;
+    use anyhow::{Context as _, Result};
     use chrono::Utc;
     use orchestrator_domain::{
         AttemptId, ModelProfile, ProviderId, ReasoningEffort, SandboxMode, SchemaVersion,
@@ -6914,17 +7049,20 @@ mod tests {
     };
     use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
     use orchestrator_state::{
-        ConfigEnvironment, Database, NewTaskRecord, RootConfig, WorkspaceDatabase,
+        ConfigEnvironment, DaemonStatus, Database, DatabaseHealth, GlobalStatePaths, NewTaskRecord,
+        RootConfig, WorkspaceDatabase, WorkspaceId, WorkspaceKind, WorkspaceRegistration,
+        WorkspaceStatus,
     };
     use rusqlite::params;
     use toml_edit::DocumentMut;
 
     use super::{
-        ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
-        acquire_task_coordinator, acquire_worker_lease, block_for_unconfirmed_termination,
-        initialize, load_config_runtime, mixed_git_checkout_warning, provider_adapter,
-        reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
-        set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
+        CheckStatus, ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
+        acquire_task_coordinator, acquire_worker_lease, append_live_doctor_checks,
+        block_for_unconfirmed_termination, initialize, load_config_runtime,
+        mixed_git_checkout_warning, provider_adapter, reset_model_profile,
+        rollback_resolution_context, run_with_coordinator_renewal, run_worker, set_model_profile,
+        set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
 
     fn test_with_database<T>(
@@ -6985,6 +7123,130 @@ mod tests {
         assert!(warning.contains("line-ending"));
         assert!(mixed_git_checkout_warning(Path::new("/home/user/project"), "linux").is_none());
         assert!(mixed_git_checkout_warning(Path::new("C:/work/project"), "windows").is_none());
+    }
+
+    #[test]
+    fn malformed_live_doctor_response_fails_every_integrity_category() -> Result<()> {
+        let root = PathBuf::from("doctor-test-root");
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let response = orchestrator_daemon::IpcResponse {
+            schema_version: orchestrator_daemon::IPC_SCHEMA_VERSION,
+            request_id: "doctor-test".to_owned(),
+            outcome: serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "workspace": null
+                }
+            }),
+        };
+        let mut checks = Vec::new();
+        let workspace_id = "00000000-0000-0000-0000-000000000002".parse::<WorkspaceId>()?;
+
+        append_live_doctor_checks(
+            &mut checks,
+            &response,
+            &paths,
+            workspace_id,
+            Path::new("doctor-test-repository"),
+            Path::new("colay"),
+        );
+
+        assert_eq!(checks.len(), 5);
+        for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+            let check = checks
+                .iter()
+                .find(|check| check.name == name)
+                .with_context(|| format!("missing {name} failure"))?;
+            assert_eq!(check.status, CheckStatus::Fail, "{name} must fail closed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_live_doctor_workspace_path_fails_every_integrity_category() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let expected_repository = root.join("expected-repository");
+        let wrong_repository = root.join("wrong-repository");
+        fs::create_dir_all(&expected_repository)?;
+        fs::create_dir_all(&wrong_repository)?;
+        let expected_repository = fs::canonicalize(expected_repository)?;
+        let wrong_repository = fs::canonicalize(wrong_repository)?;
+        let workspace_id = "00000000-0000-0000-0000-000000000003".parse::<WorkspaceId>()?;
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let now = Utc::now();
+        let diagnostics = orchestrator_daemon::WorkspaceDoctorDiagnostics {
+            schema_version: orchestrator_daemon::WORKSPACE_DOCTOR_SCHEMA_VERSION,
+            database: DatabaseHealth {
+                integrity_ok: true,
+                foreign_key_violations: 0,
+                current_schema_version: orchestrator_state::STATE_SCHEMA_VERSION,
+                last_event_sequence: 0,
+            },
+            daemon: DaemonStatus::Stopped,
+            workspace: WorkspaceRegistration {
+                workspace_id,
+                kind: WorkspaceKind::Directory,
+                status: WorkspaceStatus::Active,
+                canonical_path: wrong_repository,
+                git_common_dir: None,
+                created_at: now,
+                last_seen_at: now,
+            },
+            audit: orchestrator_daemon::WorkspaceAuditDiagnostics {
+                workspace_id,
+                verified_events: 0,
+                last_sequence: 0,
+                last_hash: None,
+            },
+            artifacts: orchestrator_daemon::WorkspaceArtifactDiagnostics {
+                root: paths.for_workspace(workspace_id).root,
+                verified_references: 0,
+                scope: orchestrator_daemon::WorkspaceArtifactScope::PersistedReferences,
+            },
+        };
+        let response = orchestrator_daemon::IpcResponse {
+            schema_version: orchestrator_daemon::IPC_SCHEMA_VERSION,
+            request_id: "doctor-test".to_owned(),
+            outcome: serde_json::json!({
+                "status": "ok",
+                "data": serde_json::to_value(diagnostics)?,
+            }),
+        };
+        let mut checks = Vec::new();
+
+        append_live_doctor_checks(
+            &mut checks,
+            &response,
+            &paths,
+            workspace_id,
+            &expected_repository,
+            Path::new("colay"),
+        );
+
+        assert_eq!(checks.len(), 5);
+        for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+            let check = checks
+                .iter()
+                .find(|check| check.name == name)
+                .with_context(|| format!("missing {name} failure"))?;
+            assert_eq!(check.status, CheckStatus::Fail, "{name} must fail closed");
+        }
+        Ok(())
     }
 
     fn write_fake_executable(path: &Path, bytes: &[u8]) -> Result<()> {

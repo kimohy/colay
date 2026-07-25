@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use orchestrator_state::{Database, STATE_SCHEMA_VERSION};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -59,6 +59,13 @@ struct DoctorFixture {
     root: PathBuf,
     repository: PathBuf,
     colay_home: PathBuf,
+}
+
+struct FutureWalState {
+    _writer: Connection,
+    database: Vec<u8>,
+    wal: Vec<u8>,
+    shm: Vec<u8>,
 }
 
 impl DoctorFixture {
@@ -113,6 +120,21 @@ impl DoctorFixture {
         Ok(())
     }
 
+    fn seed_corrupt_explicit_legacy_config(&self) -> Result<PathBuf> {
+        let config = self.repository.join("doctor-explicit.toml");
+        fs::write(
+            &config,
+            "config_version = 4\n[orchestrator]\nstate_dir = \"chosen-state\"\n",
+        )?;
+        let selected_state = self.repository.join("chosen-state");
+        fs::create_dir_all(&selected_state)?;
+        fs::write(
+            selected_state.join("orchestrator.db"),
+            b"not a SQLite database",
+        )?;
+        Ok(config)
+    }
+
     fn colay<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
@@ -157,9 +179,58 @@ impl DoctorFixture {
         self.colay_home.join("state/state.db")
     }
 
+    fn seed_current_global_workspace(&self) -> Result<()> {
+        let database = Database::open(self.global_database())?;
+        database.migrate_with_backup(&self.colay_home.join("state/backups"))?;
+        database.resolve_repository_workspace(&self.repository)?;
+        Ok(())
+    }
+
     fn schema_version(&self) -> Result<u32> {
         Connection::open(self.global_database())?
             .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    fn seed_future_schema_in_delete_journal_mode(&self) -> Result<Vec<u8>> {
+        let database = self.global_database();
+        fs::create_dir_all(database.parent().context("global database has no parent")?)?;
+        let connection = Connection::open(&database)?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+        assert_eq!(journal_mode, "delete");
+        connection.pragma_update(None, "user_version", STATE_SCHEMA_VERSION + 1)?;
+        drop(connection);
+        fs::read(database).map_err(Into::into)
+    }
+
+    fn seed_future_schema_in_wal_mode(&self) -> Result<FutureWalState> {
+        let database = self.global_database();
+        fs::create_dir_all(database.parent().context("global database has no parent")?)?;
+        let connection = Connection::open(&database)?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        assert_eq!(journal_mode, "wal");
+        connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+        connection.execute_batch("CREATE TABLE preflight_fixture(value INTEGER);")?;
+        connection.pragma_update(None, "user_version", STATE_SCHEMA_VERSION + 1)?;
+        let wal = sqlite_sidecar(&database, "-wal");
+        let shm = sqlite_sidecar(&database, "-shm");
+        Ok(FutureWalState {
+            _writer: connection,
+            database: fs::read(database)?,
+            wal: fs::read(wal)?,
+            shm: fs::read(shm)?,
+        })
+    }
+
+    fn read_only_journal_mode(&self) -> Result<String> {
+        let connection = Connection::open_with_flags(
+            self.global_database(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .map_err(Into::into)
     }
 
@@ -215,6 +286,12 @@ fn toml_path(path: &Path) -> String {
     )
 }
 
+fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 fn check_named<'a>(document: &'a Value, name: &str) -> Result<&'a Value> {
     document["data"]["checks"]
         .as_array()
@@ -238,7 +315,9 @@ fn normalize_provider_timestamps(document: &mut Value) {
 #[test]
 fn doctor_reports_global_workspace_and_operational_checks() -> Result<()> {
     let fixture = DoctorFixture::new()?;
+    fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
+    let database_before = fs::read(fixture.global_database())?;
 
     let output = fixture.colay(["--json", "doctor"])?;
 
@@ -248,6 +327,7 @@ fn doctor_reports_global_workspace_and_operational_checks() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!fixture.repository.join(".colay").exists());
+    assert_eq!(fs::read(fixture.global_database())?, database_before);
     let document: Value = serde_json::from_slice(&output.stdout)?;
     for name in [
         "state",
@@ -342,6 +422,64 @@ fn migrate_apply_is_idempotent_with_untrusted_provider_and_missing_local_config(
 }
 
 #[test]
+fn migrate_refuses_a_future_schema_before_opening_it_for_writes() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    let before = fixture.seed_future_schema_in_delete_journal_mode()?;
+
+    let migration = fixture.colay(["migrate", "apply"])?;
+
+    assert!(!migration.status.success());
+    assert_eq!(fs::read(fixture.global_database())?, before);
+    assert_eq!(fixture.read_only_journal_mode()?, "delete");
+    assert!(!fixture.global_database().with_extension("db-wal").exists());
+    assert!(!fixture.global_database().with_extension("db-shm").exists());
+    assert!(!fixture.colay_home.join("state/backups").exists());
+    Ok(())
+}
+
+#[test]
+fn migrate_preflight_does_not_change_existing_future_wal_sidecars() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    let before = fixture.seed_future_schema_in_wal_mode()?;
+    let database = fixture.global_database();
+    let wal = sqlite_sidecar(&database, "-wal");
+    let shm = sqlite_sidecar(&database, "-shm");
+
+    let migration = fixture.colay(["migrate", "apply"])?;
+
+    assert!(!migration.status.success());
+    assert_eq!(fs::read(database)?, before.database);
+    assert_eq!(fs::read(wal)?, before.wal);
+    assert_eq!(fs::read(shm)?, before.shm);
+    assert!(!fixture.colay_home.join("state/backups").exists());
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_pending_migrations_without_changing_the_database() -> Result<()> {
+    let fixture = DoctorFixture::old_global_schema_untrusted_provider()?;
+    let before = fs::read(fixture.global_database())?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(fixture.global_database())?, before);
+    assert_eq!(fixture.schema_version()?, 8);
+    assert!(!fixture.colay_home.join("state/backups").exists());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(check_named(&document, "state")?["status"], "warn");
+    assert_eq!(
+        check_named(&document, "state")?["data"]["current_schema_version"],
+        8
+    );
+    Ok(())
+}
+
+#[test]
 fn migrate_apply_refuses_a_live_daemon_owner() -> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.configure_fake_providers()?;
@@ -422,6 +560,34 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
         check_named(&document, "audit")?["data"]["workspace_id"],
         check_named(&document, "workspace")?["data"]["workspace_id"]
     );
+    Ok(())
+}
+
+#[test]
+fn live_doctor_registration_honors_the_explicit_config_state_dir() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let explicit = fixture.seed_corrupt_explicit_legacy_config()?;
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let output = fixture.colay([
+        "--config",
+        explicit
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("explicit config filename is invalid")?,
+        "--json",
+        "doctor",
+    ])?;
+
+    assert!(output.status.success());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(check_named(&document, "state")?["status"], "fail");
     Ok(())
 }
 

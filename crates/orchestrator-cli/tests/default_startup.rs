@@ -223,7 +223,7 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
         .iter()
         .find(|check| check["name"] == "state")
         .context("doctor must report user-global database state")?;
-    assert_eq!(state["status"], "pass");
+    assert_eq!(state["status"], "warn");
     assert_eq!(
         PathBuf::from(
             state["data"]["database"]
@@ -232,6 +232,7 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
         ),
         fixture.colay_home.join("state/state.db")
     );
+    assert!(!fixture.colay_home.join("state/state.db").exists());
     Ok(())
 }
 

@@ -72,10 +72,14 @@ For an existing nonzero schema, `migrate apply` creates a verified SQLite backup
 state backup directory before applying pending versions. A brand-new empty database has no prior
 state to back up. Missing local or global configuration uses validated defaults and does not create
 a repository config. Forward apply is idempotent: no pending versions succeeds without another
-backup. Provider compatibility and safe mode are never migration authority. Catalog dry-run and
-future-schema refusal complete before any migration audit append, so an unknown future database is
-not modified. After migration, `doctor` reports global integrity, foreign keys, current workspace
-audit head, and artifact-reference integrity.
+backup. Provider compatibility and safe mode are never migration authority. Every normal database
+open first reads the existing database header directly. When recovery sidecars are present, it copies
+the database and WAL or rollback journal into private temporary scratch and asks SQLite for the
+effective schema only from that copy. Future-schema refusal therefore completes before SQLite opens
+the source or changes its journal/shared-memory state, and before any migration audit append, so an
+unknown future database and its sidecars are not modified. After an explicit migration, `doctor`
+reports global integrity, foreign keys, current workspace audit head, and artifact-reference
+integrity. Doctor itself never applies a migration or creates a backup.
 
 `migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. Integration contracts verify the complete plan through v15, prove dry-run non-mutation, preserve historical event hashes, reject checksum tampering/future schemas, and exercise the workspace-partition and command-fence migrations. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
 

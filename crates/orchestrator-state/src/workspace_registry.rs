@@ -77,6 +77,17 @@ impl Database {
         self.resolve_repository_workspace_at(path, Utc::now())
     }
 
+    /// Finds the current repository registration without refreshing timestamps or inserting a
+    /// workspace. This is suitable for read-only diagnostics.
+    pub fn find_repository_workspace(
+        &self,
+        path: &Path,
+    ) -> StateResult<Option<WorkspaceRegistration>> {
+        let identity = WorkspacePathIdentity::resolve(path, WorkspaceKind::Directory)?;
+        let connection = self.lock()?;
+        load_current_by_comparison_key(&connection, &identity.comparison_key)
+    }
+
     fn resolve_repository_workspace_at(
         &self,
         path: &Path,
