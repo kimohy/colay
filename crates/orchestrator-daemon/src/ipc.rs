@@ -404,18 +404,26 @@ async fn stream_task_status<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let (workspace_id, task_id) = match requested_task(database, request) {
-        Ok(task) => task,
-        Err(error) => {
-            write_response(
-                output,
-                &IpcResponse::failure(request.request_id.clone(), error.to_string()),
-            )
-            .await?;
-            return Ok(());
-        }
+    let (workspace_id, task_id, requested_cursor) =
+        match requested_task_with_cursor(database, request) {
+            Ok(task) => task,
+            Err(error) => {
+                write_response(
+                    output,
+                    &IpcResponse::failure(request.request_id.clone(), error.to_string()),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    let workspace = database.workspace(workspace_id);
+    let mut scan_cursor = match requested_cursor {
+        Some(cursor) => i64::try_from(cursor).map_err(|_| {
+            IpcError::Protocol("task stream cursor exceeds the supported range".to_owned())
+        })?,
+        None => workspace.latest_outbox_sequence()?,
     };
-    let mut last_revision = None;
+    let mut sent_status = false;
     let mut idle_deadline = Instant::now() + TASK_STREAM_IDLE_TIMEOUT;
     loop {
         let Some(status) = crate::execution::active_task_status(database, workspace_id, task_id)?
@@ -430,25 +438,52 @@ where
             .await?;
             return Ok(());
         };
-        if last_revision != Some(status.revision) {
-            let terminal = status.state.is_terminal();
-            let revision = status.revision;
+        let records = workspace.outbox_after(scan_cursor, 256)?;
+        for record in records {
+            scan_cursor = record.sequence;
+            if record.event.task_id != Some(task_id) {
+                continue;
+            }
+            let terminal = record
+                .event
+                .to_state
+                .is_some_and(orchestrator_domain::TaskState::is_terminal);
             write_response(
                 output,
                 &IpcResponse::success(
                     request.request_id.clone(),
                     &json!({
                         "status": status,
-                        "cursor": revision,
+                        "event": record.event,
+                        "cursor": record.sequence,
                     }),
                 ),
             )
             .await?;
+            sent_status = true;
+            idle_deadline = Instant::now() + TASK_STREAM_IDLE_TIMEOUT;
             if terminal {
                 return Ok(());
             }
-            last_revision = Some(revision);
+        }
+        if !sent_status {
+            let terminal = status.state.is_terminal();
+            write_response(
+                output,
+                &IpcResponse::success(
+                    request.request_id.clone(),
+                    &json!({
+                        "status": status,
+                        "cursor": scan_cursor,
+                    }),
+                ),
+            )
+            .await?;
+            sent_status = true;
             idle_deadline = Instant::now() + TASK_STREAM_IDLE_TIMEOUT;
+            if terminal {
+                return Ok(());
+            }
         }
         let now = Instant::now();
         if now >= idle_deadline {
@@ -652,7 +687,7 @@ fn workspace_task_stream(database: &Database, request: &IpcRequest) -> Result<Va
         .ok_or_else(|| IpcError::Protocol(format!("task {task_id} does not exist")))?;
     Ok(json!({
         "status": status,
-        "cursor": status.revision,
+        "cursor": database.workspace(workspace_id).latest_outbox_sequence()?,
     }))
 }
 
@@ -865,12 +900,22 @@ fn normalize_path(path: &Path) -> Result<PathBuf, IpcError> {
 #[serde(deny_unknown_fields)]
 struct WorkspaceTaskPayload {
     task_id: String,
+    #[serde(default)]
+    cursor: Option<u64>,
 }
 
 fn requested_task(
     database: &Database,
     request: &IpcRequest,
 ) -> Result<(WorkspaceId, TaskId), IpcError> {
+    requested_task_with_cursor(database, request)
+        .map(|(workspace_id, task_id, _)| (workspace_id, task_id))
+}
+
+fn requested_task_with_cursor(
+    database: &Database,
+    request: &IpcRequest,
+) -> Result<(WorkspaceId, TaskId, Option<u64>), IpcError> {
     let workspace_id = request.workspace_id.ok_or_else(|| {
         IpcError::Protocol("workspace task request requires a registered workspace".to_owned())
     })?;
@@ -884,7 +929,7 @@ fn requested_task(
     {
         return Err(IpcError::Protocol(format!("task {task_id} does not exist")));
     }
-    Ok((workspace_id, task_id))
+    Ok((workspace_id, task_id, payload.cursor))
 }
 
 fn workspace_checkpoint(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
@@ -1030,29 +1075,32 @@ fn override_workspace_usage(database: &Database, request: &IpcRequest) -> Result
     payload.snapshot.validate().map_err(|error| {
         IpcError::Protocol(format!("manual usage snapshot is invalid: {error}"))
     })?;
-    database.record_global_usage_snapshot(&payload.snapshot)?;
     let now = Utc::now();
-    database.workspace(workspace_id).append_event(TaskEvent {
-        schema_version: SchemaVersion::state_current(),
-        sequence: 0,
-        event_id: EventId::new(),
-        session_id: None,
-        task_id: None,
-        occurred_at: now,
-        event_type: EventType::UsageCollected,
-        from_state: None,
-        to_state: None,
-        reason: None,
-        actor: EventActor::Administrator,
-        correlation_id: CorrelationId::new(),
-        causation_id: None,
-        payload: json!({
-            "snapshot": payload.snapshot,
-            "entered_by": payload.entered_by,
-        }),
-        previous_hash: None,
-        event_hash: String::new(),
-    })?;
+    database.record_global_usage_snapshot_with_event(
+        workspace_id,
+        &payload.snapshot,
+        TaskEvent {
+            schema_version: SchemaVersion::state_current(),
+            sequence: 0,
+            event_id: EventId::new(),
+            session_id: None,
+            task_id: None,
+            occurred_at: now,
+            event_type: EventType::UsageCollected,
+            from_state: None,
+            to_state: None,
+            reason: None,
+            actor: EventActor::Administrator,
+            correlation_id: CorrelationId::new(),
+            causation_id: None,
+            payload: json!({
+                "snapshot": payload.snapshot,
+                "entered_by": payload.entered_by,
+            }),
+            previous_hash: None,
+            event_hash: String::new(),
+        },
+    )?;
     Ok(json!({"snapshot": payload.snapshot}))
 }
 
@@ -1082,35 +1130,31 @@ fn submit_workspace_control(database: &Database, request: &IpcRequest) -> Result
         )));
     }
     let requested_at = Utc::now();
-    let control = workspace.request_control(
+    let control = workspace.request_control_with_event(
         task_id,
         payload.action,
         payload.payload.clone(),
         "local-ipc-client",
         requested_at,
+        TaskEvent {
+            schema_version: SchemaVersion::state_current(),
+            sequence: 0,
+            event_id: EventId::new(),
+            session_id: None,
+            task_id: Some(task_id),
+            occurred_at: requested_at,
+            event_type: EventType::ControlRequested,
+            from_state: None,
+            to_state: None,
+            reason: None,
+            actor: EventActor::User,
+            correlation_id: CorrelationId::new(),
+            causation_id: None,
+            payload: json!({}),
+            previous_hash: None,
+            event_hash: String::new(),
+        },
     )?;
-    workspace.append_event(TaskEvent {
-        schema_version: SchemaVersion::state_current(),
-        sequence: 0,
-        event_id: EventId::new(),
-        session_id: None,
-        task_id: Some(task_id),
-        occurred_at: requested_at,
-        event_type: EventType::ControlRequested,
-        from_state: None,
-        to_state: None,
-        reason: None,
-        actor: EventActor::User,
-        correlation_id: CorrelationId::new(),
-        causation_id: None,
-        payload: json!({
-            "control_id": control.control_id,
-            "action": payload.action,
-            "payload": payload.payload,
-        }),
-        previous_hash: None,
-        event_hash: String::new(),
-    })?;
     Ok(json!({
         "task_id": task_id,
         "control_id": control.control_id,
@@ -1160,20 +1204,40 @@ fn resume_workspace_task(database: &Database, request: &IpcRequest) -> Result<Va
             "disposition": disposition,
             "task_id": task_id,
             "stream": "workspace.task.stream",
+            "cursor": workspace.latest_outbox_sequence()?,
         })),
         ResumeDisposition::Requeued => {
-            let control = workspace.request_control(
+            let requested_at = Utc::now();
+            let control = workspace.requeue_task_for_resume_with_event(
                 task_id,
-                orchestrator_state::ControlAction::Resume,
-                json!({}),
+                task.revision,
                 "local-ipc-client",
-                Utc::now(),
+                requested_at,
+                TaskEvent {
+                    schema_version: SchemaVersion::state_current(),
+                    sequence: 0,
+                    event_id: EventId::new(),
+                    session_id: None,
+                    task_id: Some(task_id),
+                    occurred_at: requested_at,
+                    event_type: EventType::ControlRequested,
+                    from_state: Some(task.state),
+                    to_state: Some(orchestrator_domain::TaskState::Queued),
+                    reason: Some("verified replay-safe resume requeue".to_owned()),
+                    actor: EventActor::User,
+                    correlation_id: CorrelationId::new(),
+                    causation_id: None,
+                    payload: json!({"replay_safe": true}),
+                    previous_hash: None,
+                    event_hash: String::new(),
+                },
             )?;
             Ok(json!({
                 "disposition": disposition,
                 "task_id": task_id,
-                "state": task.state,
+                "state": orchestrator_domain::TaskState::Queued,
                 "control_id": control.control_id,
+                "cursor": workspace.latest_outbox_sequence()?,
             }))
         }
         ResumeDisposition::Rejected => Err(IpcError::Protocol(format!(
@@ -1283,18 +1347,19 @@ mod tests {
 
     use chrono::Utc;
     use orchestrator_domain::{
-        ConversationMessage, CorrelationId, EventActor, EventId, EventType, MessageId, MessageKind,
-        MessageRole, MessageState, SchemaVersion, SessionId, SessionState, TaskEnvelope, TaskEvent,
-        TaskId, TaskState, TransitionGuards,
+        ConversationMessage, CorrelationId, DaemonInstanceId, EventActor, EventId, EventType,
+        MessageId, MessageKind, MessageRole, MessageState, SchemaVersion, SessionId, SessionState,
+        TaskEnvelope, TaskEvent, TaskId, TaskState, TransitionGuards,
     };
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::{
         IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, MAX_REQUEST_BYTES,
-        handle_connection, workspace_conversation, workspace_projection,
+        handle_connection, resume_workspace_task, workspace_conversation, workspace_projection,
     };
     use orchestrator_state::{
-        Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord, WorkspaceReadRequest,
+        DaemonLeaseRequest, Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord,
+        WorkspaceReadRequest,
     };
 
     #[tokio::test]
@@ -1330,6 +1395,58 @@ mod tests {
             Some("IPC request exceeds the one MiB limit")
         );
         server_task.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_requeues_pre_worker_state_into_scheduler_eligible_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let repository = tempfile::tempdir()?;
+        let workspace_id = database
+            .resolve_repository_workspace(repository.path())?
+            .workspace_id;
+        let task_id = TaskId::new();
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("resume analyzed task", "resume analyzed task", now);
+        database
+            .workspace(workspace_id)
+            .create_task(&NewTaskRecord {
+                task_id,
+                schema_version: SchemaVersion::V1.to_owned(),
+                state: TaskState::Analyzing,
+                objective: envelope.objective.clone(),
+                original_request_redacted: envelope.original_request_redacted.clone(),
+                envelope,
+                created_at: now,
+            })?;
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id: DaemonInstanceId::new(),
+            pid: 41,
+            started_at: now,
+            ttl: chrono::TimeDelta::minutes(5),
+        })?;
+
+        let response = resume_workspace_task(
+            &database,
+            &IpcRequest {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "resume-pre-worker".to_owned(),
+                workspace_id: Some(workspace_id),
+                action: "workspace.resume".to_owned(),
+                payload: serde_json::json!({"task_id": task_id}),
+            },
+        )?;
+
+        assert_eq!(response["disposition"], "requeued");
+        assert_eq!(response["cursor"], 1);
+        let task = database
+            .workspace(workspace_id)
+            .load_task(task_id)?
+            .ok_or("resumed task disappeared")?;
+        assert_eq!(task.state, TaskState::Queued);
+        assert!(!task.paused);
         Ok(())
     }
 
@@ -1423,6 +1540,90 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader)).await??;
         assert_eq!(completed.outcome["data"]["cursor"], 2);
         assert_eq!(completed.outcome["data"]["status"]["state"], "completed");
+        tokio::time::timeout(Duration::from_secs(1), server_task).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_status_stream_replays_intervening_events_after_reconnect_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Database::open_in_memory()?);
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let repository = tempfile::tempdir()?;
+        let workspace_id = database
+            .resolve_repository_workspace(repository.path())?
+            .workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let task_id = TaskId::new();
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("reconnect stream", "reconnect stream", now);
+        workspace.create_task(&NewTaskRecord {
+            task_id,
+            schema_version: SchemaVersion::V1.to_owned(),
+            state: TaskState::Running,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope,
+            created_at: now,
+        })?;
+        workspace.transition_task_with_event(
+            task_id,
+            0,
+            TaskState::Running,
+            TaskState::Verifying,
+            None,
+            false,
+            &TransitionGuards::default(),
+            now,
+            transition_event(task_id, TaskState::Running, TaskState::Verifying, now),
+        )?;
+        workspace.transition_task_with_event(
+            task_id,
+            1,
+            TaskState::Verifying,
+            TaskState::Completed,
+            None,
+            false,
+            &TransitionGuards {
+                verification_passed: true,
+                ..TransitionGuards::default()
+            },
+            now,
+            transition_event(task_id, TaskState::Verifying, TaskState::Completed, now),
+        )?;
+
+        let root = std::path::PathBuf::from("unused");
+        let paths = GlobalStatePaths {
+            database: root.join("state.db"),
+            backups: root.join("backups"),
+            workspaces: root.join("workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(handle_connection(server, database, paths, writer));
+        let (reader, mut output) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "task-stream-reconnect".to_owned(),
+            workspace_id: Some(workspace_id),
+            action: "workspace.task.stream".to_owned(),
+            payload: serde_json::json!({"task_id": task_id, "cursor": 0}),
+        };
+        output
+            .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
+            .await?;
+
+        let verifying = read_response(&mut reader).await?;
+        assert_eq!(verifying.outcome["status"], "ok");
+        assert_eq!(verifying.outcome["data"]["cursor"], 1);
+        assert_eq!(verifying.outcome["data"]["event"]["to_state"], "verifying");
+        let completed = read_response(&mut reader).await?;
+        assert_eq!(completed.outcome["data"]["cursor"], 2);
+        assert_eq!(completed.outcome["data"]["event"]["to_state"], "completed");
         tokio::time::timeout(Duration::from_secs(1), server_task).await???;
         Ok(())
     }

@@ -506,6 +506,17 @@ impl WorkspaceDatabase<'_> {
             .map_err(StateError::from)
     }
 
+    /// Returns the latest workspace event cursor, or zero before the first event.
+    pub fn latest_outbox_sequence(&self) -> StateResult<i64> {
+        self.lock()?
+            .query_row(
+                "SELECT coalesce(max(sequence), 0) FROM task_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StateError::from)
+    }
+
     pub fn event_at(&self, sequence: i64) -> StateResult<Option<TaskEvent>> {
         let connection = self.lock()?;
         let json: Option<String> = connection

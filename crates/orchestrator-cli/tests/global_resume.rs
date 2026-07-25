@@ -289,7 +289,10 @@ fn resume_reports_a_revision_published_after_the_initial_attachment() -> Result<
         String::from_utf8_lossy(&output.stderr)
     );
     let response = serde_json::from_slice::<serde_json::Value>(&output.stdout)?;
-    assert_eq!(response["data"]["active_status"]["status"]["revision"], 1);
+    assert_eq!(
+        response["data"]["active_status"]["status"]["revision"], 1,
+        "{response:#}"
+    );
     assert_eq!(
         response["data"]["active_status"]["status"]["state"],
         "verifying"

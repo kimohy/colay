@@ -293,61 +293,23 @@ impl $database {
         daemon_instance_id: DaemonInstanceId,
         now: DateTime<Utc>,
     ) -> StateResult<ResumeDisposition> {
+        // Integrity verification can inspect checkpoint artifacts, so it must finish before the
+        // ownership transaction begins. The transaction below rechecks the checkpoint identity.
+        let verified_checkpoint_id = self
+            .latest_sealed_checkpoint(task_id)
+            .ok()
+            .flatten()
+            .map(|checkpoint| checkpoint.checkpoint_id.to_string());
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire_stale_leases(&transaction, now)?;
-        let schedule_owner = transaction
-            .query_row(
-                "SELECT daemon_instance_id FROM task_schedule_claims \
-                 WHERE task_id = ?1 AND released_at IS NULL AND expires_at > ?2 \
-                 ORDER BY acquired_at DESC LIMIT 1",
-                params![task_id.to_string(), now.to_rfc3339()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let coordinator = transaction
-            .query_row(
-                "SELECT lease_id, task_id, worktree_id, owner_id, acquired_at, renewed_at, \
-                 expires_at, released_at FROM coordinator_leases \
-                 WHERE task_id = ?1 AND released_at IS NULL",
-                [task_id.to_string()],
-                map_coordinator,
-            )
-            .optional()?;
-        let disposition = if let Some(schedule_owner) = schedule_owner {
-            if schedule_owner == daemon_instance_id.to_string() {
-                ResumeDisposition::Attached
-            } else {
-                ResumeDisposition::Rejected
-            }
-        } else if let Some(coordinator) = coordinator {
-            if coordinator.owner_id == daemon_instance_id.into_uuid() {
-                ResumeDisposition::Attached
-            } else {
-                ResumeDisposition::Rejected
-            }
-        } else if row_exists(
+        let disposition = classify_resume_disposition(
             &transaction,
-            "SELECT EXISTS(SELECT 1 FROM worker_leases \
-             WHERE task_id = ?1 AND released_at IS NULL)",
-            &task_id.to_string(),
-        )? {
-            ResumeDisposition::Rejected
-        } else {
-            let state = transaction
-                .query_row(
-                    "SELECT state FROM tasks WHERE task_id = ?1",
-                    [task_id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            match state.as_deref() {
-                Some("queued" | "analyzing" | "planned" | "checkpointed" | "blocked") => {
-                    ResumeDisposition::Requeued
-                }
-                _ => ResumeDisposition::Rejected,
-            }
-        };
+            task_id,
+            daemon_instance_id,
+            now,
+            verified_checkpoint_id.as_deref(),
+        )?;
         transaction.commit()?;
         Ok(disposition)
     }
@@ -573,6 +535,166 @@ fn row_exists(transaction: &Transaction<'_>, sql: &str, parameter: &str) -> Stat
         .map_err(StateError::from)
 }
 
+fn classify_resume_disposition(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    daemon_instance_id: DaemonInstanceId,
+    now: DateTime<Utc>,
+    verified_checkpoint_id: Option<&str>,
+) -> StateResult<ResumeDisposition> {
+    let schedule_owner = transaction
+        .query_row(
+            "SELECT daemon_instance_id FROM task_schedule_claims \
+             WHERE task_id = ?1 AND released_at IS NULL AND expires_at > ?2 \
+             ORDER BY acquired_at DESC LIMIT 1",
+            params![task_id.to_string(), now.to_rfc3339()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(schedule_owner) = schedule_owner {
+        return Ok(if schedule_owner == daemon_instance_id.to_string() {
+            ResumeDisposition::Attached
+        } else {
+            ResumeDisposition::Rejected
+        });
+    }
+    let coordinator = transaction
+        .query_row(
+            "SELECT lease_id, task_id, worktree_id, owner_id, acquired_at, renewed_at, \
+             expires_at, released_at FROM coordinator_leases \
+             WHERE task_id = ?1 AND released_at IS NULL",
+            [task_id.to_string()],
+            map_coordinator,
+        )
+        .optional()?;
+    if let Some(coordinator) = coordinator {
+        return Ok(if coordinator.owner_id == daemon_instance_id.into_uuid() {
+            ResumeDisposition::Attached
+        } else {
+            ResumeDisposition::Rejected
+        });
+    }
+    if row_exists(
+        transaction,
+        "SELECT EXISTS(SELECT 1 FROM worker_leases \
+         WHERE task_id = ?1 AND released_at IS NULL)",
+        &task_id.to_string(),
+    )? || row_exists(
+        transaction,
+        "SELECT EXISTS(SELECT 1 FROM task_attempts \
+         WHERE task_id = ?1 AND (ended_at IS NULL OR outcome IS NULL \
+         OR outcome = 'termination_unconfirmed'))",
+        &task_id.to_string(),
+    )? {
+        return Ok(ResumeDisposition::Rejected);
+    }
+    classify_replay_safe_projection(transaction, task_id, verified_checkpoint_id)
+}
+
+fn classify_replay_safe_projection(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    verified_checkpoint_id: Option<&str>,
+) -> StateResult<ResumeDisposition> {
+    let task_projection = transaction
+        .query_row(
+            "SELECT state, resume_state FROM tasks WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let replay_safe = match task_projection {
+        Some((state, _)) if state == "queued" => true,
+        Some((state, _)) if matches!(state.as_str(), "analyzing" | "planned") => {
+            has_no_worker_replay_evidence(transaction, task_id)?
+        }
+        Some((state, _)) if state == "checkpointed" => {
+            has_persisted_replay_evidence(transaction, task_id, verified_checkpoint_id)?
+        }
+        Some((state, Some(resume_state)))
+            if state == "blocked" && matches!(resume_state.as_str(), "analyzing" | "planned") =>
+        {
+            has_no_worker_replay_evidence(transaction, task_id)?
+        }
+        Some((state, Some(resume_state)))
+            if state == "blocked" && runtime_resume_state(&resume_state) =>
+        {
+            has_persisted_replay_evidence(transaction, task_id, verified_checkpoint_id)?
+        }
+        _ => false,
+    };
+    Ok(if replay_safe {
+        ResumeDisposition::Requeued
+    } else {
+        ResumeDisposition::Rejected
+    })
+}
+
+fn runtime_resume_state(state: &str) -> bool {
+    matches!(
+        state,
+        "running"
+            | "checkpoint_requested"
+            | "checkpointing"
+            | "checkpointed"
+            | "handover_requested"
+            | "handing_over"
+            | "resuming"
+            | "verifying"
+    )
+}
+
+fn has_persisted_replay_evidence(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+    verified_checkpoint_id: Option<&str>,
+) -> StateResult<bool> {
+    let Some(verified_checkpoint_id) = verified_checkpoint_id else {
+        return Ok(false);
+    };
+    transaction
+        .query_row(
+            "SELECT EXISTS( \
+            SELECT 1 FROM checkpoints checkpoint \
+            JOIN task_attempts attempt \
+              ON attempt.task_id = checkpoint.task_id \
+             AND attempt.attempt_id = checkpoint.attempt_id \
+            WHERE checkpoint.task_id = ?1 \
+              AND checkpoint.checkpoint_id = ?2 \
+              AND checkpoint.checkpoint_id = ( \
+                  SELECT latest.checkpoint_id FROM checkpoints latest \
+                  WHERE latest.task_id = checkpoint.task_id \
+                  ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1 \
+              ) \
+              AND attempt.worker_mode = 'workspace_write' \
+              AND attempt.ended_at IS NOT NULL \
+              AND attempt.outcome IS NOT NULL \
+              AND attempt.outcome != 'termination_unconfirmed' \
+              AND EXISTS( \
+                  SELECT 1 FROM worktrees worktree \
+                  WHERE worktree.task_id = checkpoint.task_id \
+                    AND worktree.state = 'active' \
+                    AND worktree.archived_at IS NULL \
+              ) \
+        )",
+            params![task_id.to_string(), verified_checkpoint_id],
+            |row| row.get(0),
+        )
+        .map_err(StateError::from)
+}
+
+fn has_no_worker_replay_evidence(
+    transaction: &Transaction<'_>,
+    task_id: TaskId,
+) -> StateResult<bool> {
+    row_exists(
+        transaction,
+        "SELECT NOT EXISTS(SELECT 1 FROM task_attempts WHERE task_id = ?1) \
+         AND NOT EXISTS(SELECT 1 FROM worktrees WHERE task_id = ?1 AND archived_at IS NULL)",
+        &task_id.to_string(),
+    )
+}
+
 fn coordinator_by_id(
     transaction: &Transaction<'_>,
     lease_id: Uuid,
@@ -697,7 +819,10 @@ mod tests {
     use rusqlite::params;
     use uuid::Uuid;
 
-    use super::{CoordinatorLeaseRequest, LeaseRenewal, WorkerLeaseMode, WorkerLeaseRequest};
+    use super::{
+        CoordinatorLeaseRequest, LeaseRenewal, ResumeDisposition, WorkerLeaseMode,
+        WorkerLeaseRequest,
+    };
     use crate::{Database, StateError, StateResult};
 
     fn timestamp() -> chrono::DateTime<Utc> {
@@ -743,6 +868,223 @@ mod tests {
             acquired_at,
             ttl: chrono::TimeDelta::minutes(5),
         }
+    }
+
+    #[test]
+    fn blocked_resume_without_recorded_resume_point_is_rejected() {
+        let database = migrated_database();
+        let task_id = TaskId::new();
+        seed_task(&database, task_id).unwrap_or_else(|error| panic!("seed: {error}"));
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE main.tasks SET state = 'blocked', resume_state = NULL \
+                     WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("block task: {error}"));
+
+        let disposition = database
+            .resume_disposition(
+                task_id,
+                orchestrator_domain::DaemonInstanceId::new(),
+                timestamp(),
+            )
+            .unwrap_or_else(|error| panic!("classify resume: {error}"));
+
+        assert_eq!(disposition, ResumeDisposition::Rejected);
+    }
+
+    #[test]
+    fn resume_rejects_unfinished_attempt_without_confirmed_process_termination() {
+        let database = migrated_database();
+        let task_id = TaskId::new();
+        seed_task(&database, task_id).unwrap_or_else(|error| panic!("seed: {error}"));
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE main.tasks SET state = 'planned' WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO main.task_attempts( \
+                        attempt_id, task_id, ordinal, provider_id, worker_mode, started_at, \
+                        ended_at, outcome, worker_result_json \
+                     ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3, NULL, NULL, NULL)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        task_id.to_string(),
+                        timestamp().to_rfc3339(),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("seed unfinished attempt: {error}"));
+
+        let disposition = database
+            .resume_disposition(
+                task_id,
+                orchestrator_domain::DaemonInstanceId::new(),
+                timestamp(),
+            )
+            .unwrap_or_else(|error| panic!("classify resume: {error}"));
+
+        assert_eq!(disposition, ResumeDisposition::Rejected);
+    }
+
+    #[test]
+    fn checkpointed_resume_without_sealed_checkpoint_and_owned_worktree_is_rejected() {
+        let database = migrated_database();
+        let task_id = TaskId::new();
+        seed_task(&database, task_id).unwrap_or_else(|error| panic!("seed: {error}"));
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE main.tasks SET state = 'checkpointed' WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("checkpoint task: {error}"));
+
+        let disposition = database
+            .resume_disposition(
+                task_id,
+                orchestrator_domain::DaemonInstanceId::new(),
+                timestamp(),
+            )
+            .unwrap_or_else(|error| panic!("classify resume: {error}"));
+
+        assert_eq!(disposition, ResumeDisposition::Rejected);
+    }
+
+    #[test]
+    fn blocked_runtime_resume_point_without_checkpoint_evidence_is_rejected() {
+        let database = migrated_database();
+        let task_id = TaskId::new();
+        seed_task(&database, task_id).unwrap_or_else(|error| panic!("seed: {error}"));
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE main.tasks SET state = 'blocked', resume_state = 'running', paused = 1 \
+                     WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("block task: {error}"));
+
+        let disposition = database
+            .resume_disposition(
+                task_id,
+                orchestrator_domain::DaemonInstanceId::new(),
+                timestamp(),
+            )
+            .unwrap_or_else(|error| panic!("classify resume: {error}"));
+
+        assert_eq!(disposition, ResumeDisposition::Rejected);
+    }
+
+    #[test]
+    fn checkpointed_resume_rejects_unverified_checkpoint_integrity() {
+        let database = migrated_database();
+        let task_id = TaskId::new();
+        seed_task(&database, task_id).unwrap_or_else(|error| panic!("seed: {error}"));
+        let attempt_id = Uuid::now_v7();
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE main.tasks SET state = 'checkpointed' WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO main.task_attempts( \
+                        attempt_id, task_id, ordinal, provider_id, worker_mode, started_at, \
+                        ended_at, outcome, worker_result_json \
+                     ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3, ?3, 'succeeded', '{}')",
+                    params![
+                        attempt_id.to_string(),
+                        task_id.to_string(),
+                        timestamp().to_rfc3339(),
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO main.worktrees( \
+                        worktree_id, task_id, repo_root, worktree_path, branch_name, \
+                        base_revision, state, created_at \
+                     ) VALUES (?1, ?2, 'C:/repo', 'C:/repo/worktree', 'task/resume', \
+                               'base', 'active', ?3)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        task_id.to_string(),
+                        timestamp().to_rfc3339(),
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO main.checkpoints( \
+                        checkpoint_id, task_id, attempt_id, schema_version, checkpoint_json, \
+                        integrity_hash, diff_artifact_id, git_head, created_at \
+                     ) VALUES (?1, ?2, ?3, '1', '{}', ?4, NULL, 'base', ?5)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        task_id.to_string(),
+                        attempt_id.to_string(),
+                        "0".repeat(64),
+                        timestamp().to_rfc3339(),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("seed corrupt checkpoint: {error}"));
+
+        let disposition = database
+            .resume_disposition(
+                task_id,
+                orchestrator_domain::DaemonInstanceId::new(),
+                timestamp(),
+            )
+            .unwrap_or_else(|error| panic!("classify resume: {error}"));
+
+        assert_eq!(disposition, ResumeDisposition::Rejected);
+    }
+
+    #[test]
+    fn pre_worker_resume_rejects_prior_worker_evidence_without_resume_point() {
+        let database = migrated_database();
+        let task_id = TaskId::new();
+        seed_task(&database, task_id).unwrap_or_else(|error| panic!("seed: {error}"));
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE main.tasks SET state = 'planned' WHERE task_id = ?1",
+                    [task_id.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO main.task_attempts( \
+                        attempt_id, task_id, ordinal, provider_id, worker_mode, started_at, \
+                        ended_at, outcome, worker_result_json \
+                     ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3, ?3, 'failed', '{}')",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        task_id.to_string(),
+                        timestamp().to_rfc3339(),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("seed prior worker: {error}"));
+
+        let disposition = database
+            .resume_disposition(
+                task_id,
+                orchestrator_domain::DaemonInstanceId::new(),
+                timestamp(),
+            )
+            .unwrap_or_else(|error| panic!("classify resume: {error}"));
+
+        assert_eq!(disposition, ResumeDisposition::Rejected);
     }
 
     #[test]

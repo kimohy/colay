@@ -1084,8 +1084,12 @@ async fn resume_task(
         .await?;
     let mut data = response.outcome["data"].clone();
     if data["disposition"].as_str() == Some("attached") {
+        let cursor = data["cursor"].as_u64().unwrap_or(0);
         let mut stream = client
-            .stream("workspace.task.stream", json!({"task_id": task_id}))
+            .stream(
+                "workspace.task.stream",
+                json!({"task_id": task_id, "cursor": cursor}),
+            )
             .await?;
         let mut updates = Vec::new();
         loop {
