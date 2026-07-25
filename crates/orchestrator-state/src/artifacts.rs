@@ -153,21 +153,20 @@ impl ArtifactStore {
 
     fn read_path(&self, relative_path: &RepoPath) -> StateResult<(PathBuf, Vec<u8>)> {
         let path = relative_path.join_to(&self.root);
-        self.ensure_safe_parent(path.parent().unwrap_or(&self.root))?;
-        if fs::symlink_metadata(&path)
-            .map_err(|error| StateError::io(&path, error))?
-            .file_type()
-            .is_symlink()
-        {
+        // This shared guard is reparse-aware on Windows, unlike `FileType::is_symlink`, and
+        // rejects every existing redirecting component before canonical containment is checked.
+        reject_symlink_components(&path)?;
+        let canonical = fs::canonicalize(&path).map_err(|error| StateError::io(&path, error))?;
+        if !canonical.starts_with(&self.root) {
             return Err(StateError::SymlinkEscape(path));
         }
         let mut file = OpenOptions::new()
             .read(true)
-            .open(&path)
-            .map_err(|error| StateError::io(&path, error))?;
+            .open(&canonical)
+            .map_err(|error| StateError::io(&canonical, error))?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
-            .map_err(|error| StateError::io(&path, error))?;
+            .map_err(|error| StateError::io(&canonical, error))?;
         Ok((path, contents))
     }
 }

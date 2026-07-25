@@ -38,6 +38,20 @@ use colay::task_planner::OfficialCliTaskPlanner;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+pub(crate) struct MaintenanceOwnership {
+    _owner_lock: DaemonOwnerLock,
+    pub(crate) paths: GlobalStatePaths,
+}
+
+pub(crate) fn acquire_maintenance() -> Result<MaintenanceOwnership> {
+    let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
+    let owner_lock = DaemonOwnerLock::acquire(&paths)?;
+    Ok(MaintenanceOwnership {
+        _owner_lock: owner_lock,
+        paths,
+    })
+}
+
 pub async fn run(
     repository: &Path,
     _config: &RootConfig,

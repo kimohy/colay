@@ -1839,6 +1839,43 @@ impl_workspace_database!(WorkspaceDatabase<'_>);
 #[cfg(test)]
 impl_workspace_database!(crate::Database);
 
+impl WorkspaceDatabase<'_> {
+    /// Lists immutable artifact evidence for this workspace so maintenance diagnostics can
+    /// verify referenced bytes without exposing the underlying `SQLite` connection.
+    pub fn list_artifacts(&self) -> StateResult<Vec<StoredArtifact>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT relative_path, sha256, byte_length FROM main.artifacts \
+             WHERE workspace_id = ?1 ORDER BY relative_path",
+        )?;
+        let rows = statement
+            .query_map([self.workspace_id().to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(relative_path, sha256, byte_length)| {
+                let relative_path = RepoPath::try_from(relative_path.as_str())
+                    .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+                let byte_length = u64::try_from(byte_length).map_err(|_| {
+                    StateError::InvalidRecord(
+                        "artifact byte length is outside the supported range".to_owned(),
+                    )
+                })?;
+                Ok(StoredArtifact {
+                    relative_path,
+                    sha256,
+                    byte_length,
+                })
+            })
+            .collect()
+    }
+}
+
 impl Database {
     pub fn record_global_usage_snapshot(&self, snapshot: &UsageSnapshot) -> StateResult<Uuid> {
         snapshot

@@ -152,9 +152,10 @@ fn initialize_repository(repository: &Path, with_legacy_state: bool) -> Result<P
         ],
     )?;
     if with_legacy_state {
-        let database_path = repository.join(".colay/orchestrator.db");
+        let global_root = repository.parent().unwrap_or(repository).join("colay-home");
+        let database_path = global_root.join("state/state.db");
         let database = Database::open(&database_path)?;
-        database.migrate_with_backup(&repository.join(".colay/backups"))?;
+        database.migrate_with_backup(&global_root.join("state/backups"))?;
         drop(database);
         let database = Connection::open(database_path)?;
         database.execute(
@@ -233,6 +234,17 @@ fn verification_stderr(repository: &Path, output: &Value) -> Result<String> {
         diagnostics.push_str(TRUNCATED_SUFFIX);
     }
     Ok(diagnostics)
+}
+
+fn load_workspace_events(connection: &Connection, workspace_id: &str) -> Result<Vec<TaskEvent>> {
+    let event_json = connection
+        .prepare("SELECT event_json FROM task_events WHERE workspace_id = ?1 ORDER BY sequence")?
+        .query_map([workspace_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    event_json
+        .iter()
+        .map(|event| serde_json::from_str::<TaskEvent>(event).map_err(Into::into))
+        .collect()
 }
 
 #[test]
@@ -359,9 +371,12 @@ fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<
     let repository = fs::canonicalize(temporary.path())?.join("repository");
     fs::create_dir_all(&repository)?;
     let config = initialize_repository(&repository, true)?;
-    let state_root = repository.join(".colay");
-    let database_path = state_root.join("orchestrator.db");
-    let backup_path = state_root.join("backups/orchestrator.db.backup.rollback-e2e");
+    let state_root = repository
+        .parent()
+        .unwrap_or(&repository)
+        .join("colay-home");
+    let database_path = state_root.join("state/state.db");
+    let backup_path = state_root.join("state/backups/state.db.backup.rollback-e2e");
 
     let database = Connection::open(&database_path)?;
     MigrationManager::backup(&database, &backup_path)?;
@@ -425,6 +440,7 @@ fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<
         |row| row.get(0),
     )?;
     assert_eq!(marker_count, 0);
+    let events = load_workspace_events(&restored, "00000000-0000-0000-0000-000000000001")?;
     drop(restored);
     let recovery = apply_output
         .pointer("/data/execution/recovery_backup_path")
@@ -432,10 +448,6 @@ fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<
         .context("rollback result omitted its recovery backup")?;
     assert!(Path::new(recovery).is_file());
 
-    let events = fs::read_to_string(state_root.join("events.jsonl"))?
-        .lines()
-        .map(serde_json::from_str::<TaskEvent>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     assert!(
         events
             .iter()

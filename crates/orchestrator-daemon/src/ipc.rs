@@ -14,9 +14,10 @@ use orchestrator_domain::{
     ProviderHealth, SchemaVersion, SessionId, TaskEvent, TaskId, UsageSnapshot, UsageSource,
 };
 use orchestrator_state::{
-    Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, ResumeDisposition,
-    RootConfig, SessionListFilter, StateError, TaskListFilter, WorkspaceId, WorkspaceOutboxRecord,
-    WorkspaceReadRequest, ensure_private_directory, ensure_private_file,
+    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths,
+    ResumeDisposition, RootConfig, SessionListFilter, StateError, TaskListFilter,
+    WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord, WorkspaceReadRequest,
+    WorkspaceStatePaths, ensure_private_directory, ensure_private_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -650,6 +651,7 @@ fn dispatch_read_request(
             .map(|status| json!({"status": status}))
             .map_err(IpcError::from),
         "workspace.status" => workspace_status(database, paths, request),
+        "workspace.doctor" => workspace_doctor(database, paths, request),
         "workspace.task.stream" => workspace_task_stream(database, request),
         "workspace.checkpoint" => workspace_checkpoint(database, request),
         "workspace.routing" => workspace_routing(database, request),
@@ -666,6 +668,80 @@ fn dispatch_read_request(
         Ok(data) => IpcResponse::success(request.request_id.clone(), &data),
         Err(error) => IpcResponse::failure(request.request_id.clone(), error.to_string()),
     })
+}
+
+fn workspace_doctor(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.doctor requires a registered workspace".to_owned())
+    })?;
+    let registration = database.load_workspace(workspace_id)?.ok_or_else(|| {
+        IpcError::Protocol("workspace.doctor targets an unknown workspace".to_owned())
+    })?;
+    let workspace = database.workspace(workspace_id);
+    Ok(json!({
+        "database": database.health()?,
+        "daemon": database.daemon_status(Utc::now())?,
+        "workspace": registration,
+        "audit": verify_workspace_audit(&workspace)?,
+        "artifacts": verify_workspace_artifacts(&workspace, &paths.for_workspace(workspace_id))?,
+    }))
+}
+
+fn verify_workspace_audit(workspace: &WorkspaceDatabase<'_>) -> Result<Value, IpcError> {
+    let head = workspace.latest_outbox_sequence()?;
+    if head < 0 {
+        return Err(IpcError::Protocol(
+            "workspace event head is negative".to_owned(),
+        ));
+    }
+    let mut previous_hash = None;
+    for sequence in 1..=head {
+        let event = workspace.event_at(sequence)?.ok_or_else(|| {
+            IpcError::Protocol(format!("workspace event sequence {sequence} is missing"))
+        })?;
+        let expected_sequence = u64::try_from(sequence)
+            .map_err(|_| IpcError::Protocol("workspace event sequence exceeds u64".to_owned()))?;
+        if event.sequence != expected_sequence || event.previous_hash != previous_hash {
+            return Err(IpcError::Protocol(format!(
+                "workspace event chain diverges at sequence {sequence}"
+            )));
+        }
+        if !event
+            .verify_hash()
+            .map_err(|error| IpcError::Protocol(error.to_string()))?
+        {
+            return Err(IpcError::Protocol(format!(
+                "workspace event hash is invalid at sequence {sequence}"
+            )));
+        }
+        previous_hash = Some(event.event_hash);
+    }
+    Ok(json!({
+        "workspace_id": workspace.workspace_id(),
+        "verified_events": head,
+        "last_sequence": head,
+        "last_hash": previous_hash,
+    }))
+}
+
+fn verify_workspace_artifacts(
+    workspace: &WorkspaceDatabase<'_>,
+    paths: &WorkspaceStatePaths,
+) -> Result<Value, IpcError> {
+    let store = ArtifactStore::open_workspace(paths)?;
+    let artifacts = workspace.list_artifacts()?;
+    for artifact in &artifacts {
+        let _ = store.read_verified(artifact)?;
+    }
+    Ok(json!({
+        "root": store.root(),
+        "verified_references": artifacts.len(),
+        "scope": "persisted_references",
+    }))
 }
 
 #[derive(Deserialize)]

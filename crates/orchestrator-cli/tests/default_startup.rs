@@ -126,9 +126,9 @@ impl CliFixture {
     }
 
     fn seed_v8_database(&self) -> Result<PathBuf> {
-        let state = self.repository.join(".colay");
+        let state = self.colay_home.join("state");
         fs::create_dir_all(&state)?;
-        let database_path = state.join("orchestrator.db");
+        let database_path = state.join("state.db");
         let connection = Connection::open(&database_path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         for (version, name, sql) in MIGRATIONS_THROUGH_V8 {
@@ -217,15 +217,20 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
     );
     assert_eq!(runtime["data"]["target_os"], std::env::consts::OS);
     assert_eq!(runtime["data"]["target_arch"], std::env::consts::ARCH);
-    let database = json["data"]["checks"]
+    let state = json["data"]["checks"]
         .as_array()
         .context("doctor checks must be an array")?
         .iter()
-        .find(|check| check["name"] == "database")
-        .context("doctor must report absent database state")?;
+        .find(|check| check["name"] == "state")
+        .context("doctor must report user-global database state")?;
+    assert_eq!(state["status"], "pass");
     assert_eq!(
-        database["detail"],
-        "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas"
+        PathBuf::from(
+            state["data"]["database"]
+                .as_str()
+                .context("state check omitted the global database path")?
+        ),
+        fixture.colay_home.join("state/state.db")
     );
     Ok(())
 }
@@ -331,7 +336,7 @@ fn migrate_apply_upgrades_existing_database_without_repository_config() -> Resul
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(applied, (9..=STATE_SCHEMA_VERSION).collect::<Vec<_>>());
     let backups =
-        fs::read_dir(fixture.repository.join(".colay/backups"))?.collect::<Result<Vec<_>, _>>()?;
+        fs::read_dir(fixture.colay_home.join("state/backups"))?.collect::<Result<Vec<_>, _>>()?;
     assert_eq!(backups.len(), 1);
     assert!(backups[0].file_type()?.is_file());
     Ok(())

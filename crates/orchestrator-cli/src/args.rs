@@ -33,9 +33,9 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
-    /// Create local state and an editable configuration without invoking providers.
+    /// Create an editable repository policy without invoking providers.
     Init(InitArgs),
-    /// Manage the repository-local background orchestration service.
+    /// Manage the per-user background orchestration service.
     Daemon(DaemonArgs),
     /// Analyze, route, and run one development task.
     Run(RunArgs),
@@ -60,10 +60,10 @@ pub enum Command {
     /// Show the newest integrity-verified vendor-neutral checkpoint.
     Checkpoint(RequiredTask),
     /// Run non-inference configuration, binary, database, and compatibility checks.
-    Doctor,
-    /// Probe public Codex interfaces without starting a model turn.
+    Doctor(DoctorArgs),
+    /// Alias for `doctor providers`; never starts a model turn.
     Compatibility,
-    /// Inspect and apply sequential SQLite/config migrations.
+    /// Inspect and apply sequential user-global SQLite/config migrations under maintenance ownership.
     Migrate(MigrationArgs),
     /// Plan or explicitly approve recovery from versioned backups.
     Rollback(RollbackArgs),
@@ -75,6 +75,18 @@ pub enum Command {
 pub struct DaemonArgs {
     #[command(subcommand)]
     pub action: DaemonAction,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct DoctorArgs {
+    #[command(subcommand)]
+    pub action: Option<DoctorAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+pub enum DoctorAction {
+    /// Refresh and report every configured provider's safe public interfaces.
+    Providers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
@@ -89,7 +101,7 @@ pub enum DaemonAction {
 
 #[derive(Clone, Debug, Args)]
 pub struct InitArgs {
-    /// Repository whose local .colay state directory will be initialized.
+    /// Repository whose editable policy override will be initialized.
     #[arg(long, default_value = ".")]
     pub repository: PathBuf,
 }

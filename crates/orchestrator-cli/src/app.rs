@@ -61,7 +61,7 @@ use uuid::Uuid;
 use orchestrator_state::{CoordinatorLease, CoordinatorLeaseRequest};
 
 use crate::args::{
-    Cli, Command, EffortName, HandoverArgs, MigrationAction, MigrationRollbackAction,
+    Cli, Command, DoctorAction, EffortName, HandoverArgs, MigrationAction, MigrationRollbackAction,
     ProfileAction, ProfileName, ProviderAction, ProviderName, RequiredTask, RollbackAction,
     RunArgs, TaskSelector, UsageAction, UsageOverrideArgs,
 };
@@ -267,8 +267,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Checkpoint(task) => {
             checkpoint(&repository, cli.config.as_deref(), &task.task_id, cli.json).await
         }
-        Command::Doctor => doctor(&repository, &runtime.effective, cli.json).await,
-        Command::Compatibility => compatibility(&runtime.effective, cli.json),
+        Command::Doctor(arguments) => match arguments.action {
+            Some(DoctorAction::Providers) => {
+                doctor_providers(&runtime.effective, "doctor_providers", cli.json).await
+            }
+            None => doctor(&repository, &runtime.effective, cli.json).await,
+        },
+        Command::Compatibility => {
+            doctor_providers(&runtime.effective, "compatibility", cli.json).await
+        }
         Command::Migrate(arguments) => migrate(
             &repository,
             &runtime.effective,
@@ -520,69 +527,49 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
     if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
         checks.push(Check::warn("wsl_mixed_git_checkout", warning));
     }
-    let config = effective.config();
-    {
-        let redaction = process_redaction(&config.orchestrator);
-        let state = StatePaths::from_config(repository, config)?;
-        if state.database.exists() {
-            match Database::open(&state.database)
-                .and_then(|database| database.health().map(|health| (database, health)))
-            {
-                Ok((database, health)) => {
-                    checks.push(Check::with_data(
-                        "database",
-                        health.integrity_ok,
-                        json!(health),
-                    ));
-                    checks.push(daemon_runtime_check(
-                        &database.daemon_status(Utc::now())?,
-                        &executable,
-                    ));
-                    if state.events.exists() {
-                        let workspace = workspace_for_repository(&database, repository)?;
-                        let reconciliation =
-                            EventLog::open(&state.events)?.reconcile_workspace(&workspace)?;
-                        checks.push(Check::with_data("event_log", true, json!(reconciliation)));
-                    } else {
-                        checks.push(Check::warn(
-                            "event_log",
-                            "events.jsonl has not been created",
-                        ));
-                    }
-                }
-                Err(error) => checks.push(Check::fail("database", error.to_string())),
+    doctor_state_checks(repository, &executable, &mut checks).await;
+    checks.push(git_health_check(repository));
+    for report in collect_provider_reports(effective).await {
+        let status = match report.health.status {
+            HealthStatus::Healthy => CheckStatus::Pass,
+            HealthStatus::Degraded | HealthStatus::Unhealthy | HealthStatus::Unknown => {
+                CheckStatus::Warn
             }
-        } else {
-            checks.push(Check::warn(
-                "database",
-                "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas",
-            ));
-        }
-
-        for (provider, config) in provider_configs(&config.orchestrator) {
-            let result =
-                diagnostic_command(&config.executable, ["--version"], repository, &redaction).await;
-            match result {
-                Ok(output) if output.success() => checks.push(Check::with_data(
-                    format!("provider_{}", provider.as_str()),
-                    true,
-                    json!({
-                        "version": output.stdout.redacted_text.trim(),
-                        "configured_executable": output.resolved_executable.configured,
-                        "resolved_executable": output.resolved_executable.path,
-                        "executable_kind": output.resolved_executable.kind,
-                    }),
-                )),
-                Ok(output) => checks.push(Check::fail(
-                    format!("provider_{}", provider.as_str()),
-                    output.stderr.redacted_text,
-                )),
-                Err(error) => checks.push(Check::warn(
-                    format!("provider_{}", provider.as_str()),
-                    error.to_string(),
-                )),
-            }
-        }
+        };
+        let detail = report
+            .health
+            .detail
+            .clone()
+            .unwrap_or_else(|| "safe public provider probes completed".to_owned());
+        let resolution = provider_config(&effective.config().orchestrator, report.provider).map(
+            |config| async {
+                diagnostic_command(
+                    &config.executable,
+                    ["--version"],
+                    repository,
+                    &process_redaction(&effective.config().orchestrator),
+                )
+                .await
+            },
+        );
+        let resolution = match resolution {
+            Some(resolution) => resolution
+                .await
+                .ok()
+                .filter(orchestrator_process::ProcessResult::success),
+            None => None,
+        };
+        checks.push(Check::with_status_data(
+            format!("provider_{}", report.provider.as_str()),
+            status,
+            detail,
+            json!({
+                "provider": report,
+                "configured_executable": resolution.as_ref().map(|output| &output.resolved_executable.configured),
+                "resolved_executable": resolution.as_ref().map(|output| &output.resolved_executable.path),
+                "executable_kind": resolution.as_ref().map(|output| output.resolved_executable.kind),
+            }),
+        ));
     }
 
     let passed = checks.iter().all(|check| check.status != CheckStatus::Fail);
@@ -596,6 +583,196 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
             inference_requests: 0,
         },
     )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut Vec<Check>) {
+    let paths = match GlobalStatePaths::resolve(&StateEnvironment::from_process()) {
+        Ok(paths) => paths,
+        Err(error) => {
+            checks.push(Check::fail("state", error.to_string()));
+            return;
+        }
+    };
+    match crate::daemon::acquire_maintenance() {
+        Ok(maintenance) => {
+            let database = match Database::open(&maintenance.paths.database).and_then(|database| {
+                database.migrate_with_backup(&maintenance.paths.backups)?;
+                Ok(database)
+            }) {
+                Ok(database) => database,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let health = match database.health() {
+                Ok(health) => health,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let state_healthy = health.integrity_ok
+                && health.foreign_key_violations == 0
+                && health.current_schema_version == orchestrator_state::STATE_SCHEMA_VERSION;
+            checks.push(Check::with_data(
+                "state",
+                state_healthy,
+                json!({
+                    "root": maintenance.paths.root,
+                    "database": maintenance.paths.database,
+                    "backups": maintenance.paths.backups,
+                    "health": health,
+                }),
+            ));
+            checks.push(daemon_runtime_check(
+                &database
+                    .daemon_status(Utc::now())
+                    .unwrap_or(DaemonStatus::Stopped),
+                executable,
+            ));
+            let registration = match database.resolve_repository_workspace(repository) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    checks.push(Check::fail("workspace", error.to_string()));
+                    return;
+                }
+            };
+            checks.push(Check::with_data("workspace", true, json!(registration)));
+            let workspace = database.workspace(registration.workspace_id);
+            checks.push(match verify_workspace_audit(&workspace) {
+                Ok(data) => Check::with_data("audit", true, data),
+                Err(error) => Check::fail("audit", error.to_string()),
+            });
+            let workspace_paths = maintenance.paths.for_workspace(registration.workspace_id);
+            checks.push(
+                match verify_workspace_artifacts(&workspace, &workspace_paths) {
+                    Ok(data) => Check::with_data("artifacts", true, data),
+                    Err(error) => Check::fail("artifacts", error.to_string()),
+                },
+            );
+        }
+        Err(lock_error) => {
+            let client = match crate::ipc_client::DaemonClient::connect(repository).await {
+                Ok(client) => client,
+                Err(ipc_error) => {
+                    checks.push(Check::fail(
+                        "state",
+                        format!(
+                            "cannot acquire maintenance ownership ({lock_error}) or query the user daemon ({ipc_error})"
+                        ),
+                    ));
+                    return;
+                }
+            };
+            let diagnostics = match client.request("workspace.doctor", json!({})).await {
+                Ok(diagnostics) => diagnostics,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let health = &diagnostics.outcome["data"]["database"];
+            let healthy = health["integrity_ok"] == true
+                && health["foreign_key_violations"] == 0
+                && health["current_schema_version"]
+                    == json!(orchestrator_state::STATE_SCHEMA_VERSION);
+            checks.push(Check::with_data(
+                "state",
+                healthy,
+                json!({
+                    "root": paths.root,
+                    "database": paths.database,
+                    "backups": paths.backups,
+                    "health": health,
+                    "via": "daemon_ipc",
+                }),
+            ));
+            match serde_json::from_value::<DaemonStatus>(
+                diagnostics.outcome["data"]["daemon"].clone(),
+            ) {
+                Ok(status) => checks.push(daemon_runtime_check(&status, executable)),
+                Err(error) => checks.push(Check::fail("daemon", error.to_string())),
+            }
+            checks.push(Check::with_data(
+                "workspace",
+                true,
+                diagnostics.outcome["data"]["workspace"].clone(),
+            ));
+            checks.push(Check::with_data(
+                "audit",
+                true,
+                diagnostics.outcome["data"]["audit"].clone(),
+            ));
+            checks.push(Check::with_data(
+                "artifacts",
+                true,
+                diagnostics.outcome["data"]["artifacts"].clone(),
+            ));
+        }
+    }
+}
+
+fn verify_workspace_audit(database: &WorkspaceDatabase<'_>) -> Result<Value> {
+    let head = database.latest_outbox_sequence()?;
+    if head < 0 {
+        bail!("workspace event head is negative");
+    }
+    let mut previous_hash = None;
+    for sequence in 1..=head {
+        let event = database
+            .event_at(sequence)?
+            .ok_or_else(|| anyhow!("workspace event sequence {sequence} is missing"))?;
+        if event.sequence != u64::try_from(sequence)? || event.previous_hash != previous_hash {
+            bail!("workspace event chain diverges at sequence {sequence}");
+        }
+        if !event.verify_hash()? {
+            bail!("workspace event hash is invalid at sequence {sequence}");
+        }
+        previous_hash = Some(event.event_hash);
+    }
+    Ok(json!({
+        "workspace_id": database.workspace_id(),
+        "verified_events": head,
+        "last_sequence": head,
+        "last_hash": previous_hash,
+    }))
+}
+
+fn verify_workspace_artifacts(
+    database: &WorkspaceDatabase<'_>,
+    paths: &orchestrator_state::WorkspaceStatePaths,
+) -> Result<Value> {
+    let store = ArtifactStore::open_workspace(paths)?;
+    let artifacts = database.list_artifacts()?;
+    for artifact in &artifacts {
+        let _ = store.read_verified(artifact)?;
+    }
+    Ok(json!({
+        "root": store.root(),
+        "verified_references": artifacts.len(),
+        "scope": "persisted_references",
+    }))
+}
+
+fn git_health_check(repository: &Path) -> Check {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(repository)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Check::with_data(
+            "git",
+            true,
+            json!({"top_level": String::from_utf8_lossy(&output.stdout).trim()}),
+        ),
+        Ok(output) => Check::warn(
+            "git",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ),
+        Err(error) => Check::warn("git", format!("Git is unavailable: {error}")),
+    }
 }
 
 fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Check {
@@ -627,21 +804,22 @@ fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Chec
             } else {
                 (
                     CheckStatus::Warn,
-                    "daemon executable or build version differs from this CLI; restart the repository daemon with the intended Colay binary".to_owned(),
+                    "daemon executable or build version differs from this CLI; restart the user daemon with the intended Colay binary".to_owned(),
                 )
             }
         }
         DaemonStatus::Stopped => (
             CheckStatus::Warn,
-            "repository daemon is stopped; start it to compare runtime identity".to_owned(),
+            "user daemon is stopped; state was checked under exclusive maintenance ownership"
+                .to_owned(),
         ),
         DaemonStatus::Failed(_) | DaemonStatus::Stale(_) => (
             CheckStatus::Warn,
-            "repository daemon is failed or stale; restart it before writable execution".to_owned(),
+            "user daemon is failed or stale; restart it before writable execution".to_owned(),
         ),
     };
     Check::with_status_data(
-        "daemon_runtime",
+        "daemon",
         status,
         detail,
         json!({
@@ -652,22 +830,32 @@ fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Chec
     )
 }
 
-fn compatibility(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
-    let executable = effective
-        .config()
-        .orchestrator
-        .providers
-        .codex
-        .as_ref()
-        .map_or("codex", |config| config.executable.as_str());
-    let report = probe_codex(
-        executable,
-        &process_redaction(&effective.config().orchestrator),
-    )?;
-    emit(json_output, "compatibility", &report)
+async fn doctor_providers(
+    effective: &EffectiveConfig,
+    command: &str,
+    json_output: bool,
+) -> Result<()> {
+    emit_versioned(
+        json_output,
+        "2",
+        command,
+        &DoctorProvidersReport {
+            schema_version: "2",
+            providers: collect_provider_reports(effective).await,
+            inference_requests: 0,
+        },
+    )
 }
 
 async fn providers(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    emit(
+        json_output,
+        "providers",
+        &collect_provider_reports(effective).await,
+    )
+}
+
+async fn collect_provider_reports(effective: &EffectiveConfig) -> Vec<ProviderReport> {
     let redaction = process_redaction(&effective.config().orchestrator);
     let mut reports = Vec::new();
     for (provider, config) in provider_configs(&effective.config().orchestrator) {
@@ -694,7 +882,7 @@ async fn providers(effective: &EffectiveConfig, json_output: bool) -> Result<()>
             },
         });
     }
-    emit(json_output, "providers", &reports)
+    reports
 }
 
 async fn set_provider_enabled(
@@ -4355,7 +4543,7 @@ fn migration_config_preview(
 
 #[allow(clippy::needless_pass_by_value)]
 fn migrate_inner(
-    repository: &Path,
+    _repository: &Path,
     effective: Option<&EffectiveConfig>,
     explicit_edit_path: &Path,
     action: MigrationAction,
@@ -4363,11 +4551,8 @@ fn migrate_inner(
 ) -> Result<()> {
     let (migratable, source_is_current, config_preview) =
         migration_config_preview(effective, explicit_edit_path)?;
-    let config = effective.map_or_else(
-        || config_preview.migrated().config(),
-        EffectiveConfig::config,
-    );
-    let state = StatePaths::from_config(repository, config)?;
+    let maintenance = crate::daemon::acquire_maintenance()?;
+    let state = &maintenance.paths;
     let database = Database::open(&state.database)?;
     match action {
         MigrationAction::Status => emit(
@@ -4401,7 +4586,9 @@ fn migrate_inner(
             }),
         ),
         MigrationAction::Apply { dry_run: false } => {
-            ensure_migration_write_allowed(config)?;
+            // Validate the complete catalog, including future-schema refusal, before the first
+            // append-only audit write. Provider compatibility never authorizes state repair.
+            let _ = database.dry_run_migrations()?;
             append_event_if_schema_available(
                 &database,
                 EventType::MigrationStarted,
@@ -4413,7 +4600,6 @@ fn migrate_inner(
             // Both plans are validated before the first write. Config apply is
             // backup-first and DB migrations run transactionally with their own
             // backup; neither path skips an intermediate schema.
-            let _ = database.dry_run_migrations()?;
             let config_status = if source_is_current {
                 orchestrator_state::ConfigMigrationApplyResult {
                     result: config_preview.result().clone(),
@@ -4444,12 +4630,11 @@ fn migrate_inner(
                     CorrelationId::new(),
                     migration_payload.clone(),
                 )?;
-                reconcile_events(&state, &workspace)?;
             }
             emit(json_output, "migrate_apply", &migration_payload)
         }
         MigrationAction::Rollback(arguments) => migrate_rollback(
-            &state,
+            state,
             &database,
             config_preview.migrated().config(),
             arguments.action,
@@ -4460,7 +4645,7 @@ fn migrate_inner(
 
 #[allow(clippy::too_many_lines)]
 fn migrate_rollback(
-    state: &StatePaths,
+    state: &GlobalStatePaths,
     database: &Database,
     config: &RootConfig,
     action: MigrationRollbackAction,
@@ -4468,9 +4653,6 @@ fn migrate_rollback(
 ) -> Result<()> {
     match action {
         MigrationRollbackAction::Plan { backup } => {
-            if let Some(workspace) = legacy_migration_workspace_if_present(database)? {
-                reconcile_events(state, &workspace)?;
-            }
             let backup = trusted_migration_backup(&state.backups, backup.as_deref())?;
             let plan = database.create_validated_migration_rollback_plan(backup)?;
             let relative = migration_rollback_plan_relative_path(&plan.integrity_hash)?;
@@ -4495,9 +4677,6 @@ fn migrate_rollback(
             ensure_migration_write_allowed(config)?;
             validate_sha256(&plan_hash)?;
             validate_approval_identity(&approved_by)?;
-            if let Some(workspace) = legacy_migration_workspace_if_present(database)? {
-                reconcile_events(state, &workspace)?;
-            }
 
             let plan_relative = migration_rollback_plan_relative_path(&plan_hash)?;
             let plan_path = plan_relative.join_to(&state.root);
@@ -4580,7 +4759,6 @@ fn migrate_rollback(
                         "result_artifact": result_artifact,
                     }),
                 )?;
-                reconcile_events(state, &workspace)?;
             }
             emit(
                 json_output,
@@ -4631,7 +4809,13 @@ fn rollback(
     action: RollbackAction,
     json_output: bool,
 ) -> Result<()> {
-    let state = StatePaths::from_config(repository, effective.config())?;
+    let maintenance = crate::daemon::acquire_maintenance()?;
+    let database = Database::open(&maintenance.paths.database)?;
+    database.migrate_with_backup(&maintenance.paths.backups)?;
+    let registration = database.resolve_repository_workspace(repository)?;
+    let workspace_paths = maintenance.paths.for_workspace(registration.workspace_id);
+    let state = global_release_state_paths(&maintenance.paths, &workspace_paths);
+    let workspace = database.workspace(registration.workspace_id);
     match action {
         RollbackAction::Plan { to } => {
             validate_release_component(&to)?;
@@ -4675,21 +4859,16 @@ fn rollback(
             let plan_relative = rollback_plan_relative_path(&to, &plan.integrity_hash)?;
             let stored = ArtifactStore::open(&state.root)?
                 .put(plan_relative.clone(), &serde_json::to_vec_pretty(&plan)?)?;
-            if state.database.exists() {
-                let database = open_ready_database(&state)?;
-                let workspace = workspace_for_repository(&database, repository)?;
-                append_event(
-                    &workspace,
-                    None,
-                    EventType::RollbackPlanned,
-                    None,
-                    None,
-                    EventActor::User,
-                    CorrelationId::new(),
-                    json!({"target": to, "plan_hash": plan.integrity_hash, "artifact": stored}),
-                )?;
-                reconcile_events(&state, &workspace)?;
-            }
+            append_event(
+                &workspace,
+                None,
+                EventType::RollbackPlanned,
+                None,
+                None,
+                EventActor::User,
+                CorrelationId::new(),
+                json!({"target": to, "plan_hash": plan.integrity_hash, "artifact": stored}),
+            )?;
             emit(
                 json_output,
                 "rollback_plan",
@@ -4751,16 +4930,12 @@ fn rollback(
             let manager = rollback_manager(&state, &plan.steps)?;
             let approval =
                 orchestrator_engine::RollbackApproval::for_plan(&plan, approved_by, Utc::now());
-            if state.database.exists() {
-                let database = open_ready_database(&state)?;
-                let database = workspace_for_repository(&database, repository)?;
-                ensure_rollback_quiescent(&database)?;
-                database.record_release_rollback_approval(
-                    &json!({"target_version": to, "plan_hash": plan_hash}),
-                    &approval.approved_by,
-                    approval.approved_at,
-                )?;
-            }
+            ensure_rollback_quiescent(&workspace)?;
+            workspace.record_release_rollback_approval(
+                &json!({"target_version": to, "plan_hash": plan_hash}),
+                &approval.approved_by,
+                approval.approved_at,
+            )?;
             let report = manager.apply(&plan, &approval)?;
             emit(
                 json_output,
@@ -4768,6 +4943,22 @@ fn rollback(
                 &json!({"plan": plan, "execution": report, "restart_required": true}),
             )
         }
+    }
+}
+
+fn global_release_state_paths(
+    global: &GlobalStatePaths,
+    workspace: &orchestrator_state::WorkspaceStatePaths,
+) -> StatePaths {
+    StatePaths {
+        root: workspace.root.clone(),
+        database: global.database.clone(),
+        events: workspace.root.join("events.jsonl"),
+        backups: workspace.backups.clone(),
+        tasks: workspace.root.join("tasks"),
+        checkpoints: workspace.checkpoints.clone(),
+        handovers: workspace.handovers.clone(),
+        worktrees: workspace.worktrees.clone(),
     }
 }
 
@@ -6521,8 +6712,17 @@ fn latest_database_backup(directory: &Path) -> Result<PathBuf> {
 }
 
 fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> {
+    emit_versioned(json_output, "1", command, data)
+}
+
+fn emit_versioned<T: Serialize>(
+    json_output: bool,
+    schema_version: &str,
+    command: &str,
+    data: &T,
+) -> Result<()> {
     let envelope = json!({
-        "schema_version": "1",
+        "schema_version": schema_version,
         "command": command,
         "data": data,
     });
@@ -6666,6 +6866,13 @@ struct DoctorReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct DoctorProvidersReport {
+    schema_version: &'static str,
+    providers: Vec<ProviderReport>,
+    inference_requests: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct ProviderReport {
     provider: ProviderId,
     enabled: bool,
@@ -6697,7 +6904,7 @@ mod tests {
         sync::Arc,
     };
 
-    use crate::args::{EffortName, MigrationAction, ProfileName, ProviderName};
+    use crate::args::{EffortName, ProfileName, ProviderName};
     use anyhow::Result;
     use chrono::Utc;
     use orchestrator_domain::{
@@ -7276,7 +7483,12 @@ mod tests {
         )?;
         assert!(load_config_runtime(&root, Some(&path), ConfigEnvironment::isolated()).is_err());
 
-        super::migrate_without_runtime(&root, &path, MigrationAction::Status, true)?;
+        let (migratable, source_is_current, preview) =
+            super::migration_config_preview(None, &path)?;
+        assert!(migratable.is_some());
+        assert!(!source_is_current);
+        assert_eq!(preview.result().initial_version, 3);
+        assert_eq!(preview.result().final_version, 4);
         Ok(())
     }
 

@@ -135,6 +135,34 @@ fn each_workspace_event_chain_starts_at_one() -> TestResult {
 }
 
 #[test]
+fn latest_event_cursor_is_scoped_to_its_workspace() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let first_path = root.path().join("first");
+    let second_path = root.path().join("second");
+    std::fs::create_dir_all(&first_path)?;
+    std::fs::create_dir_all(&second_path)?;
+
+    let database = Database::open_in_memory()?;
+    database.migrate_with_backup(std::path::Path::new("unused"))?;
+    let first_id = database
+        .resolve_workspace(&first_path, WorkspaceKind::Directory)?
+        .workspace_id;
+    let second_id = database
+        .resolve_workspace(&second_path, WorkspaceKind::Directory)?
+        .workspace_id;
+    let first = database.workspace(first_id);
+    let second = database.workspace(second_id);
+
+    first.append_event(event())?;
+    second.append_event(event())?;
+    second.append_event(event())?;
+
+    assert_eq!(first.latest_outbox_sequence()?, 1);
+    assert_eq!(second.latest_outbox_sequence()?, 2);
+    Ok(())
+}
+
+#[test]
 fn every_workspace_table_has_a_required_partition_key() -> TestResult {
     let (database, _) = fresh_database()?;
     with_database_connection(&database, |connection| {
