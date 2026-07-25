@@ -21,7 +21,7 @@ const MAX_MESSAGE_LIMIT: usize = 200;
 const DEFAULT_TASK_LIMIT: usize = 50;
 const MAX_TASK_LIMIT: usize = 100;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceReadRequest {
     pub session_id: SessionId,
     pub selected_task_id: Option<TaskId>,

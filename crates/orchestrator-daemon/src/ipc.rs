@@ -1,16 +1,22 @@
 use std::{
     fs::{File, OpenOptions},
-    path::PathBuf,
+    io::Write as _,
+    path::{Component, Path, PathBuf},
     str::FromStr as _,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
 use fs2::FileExt as _;
-use orchestrator_domain::{ClientCommand, ClientCommandId, SessionId, TaskId};
+use orchestrator_domain::{
+    ClientCommand, ClientCommandId, CorrelationId, EventActor, EventId, EventType, GraphRevisionId,
+    ProviderHealth, SchemaVersion, SessionId, TaskEvent, TaskId, UsageSnapshot, UsageSource,
+};
 use orchestrator_state::{
-    Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig, StateError,
-    TaskListFilter, WorkspaceId, ensure_private_directory, ensure_private_file,
+    Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, ResumeDisposition,
+    RootConfig, SessionListFilter, StateError, TaskListFilter, WorkspaceId, WorkspaceReadRequest,
+    ensure_private_directory, ensure_private_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const IPC_SCHEMA_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const TASK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -370,23 +378,99 @@ where
             IpcResponse::failure(String::new(), "IPC request exceeds the one MiB limit")
         } else {
             match serde_json::from_slice::<IpcRequest>(&line) {
+                Ok(request)
+                    if request.schema_version == IPC_SCHEMA_VERSION
+                        && request.action == "workspace.task.stream" =>
+                {
+                    stream_task_status(&mut output, &database, &request).await?;
+                    return Ok(());
+                }
                 Ok(request) => dispatch_request(request, &database, &paths, &writer).await,
                 Err(_) => IpcResponse::failure(String::new(), "IPC request is not valid JSON"),
             }
         };
-        let mut encoded = serde_json::to_vec(&response)?;
-        encoded.push(b'\n');
-        output
-            .write_all(&encoded)
-            .await
-            .map_err(|source| IpcError::Io {
-                path: PathBuf::from("local IPC stream"),
-                source,
-            })?;
+        write_response(&mut output, &response).await?;
         if oversized {
             return Ok(());
         }
     }
+}
+
+async fn stream_task_status<W>(
+    output: &mut W,
+    database: &Database,
+    request: &IpcRequest,
+) -> Result<(), IpcError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (workspace_id, task_id) = match requested_task(database, request) {
+        Ok(task) => task,
+        Err(error) => {
+            write_response(
+                output,
+                &IpcResponse::failure(request.request_id.clone(), error.to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let mut last_revision = None;
+    let mut idle_deadline = Instant::now() + TASK_STREAM_IDLE_TIMEOUT;
+    loop {
+        let Some(status) = crate::execution::active_task_status(database, workspace_id, task_id)?
+        else {
+            write_response(
+                output,
+                &IpcResponse::failure(
+                    request.request_id.clone(),
+                    format!("task {task_id} no longer exists"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        };
+        if last_revision != Some(status.revision) {
+            let terminal = status.state.is_terminal();
+            let revision = status.revision;
+            write_response(
+                output,
+                &IpcResponse::success(
+                    request.request_id.clone(),
+                    &json!({
+                        "status": status,
+                        "cursor": revision,
+                    }),
+                ),
+            )
+            .await?;
+            if terminal {
+                return Ok(());
+            }
+            last_revision = Some(revision);
+            idle_deadline = Instant::now() + TASK_STREAM_IDLE_TIMEOUT;
+        }
+        let now = Instant::now();
+        if now >= idle_deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(TASK_STREAM_POLL_INTERVAL.min(idle_deadline - now)).await;
+    }
+}
+
+async fn write_response<W>(output: &mut W, response: &IpcResponse) -> Result<(), IpcError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut encoded = serde_json::to_vec(response)?;
+    encoded.push(b'\n');
+    output
+        .write_all(&encoded)
+        .await
+        .map_err(|source| IpcError::Io {
+            path: PathBuf::from("local IPC stream"),
+            source,
+        })
 }
 
 async fn dispatch_request(
@@ -404,49 +488,62 @@ async fn dispatch_request(
             ),
         );
     }
-    match request.action.as_str() {
-        "daemon.ping" => IpcResponse::success(request.request_id, &json!({"ready": true})),
-        "daemon.status" => match database.daemon_status(Utc::now()) {
-            Ok(status) => IpcResponse::success(request.request_id, &json!({"status": status})),
-            Err(_) => IpcResponse::failure(request.request_id, "daemon status is unavailable"),
-        },
-        "workspace.status" => {
-            let request_id = request.request_id.clone();
-            match workspace_status(database, paths, &request) {
-                Ok(status) => IpcResponse::success(request_id, &status),
-                Err(_) => IpcResponse::failure(request_id, "workspace status is unavailable"),
-            }
-        }
-        "workspace.command.status" => {
-            let request_id = request.request_id.clone();
-            match workspace_command_status(database, &request) {
-                Ok(status) => IpcResponse::success(request_id, &status),
-                Err(_) => IpcResponse::failure(request_id, "workspace command is unavailable"),
-            }
-        }
-        "workspace.conversation" => {
-            let request_id = request.request_id.clone();
-            match workspace_conversation(database, &request) {
-                Ok(conversation) => IpcResponse::success(request_id, &conversation),
-                Err(_) => IpcResponse::failure(request_id, "workspace conversation is unavailable"),
-            }
-        }
-        "workspace.register"
-        | "workspace.command.submit"
-        | "workspace.run.submit"
-        | "daemon.stop" => {
-            let request_id = request.request_id.clone();
-            let (response, reply) = oneshot::channel();
-            let command = WriterRequest { request, response };
-            if writer.send(command).await.is_err() {
-                return IpcResponse::failure(request_id, "daemon writer is unavailable");
-            }
-            reply.await.unwrap_or_else(|_| {
-                IpcResponse::failure(request_id, "daemon writer stopped before replying")
-            })
-        }
-        _ => IpcResponse::failure(request.request_id, "unsupported IPC action"),
+    if let Some(response) = dispatch_read_request(database, paths, &request) {
+        return response;
     }
+    if !matches!(
+        request.action.as_str(),
+        "workspace.register"
+            | "workspace.command.submit"
+            | "workspace.config.write"
+            | "workspace.control"
+            | "workspace.run.submit"
+            | "workspace.resume"
+            | "workspace.selection"
+            | "workspace.usage.override"
+            | "daemon.stop"
+    ) {
+        return IpcResponse::failure(request.request_id, "unsupported IPC action");
+    }
+    let request_id = request.request_id.clone();
+    let (response, reply) = oneshot::channel();
+    let command = WriterRequest { request, response };
+    if writer.send(command).await.is_err() {
+        return IpcResponse::failure(request_id, "daemon writer is unavailable");
+    }
+    reply.await.unwrap_or_else(|_| {
+        IpcResponse::failure(request_id, "daemon writer stopped before replying")
+    })
+}
+
+fn dispatch_read_request(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Option<IpcResponse> {
+    let result = match request.action.as_str() {
+        "daemon.ping" => Ok(json!({"ready": true})),
+        "daemon.status" => database
+            .daemon_status(Utc::now())
+            .map(|status| json!({"status": status}))
+            .map_err(IpcError::from),
+        "workspace.status" => workspace_status(database, paths, request),
+        "workspace.task.stream" => workspace_task_stream(database, request),
+        "workspace.checkpoint" => workspace_checkpoint(database, request),
+        "workspace.routing" => workspace_routing(database, request),
+        "workspace.usage" => workspace_usage(database, request),
+        "workspace.dashboard" => workspace_dashboard(database, request),
+        "workspace.command.status" => workspace_command_status(database, request),
+        "workspace.conversation" => workspace_conversation(database, request),
+        "workspace.sessions" => workspace_sessions(database, request),
+        "workspace.projection" => workspace_projection(database, request),
+        "workspace.graph.revision" => workspace_graph_revision(database, request),
+        _ => return None,
+    };
+    Some(match result {
+        Ok(data) => IpcResponse::success(request.request_id.clone(), &data),
+        Err(error) => IpcResponse::failure(request.request_id.clone(), error.to_string()),
+    })
 }
 
 #[derive(Deserialize)]
@@ -549,6 +646,16 @@ fn workspace_status(
     }))
 }
 
+fn workspace_task_stream(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let (workspace_id, task_id) = requested_task(database, request)?;
+    let status = crate::execution::active_task_status(database, workspace_id, task_id)?
+        .ok_or_else(|| IpcError::Protocol(format!("task {task_id} does not exist")))?;
+    Ok(json!({
+        "status": status,
+        "cursor": status.revision,
+    }))
+}
+
 struct WriterRequest {
     request: IpcRequest,
     response: oneshot::Sender<IpcResponse>,
@@ -573,13 +680,505 @@ fn process_writer_request(
     let result = match request.action.as_str() {
         "workspace.register" => register_workspace(database, paths, &request),
         "workspace.command.submit" => submit_workspace_command(database, &request, false),
+        "workspace.config.write" => write_workspace_config(database, paths, &request),
+        "workspace.control" => submit_workspace_control(database, &request),
         "workspace.run.submit" => submit_run_command(database, &request),
+        "workspace.resume" => resume_workspace_task(database, &request),
+        "workspace.selection" => save_workspace_selection(database, &request),
+        "workspace.usage.override" => override_workspace_usage(database, &request),
         "daemon.stop" => request_daemon_stop(database),
         _ => Err(IpcError::Protocol("unsupported writer action".to_owned())),
     };
     match result {
         Ok(data) => IpcResponse::success(request.request_id, &data),
-        Err(_) => IpcResponse::failure(request.request_id, "daemon mutation was rejected"),
+        Err(error) => IpcResponse::failure(request.request_id, error.to_string()),
+    }
+}
+
+fn workspace_sessions(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.sessions requires a registered workspace".to_owned())
+    })?;
+    let sessions = database
+        .workspace(workspace_id)
+        .list_sessions(&SessionListFilter {
+            include_archived: false,
+            limit: 100,
+        })?;
+    Ok(json!({"sessions": sessions}))
+}
+
+fn workspace_projection(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.projection requires a registered workspace".to_owned())
+    })?;
+    let mut read = serde_json::from_value::<WorkspaceReadRequest>(request.payload.clone())?;
+    let workspace = database.workspace(workspace_id);
+    if read.selected_task_id.is_none() {
+        read.selected_task_id = workspace.load_workspace_selected_task(read.session_id)?;
+    }
+    Ok(json!({
+        "projection": workspace.read_workspace_projection(read)?,
+        "daemon": database.daemon_status(Utc::now())?,
+        "requirement": workspace.current_requirement_revision(read.session_id)?,
+        "integration": workspace.current_integration_batch(read.session_id)?,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceGraphRevisionPayload {
+    revision_id: String,
+}
+
+fn workspace_graph_revision(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.graph.revision requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceGraphRevisionPayload>(request.payload.clone())?;
+    let revision_id = GraphRevisionId::from_str(&payload.revision_id)
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let revision = database
+        .workspace(workspace_id)
+        .load_graph_revision(revision_id)?;
+    Ok(json!({"revision": revision}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSelectionPayload {
+    session_id: String,
+    task_id: Option<String>,
+}
+
+fn save_workspace_selection(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.selection requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceSelectionPayload>(request.payload.clone())?;
+    let session_id = SessionId::from_str(&payload.session_id)
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let task_id = payload
+        .task_id
+        .map(|value| TaskId::from_str(&value))
+        .transpose()
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let workspace = database.workspace(workspace_id);
+    if workspace.load_session(session_id)?.is_none() {
+        return Err(IpcError::Protocol(format!(
+            "session {session_id} does not exist"
+        )));
+    }
+    if let Some(task_id) = task_id
+        && workspace.load_task(task_id)?.is_none()
+    {
+        return Err(IpcError::Protocol(format!("task {task_id} does not exist")));
+    }
+    workspace.save_workspace_selected_task(session_id, task_id, Utc::now())?;
+    Ok(json!({"session_id": session_id, "task_id": task_id}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceConfigWritePayload {
+    path: PathBuf,
+    content: String,
+}
+
+fn write_workspace_config(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.config.write requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceConfigWritePayload>(request.payload.clone())?;
+    let registration = database
+        .load_workspace(workspace_id)?
+        .ok_or_else(|| IpcError::Protocol("registered workspace disappeared".to_owned()))?;
+    let target = normalize_path(&payload.path)?;
+    let workspace = normalize_path(&registration.canonical_path)?;
+    let global_config = normalize_path(&paths.config)?;
+    if target != global_config && !target.starts_with(&workspace) {
+        return Err(IpcError::Protocol(
+            "configuration mutation escaped the registered workspace and user-global config"
+                .to_owned(),
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| IpcError::Protocol("configuration path has no parent".to_owned()))?;
+    ensure_private_directory(parent)?;
+    orchestrator_state::reject_symlink_components(&target)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|source| IpcError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    temporary
+        .write_all(payload.content.as_bytes())
+        .map_err(|source| IpcError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|source| IpcError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary.persist(&target).map_err(|error| IpcError::Io {
+        path: target.clone(),
+        source: error.error,
+    })?;
+    ensure_private_file(&target)?;
+    Ok(json!({"path": target}))
+}
+
+fn normalize_path(path: &Path) -> Result<PathBuf, IpcError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(IpcError::Protocol(
+                        "configuration path contains invalid parent traversal".to_owned(),
+                    ));
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    if !normalized.is_absolute() {
+        return Err(IpcError::Protocol(
+            "configuration path must be absolute".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceTaskPayload {
+    task_id: String,
+}
+
+fn requested_task(
+    database: &Database,
+    request: &IpcRequest,
+) -> Result<(WorkspaceId, TaskId), IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace task request requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceTaskPayload>(request.payload.clone())?;
+    let task_id = TaskId::from_str(&payload.task_id)
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    if database
+        .workspace(workspace_id)
+        .load_task(task_id)?
+        .is_none()
+    {
+        return Err(IpcError::Protocol(format!("task {task_id} does not exist")));
+    }
+    Ok((workspace_id, task_id))
+}
+
+fn workspace_checkpoint(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let (workspace_id, task_id) = requested_task(database, request)?;
+    let checkpoint = database
+        .workspace(workspace_id)
+        .latest_sealed_checkpoint(task_id)?
+        .ok_or_else(|| IpcError::Protocol(format!("task {task_id} has no checkpoint")))?;
+    Ok(json!({"checkpoint": checkpoint}))
+}
+
+fn workspace_routing(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let (workspace_id, task_id) = requested_task(database, request)?;
+    let decision = database
+        .workspace(workspace_id)
+        .list_routing_audits(task_id, 1)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| IpcError::Protocol(format!("no routing decision for task {task_id}")))?;
+    Ok(json!({"decision": decision}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceUsagePayload {
+    defaults: Vec<UsageSnapshot>,
+}
+
+fn workspace_usage(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.usage requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceUsagePayload>(request.payload.clone())?;
+    let snapshots = resolved_usage_snapshots(database, payload.defaults)?;
+    Ok(json!({"snapshots": snapshots}))
+}
+
+fn resolved_usage_snapshots(
+    database: &Database,
+    defaults: Vec<UsageSnapshot>,
+) -> Result<Vec<UsageSnapshot>, IpcError> {
+    defaults
+        .into_iter()
+        .map(|fallback| {
+            database
+                .list_global_usage_snapshots(Some(fallback.provider), 256)
+                .map(|stored| {
+                    stored
+                        .into_iter()
+                        .find(|snapshot| snapshot.quota_scope == fallback.quota_scope)
+                        .unwrap_or(fallback)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDashboardPayload {
+    task_id: Option<String>,
+    defaults: Vec<UsageSnapshot>,
+}
+
+fn workspace_dashboard(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.dashboard requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceDashboardPayload>(request.payload.clone())?;
+    let workspace = database.workspace(workspace_id);
+    let tasks = if let Some(task_id) = payload.task_id {
+        let task_id =
+            TaskId::from_str(&task_id).map_err(|error| IpcError::Protocol(error.to_string()))?;
+        workspace
+            .load_task(task_id)?
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        workspace.list_tasks(&TaskListFilter {
+            state: None,
+            include_archived: false,
+            limit: 100,
+        })?
+    };
+    let selected_task_id = tasks.first().map(|task| task.task_id);
+    let routing = selected_task_id
+        .map(|task_id| workspace.list_routing_audits(task_id, 1))
+        .transpose()?
+        .and_then(|mut records| records.pop());
+    let handover = selected_task_id
+        .map(|task_id| workspace.latest_handover(task_id))
+        .transpose()?
+        .flatten();
+    let handover_count = selected_task_id
+        .map(|task_id| workspace.count_handovers(task_id))
+        .transpose()?
+        .unwrap_or(0);
+    let verification = selected_task_id
+        .map(|task_id| workspace.latest_verification(task_id))
+        .transpose()?
+        .flatten();
+    let usage = resolved_usage_snapshots(database, payload.defaults)?;
+    let health = usage
+        .iter()
+        .map(|snapshot| database.latest_provider_health(snapshot.provider))
+        .collect::<Result<Vec<Option<ProviderHealth>>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "tasks": tasks,
+        "usage": usage,
+        "routing": routing,
+        "handover": handover,
+        "handover_count": handover_count,
+        "verification": verification,
+        "provider_health": health,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceUsageOverridePayload {
+    snapshot: UsageSnapshot,
+    entered_by: String,
+}
+
+fn override_workspace_usage(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.usage.override requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceUsageOverridePayload>(request.payload.clone())?;
+    if payload.entered_by.trim().is_empty() {
+        return Err(IpcError::Protocol(
+            "manual usage audit identity must not be blank".to_owned(),
+        ));
+    }
+    if payload.snapshot.source != UsageSource::ManualOverride {
+        return Err(IpcError::Protocol(
+            "usage override requires a manual-override snapshot".to_owned(),
+        ));
+    }
+    payload.snapshot.validate().map_err(|error| {
+        IpcError::Protocol(format!("manual usage snapshot is invalid: {error}"))
+    })?;
+    database.record_global_usage_snapshot(&payload.snapshot)?;
+    let now = Utc::now();
+    database.workspace(workspace_id).append_event(TaskEvent {
+        schema_version: SchemaVersion::state_current(),
+        sequence: 0,
+        event_id: EventId::new(),
+        session_id: None,
+        task_id: None,
+        occurred_at: now,
+        event_type: EventType::UsageCollected,
+        from_state: None,
+        to_state: None,
+        reason: None,
+        actor: EventActor::Administrator,
+        correlation_id: CorrelationId::new(),
+        causation_id: None,
+        payload: json!({
+            "snapshot": payload.snapshot,
+            "entered_by": payload.entered_by,
+        }),
+        previous_hash: None,
+        event_hash: String::new(),
+    })?;
+    Ok(json!({"snapshot": payload.snapshot}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceControlPayload {
+    task_id: String,
+    action: orchestrator_state::ControlAction,
+    payload: Value,
+}
+
+fn submit_workspace_control(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.control requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceControlPayload>(request.payload.clone())?;
+    let task_id = TaskId::from_str(&payload.task_id)
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let workspace = database.workspace(workspace_id);
+    let task = workspace
+        .load_task(task_id)?
+        .ok_or_else(|| IpcError::Protocol(format!("task {task_id} does not exist")))?;
+    if task.state.is_terminal() {
+        return Err(IpcError::Protocol(format!(
+            "task {task_id} is terminal ({:?})",
+            task.state
+        )));
+    }
+    let requested_at = Utc::now();
+    let control = workspace.request_control(
+        task_id,
+        payload.action,
+        payload.payload.clone(),
+        "local-ipc-client",
+        requested_at,
+    )?;
+    workspace.append_event(TaskEvent {
+        schema_version: SchemaVersion::state_current(),
+        sequence: 0,
+        event_id: EventId::new(),
+        session_id: None,
+        task_id: Some(task_id),
+        occurred_at: requested_at,
+        event_type: EventType::ControlRequested,
+        from_state: None,
+        to_state: None,
+        reason: None,
+        actor: EventActor::User,
+        correlation_id: CorrelationId::new(),
+        causation_id: None,
+        payload: json!({
+            "control_id": control.control_id,
+            "action": payload.action,
+            "payload": payload.payload,
+        }),
+        previous_hash: None,
+        event_hash: String::new(),
+    })?;
+    Ok(json!({
+        "task_id": task_id,
+        "control_id": control.control_id,
+        "action": payload.action,
+        "safe_checkpoint_required": matches!(
+            payload.action,
+            orchestrator_state::ControlAction::Pause
+                | orchestrator_state::ControlAction::Cancel
+                | orchestrator_state::ControlAction::Handover
+        ),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeWorkspaceTaskPayload {
+    task_id: String,
+}
+
+fn resume_workspace_task(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.resume requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<ResumeWorkspaceTaskPayload>(request.payload.clone())?;
+    let task_id = TaskId::from_str(&payload.task_id)
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let daemon_instance_id = match database.daemon_status(Utc::now())? {
+        orchestrator_state::DaemonStatus::Online(instance) => instance.instance_id,
+        _ => {
+            return Err(IpcError::Protocol(
+                "resume requires a healthy online user daemon".to_owned(),
+            ));
+        }
+    };
+    let workspace = database.workspace(workspace_id);
+    let task = workspace
+        .load_task(task_id)?
+        .ok_or_else(|| IpcError::Protocol(format!("task {task_id} does not exist")))?;
+    if task.state.is_terminal() {
+        return Err(IpcError::Protocol(format!(
+            "terminal task {task_id} cannot be resumed"
+        )));
+    }
+    let disposition = workspace.resume_disposition(task_id, daemon_instance_id, Utc::now())?;
+    match disposition {
+        ResumeDisposition::Attached => Ok(json!({
+            "disposition": disposition,
+            "task_id": task_id,
+            "stream": "workspace.task.stream",
+        })),
+        ResumeDisposition::Requeued => {
+            let control = workspace.request_control(
+                task_id,
+                orchestrator_state::ControlAction::Resume,
+                json!({}),
+                "local-ipc-client",
+                Utc::now(),
+            )?;
+            Ok(json!({
+                "disposition": disposition,
+                "task_id": task_id,
+                "state": task.state,
+                "control_id": control.control_id,
+            }))
+        }
+        ResumeDisposition::Rejected => Err(IpcError::Protocol(format!(
+            "task {task_id} may still be owned by an external process; automatic resume is rejected; reconcile process and worktree ownership, then run `colay task takeover {task_id}`"
+        ))),
     }
 }
 
@@ -680,20 +1279,23 @@ fn request_daemon_stop(database: &Database) -> Result<Value, IpcError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use chrono::Utc;
     use orchestrator_domain::{
         ConversationMessage, CorrelationId, EventActor, EventId, EventType, MessageId, MessageKind,
-        MessageRole, MessageState, SchemaVersion, SessionId, SessionState, TaskEvent,
+        MessageRole, MessageState, SchemaVersion, SessionId, SessionState, TaskEnvelope, TaskEvent,
+        TaskId, TaskState, TransitionGuards,
     };
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::{
-        IPC_SCHEMA_VERSION, IpcRequest, IpcResponse, MAX_REQUEST_BYTES, handle_connection,
-        workspace_conversation,
+        IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, MAX_REQUEST_BYTES,
+        handle_connection, workspace_conversation, workspace_projection,
     };
-    use orchestrator_state::{Database, GlobalStatePaths, NewSessionRecord};
+    use orchestrator_state::{
+        Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord, WorkspaceReadRequest,
+    };
 
     #[tokio::test]
     async fn oversized_request_is_rejected_and_connection_is_closed()
@@ -729,6 +1331,141 @@ mod tests {
         );
         server_task.await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_status_stream_emits_new_revisions_and_closes_after_terminal_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Database::open_in_memory()?);
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let repository = tempfile::tempdir()?;
+        let workspace_id = database
+            .resolve_repository_workspace(repository.path())?
+            .workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let task_id = TaskId::new();
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("stream active task", "stream active task", now);
+        workspace.create_task(&NewTaskRecord {
+            task_id,
+            schema_version: SchemaVersion::V1.to_owned(),
+            state: TaskState::Running,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope,
+            created_at: now,
+        })?;
+        let root = std::path::PathBuf::from("unused");
+        let paths = GlobalStatePaths {
+            database: root.join("state.db"),
+            backups: root.join("backups"),
+            workspaces: root.join("workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(handle_connection(
+            server,
+            Arc::clone(&database),
+            paths,
+            writer,
+        ));
+        let (reader, mut output) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "task-stream".to_owned(),
+            workspace_id: Some(workspace_id),
+            action: "workspace.task.stream".to_owned(),
+            payload: serde_json::json!({"task_id": task_id}),
+        };
+        output
+            .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
+            .await?;
+
+        let initial = read_response(&mut reader).await?;
+        assert_eq!(initial.outcome["data"]["cursor"], 0);
+        assert_eq!(initial.outcome["data"]["status"]["state"], "running");
+
+        workspace.transition_task_with_event(
+            task_id,
+            0,
+            TaskState::Running,
+            TaskState::Verifying,
+            None,
+            false,
+            &TransitionGuards::default(),
+            now,
+            transition_event(task_id, TaskState::Running, TaskState::Verifying, now),
+        )?;
+        let verifying =
+            tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader)).await??;
+        assert_eq!(verifying.outcome["data"]["cursor"], 1);
+        assert_eq!(verifying.outcome["data"]["status"]["state"], "verifying");
+
+        workspace.transition_task_with_event(
+            task_id,
+            1,
+            TaskState::Verifying,
+            TaskState::Completed,
+            None,
+            false,
+            &TransitionGuards {
+                verification_passed: true,
+                ..TransitionGuards::default()
+            },
+            now,
+            transition_event(task_id, TaskState::Verifying, TaskState::Completed, now),
+        )?;
+        let completed =
+            tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader)).await??;
+        assert_eq!(completed.outcome["data"]["cursor"], 2);
+        assert_eq!(completed.outcome["data"]["status"]["state"], "completed");
+        tokio::time::timeout(Duration::from_secs(1), server_task).await???;
+        Ok(())
+    }
+
+    async fn read_response<R>(reader: &mut BufReader<R>) -> Result<IpcResponse, IpcError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .await
+            .map_err(|source| IpcError::Io {
+                path: std::path::PathBuf::from("test IPC stream"),
+                source,
+            })?;
+        serde_json::from_str(&response).map_err(Into::into)
+    }
+
+    fn transition_event(
+        task_id: TaskId,
+        from_state: TaskState,
+        to_state: TaskState,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> TaskEvent {
+        TaskEvent {
+            schema_version: SchemaVersion::state_current(),
+            sequence: 0,
+            event_id: EventId::new(),
+            session_id: None,
+            task_id: Some(task_id),
+            occurred_at,
+            event_type: EventType::StateTransitioned,
+            from_state: Some(from_state),
+            to_state: Some(to_state),
+            reason: None,
+            actor: EventActor::Orchestrator,
+            correlation_id: CorrelationId::new(),
+            causation_id: None,
+            payload: serde_json::json!({}),
+            previous_hash: None,
+            event_hash: String::new(),
+        }
     }
 
     #[test]
@@ -810,6 +1547,82 @@ mod tests {
             Some("message-205")
         );
         assert!(!response.to_string().contains("first-dropped-marker"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_projection_restores_the_durable_selection_when_no_task_is_explicit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let repository = tempfile::tempdir()?;
+        let workspace_id = database
+            .resolve_repository_workspace(repository.path())?
+            .workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let now = Utc::now();
+        workspace.create_session_with_event(
+            &NewSessionRecord {
+                session_id,
+                schema_version: SchemaVersion::V1.to_owned(),
+                title: "durable TUI selection".to_owned(),
+                state: SessionState::Drafting,
+                created_at: now,
+            },
+            TaskEvent {
+                schema_version: SchemaVersion::state_current(),
+                sequence: 0,
+                event_id: EventId::new(),
+                session_id: Some(session_id),
+                task_id: None,
+                occurred_at: now,
+                event_type: EventType::SessionCreated,
+                from_state: None,
+                to_state: None,
+                reason: None,
+                actor: EventActor::User,
+                correlation_id: CorrelationId::new(),
+                causation_id: None,
+                payload: serde_json::json!({}),
+                previous_hash: None,
+                event_hash: String::new(),
+            },
+        )?;
+        let envelope = TaskEnvelope::new("selected task", "selected task", now);
+        workspace.create_task(&NewTaskRecord {
+            task_id,
+            schema_version: SchemaVersion::V1.to_owned(),
+            state: TaskState::Running,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope,
+            created_at: now,
+        })?;
+        workspace.save_workspace_selected_task(session_id, Some(task_id), now)?;
+
+        let response = workspace_projection(
+            &database,
+            &IpcRequest {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "durable-selection".to_owned(),
+                workspace_id: Some(workspace_id),
+                action: "workspace.projection".to_owned(),
+                payload: serde_json::to_value(WorkspaceReadRequest {
+                    session_id,
+                    selected_task_id: None,
+                    before_ordinal: None,
+                    message_limit: 10,
+                    task_limit: 10,
+                })?,
+            },
+        )?;
+
+        assert_eq!(
+            response["projection"]["inspector"]["task"]["task"]["task_id"],
+            task_id.to_string()
+        );
         Ok(())
     }
 }

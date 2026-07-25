@@ -29,6 +29,11 @@ pub struct IpcResponseStream {
 }
 
 impl DaemonClient {
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
     pub async fn connect_or_start(
         repository: &Path,
         explicit_config: Option<&Path>,

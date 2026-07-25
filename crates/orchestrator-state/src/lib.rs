@@ -63,8 +63,8 @@ pub use graphs::{
 pub use instructions::StoredTaskInstruction;
 pub use integrations::{IntegrationBatchStatus, StoredIntegrationBatch};
 pub use leases::{
-    CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, WorkerLease, WorkerLeaseMode,
-    WorkerLeaseRequest,
+    CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, ResumeDisposition, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest,
 };
 pub use legacy_import::{LegacyImportPlan, LegacyImportResult, LegacyImporter};
 pub use migrations::{

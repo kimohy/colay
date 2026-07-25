@@ -8,10 +8,11 @@ use orchestrator_domain::{
     TaskState,
 };
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use crate::{StateError, StateResult, WorkspaceDatabase, database::append_event_in_transaction};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum IntegrationBatchStatus {
     Preview,
     Blocked,
@@ -36,7 +37,7 @@ impl IntegrationBatchStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct StoredIntegrationBatch {
     pub preview: IntegrationPreview,
     pub status: IntegrationBatchStatus,

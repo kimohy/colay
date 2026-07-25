@@ -557,8 +557,8 @@ mod tests {
     use rusqlite::params;
 
     use super::ClaimReadyTaskRequest;
-    use crate::DaemonLeaseRequest;
     use crate::Database;
+    use crate::{DaemonLeaseRequest, ResumeDisposition};
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0)
@@ -753,6 +753,40 @@ mod tests {
             now(),
             "done"
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn active_schedule_claim_attaches_only_to_its_daemon_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, daemon) = setup()?;
+        let (session, revision) = seed_graph(&database)?;
+        let task = seed_task(
+            &database,
+            session,
+            revision,
+            1,
+            ProviderId::Codex,
+            "src/a",
+            &[],
+        )?;
+        let claimed = database
+            .claim_next_ready_task(&request(daemon))?
+            .ok_or("claim missing")?;
+        assert_eq!(claimed.task_id, task);
+
+        assert_eq!(
+            database.resume_disposition(task, daemon, now() + TimeDelta::seconds(1))?,
+            ResumeDisposition::Attached
+        );
+        assert_eq!(
+            database.resume_disposition(
+                task,
+                DaemonInstanceId::new(),
+                now() + TimeDelta::seconds(1),
+            )?,
+            ResumeDisposition::Rejected
+        );
         Ok(())
     }
 

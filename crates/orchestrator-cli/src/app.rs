@@ -1,10 +1,8 @@
 use std::{
     collections::HashMap,
     fs,
-    future::Future,
     io::Write as _,
     path::{Path, PathBuf},
-    pin::Pin,
     str::FromStr as _,
     sync::Arc,
     time::{Duration, Instant},
@@ -46,11 +44,11 @@ use orchestrator_providers::{
 };
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
-    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, DaemonStatus, Database,
-    EffectiveConfig, EventLog, GlobalStatePaths, LeaseRenewal, MigratableConfigDocument,
-    NewTaskAttemptRecord, NewWorktreeRecord, OrchestratorConfig, ProviderConfig,
-    RepositoryStatePaths as StatePaths, RootConfig, StateEnvironment, StateError, TaskListFilter,
-    WorkerLease, WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
+    ControlAction, DaemonStatus, Database, EffectiveConfig, EventLog, GlobalStatePaths,
+    LeaseRenewal, MigratableConfigDocument, NewTaskAttemptRecord, NewWorktreeRecord,
+    OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig,
+    RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,6 +56,9 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 use uuid::Uuid;
+
+#[cfg(test)]
+use orchestrator_state::{CoordinatorLease, CoordinatorLeaseRequest};
 
 use crate::args::{
     Cli, Command, EffortName, HandoverArgs, MigrationAction, MigrationRollbackAction,
@@ -72,8 +73,9 @@ use crate::profile_config::{
 const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
 const DEFAULT_CONFIG_PATH: &str = ".colay/config.toml";
 const LEGACY_CONFIG_PATH: &str = ".codex/orchestrator/config.toml";
-const COORDINATOR_LEASE_TTL_SECONDS: i64 = 30;
 const WORKER_LEASE_TTL_SECONDS: i64 = 20;
+#[cfg(test)]
+const COORDINATOR_LEASE_TTL_SECONDS: i64 = 30;
 const LEASE_RENEWAL_INTERVAL_SECONDS: u64 = 5;
 const RUN_SESSION_KEY: &str = "cli-run-session-v1";
 const RUN_REQUESTED_BY: &str = "local-cli-run";
@@ -148,82 +150,122 @@ pub async fn run(cli: Cli) -> Result<()> {
             status(&repository, cli.config.as_deref(), &selector, cli.json).await
         }
         Command::Providers(arguments) => match arguments.action {
-            Some(ProviderAction::Enable { provider }) => set_provider_enabled(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                provider.into(),
-                true,
-                cli.json,
-            ),
-            Some(ProviderAction::Disable { provider }) => set_provider_enabled(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                provider.into(),
-                false,
-                cli.json,
-            ),
+            Some(ProviderAction::Enable { provider }) => {
+                set_provider_enabled(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    provider.into(),
+                    true,
+                    cli.json,
+                )
+                .await
+            }
+            Some(ProviderAction::Disable { provider }) => {
+                set_provider_enabled(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    provider.into(),
+                    false,
+                    cli.json,
+                )
+                .await
+            }
             None => providers(&runtime.effective, cli.json).await,
         },
         Command::Profiles(arguments) => match arguments.action {
-            Some(ProfileAction::Set(arguments)) => set_model_profile(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                arguments.provider,
-                arguments.profile,
-                &arguments.model,
-                arguments.effort,
-                cli.json,
-            ),
-            Some(ProfileAction::Reset(arguments)) => reset_model_profile(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                arguments.provider,
-                arguments.profile,
-                cli.json,
-            ),
+            Some(ProfileAction::Set(arguments)) => {
+                set_model_profile(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    arguments.provider,
+                    arguments.profile,
+                    &arguments.model,
+                    arguments.effort,
+                    cli.json,
+                )
+                .await
+            }
+            Some(ProfileAction::Reset(arguments)) => {
+                reset_model_profile(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    arguments.provider,
+                    arguments.profile,
+                    cli.json,
+                )
+                .await
+            }
             None => profiles(&runtime.effective, cli.json),
         },
         Command::Usage(arguments) => match arguments.action {
             Some(UsageAction::Override(arguments)) => {
-                usage_override(&repository, &runtime.effective, arguments, cli.json)
+                usage_override(
+                    &repository,
+                    cli.config.as_deref(),
+                    &runtime.effective,
+                    arguments,
+                    cli.json,
+                )
+                .await
             }
-            None => usage(&repository, &runtime.effective, cli.json),
+            None => {
+                usage(
+                    &repository,
+                    cli.config.as_deref(),
+                    &runtime.effective,
+                    cli.json,
+                )
+                .await
+            }
         },
         Command::Handover(arguments) => {
-            control_handover(&repository, &runtime.effective, arguments, cli.json)
+            control_handover(&repository, cli.config.as_deref(), arguments, cli.json).await
         }
-        Command::Pause(task) => control(
-            &repository,
-            &runtime.effective,
-            task,
-            "pause",
-            json!({}),
-            cli.json,
-        ),
+        Command::Pause(task) => {
+            control(
+                &repository,
+                cli.config.as_deref(),
+                task,
+                "pause",
+                json!({}),
+                cli.json,
+            )
+            .await
+        }
         Command::Resume(task) => {
-            resume_task(&repository, &runtime.effective, &task, cli.json).await
+            resume_task(
+                &repository,
+                cli.config.as_deref(),
+                &runtime.effective,
+                &task,
+                cli.json,
+            )
+            .await
         }
-        Command::Cancel(task) => control(
-            &repository,
-            &runtime.effective,
-            task,
-            "cancel",
-            json!({}),
-            cli.json,
-        ),
+        Command::Cancel(task) => {
+            control(
+                &repository,
+                cli.config.as_deref(),
+                task,
+                "cancel",
+                json!({}),
+                cli.json,
+            )
+            .await
+        }
         Command::ExplainRouting(task) => {
-            explain_routing(&repository, &runtime.effective, &task.task_id, cli.json)
+            explain_routing(&repository, cli.config.as_deref(), &task.task_id, cli.json).await
         }
         Command::Checkpoint(task) => {
-            checkpoint(&repository, &runtime.effective, &task.task_id, cli.json)
+            checkpoint(&repository, cli.config.as_deref(), &task.task_id, cli.json).await
         }
         Command::Doctor => doctor(&repository, &runtime.effective, cli.json).await,
         Command::Compatibility => compatibility(&runtime.effective, cli.json),
@@ -655,7 +697,7 @@ async fn providers(effective: &EffectiveConfig, json_output: bool) -> Result<()>
     emit(json_output, "providers", &reports)
 }
 
-fn set_provider_enabled(
+async fn set_provider_enabled(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,
@@ -669,7 +711,13 @@ fn set_provider_enabled(
     let providers = ensure_override_table(orchestrator, "providers")?;
     let provider_override = ensure_override_table(providers, provider.as_str())?;
     provider_override.insert("enabled", toml_edit::value(enabled));
-    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    write_override_via_daemon(
+        repository,
+        cli_config,
+        &document,
+        &runtime.explicit_edit_path,
+    )
+    .await?;
     let reloaded = load_config_runtime(repository, cli_config, environment)?;
     let persisted = provider_config(&reloaded.effective.config().orchestrator, provider)
         .is_some_and(|config| config.enabled == enabled);
@@ -702,7 +750,7 @@ fn selected_profile_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn set_model_profile(
+async fn set_model_profile(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,
@@ -722,7 +770,13 @@ fn set_model_profile(
         model,
         effort.map(EffortName::as_str),
     )?;
-    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    write_override_via_daemon(
+        repository,
+        cli_config,
+        &document,
+        &runtime.explicit_edit_path,
+    )
+    .await?;
     let reloaded = load_config_runtime(repository, cli_config, environment)?;
     let row = selected_profile_row(reloaded.effective.config(), provider, profile)?;
     if row.model != model.trim() {
@@ -734,7 +788,7 @@ fn set_model_profile(
     emit(json_output, "profile_updated", &row)
 }
 
-fn reset_model_profile(
+async fn reset_model_profile(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,
@@ -748,7 +802,13 @@ fn reset_model_profile(
     if !reset_profile_override(&mut document, provider_id.as_str(), profile.as_str())? {
         bail!("selected writable layer has no override for this model profile");
     }
-    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    write_override_via_daemon(
+        repository,
+        cli_config,
+        &document,
+        &runtime.explicit_edit_path,
+    )
+    .await?;
     let reloaded = load_config_runtime(repository, cli_config, environment)?;
     let row = selected_profile_row(reloaded.effective.config(), provider, profile)?;
     emit(json_output, "profile_reset", &row)
@@ -777,6 +837,32 @@ fn ensure_override_table<'a>(
         .get_mut(key)
         .and_then(Item::as_table_like_mut)
         .ok_or_else(|| anyhow!("configuration override `{key}` must be a table"))
+}
+
+async fn write_override_via_daemon(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    document: &DocumentMut,
+    path: &Path,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        let _ = (repository, explicit_config);
+        std::future::ready(()).await;
+        save_override_atomic(document, path)
+    }
+    #[cfg(not(test))]
+    {
+        let client =
+            crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+        client
+            .request(
+                "workspace.config.write",
+                json!({"path": path, "content": document.to_string()}),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 fn save_override_atomic(document: &DocumentMut, path: &Path) -> Result<()> {
@@ -981,6 +1067,7 @@ async fn load_client_command(
 #[allow(clippy::too_many_lines)]
 async fn resume_task(
     repository: &Path,
+    explicit_config: Option<&Path>,
     effective: &EffectiveConfig,
     task: &RequiredTask,
     json_output: bool,
@@ -989,40 +1076,46 @@ async fn resume_task(
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
-    let state = StatePaths::from_config(repository, document.config())?;
-    let global_database = open_ready_database(&state)?;
-    let database = workspace_for_repository(&global_database, repository)?;
     let task_id = TaskId::from_str(&task.task_id)?;
-    let correlation_id = CorrelationId::new();
-    let stored = database
-        .load_task(task_id)?
-        .ok_or_else(|| anyhow!("task {task_id} does not exist"))?;
-    if stored.state.is_terminal() {
-        bail!("terminal task {task_id} cannot be resumed");
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.resume", json!({"task_id": task_id}))
+        .await?;
+    let mut data = response.outcome["data"].clone();
+    if data["disposition"].as_str() == Some("attached") {
+        let mut stream = client
+            .stream("workspace.task.stream", json!({"task_id": task_id}))
+            .await?;
+        let mut updates = Vec::new();
+        loop {
+            let status = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .context("timed out attaching to the active task status stream")??;
+            let Some(status) = status else {
+                break;
+            };
+            if status.outcome["status"].as_str() != Some("ok") {
+                bail!(
+                    "{}",
+                    status.outcome["error"]
+                        .as_str()
+                        .unwrap_or("active task status stream failed")
+                );
+            }
+            updates.push(status.outcome["data"].clone());
+        }
+        let latest = updates
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("user daemon closed the active task status stream"))?;
+        data["active_status"] = latest;
+        data["active_status_updates"] = json!(updates);
     }
-    let coordinator = acquire_task_coordinator(&database, task_id)?;
-    let result = run_with_coordinator_renewal(
-        &database,
-        &coordinator,
-        Box::pin(resume_task_coordinated(
-            repository,
-            document,
-            &state,
-            &global_database,
-            &database,
-            task_id,
-            correlation_id,
-            stored,
-            coordinator.lease_id,
-            json_output,
-        )),
-    )
-    .await;
-    let released =
-        database.release_coordinator_lease(coordinator.lease_id, coordinator.owner_id, Utc::now());
-    coordinated_result(result, released)
+    emit(json_output, "resume", &data)
 }
 
+#[allow(dead_code)]
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2946,6 +3039,7 @@ fn persist_worktree(database: &WorkspaceDatabase<'_>, worktree: &GitWorktree) ->
     Ok(())
 }
 
+#[cfg(test)]
 fn acquire_task_coordinator(
     database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
@@ -2969,6 +3063,7 @@ fn acquire_task_coordinator(
     }
 }
 
+#[cfg(test)]
 fn coordinator_conflict_diagnostic(
     database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
@@ -3008,10 +3103,11 @@ fn coordinator_conflict_diagnostic(
     )
 }
 
+#[cfg(test)]
 async fn run_with_coordinator_renewal(
     database: &WorkspaceDatabase<'_>,
     coordinator: &CoordinatorLease,
-    mut operation: Pin<Box<dyn Future<Output = Result<()>> + '_>>,
+    mut operation: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + '_>>,
 ) -> Result<()> {
     let mut renewal = tokio::time::interval(Duration::from_secs(LEASE_RENEWAL_INTERVAL_SECONDS));
     renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3030,20 +3126,6 @@ async fn run_with_coordinator_renewal(
                 ).context("coordinator lease heartbeat failed")?;
             }
         }
-    }
-}
-
-fn coordinated_result(
-    result: Result<()>,
-    released: orchestrator_state::StateResult<bool>,
-) -> Result<()> {
-    match (result, released) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(error), Ok(_)) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(error), Err(release_error)) => Err(error.context(format!(
-            "coordinator lease release also failed: {release_error}"
-        ))),
     }
 }
 
@@ -4032,15 +4114,25 @@ async fn status(
     emit(json_output, "status", &response.outcome["data"])
 }
 
-fn usage(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
-    let (_, database) = load_existing_state(repository, effective)?;
-    let snapshots = latest_usage_snapshots(&database, &effective.config().orchestrator)?;
-    emit(json_output, "usage", &snapshots)
+async fn usage(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    effective: &EffectiveConfig,
+    json_output: bool,
+) -> Result<()> {
+    let defaults = usage_defaults(&effective.config().orchestrator)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.usage", json!({"defaults": defaults}))
+        .await?;
+    emit(json_output, "usage", &response.outcome["data"]["snapshots"])
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn usage_override(
+async fn usage_override(
     repository: &Path,
+    explicit_config: Option<&Path>,
     effective: &EffectiveConfig,
     arguments: UsageOverrideArgs,
     json_output: bool,
@@ -4048,8 +4140,6 @@ fn usage_override(
     if arguments.entered_by.trim().is_empty() {
         bail!("--entered-by must be a non-empty audit identity");
     }
-    let (_, database) = load_existing_state(repository, effective)?;
-    let workspace = workspace_for_repository(&database, repository)?;
     let provider = ProviderId::from(arguments.provider);
     let provider_config = provider_config(&effective.config().orchestrator, provider)
         .ok_or_else(|| anyhow!("provider {} is not configured", provider.as_str()))?;
@@ -4103,31 +4193,30 @@ fn usage_override(
     snapshot.source = UsageSource::ManualOverride;
     snapshot.confidence = UsageConfidence::Confirmed;
     snapshot.validate()?;
-    persist_global_usage(&database, &snapshot)?;
-    append_event(
-        &workspace,
-        None,
-        EventType::UsageCollected,
-        None,
-        None,
-        EventActor::Administrator,
-        CorrelationId::new(),
-        json!({"snapshot": snapshot, "entered_by": arguments.entered_by}),
-    )?;
-    let state = StatePaths::from_config(repository, effective.config())?;
-    reconcile_events(&state, &workspace)?;
-    emit(json_output, "usage_override", &snapshot)
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request(
+            "workspace.usage.override",
+            json!({"snapshot": snapshot, "entered_by": arguments.entered_by}),
+        )
+        .await?;
+    emit(
+        json_output,
+        "usage_override",
+        &response.outcome["data"]["snapshot"],
+    )
 }
 
-fn control_handover(
+async fn control_handover(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     arguments: HandoverArgs,
     json_output: bool,
 ) -> Result<()> {
     control(
         repository,
-        effective,
+        explicit_config,
         RequiredTask {
             task_id: arguments.task_id,
         },
@@ -4135,28 +4224,19 @@ fn control_handover(
         json!({"to": ProviderId::from(arguments.to)}),
         json_output,
     )
+    .await
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn control(
+async fn control(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     task: RequiredTask,
     action: &str,
     payload: Value,
     json_output: bool,
 ) -> Result<()> {
-    let (state, database) = load_existing_state(repository, effective)?;
-    let database = workspace_for_repository(&database, repository)?;
     let task_id = TaskId::from_str(&task.task_id)?;
-    let current_state = database
-        .load_task(task_id)?
-        .ok_or_else(|| anyhow!("task {task_id} does not exist"))?
-        .state;
-    if current_state.is_terminal() {
-        bail!("task {task_id} is terminal ({current_state:?})");
-    }
-    let requested_at = Utc::now();
     let control_action = match action {
         "pause" => orchestrator_state::ControlAction::Pause,
         "resume" => orchestrator_state::ControlAction::Resume,
@@ -4164,66 +4244,57 @@ fn control(
         "handover" => orchestrator_state::ControlAction::Handover,
         _ => bail!("unsupported control action {action}"),
     };
-    let request = database.request_control(
-        task_id,
-        control_action,
-        payload.clone(),
-        "user",
-        requested_at,
-    )?;
-    append_event(
-        &database,
-        Some(task_id),
-        EventType::ControlRequested,
-        None,
-        None,
-        EventActor::User,
-        CorrelationId::new(),
-        json!({"control_id": request.control_id, "action": action, "payload": payload}),
-    )?;
-    reconcile_events(&state, &database)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request(
+            "workspace.control",
+            json!({
+                "task_id": task_id,
+                "action": control_action,
+                "payload": payload,
+            }),
+        )
+        .await?;
+    emit(json_output, "control_requested", &response.outcome["data"])
+}
+
+async fn explain_routing(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    task_id: &str,
+    json_output: bool,
+) -> Result<()> {
+    let task_id = TaskId::from_str(task_id)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.routing", json!({"task_id": task_id}))
+        .await?;
     emit(
         json_output,
-        "control_requested",
-        &json!({
-            "task_id": task_id,
-            "control_id": request.control_id,
-            "action": action,
-            "safe_checkpoint_required": matches!(action, "pause" | "cancel" | "handover"),
-        }),
+        "explain_routing",
+        &response.outcome["data"]["decision"],
     )
 }
 
-fn explain_routing(
+async fn checkpoint(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     task_id: &str,
     json_output: bool,
 ) -> Result<()> {
-    let (_, database) = load_existing_state(repository, effective)?;
-    let database = workspace_for_repository(&database, repository)?;
     let task_id = TaskId::from_str(task_id)?;
-    let decision = database
-        .list_routing_audits(task_id, 1)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no routing decision for task {task_id}"))?;
-    emit(json_output, "explain_routing", &decision)
-}
-
-fn checkpoint(
-    repository: &Path,
-    effective: &EffectiveConfig,
-    task_id: &str,
-    json_output: bool,
-) -> Result<()> {
-    let (_, database) = load_existing_state(repository, effective)?;
-    let database = workspace_for_repository(&database, repository)?;
-    let task_id = TaskId::from_str(task_id)?;
-    let checkpoint = database
-        .latest_sealed_checkpoint(task_id)?
-        .ok_or_else(|| anyhow!("task {task_id} has no checkpoint"))?;
-    emit(json_output, "checkpoint", &checkpoint)
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.checkpoint", json!({"task_id": task_id}))
+        .await?;
+    emit(
+        json_output,
+        "checkpoint",
+        &response.outcome["data"]["checkpoint"],
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -5077,38 +5148,32 @@ async fn legacy_tui(
     if !config.features.orchestrator_tui {
         bail!("orchestrator TUI is disabled by configuration");
     }
-    let (_, database) = load_existing_state(repository, &runtime.effective)?;
-    let workspace = workspace_for_repository(&database, repository)?;
-    let rows = task_status_rows(&workspace, selector.task_id.as_deref())?;
-    let task = rows.first();
-    let usage = latest_usage_snapshots(&database, &config.orchestrator)?;
-    let selected_task_id = task
-        .map(|task| TaskId::from_str(&task.task_id))
-        .transpose()?;
-    let stored_task = selected_task_id
-        .map(|task_id| workspace.load_task(task_id))
-        .transpose()?
-        .flatten();
-    let task_envelope = stored_task
-        .as_ref()
+    let defaults = usage_defaults(&config.orchestrator)?;
+    let client = crate::ipc_client::DaemonClient::connect_or_start(repository, cli_config).await?;
+    let dashboard = client
+        .request(
+            "workspace.dashboard",
+            json!({"task_id": selector.task_id.as_deref(), "defaults": defaults}),
+        )
+        .await?
+        .outcome["data"]
+        .clone();
+    let tasks = serde_json::from_value::<Vec<StoredTask>>(dashboard["tasks"].clone())?;
+    let task = tasks.first();
+    let usage = serde_json::from_value::<Vec<UsageSnapshot>>(dashboard["usage"].clone())?;
+    let task_envelope = task
         .map(|stored| serde_json::from_value::<TaskEnvelope>(stored.envelope.clone()))
         .transpose()?;
-    let latest_routing = selected_task_id
-        .map(|task_id| workspace.list_routing_audits(task_id, 1))
-        .transpose()?
-        .and_then(|mut decisions| decisions.pop());
-    let latest_handover = selected_task_id
-        .map(|task_id| workspace.latest_handover(task_id))
-        .transpose()?
-        .flatten();
-    let handover_count = selected_task_id
-        .map(|task_id| count_handovers(&workspace, task_id))
-        .transpose()?
-        .unwrap_or(0);
-    let latest_verification = selected_task_id
-        .map(|task_id| latest_verification_result(&workspace, task_id))
-        .transpose()?
-        .flatten();
+    let latest_routing =
+        serde_json::from_value::<Option<RoutingAuditRecord>>(dashboard["routing"].clone())?;
+    let latest_handover =
+        serde_json::from_value::<Option<StoredHandover>>(dashboard["handover"].clone())?;
+    let handover_count = serde_json::from_value::<u32>(dashboard["handover_count"].clone())?;
+    let latest_verification = serde_json::from_value::<
+        Option<orchestrator_domain::VerificationResult>,
+    >(dashboard["verification"].clone())?;
+    let provider_health =
+        serde_json::from_value::<Vec<ProviderHealth>>(dashboard["provider_health"].clone())?;
     let entered_by = std::env::var("USERNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -5137,9 +5202,9 @@ async fn legacy_tui(
                 .as_ref()
                 .and_then(|envelope| envelope.assessment.as_ref());
             orchestrator_tui::TaskPanel {
-                id: task.task_id.clone(),
+                id: task.task_id.to_string(),
                 objective: task.objective.clone(),
-                state: task.state.clone(),
+                state: format!("{:?}", task.state),
                 difficulty: assessment.map_or_else(
                     || "Unknown".to_owned(),
                     |value| format!("{:?} ({})", value.difficulty, value.total_score),
@@ -5153,7 +5218,7 @@ async fn legacy_tui(
                             .collect()
                     })
                     .unwrap_or_default(),
-                phase: task.state.clone(),
+                phase: format!("{:?}", task.state),
             }
         }),
         providers: usage
@@ -5168,9 +5233,9 @@ async fn legacy_tui(
                     .map_or_else(|| "Unknown".to_owned(), |value| value.to_rfc3339()),
                 source: format!("{:?}", usage.source),
                 confidence: format!("{:?}", usage.confidence),
-                health: latest_provider_health(&database, usage.provider)
-                    .ok()
-                    .flatten()
+                health: provider_health
+                    .iter()
+                    .find(|health| health.provider == usage.provider)
                     .map_or_else(
                         || "Unknown".to_owned(),
                         |health| format!("{:?}", health.status),
@@ -5245,7 +5310,13 @@ async fn legacy_tui(
             let mut document = load_edit_document(&runtime.explicit_edit_path)?;
             ensure_override_table(document.as_table_mut(), "orchestrator")?
                 .insert("automatic_routing", toml_edit::value(enabled));
-            save_override_atomic(&document, &runtime.explicit_edit_path)?;
+            write_override_via_daemon(
+                repository,
+                cli_config,
+                &document,
+                &runtime.explicit_edit_path,
+            )
+            .await?;
             let _ = load_config_runtime(repository, cli_config, environment)?;
             emit(
                 json_output,
@@ -5263,78 +5334,96 @@ async fn legacy_tui(
                 enabled,
                 json_output,
             )
+            .await
         }
         orchestrator_tui::ControlAction::SelectProvider { task_id, provider }
         | orchestrator_tui::ControlAction::Handover {
             task_id,
             to_provider: provider,
-        } => control(
-            repository,
-            &runtime.effective,
-            RequiredTask { task_id },
-            "handover",
-            json!({"to": parse_provider_id(&provider)?}),
-            json_output,
-        ),
-        orchestrator_tui::ControlAction::Pause { task_id } => control(
-            repository,
-            &runtime.effective,
-            RequiredTask { task_id },
-            "pause",
-            json!({}),
-            json_output,
-        ),
+        } => {
+            control(
+                repository,
+                cli_config,
+                RequiredTask { task_id },
+                "handover",
+                json!({"to": parse_provider_id(&provider)?}),
+                json_output,
+            )
+            .await
+        }
+        orchestrator_tui::ControlAction::Pause { task_id } => {
+            control(
+                repository,
+                cli_config,
+                RequiredTask { task_id },
+                "pause",
+                json!({}),
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::Resume { task_id } => {
             resume_task(
                 repository,
+                cli_config,
                 &runtime.effective,
                 &RequiredTask { task_id },
                 json_output,
             )
             .await
         }
-        orchestrator_tui::ControlAction::Cancel { task_id } => control(
-            repository,
-            &runtime.effective,
-            RequiredTask { task_id },
-            "cancel",
-            json!({}),
-            json_output,
-        ),
+        orchestrator_tui::ControlAction::Cancel { task_id } => {
+            control(
+                repository,
+                cli_config,
+                RequiredTask { task_id },
+                "cancel",
+                json!({}),
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::UsageOverride {
             provider,
             used,
             limit,
             remaining,
             entered_by,
-        } => usage_override(
-            repository,
-            &runtime.effective,
-            UsageOverrideArgs {
-                provider: parse_provider_name(&provider)?,
-                used,
-                limit,
-                remaining,
-                entered_by,
-            },
-            json_output,
-        ),
+        } => {
+            usage_override(
+                repository,
+                cli_config,
+                &runtime.effective,
+                UsageOverrideArgs {
+                    provider: parse_provider_name(&provider)?,
+                    used,
+                    limit,
+                    remaining,
+                    entered_by,
+                },
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::SetModelProfile {
             provider,
             profile,
             model,
             effort,
-        } => set_model_profile(
-            repository,
-            cli_config,
-            environment,
-            runtime,
-            parse_provider_name(&provider)?,
-            parse_profile_name(&profile)?,
-            &model,
-            Some(parse_effort_name(&effort)?),
-            json_output,
-        ),
+        } => {
+            set_model_profile(
+                repository,
+                cli_config,
+                environment,
+                runtime,
+                parse_provider_name(&provider)?,
+                parse_profile_name(&profile)?,
+                &model,
+                Some(parse_effort_name(&effort)?),
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::ResetModelProfile { provider, profile } => {
             reset_model_profile(
                 repository,
@@ -5345,6 +5434,7 @@ async fn legacy_tui(
                 parse_profile_name(&profile)?,
                 json_output,
             )
+            .await
         }
         orchestrator_tui::ControlAction::Quit => Ok(()),
     }
@@ -5380,24 +5470,6 @@ fn parse_effort_name(value: &str) -> Result<EffortName> {
         "high" => Ok(EffortName::High),
         _ => bail!("unsupported reasoning effort `{value}`"),
     }
-}
-
-fn latest_provider_health(
-    database: &Database,
-    provider: ProviderId,
-) -> Result<Option<ProviderHealth>> {
-    Ok(database.latest_provider_health(provider)?)
-}
-
-fn latest_verification_result(
-    database: &WorkspaceDatabase<'_>,
-    task_id: TaskId,
-) -> Result<Option<orchestrator_domain::VerificationResult>> {
-    Ok(database.latest_verification(task_id)?)
-}
-
-fn count_handovers(database: &WorkspaceDatabase<'_>, task_id: TaskId) -> Result<u32> {
-    Ok(database.count_handovers(task_id)?)
 }
 
 fn routing_alternatives(value: &Value, selected: Option<ProviderId>) -> Vec<String> {
@@ -6114,6 +6186,20 @@ fn latest_usage_snapshots(
     Ok(snapshots)
 }
 
+fn usage_defaults(config: &OrchestratorConfig) -> Result<Vec<UsageSnapshot>> {
+    let now = Utc::now();
+    provider_configs(config)
+        .map(|(provider, provider_config)| {
+            let mut snapshot =
+                UsageSnapshot::unknown(provider, quota_scope(provider, provider_config)?, now);
+            let window = period_window(&reset_policy(provider_config)?, now)?;
+            snapshot.period_started_at = Some(window.started_at);
+            snapshot.resets_at = Some(window.resets_at);
+            Ok(snapshot)
+        })
+        .collect()
+}
+
 fn usage_history(database: &Database, provider: ProviderId) -> Result<Vec<UsageSnapshot>> {
     let mut snapshots = database.list_global_usage_snapshots(Some(provider), 256)?;
     snapshots.reverse();
@@ -6407,15 +6493,6 @@ fn legacy_migration_workspace_if_present(
     }
 }
 
-fn load_existing_state(
-    repository: &Path,
-    effective: &EffectiveConfig,
-) -> Result<(StatePaths, Database)> {
-    let state = StatePaths::from_config(repository, effective.config())?;
-    let database = open_ready_database(&state)?;
-    Ok((state, database))
-}
-
 fn reconcile_events(state: &StatePaths, database: &WorkspaceDatabase<'_>) -> Result<()> {
     EventLog::open(&state.events)?.reconcile_workspace(database)?;
     Ok(())
@@ -6437,34 +6514,6 @@ fn latest_database_backup(directory: &Path) -> Result<PathBuf> {
     backups
         .pop()
         .ok_or_else(|| anyhow!("no database backup is available"))
-}
-
-fn task_status_rows(
-    database: &WorkspaceDatabase<'_>,
-    task_id: Option<&str>,
-) -> Result<Vec<TaskStatusRow>> {
-    let tasks = if let Some(task_id) = task_id {
-        let task_id = TaskId::from_str(task_id)?;
-        database.load_task(task_id)?.into_iter().collect()
-    } else {
-        database.list_tasks(&TaskListFilter {
-            state: None,
-            include_archived: false,
-            limit: 100,
-        })?
-    };
-    tasks
-        .into_iter()
-        .map(|task| {
-            Ok(TaskStatusRow {
-                task_id: task.task_id.to_string(),
-                state: enum_name(&task.state)?,
-                objective: task.objective,
-                created_at: task.created_at.to_rfc3339(),
-                updated_at: task.updated_at.to_rfc3339(),
-            })
-        })
-        .collect()
 }
 
 fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> {
@@ -6512,15 +6561,6 @@ struct PlannedTask {
     task: TaskEnvelope,
     routing: RoutingDecision,
     plan_only: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct TaskStatusRow {
-    task_id: String,
-    state: String,
-    objective: String,
-    created_at: String,
-    updated_at: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -6837,8 +6877,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn profile_set_persists_one_override_and_reloads_effective_config() -> Result<()> {
+    #[tokio::test]
+    async fn profile_set_persists_one_override_and_reloads_effective_config() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -6853,7 +6893,8 @@ mod tests {
             "company-fable",
             Some(EffortName::High),
             true,
-        )?;
+        )
+        .await?;
 
         let reloaded = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
         let profiles = &reloaded.effective.config().orchestrator.model_profiles;
@@ -6862,8 +6903,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn profile_reset_reveals_the_compiled_preset() -> Result<()> {
+    #[tokio::test]
+    async fn profile_reset_reveals_the_compiled_preset() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -6877,7 +6918,8 @@ mod tests {
             "company-gemini",
             None,
             true,
-        )?;
+        )
+        .await?;
         let runtime = load_config_runtime(&root, None, environment.clone())?;
         reset_model_profile(
             &root,
@@ -6887,7 +6929,8 @@ mod tests {
             ProviderName::Gemini,
             ProfileName::Standard,
             true,
-        )?;
+        )
+        .await?;
 
         let reloaded = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
         assert_eq!(
@@ -7121,8 +7164,8 @@ mod tests {
         assert!(example.contains("orchestrator.model_profiles.agy.premium"));
     }
 
-    #[test]
-    fn provider_enable_adds_only_the_requested_agy_boolean() -> Result<()> {
+    #[tokio::test]
+    async fn provider_enable_adds_only_the_requested_agy_boolean() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -7135,7 +7178,8 @@ mod tests {
             ProviderId::Agy,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         let persisted = fs::read_to_string(&runtime.explicit_edit_path)?.parse::<DocumentMut>()?;
         let providers = persisted["orchestrator"]["providers"]
@@ -7150,8 +7194,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn repository_provider_edit_preserves_global_comments() -> Result<()> {
+    #[tokio::test]
+    async fn repository_provider_edit_preserves_global_comments() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let global = root.join("home/config.toml");
         fs::create_dir_all(
@@ -7176,15 +7220,16 @@ mod tests {
             ProviderId::Claude,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         assert_eq!(fs::read_to_string(global)?, original);
         assert!(runtime.explicit_edit_path.exists());
         Ok(())
     }
 
-    #[test]
-    fn provider_edit_targets_the_environment_override() -> Result<()> {
+    #[tokio::test]
+    async fn provider_edit_targets_the_environment_override() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment_path = root.join("environment.toml");
         fs::write(
@@ -7206,7 +7251,8 @@ mod tests {
             ProviderId::Gemini,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         let persisted = fs::read_to_string(environment_path)?;
         assert!(persisted.starts_with("# environment comment\n"));
@@ -7230,8 +7276,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
+    #[tokio::test]
+    async fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let legacy = root.join(".codex/orchestrator/config.toml");
         write_layer(&legacy, 3)?;
@@ -7246,7 +7292,8 @@ mod tests {
             ProviderId::Codex,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         assert!(fs::read_to_string(&legacy)?.contains("enabled = false"));
         assert!(!root.join(".colay/config.toml").exists());

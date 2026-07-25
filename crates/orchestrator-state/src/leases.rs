@@ -1,7 +1,7 @@
 use std::str::FromStr as _;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use orchestrator_domain::{ProviderId, TaskId};
+use orchestrator_domain::{DaemonInstanceId, ProviderId, TaskId};
 use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,6 +28,18 @@ pub struct CoordinatorLeaseRequest {
     pub owner_id: Uuid,
     pub acquired_at: DateTime<Utc>,
     pub ttl: TimeDelta,
+}
+
+/// Result of reconciling a resume request against authoritative daemon and worker ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeDisposition {
+    /// The healthy current daemon already owns the active task; callers must attach.
+    Attached,
+    /// No active process ownership remains and replay from persisted state is safe.
+    Requeued,
+    /// Process ownership is external or uncertain, so implicit takeover is forbidden.
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +284,72 @@ impl $database {
             .optional()?;
         transaction.commit()?;
         Ok(lease)
+    }
+
+    /// Reconciles resume ownership without ever acquiring a second coordinator lease.
+    pub fn resume_disposition(
+        &self,
+        task_id: TaskId,
+        daemon_instance_id: DaemonInstanceId,
+        now: DateTime<Utc>,
+    ) -> StateResult<ResumeDisposition> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire_stale_leases(&transaction, now)?;
+        let schedule_owner = transaction
+            .query_row(
+                "SELECT daemon_instance_id FROM task_schedule_claims \
+                 WHERE task_id = ?1 AND released_at IS NULL AND expires_at > ?2 \
+                 ORDER BY acquired_at DESC LIMIT 1",
+                params![task_id.to_string(), now.to_rfc3339()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let coordinator = transaction
+            .query_row(
+                "SELECT lease_id, task_id, worktree_id, owner_id, acquired_at, renewed_at, \
+                 expires_at, released_at FROM coordinator_leases \
+                 WHERE task_id = ?1 AND released_at IS NULL",
+                [task_id.to_string()],
+                map_coordinator,
+            )
+            .optional()?;
+        let disposition = if let Some(schedule_owner) = schedule_owner {
+            if schedule_owner == daemon_instance_id.to_string() {
+                ResumeDisposition::Attached
+            } else {
+                ResumeDisposition::Rejected
+            }
+        } else if let Some(coordinator) = coordinator {
+            if coordinator.owner_id == daemon_instance_id.into_uuid() {
+                ResumeDisposition::Attached
+            } else {
+                ResumeDisposition::Rejected
+            }
+        } else if row_exists(
+            &transaction,
+            "SELECT EXISTS(SELECT 1 FROM worker_leases \
+             WHERE task_id = ?1 AND released_at IS NULL)",
+            &task_id.to_string(),
+        )? {
+            ResumeDisposition::Rejected
+        } else {
+            let state = transaction
+                .query_row(
+                    "SELECT state FROM tasks WHERE task_id = ?1",
+                    [task_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match state.as_deref() {
+                Some("queued" | "analyzing" | "planned" | "checkpointed" | "blocked") => {
+                    ResumeDisposition::Requeued
+                }
+                _ => ResumeDisposition::Rejected,
+            }
+        };
+        transaction.commit()?;
+        Ok(disposition)
     }
 
     /// Acquires a child provider lease under an active coordinator.

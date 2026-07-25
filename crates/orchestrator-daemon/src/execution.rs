@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use chrono::{TimeDelta, Utc};
 use orchestrator_domain::{
     CorrelationId, DaemonInstanceId, EventActor, EventId, EventType, ProviderId, SchemaVersion,
-    TaskEvent, TaskInstructionState, TaskState, TransitionGuards, WorkerOutcome,
+    TaskEvent, TaskId, TaskInstructionState, TaskState, TransitionGuards, WorkerOutcome,
 };
 use orchestrator_engine::{
     GitWorktree, TaskExecutionReport, TaskExecutionRequest, TaskExecutor, canonicalize_directory,
@@ -12,6 +12,7 @@ use orchestrator_state::{
     ClaimReadyTaskRequest, ClaimedTask, Database, NewTaskAttemptRecord, NewWorktreeRecord,
     WorkspaceDatabase, WorkspaceId,
 };
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{DaemonError, MessageRedactor};
@@ -24,6 +25,35 @@ pub struct ExecutionServices {
     pub global_limit: usize,
     pub provider_limits: BTreeMap<ProviderId, usize>,
     pub claim_ttl: TimeDelta,
+}
+
+/// A revision-cursor snapshot emitted when a CLI attaches to a task already owned by this
+/// daemon. Re-reading after `revision` changes is replay-safe and never creates a worker attempt.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ActiveTaskStatus {
+    pub task_id: TaskId,
+    pub state: TaskState,
+    pub revision: u64,
+    pub attempt_count: usize,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+pub(crate) fn active_task_status(
+    database: &Database,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+) -> orchestrator_state::StateResult<Option<ActiveTaskStatus>> {
+    let workspace = database.workspace(workspace_id);
+    let Some(task) = workspace.load_task(task_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(ActiveTaskStatus {
+        task_id,
+        state: task.state,
+        revision: task.revision,
+        attempt_count: workspace.list_task_attempts(task_id)?.len(),
+        updated_at: task.updated_at,
+    }))
 }
 
 pub(crate) fn validate_execution_services(services: &ExecutionServices) -> Result<(), DaemonError> {

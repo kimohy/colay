@@ -2,12 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     path::Path,
-    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
 use orchestrator_daemon::{
@@ -19,16 +18,15 @@ use orchestrator_engine::{
     ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
     GitIntegrationManager, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
 };
-use orchestrator_process::{RedactionConfig, Redactor, terminate_child_tree};
+use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{
     ConfigEnvironment, ConfigRequest, DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database,
-    EventLog, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig, StateEnvironment,
+    GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig, StateEnvironment,
     WorkspaceId, load_effective_config,
 };
 use serde::Serialize;
 use serde_json::json;
-use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::DaemonAction;
@@ -37,14 +35,8 @@ use colay::conversation_orchestrator::OfficialCliConversationOrchestrator;
 use colay::task_executor::OfficialCliTaskExecutor;
 use colay::task_planner::OfficialCliTaskPlanner;
 
-const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const STARTUP_MARGIN: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-struct SpawnedDaemon {
-    child: Child,
-    pid: u32,
-}
 
 pub async fn run(
     repository: &Path,
@@ -156,88 +148,7 @@ impl GlobalDaemonBootstrap {
     }
 }
 
-pub(crate) async fn ensure_started(
-    repository: &Path,
-    config: &RootConfig,
-    explicit_config: Option<&Path>,
-) -> Result<DaemonStatus> {
-    let paths = RepositoryStatePaths::from_config(repository, config)?;
-    let (database, _) = initialize_database(&paths, repository)?;
-    if let DaemonStatus::Online(instance) = database.daemon_status(Utc::now())? {
-        return Ok(DaemonStatus::Online(instance));
-    }
-
-    let mut spawned = spawn_server(repository, explicit_config)?;
-    let startup_timeout = startup_timeout(config);
-    let deadline = Instant::now() + startup_timeout;
-    loop {
-        match database.daemon_status(Utc::now())? {
-            online @ DaemonStatus::Online(_) => return Ok(online),
-            DaemonStatus::Booting(_)
-            | DaemonStatus::Probing(_)
-            | DaemonStatus::Failed(_)
-            | DaemonStatus::Stopped
-            | DaemonStatus::Stale(_) => {}
-        }
-        if let Some(exit) = spawned
-            .child
-            .try_wait()
-            .context("cannot inspect daemon child")?
-        {
-            fail_and_release_spawned_lease(
-                &database,
-                spawned.pid,
-                "daemon child exited during startup",
-            )?;
-            let diagnostic = database
-                .daemon_startup_diagnostic_for_pid(spawned.pid)?
-                .unwrap_or_default();
-            bail!(
-                "daemon child exited before becoming healthy: {exit}{}",
-                format_startup_diagnostic(&diagnostic)
-            );
-        }
-        if Instant::now() >= deadline {
-            let status = database.daemon_status(Utc::now())?;
-            if let online @ DaemonStatus::Online(_) = status {
-                return Ok(online);
-            }
-            let phase = daemon_phase_name(&status);
-            let (_, tree_error) = terminate_child_tree(&mut spawned.child)
-                .await
-                .context("cannot terminate timed-out daemon child")?;
-            fail_and_release_spawned_lease(
-                &database,
-                spawned.pid,
-                "daemon startup exceeded its bounded deadline",
-            )?;
-            let diagnostic = database
-                .daemon_startup_diagnostic_for_pid(spawned.pid)?
-                .unwrap_or_default();
-            let tree_error = tree_error
-                .map(|error| format!("; process-tree cleanup warning: {error}"))
-                .unwrap_or_default();
-            bail!(
-                "daemon did not become online within {} seconds (last phase: {phase}){tree_error}{}",
-                startup_timeout.as_secs(),
-                format_startup_diagnostic(&diagnostic)
-            );
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
-
-fn daemon_phase_name(status: &DaemonStatus) -> &'static str {
-    match status {
-        DaemonStatus::Stopped => "stopped",
-        DaemonStatus::Booting(_) => "booting",
-        DaemonStatus::Probing(_) => "probing",
-        DaemonStatus::Online(_) => "online",
-        DaemonStatus::Failed(_) => "failed",
-        DaemonStatus::Stale(_) => "stale",
-    }
-}
-
+#[cfg(test)]
 fn fail_and_release_spawned_lease(database: &Database, pid: u32, diagnostic: &str) -> Result<()> {
     let instance = match database.daemon_status(Utc::now())? {
         DaemonStatus::Booting(instance)
@@ -262,31 +173,6 @@ fn fail_and_release_spawned_lease(database: &Database, pid: u32, diagnostic: &st
         database.release_daemon(instance.instance_id, Utc::now())?;
     }
     Ok(())
-}
-
-fn format_startup_diagnostic(diagnostic: &str) -> String {
-    if diagnostic.is_empty() {
-        String::new()
-    } else {
-        format!("; startup diagnostic: {diagnostic}")
-    }
-}
-
-fn startup_timeout(config: &RootConfig) -> Duration {
-    let providers = &config.orchestrator.providers;
-    let enabled_count = [
-        providers.gemini.as_ref(),
-        providers.agy.as_ref(),
-        providers.codex.as_ref(),
-        providers.claude.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|provider| provider.enabled)
-    .count();
-    let probe_budget =
-        PROVIDER_PROBE_TIMEOUT.saturating_mul(u32::try_from(enabled_count).unwrap_or(u32::MAX));
-    probe_budget.saturating_add(STARTUP_MARGIN)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -649,75 +535,6 @@ async fn stop_global(repository: &Path) -> Result<DaemonStatus> {
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
-
-pub(crate) fn initialize_database(
-    paths: &RepositoryStatePaths,
-    repository: &Path,
-) -> Result<(Database, WorkspaceId)> {
-    let database = Database::open(&paths.database)?;
-    database.migrate_with_backup(&paths.backups)?;
-    let workspace_id = database
-        .resolve_repository_workspace(repository)?
-        .workspace_id;
-    let workspace = database.workspace(workspace_id);
-    EventLog::open(&paths.events)?.reconcile_workspace(&workspace)?;
-    Ok((database, workspace_id))
-}
-
-pub(crate) fn open_ready_database(paths: &RepositoryStatePaths) -> Result<Database> {
-    if !paths.database.exists() {
-        bail!(
-            "state database does not exist at {}; run `colay init` or `colay daemon start`",
-            paths.database.display()
-        );
-    }
-    let database = Database::open(&paths.database)?;
-    let migration = database.migration_status()?;
-    if !migration.pending_versions.is_empty() {
-        bail!(
-            "state schema migration is required ({:?}); run `colay migrate apply`",
-            migration.pending_versions
-        );
-    }
-    Ok(database)
-}
-
-fn spawn_server(repository: &Path, explicit_config: Option<&Path>) -> Result<SpawnedDaemon> {
-    let executable = std::env::current_exe().context("cannot resolve current colay executable")?;
-    let mut command = Command::new(executable);
-    if let Some(config) = explicit_config {
-        command.arg("--config").arg(config);
-    }
-    command
-        .arg("daemon")
-        .arg("serve")
-        .current_dir(repository)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    configure_background_process(&mut command);
-    let child = command.spawn().context("cannot spawn repository daemon")?;
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("spawned repository daemon has no process ID"))?;
-    Ok(SpawnedDaemon { child, pid })
-}
-
-#[cfg(windows)]
-fn configure_background_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(unix)]
-fn configure_background_process(command: &mut Command) {
-    command.process_group(0);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_background_process(_command: &mut Command) {}
 
 struct ProcessMessageRedactor(Redactor);
 
