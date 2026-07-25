@@ -18,6 +18,23 @@ pub enum ClientCommandRecoveryDisposition {
 macro_rules! impl_workspace_database {
     ($database:ty) => {
 impl $database {
+    pub fn client_command_is_plan_only(
+        &self,
+        command_id: ClientCommandId,
+    ) -> StateResult<bool> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT plan_only FROM client_command_invocations WHERE command_id = ?1",
+                    [command_id.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .map(|value| value.unwrap_or(false))
+                .map_err(StateError::from)
+        })
+    }
+
     pub fn load_client_command(
         &self,
         command_id: ClientCommandId,
@@ -57,6 +74,14 @@ impl $database {
     }
 
     pub fn submit_client_command(&self, command: &ClientCommand) -> StateResult<ClientCommand> {
+        self.submit_client_command_with_invocation(command, false)
+    }
+
+    pub fn submit_client_command_with_invocation(
+        &self,
+        command: &ClientCommand,
+        plan_only: bool,
+    ) -> StateResult<ClientCommand> {
         command
             .validate()
             .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
@@ -65,30 +90,70 @@ impl $database {
                 "new client command must be pending".to_owned(),
             ));
         }
-
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = load_by_idempotency_key(&transaction, &command.idempotency_key)? {
             ensure_idempotent_match(&existing, command)?;
+            ensure_invocation_match(
+                &transaction,
+                existing.command_id,
+                existing.command_id,
+                plan_only,
+            )?;
             transaction.commit()?;
             return Ok(existing);
         }
+        insert_pending_command(&transaction, command)?;
+        insert_command_invocation(
+            &transaction,
+            command.command_id,
+            command.command_id,
+            plan_only,
+            command.requested_at,
+        )?;
+        transaction.commit()?;
+        Ok(command.clone())
+    }
 
-        transaction.execute(
-            "INSERT INTO main.client_commands(
-                command_id, session_id, task_id, action, payload_json, idempotency_key, state,
-                requested_by, requested_at, claimed_at, completed_at, outcome
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, NULL, NULL, NULL)",
-            params![
-                command.command_id.to_string(),
-                command.session_id.map(|value| value.to_string()),
-                command.task_id.map(|value| value.to_string()),
-                action_name(command.action),
-                serde_json::to_string(&command.payload)?,
-                command.idempotency_key,
-                command.requested_by,
-                command.requested_at.to_rfc3339(),
-            ],
+    pub fn submit_derived_client_command(
+        &self,
+        source_command_id: ClientCommandId,
+        command: &ClientCommand,
+    ) -> StateResult<ClientCommand> {
+        command
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        if command.state != ClientCommandState::Pending {
+            return Err(StateError::InvalidRecord(
+                "new client command must be pending".to_owned(),
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (root_command_id, plan_only) = load_command_invocation(&transaction, source_command_id)?
+            .ok_or_else(|| {
+                StateError::InvalidRecord(
+                    "derived client command source has no invocation provenance".to_owned(),
+                )
+            })?;
+        if let Some(existing) = load_by_idempotency_key(&transaction, &command.idempotency_key)? {
+            ensure_idempotent_match(&existing, command)?;
+            ensure_invocation_match(
+                &transaction,
+                existing.command_id,
+                root_command_id,
+                plan_only,
+            )?;
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        insert_pending_command(&transaction, command)?;
+        insert_command_invocation(
+            &transaction,
+            command.command_id,
+            root_command_id,
+            plan_only,
+            command.requested_at,
         )?;
         transaction.commit()?;
         Ok(command.clone())
@@ -369,6 +434,89 @@ fn load_by_idempotency_key(
         )
         .optional()
         .map_err(StateError::from)
+}
+
+fn insert_pending_command(
+    transaction: &Transaction<'_>,
+    command: &ClientCommand,
+) -> StateResult<()> {
+    transaction.execute(
+        "INSERT INTO main.client_commands(
+            command_id, session_id, task_id, action, payload_json, idempotency_key, state,
+            requested_by, requested_at, claimed_at, completed_at, outcome
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, NULL, NULL, NULL)",
+        params![
+            command.command_id.to_string(),
+            command.session_id.map(|value| value.to_string()),
+            command.task_id.map(|value| value.to_string()),
+            action_name(command.action),
+            serde_json::to_string(&command.payload)?,
+            command.idempotency_key,
+            command.requested_by,
+            command.requested_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_command_invocation(
+    transaction: &Transaction<'_>,
+    command_id: ClientCommandId,
+    root_command_id: ClientCommandId,
+    plan_only: bool,
+    recorded_at: DateTime<Utc>,
+) -> StateResult<()> {
+    transaction.execute(
+        "INSERT INTO main.client_command_invocations(
+            command_id, root_command_id, plan_only, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            command_id.to_string(),
+            root_command_id.to_string(),
+            plan_only,
+            recorded_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_command_invocation(
+    transaction: &Transaction<'_>,
+    command_id: ClientCommandId,
+) -> StateResult<Option<(ClientCommandId, bool)>> {
+    let stored = transaction
+        .query_row(
+            "SELECT root_command_id, plan_only FROM client_command_invocations
+             WHERE command_id = ?1",
+            [command_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?;
+    stored
+        .map(|(root_command_id, plan_only)| {
+            ClientCommandId::from_str(&root_command_id)
+                .map(|root_command_id| (root_command_id, plan_only))
+                .map_err(|error| StateError::InvalidRecord(error.to_string()))
+        })
+        .transpose()
+}
+
+fn ensure_invocation_match(
+    transaction: &Transaction<'_>,
+    command_id: ClientCommandId,
+    root_command_id: ClientCommandId,
+    plan_only: bool,
+) -> StateResult<()> {
+    match load_command_invocation(transaction, command_id)? {
+        Some((stored_root, stored_plan_only))
+            if stored_root == root_command_id && stored_plan_only == plan_only =>
+        {
+            Ok(())
+        }
+        _ => Err(StateError::InvalidRecord(
+            "idempotent client command invocation provenance does not match".to_owned(),
+        )),
+    }
 }
 
 fn ensure_idempotent_match(existing: &ClientCommand, submitted: &ClientCommand) -> StateResult<()> {

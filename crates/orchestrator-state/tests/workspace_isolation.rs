@@ -16,6 +16,7 @@ const WORKSPACE_TABLES: &[&str] = &[
     "changed_files",
     "checkpoints",
     "client_commands",
+    "client_command_invocations",
     "command_evidence",
     "conversation_attempts",
     "conversation_messages",

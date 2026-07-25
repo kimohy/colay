@@ -180,8 +180,10 @@ fn append_message(
     if let Some(existing) = database.load_message(payload.message_id)? {
         if existing == expected {
             if command.task_id.is_none() {
-                database
-                    .submit_client_command(&conversation_command(command, payload.message_id)?)?;
+                database.submit_derived_client_command(
+                    command.command_id,
+                    &conversation_command(command, payload.message_id)?,
+                )?;
             }
             return Ok(format!("message:{}", payload.message_id));
         }
@@ -206,6 +208,7 @@ fn append_message(
             .append_session_message_and_queue_conversation(
                 &expected,
                 event,
+                command.command_id,
                 &conversation_command(command, payload.message_id)?,
             )
             .map(|_| ())

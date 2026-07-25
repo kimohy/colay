@@ -416,6 +416,30 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     assert_eq!(completed_counts.0, 2);
     assert_eq!(completed_counts.1, 2);
     assert_eq!(completed_counts.3, 1);
+    let global_worktree_root = fs::canonicalize(
+        fixture
+            .colay_home
+            .join("data/workspaces")
+            .join(workspace_id.to_string())
+            .join("worktrees"),
+    )?;
+    let worktree_paths = with_workspace(&database_path, &workspace, |connection| {
+        let mut statement = connection.prepare("SELECT worktree_path FROM worktrees")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    })?;
+    assert_eq!(worktree_paths.len(), 2);
+    let worktree_paths = worktree_paths
+        .iter()
+        .map(fs::canonicalize)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        worktree_paths
+            .iter()
+            .all(|path| path.starts_with(&global_worktree_root))
+    );
 
     drop(database);
     let reopened = fixture.database()?;

@@ -3,10 +3,10 @@ use std::{path::PathBuf, sync::Arc};
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
     ApproveGraphCommandPayload, ClientCommand, ClientCommandAction, ConversationMessage,
-    CorrelationId, EventActor, EventId, EventType, GraphRevisionId, GraphValidationAuthority,
-    GraphValidationPolicy, MessageId, MessageKind, MessageRole, MessageState, PlanningAttemptId,
-    ProviderId, RepoValidationEvidence, RequestPlanCommandPayload, SandboxMode, SchemaVersion,
-    SessionId, SessionState, TaskEvent, ValidatedTaskGraph, canonical_sha256,
+    CorrelationId, EventActor, EventId, EventType, GraphAuthorityPromotion, GraphRevisionId,
+    GraphValidationAuthority, GraphValidationPolicy, MessageId, MessageKind, MessageRole,
+    MessageState, PlanningAttemptId, ProviderId, RepoValidationEvidence, RequestPlanCommandPayload,
+    SandboxMode, SchemaVersion, SessionId, SessionState, TaskEvent, ValidatedTaskGraph,
     validate_task_graph_with_authority,
 };
 use orchestrator_engine::{
@@ -23,7 +23,6 @@ use crate::{CommandProcessingResult, DaemonError, MessageRedactor};
 const DEFERRED_BASE_COMMIT: &str = "0000000000000000000000000000000000000000";
 const DEFERRED_GIT_ROOT: &str = "deferred until exact writable approval";
 const DEFERRED_GIT_CHECK: &str = "writable_git_preflight_deferred";
-const PLAN_ONLY_REQUESTER: &str = "local-cli-run-plan-only";
 
 #[derive(Clone)]
 pub struct PlanningServices {
@@ -180,7 +179,7 @@ async fn request_plan(
         goal_message_id: payload.goal_message_id,
         goal_redacted: goal.content_redacted,
         repository_summary_redacted: "repository-local Rust workspace".to_owned(),
-        validation_policy: services.validation_policy.clone(),
+        validation_policy: structural_validation_policy(),
         sandbox: SandboxMode::ReadOnly,
     };
     let completed_at = Utc::now();
@@ -351,6 +350,7 @@ async fn validate_candidate_authority(
     {
         required_approvals.push("recorded risk acknowledgement".to_owned());
     }
+    let structural_policy = structural_validation_policy();
     let evidence = RepoValidationEvidence {
         schema_version: SchemaVersion::v1(),
         requirement_revision_id: requirement.requirement_revision_id,
@@ -364,20 +364,18 @@ async fn validate_candidate_authority(
             || DEFERRED_BASE_COMMIT.to_owned(),
             |readiness| readiness.base_commit.clone(),
         ),
-        eligible_providers: services
-            .validation_policy
+        eligible_providers: structural_policy
             .eligible_providers
             .iter()
             .copied()
             .collect(),
-        eligible_profiles: services
-            .validation_policy
+        eligible_profiles: structural_policy
             .eligible_profiles
             .iter()
             .copied()
             .collect(),
-        max_parallel_workers: services.validation_policy.max_parallel_workers,
-        per_provider_limits: services.validation_policy.per_provider_limits.clone(),
+        max_parallel_workers: structural_policy.max_parallel_workers,
+        per_provider_limits: structural_policy.per_provider_limits.clone(),
         normalized_write_scopes,
         verification_plan: requirement.snapshot.verification_plan,
         required_approvals,
@@ -387,7 +385,7 @@ async fn validate_candidate_authority(
                 .map_or_else(|| DEFERRED_GIT_CHECK.to_owned(), |_| "git_ready".to_owned()),
             "graph_valid".to_owned(),
             "write_scopes_valid".to_owned(),
-            "provider_profile_eligible".to_owned(),
+            "provider_profile_structurally_declared".to_owned(),
             "verification_plan_present".to_owned(),
         ],
         validated_at,
@@ -403,8 +401,26 @@ async fn validate_candidate_authority(
         git_root_redacted: evidence.git_root_redacted.clone(),
         validation_checks: evidence.checks.clone(),
     };
-    validate_task_graph_with_authority(graph.proposal, &services.validation_policy, authority)
+    validate_task_graph_with_authority(graph.proposal, &structural_policy, authority)
         .map_err(|error| error.to_string())
+}
+
+fn structural_validation_policy() -> GraphValidationPolicy {
+    GraphValidationPolicy {
+        eligible_providers: std::collections::BTreeSet::from([
+            ProviderId::Agy,
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Gemini,
+        ]),
+        eligible_profiles: std::collections::BTreeSet::from([
+            orchestrator_domain::ModelProfile::Economy,
+            orchestrator_domain::ModelProfile::Standard,
+            orchestrator_domain::ModelProfile::Premium,
+        ]),
+        max_parallel_workers: 1,
+        per_provider_limits: std::collections::BTreeMap::new(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -428,7 +444,7 @@ async fn approve_graph(
     payload
         .validate()
         .map_err(|error| ExecutionError::Rejected(error.to_string()))?;
-    if command.requested_by == PLAN_ONLY_REQUESTER {
+    if database.client_command_is_plan_only(command.command_id)? {
         return Err(ExecutionError::Rejected(
             "plan-only run invocation cannot promote a graph; submit a later explicit exact approval"
                 .to_owned(),
@@ -478,21 +494,16 @@ async fn approve_graph(
     let proposal = revision.proposal.as_ref().ok_or_else(|| {
         ExecutionError::Rejected("approved graph revision has no proposal".to_owned())
     })?;
-    if proposal.nodes.iter().any(|node| {
-        !services
-            .validation_policy
-            .eligible_providers
-            .contains(&node.provider.unwrap_or(proposal.planner_provider))
-            || !services
-                .validation_policy
-                .eligible_profiles
-                .contains(&node.profile)
-    }) {
-        return Err(ExecutionError::Rejected(
-            "provider writable eligibility changed after graph validation; run provider diagnostics and request a new plan"
-                .to_owned(),
-        ));
-    }
+    validate_task_graph_with_authority(
+        proposal.clone(),
+        &services.validation_policy,
+        authority.clone(),
+    )
+    .map_err(|error| {
+        ExecutionError::Rejected(format!(
+            "current writable policy rejects the exact graph: {error}"
+        ))
+    })?;
     let readiness = inspect_git_repository(&services.repository_root)
         .await
         .map_err(|error| {
@@ -505,37 +516,30 @@ async fn approve_graph(
             "repository HEAD changed after validation; generate a new proposal".to_owned(),
         ));
     }
-    let materialization_authority = if authority_is_deferred(&authority) {
-        GraphValidationAuthority {
-            requirement_revision_id: authority.requirement_revision_id,
-            validation_hash: canonical_sha256(&serde_json::json!({
-                "graph_revision_id": revision.revision_id,
-                "proposal_hash": revision.proposal_hash,
-                "plan_validation_hash": authority.validation_hash,
-                "git_root_redacted": redactor.redact(
-                    &readiness.repository_root.to_string_lossy()
-                ),
-                "base_commit": readiness.base_commit,
-                "eligible_providers": services.validation_policy.eligible_providers,
-                "eligible_profiles": services.validation_policy.eligible_profiles,
-            }))
-            .map_err(|error| ExecutionError::Rejected(error.to_string()))?,
-            base_commit: readiness.base_commit,
+    let (materialization_authority, promotion) = if authority_is_deferred(&authority) {
+        let promotion = GraphAuthorityPromotion {
+            schema_version: SchemaVersion::v1(),
+            graph_revision_id: revision.revision_id,
+            proposal_hash: revision.proposal_hash.clone().ok_or_else(|| {
+                ExecutionError::Rejected("approved graph revision has no proposal hash".to_owned())
+            })?,
+            prior_authority: authority,
             git_root_redacted: redactor.redact(&readiness.repository_root.to_string_lossy()),
-            validation_checks: vec![
-                "git_ready".to_owned(),
-                "head_resolved".to_owned(),
-                "provider_profile_eligible".to_owned(),
-                "exact_graph_approval".to_owned(),
-            ],
-        }
+            base_commit: readiness.base_commit,
+            validation_policy: services.validation_policy.clone(),
+        };
+        let promoted = promotion
+            .promoted_authority()
+            .map_err(|error| ExecutionError::Rejected(error.to_string()))?;
+        (promoted, Some(promotion))
     } else {
-        authority
+        (authority, None)
     };
     let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: payload.revision_id,
         expected_proposal_hash: payload.proposal_hash,
         authority: Some(materialization_authority),
+        promotion,
         approved_by: payload.approved_by,
         approved_at: now,
     })?;

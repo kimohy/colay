@@ -7,8 +7,11 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use orchestrator_domain::{
-    GraphRevisionId, GraphValidationPolicy, MessageId, ModelProfile, PlanningAttemptId, ProviderId,
-    RepoPath, SchemaVersion, SessionId, TaskGraphNode, TaskGraphProposal, validate_task_graph,
+    GraphAuthorityPromotion, GraphRevisionId, GraphValidationAuthority, GraphValidationPolicy,
+    MessageId, ModelProfile, PlanningAttemptId, ProviderId, RepoPath, RequirementRevision,
+    RequirementRevisionId, RequirementSnapshot, SchemaVersion, SessionId, TaskGraphNode,
+    TaskGraphProposal, VerificationCommand, validate_task_graph,
+    validate_task_graph_with_authority,
 };
 use orchestrator_state::{
     ApprovedGraph, Database, GraphApprovalRequest, GraphRevisionStatus, NewGraphAttempt,
@@ -182,6 +185,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
         revision_id: first.proposal.revision_id,
         expected_proposal_hash: "0".repeat(64),
         authority: None,
+        promotion: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(5),
     });
@@ -191,6 +195,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
         revision_id: first.proposal.revision_id,
         expected_proposal_hash: first.proposal_hash.clone(),
         authority: None,
+        promotion: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(5),
     })?;
@@ -201,6 +206,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
             revision_id: first.proposal.revision_id,
             expected_proposal_hash: first.proposal_hash.clone(),
             authority: None,
+            promotion: None,
             approved_by: "tester".to_owned(),
             approved_at: timestamp(5),
         })?;
@@ -257,6 +263,7 @@ fn exact_current_hash_approval_materializes_once_and_wrong_or_stale_hashes_fail_
                 revision_id: stale_revision_id,
                 expected_proposal_hash: stale_hash,
                 authority: None,
+                promotion: None,
                 approved_by: "tester".to_owned(),
                 approved_at: timestamp(8),
             })
@@ -288,8 +295,9 @@ fn newer_session_message_invalidates_pending_graph_approval()
 
     let approval = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: graph.proposal.revision_id,
-        expected_proposal_hash: graph.proposal_hash,
+        expected_proposal_hash: graph.proposal_hash.clone(),
         authority: None,
+        promotion: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(4),
     });
@@ -335,6 +343,7 @@ fn agy_planner_and_worker_provider_round_trip_through_graph_materialization()
         revision_id: graph.proposal.revision_id,
         expected_proposal_hash: graph.proposal_hash,
         authority: None,
+        promotion: None,
         approved_by: "tester".to_owned(),
         approved_at: timestamp(5),
     })?;
@@ -376,6 +385,7 @@ fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
                 authority: None,
+                promotion: None,
                 approved_by: "tester".to_owned(),
                 approved_at: timestamp(8),
             })
@@ -402,6 +412,94 @@ fn approval_is_atomic_when_dependency_insert_fails() -> Result<(), Box<dyn std::
         let events: i64 =
             connection.query_row("SELECT count(*) FROM task_events", [], |row| row.get(0))?;
         assert_eq!(events, 1, "approval events escaped the rollback");
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn forged_deferred_authority_promotion_is_rejected_at_state_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id) = database()?;
+    let database_path = database.path().to_path_buf();
+    let database = database.workspace(workspace_id);
+    let session_id = SessionId::new();
+    let goal_id = MessageId::new();
+    seed_session(&database_path, &database, session_id, goal_id)?;
+    let proposal = validated_graph(session_id, goal_id).proposal;
+    let requirement_revision_id = RequirementRevisionId::new();
+    database.record_requirement_revision(&RequirementRevision::seal(
+        requirement_revision_id,
+        session_id,
+        goal_id,
+        1,
+        RequirementSnapshot {
+            objective: "bind approval authority".to_owned(),
+            in_scope: vec!["graph approval".to_owned()],
+            out_of_scope: Vec::new(),
+            constraints: Vec::new(),
+            acceptance_criteria: vec!["forgeries fail closed".to_owned()],
+            verification_plan: vec![VerificationCommand {
+                executable: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+            }],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        },
+        timestamp(1),
+    )?)?;
+    let deferred_authority = GraphValidationAuthority {
+        requirement_revision_id,
+        validation_hash: "b".repeat(64),
+        base_commit: "0".repeat(40),
+        git_root_redacted: "deferred until exact writable approval".to_owned(),
+        validation_checks: vec!["writable_git_preflight_deferred".to_owned()],
+    };
+    let promotion_policy = GraphValidationPolicy {
+        eligible_providers: BTreeSet::from([ProviderId::Codex]),
+        eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+        max_parallel_workers: 2,
+        per_provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+    };
+    let graph = validate_task_graph_with_authority(
+        proposal,
+        &promotion_policy,
+        deferred_authority.clone(),
+    )?;
+    record_valid(&database, &graph)?;
+
+    let forged_authority = GraphValidationAuthority {
+        requirement_revision_id,
+        validation_hash: "f".repeat(64),
+        base_commit: "a".repeat(40),
+        git_root_redacted: "forged-root".to_owned(),
+        validation_checks: vec!["git_ready".to_owned()],
+    };
+    let approval = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
+        revision_id: graph.proposal.revision_id,
+        expected_proposal_hash: graph.proposal_hash.clone(),
+        authority: Some(forged_authority),
+        promotion: Some(GraphAuthorityPromotion {
+            schema_version: SchemaVersion::v1(),
+            graph_revision_id: graph.proposal.revision_id,
+            proposal_hash: graph.proposal_hash.clone(),
+            prior_authority: deferred_authority,
+            git_root_redacted: "forged-root".to_owned(),
+            base_commit: "a".repeat(40),
+            validation_policy: promotion_policy,
+        }),
+        approved_by: "tester".to_owned(),
+        approved_at: timestamp(8),
+    });
+
+    assert!(
+        approval.is_err(),
+        "forged promotion unexpectedly materialized tasks"
+    );
+    with_workspace_connection(&database_path, &database, |connection| {
+        let tasks: i64 =
+            connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
+        assert_eq!(tasks, 0);
         Ok(())
     })?;
     Ok(())

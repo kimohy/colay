@@ -2,10 +2,11 @@ use std::{collections::BTreeMap, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ConversationMessage, CorrelationId, EventActor, EventId, EventType, GraphRevisionId,
-    GraphValidationSummary, MessageId, MessageKind, MessageRole, MessageState, ModelProfile,
-    PlanningAttemptId, ProviderId, SchemaVersion, SessionId, TaskEnvelope, TaskEvent,
+    ConversationMessage, CorrelationId, EventActor, EventId, EventType, GraphAuthorityPromotion,
+    GraphRevisionId, GraphValidationSummary, MessageId, MessageKind, MessageRole, MessageState,
+    ModelProfile, PlanningAttemptId, ProviderId, SchemaVersion, SessionId, TaskEnvelope, TaskEvent,
     TaskGraphProposal, TaskId, TaskState, task_graph_proposal_hash,
+    validate_task_graph_with_authority,
 };
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,7 @@ pub struct GraphApprovalRequest {
     pub revision_id: GraphRevisionId,
     pub expected_proposal_hash: String,
     pub authority: Option<orchestrator_domain::GraphValidationAuthority>,
+    pub promotion: Option<GraphAuthorityPromotion>,
     pub approved_by: String,
     pub approved_at: DateTime<Utc>,
 }
@@ -488,16 +490,7 @@ impl $database {
                     request.revision_id
                 ))
             })?;
-        let stored_authority = authority_from_validation(&revision.validation);
-        if stored_authority != request.authority
-            && !stored_authority.as_ref().is_some_and(|stored| {
-                deferred_authority_can_promote(stored, request.authority.as_ref())
-            })
-        {
-            return Err(StateError::InvalidRecord(
-                "graph approval authority does not match the sealed graph validation".to_owned(),
-            ));
-        }
+        validate_approval_authority(&revision, request)?;
 
         if let Some((
             stored_hash,
@@ -770,36 +763,71 @@ impl_workspace_database!(WorkspaceDatabase<'_>);
 #[cfg(test)]
 impl_workspace_database!(crate::Database);
 
-fn deferred_authority_can_promote(
-    stored: &orchestrator_domain::GraphValidationAuthority,
-    promoted: Option<&orchestrator_domain::GraphValidationAuthority>,
-) -> bool {
+fn validate_approval_authority(
+    revision: &StoredGraphRevision,
+    request: &GraphApprovalRequest,
+) -> StateResult<()> {
     const DEFERRED_BASE_COMMIT: &str = "0000000000000000000000000000000000000000";
-    let Some(promoted) = promoted else {
-        return false;
+    const DEFERRED_GIT_ROOT: &str = "deferred until exact writable approval";
+    let stored = authority_from_validation(&revision.validation);
+    if stored == request.authority {
+        return if request.promotion.is_none() {
+            Ok(())
+        } else {
+            Err(StateError::InvalidRecord(
+                "unchanged graph approval authority cannot carry promotion evidence".to_owned(),
+            ))
+        };
+    }
+    let (Some(stored), Some(promotion), Some(requested)) = (
+        stored.as_ref(),
+        request.promotion.as_ref(),
+        request.authority.as_ref(),
+    ) else {
+        return Err(StateError::InvalidRecord(
+            "graph approval authority does not match the sealed graph validation".to_owned(),
+        ));
     };
-    stored.base_commit == DEFERRED_BASE_COMMIT
-        && stored
+    let proposal = revision.proposal.as_ref().ok_or_else(|| {
+        StateError::InvalidRecord("promoted graph revision has no proposal".to_owned())
+    })?;
+    let proposal_hash = revision.proposal_hash.as_deref().ok_or_else(|| {
+        StateError::InvalidRecord("promoted graph revision has no proposal hash".to_owned())
+    })?;
+    if stored.base_commit != DEFERRED_BASE_COMMIT
+        || stored.git_root_redacted != DEFERRED_GIT_ROOT
+        || !stored
             .validation_checks
             .iter()
             .any(|check| check == "writable_git_preflight_deferred")
-        && promoted.requirement_revision_id == stored.requirement_revision_id
-        && promoted.base_commit != DEFERRED_BASE_COMMIT
-        && matches!(promoted.base_commit.len(), 40 | 64)
-        && promoted
-            .base_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        && promoted.validation_hash.len() == 64
-        && promoted
-            .validation_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        && !promoted.git_root_redacted.trim().is_empty()
-        && promoted
-            .validation_checks
-            .iter()
-            .any(|check| check == "git_ready")
+        || promotion.graph_revision_id != revision.revision_id
+        || promotion.proposal_hash != proposal_hash
+        || promotion.proposal_hash != request.expected_proposal_hash
+        || &promotion.prior_authority != stored
+    {
+        return Err(StateError::InvalidRecord(
+            "graph authority promotion does not bind the stored deferred validation".to_owned(),
+        ));
+    }
+    let expected = promotion
+        .promoted_authority()
+        .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+    if &expected != requested {
+        return Err(StateError::InvalidRecord(
+            "graph authority promotion seal does not match the requested authority".to_owned(),
+        ));
+    }
+    validate_task_graph_with_authority(
+        proposal.clone(),
+        &promotion.validation_policy,
+        stored.clone(),
+    )
+    .map_err(|error| {
+        StateError::InvalidRecord(format!(
+            "graph authority promotion policy rejects the stored proposal: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn authority_from_validation(

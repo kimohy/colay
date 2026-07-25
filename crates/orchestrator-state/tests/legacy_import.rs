@@ -219,9 +219,10 @@ fn schema_v13_reserved_workspace_source_is_supported() -> TestResult {
     }
     let connection = Connection::open(&fixture.source.database)?;
     connection.execute_batch(
-        "DROP TABLE legacy_import_id_mappings; \
+        "DROP TABLE client_command_invocations; \
+         DROP TABLE legacy_import_id_mappings; \
          DROP TABLE legacy_imports; \
-         DELETE FROM schema_migrations WHERE version = 14; \
+         DELETE FROM schema_migrations WHERE version >= 14; \
          PRAGMA user_version = 13;",
     )?;
     drop(connection);
@@ -1082,9 +1083,10 @@ fn migrate_source_to_v13(fixture: &ImportFixture) -> TestResult {
         source.migrate_with_backup(&fixture.source.backups)?;
     }
     Connection::open(&fixture.source.database)?.execute_batch(
-        "DROP TABLE legacy_import_id_mappings; \
+        "DROP TABLE client_command_invocations; \
+         DROP TABLE legacy_import_id_mappings; \
          DROP TABLE legacy_imports; \
-         DELETE FROM schema_migrations WHERE version = 14; \
+         DELETE FROM schema_migrations WHERE version >= 14; \
          PRAGMA user_version = 13;",
     )?;
     Ok(())

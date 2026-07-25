@@ -73,7 +73,7 @@ pub(crate) async fn request_conversation_turn(
             started_at: command.requested_at,
         })?;
         let transcript = database
-            .messages_after(session_id, 0, 200)?
+            .latest_messages(session_id, 200)?
             .into_iter()
             .filter(|(_, message)| message.task_id.is_none())
             .map(|(_, message)| {
@@ -162,7 +162,10 @@ fn reconcile_outcome(
         .map_err(|error| ConversationCommandError::Rejected(error.to_string()))?;
         database.record_requirement_revision(&revision)?;
         if matches!(outcome, ConversationOutcome::WorktreeTaskCandidate { .. }) {
-            database.submit_client_command(&plan_command(command, source_message_id)?)?;
+            database.submit_derived_client_command(
+                command.command_id,
+                &plan_command(command, source_message_id)?,
+            )?;
         }
     }
     Ok(())

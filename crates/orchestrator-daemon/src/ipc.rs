@@ -431,7 +431,10 @@ async fn dispatch_request(
                 Err(_) => IpcResponse::failure(request_id, "workspace conversation is unavailable"),
             }
         }
-        "workspace.register" | "workspace.command.submit" | "daemon.stop" => {
+        "workspace.register"
+        | "workspace.command.submit"
+        | "workspace.run.submit"
+        | "daemon.stop" => {
             let request_id = request.request_id.clone();
             let (response, reply) = oneshot::channel();
             let command = WriterRequest { request, response };
@@ -492,7 +495,7 @@ fn workspace_conversation(database: &Database, request: &IpcRequest) -> Result<V
         .map_err(|error| IpcError::Protocol(error.to_string()))?;
     let workspace = database.workspace(workspace_id);
     let session = workspace.load_session(session_id)?;
-    let messages = workspace.messages_after(session_id, 0, 200)?;
+    let messages = workspace.latest_messages(session_id, 200)?;
     Ok(json!({
         "session": session,
         "messages": messages,
@@ -569,7 +572,8 @@ fn process_writer_request(
 ) -> IpcResponse {
     let result = match request.action.as_str() {
         "workspace.register" => register_workspace(database, paths, &request),
-        "workspace.command.submit" => submit_workspace_command(database, &request),
+        "workspace.command.submit" => submit_workspace_command(database, &request, false),
+        "workspace.run.submit" => submit_run_command(database, &request),
         "daemon.stop" => request_daemon_stop(database),
         _ => Err(IpcError::Protocol("unsupported writer action".to_owned())),
     };
@@ -579,7 +583,11 @@ fn process_writer_request(
     }
 }
 
-fn submit_workspace_command(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+fn submit_workspace_command(
+    database: &Database,
+    request: &IpcRequest,
+    plan_only: bool,
+) -> Result<Value, IpcError> {
     let workspace_id = request.workspace_id.ok_or_else(|| {
         IpcError::Protocol("workspace.command.submit requires a registered workspace".to_owned())
     })?;
@@ -588,10 +596,36 @@ fn submit_workspace_command(database: &Database, request: &IpcRequest) -> Result
             "workspace.command.submit targets an unknown workspace".to_owned(),
         ));
     }
-    let command = serde_json::from_value::<ClientCommand>(request.payload.clone())?;
+    let mut command = serde_json::from_value::<ClientCommand>(request.payload.clone())?;
+    "local-ipc-client".clone_into(&mut command.requested_by);
     let stored = database
         .workspace(workspace_id)
-        .submit_client_command(&command)?;
+        .submit_client_command_with_invocation(&command, plan_only)?;
+    Ok(json!({"command": stored}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCommandPayload {
+    command: ClientCommand,
+    plan_only: bool,
+}
+
+fn submit_run_command(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.run.submit requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<RunCommandPayload>(request.payload.clone())?;
+    if payload.command.action != orchestrator_domain::ClientCommandAction::AppendMessage {
+        return Err(IpcError::Protocol(
+            "workspace.run.submit requires an append-message command".to_owned(),
+        ));
+    }
+    let mut command = payload.command;
+    "local-cli-run".clone_into(&mut command.requested_by);
+    let stored = database
+        .workspace(workspace_id)
+        .submit_client_command_with_invocation(&command, payload.plan_only)?;
     Ok(json!({"command": stored}))
 }
 
@@ -648,10 +682,18 @@ fn request_daemon_stop(database: &Database) -> Result<Value, IpcError> {
 mod tests {
     use std::sync::Arc;
 
+    use chrono::Utc;
+    use orchestrator_domain::{
+        ConversationMessage, CorrelationId, EventActor, EventId, EventType, MessageId, MessageKind,
+        MessageRole, MessageState, SchemaVersion, SessionId, SessionState, TaskEvent,
+    };
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-    use super::{IpcResponse, MAX_REQUEST_BYTES, handle_connection};
-    use orchestrator_state::{Database, GlobalStatePaths};
+    use super::{
+        IPC_SCHEMA_VERSION, IpcRequest, IpcResponse, MAX_REQUEST_BYTES, handle_connection,
+        workspace_conversation,
+    };
+    use orchestrator_state::{Database, GlobalStatePaths, NewSessionRecord};
 
     #[tokio::test]
     async fn oversized_request_is_rejected_and_connection_is_closed()
@@ -686,6 +728,88 @@ mod tests {
             Some("IPC request exceeds the one MiB limit")
         );
         server_task.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_conversation_returns_latest_two_hundred_messages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let repository = tempfile::tempdir()?;
+        let workspace_id = database
+            .resolve_repository_workspace(repository.path())?
+            .workspace_id;
+        let session_id = SessionId::new();
+        let now = Utc::now();
+        let workspace = database.workspace(workspace_id);
+        workspace.create_session_with_event(
+            &NewSessionRecord {
+                session_id,
+                schema_version: SchemaVersion::V1.to_owned(),
+                title: "long IPC conversation".to_owned(),
+                state: SessionState::Drafting,
+                created_at: now,
+            },
+            TaskEvent {
+                schema_version: SchemaVersion::state_current(),
+                sequence: 0,
+                event_id: EventId::new(),
+                session_id: Some(session_id),
+                task_id: None,
+                occurred_at: now,
+                event_type: EventType::SessionCreated,
+                from_state: None,
+                to_state: None,
+                reason: None,
+                actor: EventActor::User,
+                correlation_id: CorrelationId::new(),
+                causation_id: None,
+                payload: serde_json::json!({}),
+                previous_hash: None,
+                event_hash: String::new(),
+            },
+        )?;
+        for ordinal in 1..=205 {
+            workspace.append_message(&ConversationMessage {
+                message_id: MessageId::new(),
+                session_id,
+                task_id: None,
+                role: MessageRole::User,
+                kind: MessageKind::UserMessage,
+                state: MessageState::Final,
+                content_redacted: if ordinal == 1 {
+                    "first-dropped-marker".to_owned()
+                } else {
+                    format!("message-{ordinal}")
+                },
+                created_at: now,
+                finalized_at: Some(now),
+            })?;
+        }
+        let response = workspace_conversation(
+            &database,
+            &IpcRequest {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "conversation-tail".to_owned(),
+                workspace_id: Some(workspace_id),
+                action: "workspace.conversation".to_owned(),
+                payload: serde_json::json!({"session_id": session_id}),
+            },
+        )?;
+        let messages = response["messages"]
+            .as_array()
+            .ok_or("messages are not an array")?;
+        assert_eq!(messages.len(), 200);
+        assert_eq!(messages.first().and_then(|item| item[0].as_u64()), Some(6));
+        assert_eq!(messages.last().and_then(|item| item[0].as_u64()), Some(205));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|item| item[1]["content_redacted"].as_str()),
+            Some("message-205")
+        );
+        assert!(!response.to_string().contains("first-dropped-marker"));
         Ok(())
     }
 }

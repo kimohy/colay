@@ -39,7 +39,8 @@ pub struct TaskGraphNode {
     pub parallel_safety: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphValidationPolicy {
     pub eligible_providers: BTreeSet<ProviderId>,
     pub eligible_profiles: BTreeSet<ModelProfile>,
@@ -68,6 +69,61 @@ pub struct GraphValidationAuthority {
     pub git_root_redacted: String,
     #[serde(default)]
     pub validation_checks: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphAuthorityPromotion {
+    pub schema_version: SchemaVersion,
+    pub graph_revision_id: GraphRevisionId,
+    pub proposal_hash: String,
+    pub prior_authority: GraphValidationAuthority,
+    pub git_root_redacted: String,
+    pub base_commit: String,
+    pub validation_policy: GraphValidationPolicy,
+}
+
+impl GraphAuthorityPromotion {
+    pub const VALIDATION_CHECKS: [&'static str; 4] = [
+        "git_ready",
+        "head_resolved",
+        "current_policy_validated",
+        "exact_graph_approval",
+    ];
+
+    /// Seals every value needed to promote deferred planning authority into writable authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity error when the evidence is malformed or cannot be serialized.
+    pub fn promoted_authority(&self) -> Result<GraphValidationAuthority, GraphValidationError> {
+        if self.schema_version != SchemaVersion::v1()
+            || !is_sha256(&self.proposal_hash)
+            || !is_sha256(&self.prior_authority.validation_hash)
+            || !matches!(self.base_commit.len(), 40 | 64)
+            || !self
+                .base_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.git_root_redacted.trim().is_empty()
+        {
+            return Err(GraphValidationError::InvalidAuthority);
+        }
+        Ok(GraphValidationAuthority {
+            requirement_revision_id: self.prior_authority.requirement_revision_id,
+            validation_hash: canonical_sha256(self).map_err(|error| {
+                GraphValidationError::Integrity {
+                    message: error.to_string(),
+                }
+            })?,
+            base_commit: self.base_commit.clone(),
+            git_root_redacted: self.git_root_redacted.clone(),
+            validation_checks: Self::VALIDATION_CHECKS
+                .iter()
+                .map(|check| (*check).to_owned())
+                .collect(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

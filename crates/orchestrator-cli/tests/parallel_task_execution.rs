@@ -199,6 +199,7 @@ fn seed_approved_graph(
         revision_id: graph.proposal.revision_id,
         expected_proposal_hash: graph.proposal_hash,
         authority: None,
+        promotion: None,
         approved_by: "parallel-e2e".to_owned(),
         approved_at: Utc::now(),
     })?;

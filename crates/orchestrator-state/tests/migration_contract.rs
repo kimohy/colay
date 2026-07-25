@@ -2,7 +2,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use orchestrator_domain::{
-    CorrelationId, EventActor, EventId, EventType, SchemaVersion, TaskEvent,
+    ClientCommandId, CorrelationId, EventActor, EventId, EventType, SchemaVersion, TaskEvent,
 };
 use orchestrator_state::{
     Database, MigrationManager, STATE_SCHEMA_VERSION, StateError, WorkspaceId,
@@ -51,7 +51,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(initial.current_version, 1);
     assert_eq!(
         initial.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     let dry_run = database.dry_run_migrations()?;
@@ -88,6 +88,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
             "conversation_attempts",
             "requirement_revisions",
             "session_requirement_heads",
+            "client_command_invocations",
             "workspaces",
             "workspace_paths",
             "legacy_imports",
@@ -119,8 +120,60 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(backup_status.current_version, 1);
     assert_eq!(
         backup_status.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
+    Ok(())
+}
+
+#[test]
+fn v14_plan_only_requester_is_backfilled_into_authoritative_invocation_fence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let database_path = directory.path().join("state.db");
+    let backup_directory = directory.path().join("backups");
+    let database = Database::open(&database_path)?;
+    database.migrate_with_backup(&backup_directory)?;
+    let workspace_root = directory.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root)?;
+    let workspace_id = database
+        .resolve_repository_workspace(&workspace_root)?
+        .workspace_id;
+    let command_id = ClientCommandId::new();
+    with_database_connection(&database, |connection| {
+        connection.execute_batch(
+            "DROP TABLE client_command_invocations;
+             DELETE FROM schema_migrations WHERE version = 15;
+             PRAGMA user_version = 14;",
+        )?;
+        connection.execute(
+            "INSERT INTO client_commands(
+                workspace_id, command_id, session_id, task_id, action, payload_json,
+                idempotency_key, state, requested_by, requested_at)
+             VALUES (?1, ?2, NULL, NULL, 'stop_daemon', '{}', ?3, 'pending',
+                     'local-cli-run-plan-only', ?4)",
+            params![
+                workspace_id.to_string(),
+                command_id.to_string(),
+                format!("plan-only-{command_id}"),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    })?;
+
+    database.migrate_with_backup(&backup_directory)?;
+
+    with_database_connection(&database, |connection| {
+        let (root_command_id, plan_only): (String, bool) = connection.query_row(
+            "SELECT root_command_id, plan_only FROM client_command_invocations
+             WHERE command_id = ?1",
+            [command_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(root_command_id, command_id.to_string());
+        assert!(plan_only);
+        Ok(())
+    })?;
     Ok(())
 }
 

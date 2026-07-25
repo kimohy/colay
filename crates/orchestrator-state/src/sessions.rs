@@ -248,6 +248,7 @@ impl $database {
         &self,
         message: &ConversationMessage,
         mut event: TaskEvent,
+        source_command_id: orchestrator_domain::ClientCommandId,
         command: &ClientCommand,
     ) -> StateResult<u64> {
         message
@@ -286,6 +287,22 @@ impl $database {
                     command.requested_at.to_rfc3339(),
                 ],
             )?;
+            let copied_invocations = transaction.execute(
+                "INSERT INTO main.client_command_invocations(
+                    command_id, root_command_id, plan_only, recorded_at)
+                 SELECT ?1, root_command_id, plan_only, ?2
+                 FROM client_command_invocations WHERE command_id = ?3",
+                params![
+                    command.command_id.to_string(),
+                    command.requested_at.to_rfc3339(),
+                    source_command_id.to_string(),
+                ],
+            )?;
+            if copied_invocations != 1 {
+                return Err(StateError::InvalidRecord(
+                    "conversation follow-up source has no invocation provenance".to_owned(),
+                ));
+            }
             append_event_in_transaction(transaction, &mut event)?;
             invalidate_pre_task_candidate_in_transaction(
                 transaction,
@@ -368,6 +385,26 @@ impl $database {
                 .query_map(params![session_id.to_string(), ordinal, limit], map_message)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(StateError::from)
+        })
+    }
+
+    pub fn latest_messages(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> StateResult<Vec<(u64, ConversationMessage)>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT ordinal, message_id, session_id, task_id, role, kind, state,
+                 content_redacted, created_at, finalized_at FROM conversation_messages
+                 WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT ?2",
+            )?;
+            let mut messages = statement
+                .query_map(params![session_id.to_string(), limit], map_message)?
+                .collect::<Result<Vec<_>, _>>()?;
+            messages.reverse();
+            Ok(messages)
         })
     }
 }
@@ -851,6 +888,41 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0], (1, first));
         assert_eq!(messages[1], (2, second));
+        Ok(())
+    }
+
+    #[test]
+    fn latest_messages_returns_the_tail_in_conversation_order() -> StateResult<()> {
+        let database = migrated_database();
+        let session = new_session("long conversation");
+        database.create_session_with_event(
+            &session,
+            session_event(session.session_id, EventType::SessionCreated),
+        )?;
+        for ordinal in 1..=205 {
+            database.append_message(&ConversationMessage {
+                message_id: MessageId::new(),
+                session_id: session.session_id,
+                task_id: None,
+                role: MessageRole::User,
+                kind: MessageKind::UserMessage,
+                state: MessageState::Final,
+                content_redacted: format!("message-{ordinal}"),
+                created_at: timestamp(),
+                finalized_at: Some(timestamp()),
+            })?;
+        }
+
+        let messages = database.latest_messages(session.session_id, 200)?;
+        assert_eq!(messages.len(), 200);
+        assert_eq!(messages.first().map(|(ordinal, _)| *ordinal), Some(6));
+        assert_eq!(messages.last().map(|(ordinal, _)| *ordinal), Some(205));
+        assert_eq!(
+            messages
+                .last()
+                .map(|(_, message)| message.content_redacted.as_str()),
+            Some("message-205")
+        );
         Ok(())
     }
 

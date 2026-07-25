@@ -1314,6 +1314,7 @@ mod tests {
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
                 authority: None,
+                promotion: None,
                 approved_by: "test".to_owned(),
                 approved_at: chrono::Utc::now(),
             })?;

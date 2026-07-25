@@ -77,7 +77,6 @@ const WORKER_LEASE_TTL_SECONDS: i64 = 20;
 const LEASE_RENEWAL_INTERVAL_SECONDS: u64 = 5;
 const RUN_SESSION_KEY: &str = "cli-run-session-v1";
 const RUN_REQUESTED_BY: &str = "local-cli-run";
-const RUN_PLAN_ONLY_REQUESTED_BY: &str = "local-cli-run-plan-only";
 const RUN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 
@@ -829,11 +828,6 @@ async fn run_conversation(
         crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
     let session_id = ensure_run_session(&client).await?;
     let message_id = MessageId::new();
-    let requested_by = if arguments.plan_only {
-        RUN_PLAN_ONLY_REQUESTED_BY
-    } else {
-        RUN_REQUESTED_BY
-    };
     let command = pending_client_command(
         Some(session_id),
         ClientCommandAction::AppendMessage,
@@ -842,10 +836,13 @@ async fn run_conversation(
             content,
         })?,
         format!("cli-run-message-{message_id}"),
-        requested_by,
+        RUN_REQUESTED_BY,
     );
     client
-        .request("workspace.command.submit", serde_json::to_value(&command)?)
+        .request(
+            "workspace.run.submit",
+            json!({"command": command, "plan_only": arguments.plan_only}),
+        )
         .await?;
     wait_for_client_command(&client, command.command_id).await?;
     let conversation_command_id = ClientCommandId::from_uuid(message_id.into_uuid());
