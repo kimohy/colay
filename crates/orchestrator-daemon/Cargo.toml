@@ -9,10 +9,12 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 hex.workspace = true
 orchestrator-domain = { path = "../orchestrator-domain" }
 orchestrator-engine = { path = "../orchestrator-engine" }
 orchestrator-state = { path = "../orchestrator-state" }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

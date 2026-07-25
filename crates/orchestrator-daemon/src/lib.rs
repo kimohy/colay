@@ -1,4 +1,4 @@
-//! Repository-local daemon heartbeat and shutdown loop.
+//! User-local daemon heartbeat, IPC, and orchestration loop.
 #![allow(clippy::missing_errors_doc)]
 #![cfg_attr(test, allow(clippy::panic))]
 
@@ -15,6 +15,7 @@ mod commands;
 mod conversation;
 mod execution;
 mod integration;
+mod ipc;
 mod planning;
 #[cfg(test)]
 mod test_support;
@@ -22,6 +23,9 @@ mod test_support;
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
 pub use execution::ExecutionServices;
 pub use integration::IntegrationServices;
+pub use ipc::{
+    DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, IpcServer, ipc_endpoint,
+};
 pub use planning::{PlanningServices, process_next_orchestration_command};
 
 #[derive(Clone, Copy, Debug)]

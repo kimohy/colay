@@ -116,8 +116,6 @@ impl Fixture {
                 String::from_utf8_lossy(&initialized.stderr)
             );
         }
-        let database = self.database()?;
-        database.resolve_repository_workspace(&self.repository)?;
         let mut config = RootConfig::default();
         config.features.codex_app_server_adapter = false;
         config.orchestrator.max_parallel_workers = 2;
@@ -137,7 +135,7 @@ impl Fixture {
     }
 
     fn database(&self) -> Result<Database> {
-        Database::open(self.repository.join(".colay/orchestrator.db")).map_err(Into::into)
+        Database::open(self.colay_home.join("state/state.db")).map_err(Into::into)
     }
 
     fn wait_online(&self) -> Result<()> {

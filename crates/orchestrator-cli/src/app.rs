@@ -45,10 +45,10 @@ use orchestrator_providers::{
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
     ControlAction, CoordinatorLease, CoordinatorLeaseRequest, DaemonStatus, Database,
-    EffectiveConfig, EventLog, LeaseRenewal, MigratableConfigDocument, NewTaskAttemptRecord,
-    NewWorktreeRecord, OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths,
-    RootConfig, StateError, TaskListFilter, WorkerLease, WorkerLeaseMode, WorkerLeaseRequest,
-    WorkspaceDatabase, load_effective_config,
+    EffectiveConfig, EventLog, GlobalStatePaths, LeaseRenewal, MigratableConfigDocument,
+    NewTaskAttemptRecord, NewWorktreeRecord, OrchestratorConfig, ProviderConfig,
+    RepositoryStatePaths as StatePaths, RootConfig, StateEnvironment, StateError, TaskListFilter,
+    WorkerLease, WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -415,7 +415,7 @@ fn configure_tracing() {
         .try_init();
 }
 
-fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> Result<()> {
+fn initialize(_repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> Result<()> {
     let config_path = &runtime.explicit_edit_path;
     if config_path.exists() {
         bail!("configuration already exists: {}", config_path.display());
@@ -432,20 +432,15 @@ fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> 
     }
     let document = CONFIG_TEMPLATE.parse::<DocumentMut>()?;
     save_override_atomic(&document, config_path)?;
-    let state = StatePaths::from_config(repository, runtime.effective.config())?;
-    let database = initialize_repository_state(&state)?;
-    let migration = database.migration_status()?;
-    let events = EventLog::open(&state.events)?;
-    let workspace = workspace_for_repository(&database, repository)?;
-    let reconciliation = events.reconcile_workspace(&workspace)?;
+    let state = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
     emit(
         json_output,
         "initialized",
         &json!({
             "config": config_path,
             "state_dir": state.root,
-            "migration": migration,
-            "event_log": reconciliation,
+            "migration": Value::Null,
+            "event_log": Value::Null,
             "provider_inference_started": false,
         }),
     )

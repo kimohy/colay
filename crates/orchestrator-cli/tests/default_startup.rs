@@ -4,8 +4,9 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 use anyhow::{Context as _, Result};
@@ -82,8 +83,9 @@ impl CliFixture {
         #[cfg(not(windows))]
         let system_root = system_root();
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_colay"));
-        command
+        let mut stdout = tempfile::tempfile()?;
+        let mut stderr = tempfile::tempfile()?;
+        let status = Command::new(env!("CARGO_BIN_EXE_colay"))
             .args(args)
             .current_dir(&self.repository)
             .env_clear()
@@ -93,8 +95,22 @@ impl CliFixture {
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
             .env("TEMP", &self.temp_root)
-            .env("TMP", &self.temp_root);
-        command.output().context("failed to invoke colay")
+            .env("TMP", &self.temp_root)
+            .stdout(Stdio::from(stdout.try_clone()?))
+            .stderr(Stdio::from(stderr.try_clone()?))
+            .status()
+            .context("failed to invoke colay")?;
+        stdout.seek(SeekFrom::Start(0))?;
+        stderr.seek(SeekFrom::Start(0))?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout.read_to_end(&mut stdout_bytes)?;
+        stderr.read_to_end(&mut stderr_bytes)?;
+        Ok(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
     }
 
     fn configure_fake_codex(&self) -> Result<()> {
@@ -272,6 +288,12 @@ fn first_plan_only_run_initializes_local_state() -> Result<()> {
     Ok(())
 }
 
+impl Drop for CliFixture {
+    fn drop(&mut self) {
+        let _ = self.colay(["daemon", "stop"]);
+    }
+}
+
 #[test]
 fn compatibility_and_status_do_not_create_repository_state() -> Result<()> {
     let fixture = CliFixture::new()?;
@@ -347,13 +369,10 @@ fn failed_event_reconciliation_blocks_retries_before_task_mutation() -> Result<(
 
     let status = fixture.colay(["--json", "status"])?;
     assert!(
-        status.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&status.stderr)
+        !status.status.success(),
+        "corrupt legacy evidence unexpectedly allowed global bootstrap: {}",
+        String::from_utf8_lossy(&status.stdout)
     );
-    let status: Value = serde_json::from_slice(&status.stdout)?;
-    assert_eq!(status["data"]["tasks"], Value::Array(Vec::new()));
-    assert_eq!(status["data"]["database"]["last_event_sequence"], 0);
 
     let database = Connection::open(state.join("orchestrator.db"))?;
     let tasks: i64 = database.query_row(

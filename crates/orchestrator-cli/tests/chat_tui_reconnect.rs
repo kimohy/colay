@@ -78,7 +78,7 @@ impl Fixture {
     }
 
     fn database(&self) -> Result<Database> {
-        Database::open(self.repository.join(".colay/orchestrator.db")).map_err(Into::into)
+        Database::open(self.colay_home.join("state/state.db")).map_err(Into::into)
     }
 
     fn wait_online(&self) -> Result<()> {
@@ -155,9 +155,6 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
 
     let initialized = fixture.output(&["init"])?;
     assert!(initialized.status.success());
-    let initialized_database = fixture.database()?;
-    initialized_database.resolve_repository_workspace(&fixture.repository)?;
-    drop(initialized_database);
     assert!(
         fixture
             .status_without_capture(&["daemon", "start"])?

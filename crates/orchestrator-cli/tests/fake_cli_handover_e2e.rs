@@ -11,7 +11,7 @@ use chrono::Utc;
 use orchestrator_domain::{
     Checkpoint, EventType, HandoverAcknowledgement, HandoverBundle, ProviderId, TaskEvent, TaskId,
 };
-use orchestrator_state::{MigrationManager, ensure_private_file};
+use orchestrator_state::{Database, MigrationManager, ensure_private_file};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -122,7 +122,11 @@ fn initialize_repository(repository: &Path) -> Result<PathBuf> {
             OsString::from("."),
         ],
     )?;
-    let database = Connection::open(repository.join(".colay/orchestrator.db"))?;
+    let database_path = repository.join(".colay/orchestrator.db");
+    let database = Database::open(&database_path)?;
+    database.migrate_with_backup(&repository.join(".colay/backups"))?;
+    drop(database);
+    let database = Connection::open(database_path)?;
     database.execute(
         "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
          VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
