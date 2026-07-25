@@ -828,6 +828,7 @@ dependencies = [
  "orchestrator-domain",
  "orchestrator-engine",
  "orchestrator-state",
+ "orchestrator-windows-ipc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -951,6 +952,7 @@ dependencies = [
  "orchestrator-process",
  "orchestrator-providers",
  "orchestrator-state",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -967,6 +969,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "orchestrator-windows-ipc"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

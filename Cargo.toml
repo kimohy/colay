@@ -11,6 +11,7 @@ members = [
     "crates/orchestrator-cli",
     "crates/orchestrator-tui",
     "crates/orchestrator-test-support",
+    "crates/orchestrator-windows-ipc",
 ]
 resolver = "3"
 

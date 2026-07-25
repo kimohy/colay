@@ -29,10 +29,6 @@ async fn run(arguments: args::Cli) -> Result<()> {
     ) {
         return daemon::serve_global(&repository, arguments.config.as_deref()).await;
     }
-    if matches!(&arguments.command, args::Command::Status(_)) {
-        ipc_client::DaemonClient::connect_or_start(&repository, arguments.config.as_deref())
-            .await?;
-    }
     app::run(arguments).await
 }
 

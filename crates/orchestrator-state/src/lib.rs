@@ -72,6 +72,8 @@ pub use migrations::{
     ROLLBACK_PLAN_SCHEMA_VERSION, RollbackApplyResult, RollbackPlan, STATE_SCHEMA_VERSION,
 };
 pub use paths::RepositoryStatePaths;
+#[cfg(windows)]
+pub use permissions::current_windows_user_sid;
 pub use permissions::{
     ensure_private_directory, ensure_private_file, reject_symlink_components, verify_private_file,
 };

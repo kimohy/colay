@@ -342,6 +342,11 @@ fn current_windows_identity() -> StateResult<WindowsIdentity> {
 }
 
 #[cfg(windows)]
+pub fn current_windows_user_sid() -> StateResult<String> {
+    current_windows_identity().map(|identity| identity.sid)
+}
+
+#[cfg(windows)]
 fn extract_account_authority(output: &[u8]) -> Option<&[u8]> {
     let field_start = output.iter().position(|byte| *byte == b'"')? + 1;
     let field_end = output[field_start..]

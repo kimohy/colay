@@ -1,14 +1,16 @@
 use std::{
     fs::{File, OpenOptions},
     path::PathBuf,
+    str::FromStr as _,
     sync::Arc,
 };
 
 use chrono::Utc;
 use fs2::FileExt as _;
+use orchestrator_domain::TaskId;
 use orchestrator_state::{
     Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig, StateError,
-    WorkspaceId, ensure_private_directory, ensure_private_file,
+    TaskListFilter, WorkspaceId, ensure_private_directory, ensure_private_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -103,7 +105,7 @@ impl DaemonOwnerLock {
             })?;
         ensure_private_file(&lock_path)?;
         file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if lock_is_contended(&error) {
                 IpcError::AlreadyOwned
             } else {
                 IpcError::Io {
@@ -113,6 +115,22 @@ impl DaemonOwnerLock {
             }
         })?;
         Ok(Self { file })
+    }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Windows reports a non-blocking LockFileEx collision as either a sharing or lock
+        // violation rather than `WouldBlock`.
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -127,6 +145,8 @@ pub struct IpcServer {
     listener: tokio::net::UnixListener,
     #[cfg(windows)]
     pipe_name: String,
+    #[cfg(windows)]
+    pipe_owner_sid: String,
     database: Arc<Database>,
     paths: GlobalStatePaths,
 }
@@ -170,6 +190,7 @@ impl IpcServer {
         {
             Ok(Self {
                 pipe_name: ipc_endpoint(paths).to_string_lossy().into_owned(),
+                pipe_owner_sid: orchestrator_state::current_windows_user_sid()?,
                 database,
                 paths: paths.clone(),
             })
@@ -214,8 +235,14 @@ impl IpcServer {
                     })?;
                     let connection_writer = writer.clone();
                     let connection_database = Arc::clone(&self.database);
+                    let connection_paths = self.paths.clone();
                     connections.spawn(async move {
-                        handle_connection(stream, connection_database, connection_writer).await
+                        handle_connection(
+                            stream,
+                            connection_database,
+                            connection_paths,
+                            connection_writer,
+                        ).await
                     });
                 }
             }
@@ -247,14 +274,19 @@ impl IpcServer {
         let mut first_instance = true;
         let mut connections = JoinSet::new();
         loop {
-            let server = ServerOptions::new()
+            let mut options = ServerOptions::new();
+            options
                 .first_pipe_instance(first_instance)
-                .reject_remote_clients(true)
-                .create(&self.pipe_name)
-                .map_err(|source| IpcError::Io {
-                    path: PathBuf::from(&self.pipe_name),
-                    source,
-                })?;
+                .reject_remote_clients(true);
+            let server = orchestrator_windows_ipc::create_current_user_only_named_pipe(
+                &options,
+                &self.pipe_name,
+                &self.pipe_owner_sid,
+            )
+            .map_err(|source| IpcError::Io {
+                path: PathBuf::from(&self.pipe_name),
+                source,
+            })?;
             first_instance = false;
             tokio::select! {
                 () = cancellation.cancelled() => break,
@@ -265,8 +297,14 @@ impl IpcServer {
                     })?;
                     let connection_writer = writer.clone();
                     let connection_database = Arc::clone(&self.database);
+                    let connection_paths = self.paths.clone();
                     connections.spawn(async move {
-                        handle_connection(server, connection_database, connection_writer).await
+                        handle_connection(
+                            server,
+                            connection_database,
+                            connection_paths,
+                            connection_writer,
+                        ).await
                     });
                 }
             }
@@ -276,6 +314,13 @@ impl IpcServer {
         while connections.join_next().await.is_some() {}
         Ok(())
     }
+}
+
+#[cfg(windows)]
+pub fn windows_named_pipe_security_descriptor(
+    client: &tokio::net::windows::named_pipe::NamedPipeClient,
+) -> std::io::Result<String> {
+    orchestrator_windows_ipc::named_pipe_security_descriptor(client)
 }
 
 #[must_use]
@@ -299,6 +344,7 @@ pub fn ipc_endpoint(paths: &GlobalStatePaths) -> PathBuf {
 async fn handle_connection<S>(
     stream: S,
     database: Arc<Database>,
+    paths: GlobalStatePaths,
     writer: mpsc::Sender<WriterRequest>,
 ) -> Result<(), IpcError>
 where
@@ -324,7 +370,7 @@ where
             IpcResponse::failure(String::new(), "IPC request exceeds the one MiB limit")
         } else {
             match serde_json::from_slice::<IpcRequest>(&line) {
-                Ok(request) => dispatch_request(request, &database, &writer).await,
+                Ok(request) => dispatch_request(request, &database, &paths, &writer).await,
                 Err(_) => IpcResponse::failure(String::new(), "IPC request is not valid JSON"),
             }
         };
@@ -346,6 +392,7 @@ where
 async fn dispatch_request(
     request: IpcRequest,
     database: &Database,
+    paths: &GlobalStatePaths,
     writer: &mpsc::Sender<WriterRequest>,
 ) -> IpcResponse {
     if request.schema_version != IPC_SCHEMA_VERSION {
@@ -363,6 +410,13 @@ async fn dispatch_request(
             Ok(status) => IpcResponse::success(request.request_id, &json!({"status": status})),
             Err(_) => IpcResponse::failure(request.request_id, "daemon status is unavailable"),
         },
+        "workspace.status" => {
+            let request_id = request.request_id.clone();
+            match workspace_status(database, paths, &request) {
+                Ok(status) => IpcResponse::success(request_id, &status),
+                Err(_) => IpcResponse::failure(request_id, "workspace status is unavailable"),
+            }
+        }
         "workspace.register" | "daemon.stop" => {
             let request_id = request.request_id.clone();
             let (response, reply) = oneshot::channel();
@@ -376,6 +430,52 @@ async fn dispatch_request(
         }
         _ => IpcResponse::failure(request.request_id, "unsupported IPC action"),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceStatusPayload {
+    task_id: Option<String>,
+}
+
+fn workspace_status(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.status requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceStatusPayload>(request.payload.clone())?;
+    let workspace = database.workspace(workspace_id);
+    let tasks = if let Some(task_id) = payload.task_id {
+        let task_id =
+            TaskId::from_str(&task_id).map_err(|error| IpcError::Protocol(error.to_string()))?;
+        workspace.load_task(task_id)?.into_iter().collect()
+    } else {
+        workspace.list_tasks(&TaskListFilter {
+            state: None,
+            include_archived: false,
+            limit: 100,
+        })?
+    };
+    let tasks = tasks
+        .into_iter()
+        .map(|task| {
+            json!({
+                "task_id": task.task_id,
+                "state": task.state,
+                "objective": task.objective,
+                "created_at": task.created_at,
+                "updated_at": task.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "tasks": tasks,
+        "database": database.health()?,
+        "state_dir": paths.root,
+    }))
 }
 
 struct WriterRequest {
@@ -466,16 +566,25 @@ mod tests {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::{IpcResponse, MAX_REQUEST_BYTES, handle_connection};
-    use orchestrator_state::Database;
+    use orchestrator_state::{Database, GlobalStatePaths};
 
     #[tokio::test]
     async fn oversized_request_is_rejected_and_connection_is_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let database = Arc::new(Database::open_in_memory()?);
         database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let root = std::path::PathBuf::from("unused");
+        let paths = GlobalStatePaths {
+            database: root.join("state.db"),
+            backups: root.join("backups"),
+            workspaces: root.join("workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
         let (mut client, server) = tokio::io::duplex(MAX_REQUEST_BYTES.saturating_add(2));
-        let server_task = tokio::spawn(handle_connection(server, database, writer));
+        let server_task = tokio::spawn(handle_connection(server, database, paths, writer));
 
         client
             .write_all(&vec![b'x'; MAX_REQUEST_BYTES.saturating_add(1)])

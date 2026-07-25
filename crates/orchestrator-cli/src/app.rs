@@ -131,7 +131,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Run(arguments) => {
             run_task(&repository, &runtime.effective, arguments, cli.json).await
         }
-        Command::Status(selector) => status(&repository, &runtime.effective, &selector, cli.json),
+        Command::Status(selector) => {
+            status(&repository, cli.config.as_deref(), &selector, cli.json).await
+        }
         Command::Providers(arguments) => match arguments.action {
             Some(ProviderAction::Enable { provider }) => set_provider_enabled(
                 &repository,
@@ -4009,29 +4011,21 @@ fn acceptance_evidence(
     }
 }
 
-fn status(
+async fn status(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     selector: &TaskSelector,
     json_output: bool,
 ) -> Result<()> {
-    let state = StatePaths::from_config(repository, effective.config())?;
-    if !state.database.exists() {
-        return emit(
-            json_output,
-            "status",
-            &json!({"tasks": [], "database": Value::Null, "state_dir": state.root}),
-        );
-    }
-    let database = open_ready_database(&state)?;
-    let workspace = workspace_for_repository(&database, repository)?;
-    let tasks = task_status_rows(&workspace, selector.task_id.as_deref())?;
-    let health = database.health()?;
-    emit(
-        json_output,
-        "status",
-        &json!({"tasks": tasks, "database": health, "state_dir": state.root}),
-    )
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request(
+            "workspace.status",
+            json!({"task_id": selector.task_id.as_deref()}),
+        )
+        .await?;
+    emit(json_output, "status", &response.outcome["data"])
 }
 
 fn usage(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {

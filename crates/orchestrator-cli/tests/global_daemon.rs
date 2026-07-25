@@ -5,11 +5,15 @@ use std::{
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest};
+#[cfg(windows)]
+use orchestrator_state::{GlobalStatePaths, StateEnvironment, current_windows_user_sid};
 use orchestrator_state::{STATE_SCHEMA_VERSION, WorkspaceId};
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -55,6 +59,7 @@ const MIGRATIONS_THROUGH_V8: &[(u32, &str, &str)] = &[
 ];
 
 struct GlobalDaemonFixture {
+    _serial: MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
     root: PathBuf,
     first: PathBuf,
@@ -64,6 +69,7 @@ struct GlobalDaemonFixture {
 
 impl GlobalDaemonFixture {
     fn new() -> Result<Self> {
+        let serial = global_daemon_test_guard();
         let temp = tempfile::tempdir()?;
         let root = fs::canonicalize(temp.path())?;
         let first = root.join("first");
@@ -82,6 +88,7 @@ impl GlobalDaemonFixture {
             ),
         )?;
         Ok(Self {
+            _serial: serial,
             _temp: temp,
             root,
             first,
@@ -128,6 +135,34 @@ impl GlobalDaemonFixture {
             ),
         )?;
         Ok(())
+    }
+
+    fn install_schema_guard_provider(&self) -> Result<PathBuf> {
+        let guard_directory = self.root.join("schema-guard-provider");
+        fs::create_dir_all(&guard_directory)?;
+        let executable =
+            guard_directory.join(format!("fake-provider-cli{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(
+            PathBuf::from(env!("CARGO_BIN_EXE_colay-e2e-fake-provider")),
+            &executable,
+        )?;
+        fs::write(
+            self.colay_home.join("config.toml"),
+            format!(
+                "config_version = 4\n[orchestrator.providers.codex]\nexecutable = {}\n",
+                toml_path(&executable)
+            ),
+        )?;
+        let observation = guard_directory.join("schema-observation.json");
+        fs::write(
+            guard_directory.join("schema-guard.json"),
+            serde_json::to_vec_pretty(&json!({
+                "database": self.global_database(),
+                "required_schema_version": STATE_SCHEMA_VERSION,
+                "observation": observation,
+            }))?,
+        )?;
+        Ok(observation)
     }
 
     fn run<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
@@ -219,6 +254,14 @@ impl GlobalDaemonFixture {
     }
 }
 
+fn global_daemon_test_guard() -> MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    match TEST_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn toml_path(path: &Path) -> String {
     format!(
         "\"{}\"",
@@ -246,8 +289,81 @@ fn two_repositories_share_one_global_daemon_and_database() -> Result<()> {
 }
 
 #[test]
+fn status_reads_global_state_without_opening_repository_sqlite() -> Result<()> {
+    let fixture = GlobalDaemonFixture::new()?;
+
+    let output = fixture.run(["--json", "status"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(envelope["command"], "status");
+    assert_eq!(
+        PathBuf::from(
+            envelope["data"]["state_dir"]
+                .as_str()
+                .context("status omitted the global state directory")?
+        ),
+        fixture.colay_home
+    );
+    assert!(!fixture.first.join(".colay/orchestrator.db").exists());
+    Ok(())
+}
+
+#[test]
+fn second_daemon_owner_is_rejected_without_displacing_the_live_owner() -> Result<()> {
+    let fixture = GlobalDaemonFixture::new()?;
+    let first = fixture.run(["status"])?;
+    assert!(first.status.success());
+    assert_eq!(fixture.online_daemon_instances()?, 1);
+
+    let contender = fixture.run(["daemon", "serve"])?;
+
+    assert!(!contender.status.success());
+    assert!(
+        String::from_utf8_lossy(&contender.stderr)
+            .contains("daemon singleton is already owned by another process"),
+        "{}",
+        String::from_utf8_lossy(&contender.stderr)
+    );
+    let still_live = fixture.run(["daemon", "status"])?;
+    assert!(still_live.status.success());
+    assert_eq!(fixture.online_daemon_instances()?, 1);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pipe_dacl_grants_access_only_to_the_current_user_sid() -> Result<()> {
+    let fixture = GlobalDaemonFixture::new()?;
+    let started = fixture.run(["status"])?;
+    assert!(started.status.success());
+    let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+        fixture.colay_home.clone(),
+    )?)?;
+    let endpoint = orchestrator_daemon::ipc_endpoint(&paths);
+    let runtime = tokio::runtime::Runtime::new()?;
+    let descriptor = runtime.block_on(async {
+        let client = tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint)?;
+        orchestrator_daemon::windows_named_pipe_security_descriptor(&client)
+    })?;
+    let sid = current_windows_user_sid()?;
+
+    assert!(descriptor.contains(&format!(";;;{sid})")));
+    assert_eq!(descriptor.matches("(A;").count(), 1);
+    for broad_principal in ["WD", "AN", "AU", "BU"] {
+        assert!(!descriptor.contains(&format!(";;;{broad_principal})")));
+    }
+    Ok(())
+}
+
+#[test]
 fn old_schema_migrates_before_untrusted_provider_is_evaluated() -> Result<()> {
     let fixture = GlobalDaemonFixture::with_schema(8)?;
+    let observation = fixture.install_schema_guard_provider()?;
     let output = fixture.run(["daemon", "start"])?;
     assert!(
         output.status.success(),
@@ -255,6 +371,15 @@ fn old_schema_migrates_before_untrusted_provider_is_evaluated() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fixture.schema_version()?, STATE_SCHEMA_VERSION);
+    let observation_deadline = Instant::now() + Duration::from_secs(5);
+    while !observation.exists() && Instant::now() < observation_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let observation: serde_json::Value = serde_json::from_slice(
+        &fs::read(observation).context("fake provider did not record its schema observation")?,
+    )?;
+    assert_eq!(observation["observed_schema_version"], STATE_SCHEMA_VERSION);
+    assert_eq!(observation["guard_passed"], true);
     Ok(())
 }
 

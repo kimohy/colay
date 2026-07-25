@@ -22,6 +22,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+orchestrator-windows-ipc = { path = "../orchestrator-windows-ipc" }
+
 [dev-dependencies]
 rusqlite.workspace = true
 tempfile.workspace = true

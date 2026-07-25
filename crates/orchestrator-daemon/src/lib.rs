@@ -23,6 +23,8 @@ mod test_support;
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
 pub use execution::ExecutionServices;
 pub use integration::IntegrationServices;
+#[cfg(windows)]
+pub use ipc::windows_named_pipe_security_descriptor;
 pub use ipc::{
     DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, IpcServer, ipc_endpoint,
 };

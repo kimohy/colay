@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::Path,
     process::Stdio,
     sync::Arc,
@@ -310,7 +311,7 @@ async fn serve_foreground(
         started_at: Utc::now(),
         ttl: settings.lease_ttl,
     })?;
-    let mut startup_lease = StartupLeaseGuard::new(Arc::clone(&database), instance_id);
+    let startup_lease = StartupLeaseGuard::new(Arc::clone(&database), instance_id);
     database.record_daemon_runtime_identity(
         instance_id,
         &std::env::current_exe()?.to_string_lossy(),
@@ -487,53 +488,88 @@ async fn serve_foreground(
     }
     startup_heartbeat.abort();
     let _ = startup_heartbeat.await;
-    let result = serve_with_full_orchestration_on_owned_lease(
-        database,
-        workspace_id,
-        instance_id,
-        cancellation.clone(),
-        settings,
-        redactor,
-        PlanningServices {
-            conversation,
-            repository_root: repository_root.clone(),
-            planner,
-            planner_provider,
-            validation_policy: GraphValidationPolicy {
-                eligible_providers: BTreeSet::from([planner_provider]),
-                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
-                max_parallel_workers: usize::try_from(config.orchestrator.max_parallel_workers)
+    let runtime_cancellation = cancellation.clone();
+    let runtime = async move {
+        let mut startup_lease = startup_lease;
+        let result = serve_with_full_orchestration_on_owned_lease(
+            database,
+            workspace_id,
+            instance_id,
+            runtime_cancellation,
+            settings,
+            redactor,
+            PlanningServices {
+                conversation,
+                repository_root: repository_root.clone(),
+                planner,
+                planner_provider,
+                validation_policy: GraphValidationPolicy {
+                    eligible_providers: BTreeSet::from([planner_provider]),
+                    eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                    max_parallel_workers: usize::try_from(config.orchestrator.max_parallel_workers)
+                        .unwrap_or(usize::MAX)
+                        .max(1),
+                    per_provider_limits: BTreeMap::new(),
+                },
+                integration: Some(integration),
+            },
+            ExecutionServices {
+                executor,
+                repository_root,
+                state_root: workspace_paths.root.clone(),
+                global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
                     .unwrap_or(usize::MAX)
                     .max(1),
-                per_provider_limits: BTreeMap::new(),
+                provider_limits,
+                claim_ttl: TimeDelta::minutes(
+                    i64::try_from(config.orchestrator.default_timeout_minutes)
+                        .unwrap_or(i64::MAX)
+                        .saturating_add(10),
+                ),
             },
-            integration: Some(integration),
-        },
-        ExecutionServices {
-            executor,
-            repository_root,
-            state_root: workspace_paths.root.clone(),
-            global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
-                .unwrap_or(usize::MAX)
-                .max(1),
-            provider_limits,
-            claim_ttl: TimeDelta::minutes(
-                i64::try_from(config.orchestrator.default_timeout_minutes)
-                    .unwrap_or(i64::MAX)
-                    .saturating_add(10),
-            ),
-        },
-    )
-    .await;
-    startup_lease.handoff();
+        )
+        .await;
+        startup_lease.handoff();
+        result?;
+        Ok(())
+    };
+    let result = supervise_daemon_runtime(cancellation.clone(), ipc_task, runtime).await;
     signal_task.abort();
-    cancellation.cancel();
-    let ipc_result = ipc_task
-        .await
-        .map_err(|error| anyhow::anyhow!("IPC task failed: {error}"))?;
-    ipc_result?;
-    result?;
-    Ok(())
+    result
+}
+
+async fn supervise_daemon_runtime<F>(
+    cancellation: CancellationToken,
+    mut ipc_task: tokio::task::JoinHandle<Result<(), orchestrator_daemon::IpcError>>,
+    runtime: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::pin!(runtime);
+    tokio::select! {
+        runtime_result = &mut runtime => {
+            cancellation.cancel();
+            let ipc_result = ipc_task
+                .await
+                .map_err(|error| anyhow::anyhow!("IPC task failed: {error}"))?;
+            ipc_result?;
+            runtime_result
+        }
+        ipc_join = &mut ipc_task => {
+            let ipc_result = ipc_join
+                .map_err(|error| anyhow::anyhow!("IPC task failed: {error}"))?;
+            if cancellation.is_cancelled() {
+                let runtime_result = runtime.await;
+                ipc_result?;
+                runtime_result
+            } else {
+                cancellation.cancel();
+                ipc_result?;
+                bail!("IPC server stopped unexpectedly while the daemon was online")
+            }
+        }
+    }
 }
 
 struct StartupLeaseGuard {
@@ -738,11 +774,17 @@ fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{TimeDelta, Utc};
     use orchestrator_domain::DaemonInstanceId;
     use orchestrator_state::{DaemonLeaseRequest, DaemonStatus, Database};
+    use tokio_util::sync::CancellationToken;
 
-    use super::{fail_and_release_spawned_lease, fail_startup_without_heartbeat};
+    use super::{
+        StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
+        supervise_daemon_runtime,
+    };
 
     struct IdentityRedactor;
 
@@ -822,6 +864,56 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "service setup failed");
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_failure_cancels_runtime_and_releases_online_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(database()?);
+        let instance_id = DaemonInstanceId::new();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: TimeDelta::seconds(5),
+        })?;
+        database.transition_daemon_phase(
+            instance_id,
+            orchestrator_state::DaemonPhase::Probing,
+            None,
+        )?;
+        database.transition_daemon_phase(
+            instance_id,
+            orchestrator_state::DaemonPhase::Online,
+            None,
+        )?;
+        let cancellation = CancellationToken::new();
+        let runtime_cancellation = cancellation.clone();
+        let guard = StartupLeaseGuard::new(Arc::clone(&database), instance_id);
+        let runtime = async move {
+            let _guard = guard;
+            runtime_cancellation.cancelled().await;
+            Ok(())
+        };
+        let ipc_task = tokio::spawn(async {
+            Err(orchestrator_daemon::IpcError::Protocol(
+                "injected accept failure".to_owned(),
+            ))
+        });
+
+        let error = match supervise_daemon_runtime(cancellation.clone(), ipc_task, runtime).await {
+            Ok(()) => {
+                return Err(
+                    std::io::Error::other("IPC failure must stop the daemon runtime").into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("injected accept failure"));
+        assert!(cancellation.is_cancelled());
         assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
         Ok(())
     }
