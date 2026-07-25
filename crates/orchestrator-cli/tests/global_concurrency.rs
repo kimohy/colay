@@ -9,10 +9,10 @@ use std::{
     process::{Command, Output, Stdio},
     sync::{Arc, Barrier, Mutex, MutexGuard},
     thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow};
-#[cfg(unix)]
+use anyhow::{Context as _, Result, anyhow, bail};
 use orchestrator_state::{GlobalStatePaths, StateEnvironment};
 use rusqlite::Connection;
 
@@ -32,6 +32,7 @@ struct CommandContext {
     executable: PathBuf,
     path: OsString,
     colay_home: PathBuf,
+    daemon_log: PathBuf,
     temp: PathBuf,
 }
 
@@ -65,6 +66,7 @@ impl ConcurrencyFixture {
             executable,
             path,
             colay_home: colay_home.clone(),
+            daemon_log: root.join("daemon-stderr.log"),
             temp: root.clone(),
         };
         Ok(Self {
@@ -126,21 +128,23 @@ impl ConcurrencyFixture {
     fn daemon_diagnostics(&self) -> Result<String> {
         let connection = Connection::open(self.database())?;
         let mut statement = connection.prepare(
-            "SELECT pid, phase, COALESCE(startup_error, ''), COALESCE(released_at, '') \
+            "SELECT pid, phase, COALESCE(startup_error, ''), \
+                    COALESCE(stop_requested_at, ''), COALESCE(released_at, '') \
              FROM daemon_instances ORDER BY started_at",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(format!(
-                "pid={} phase={} startup_error={:?} released_at={:?}",
+                "pid={} phase={} startup_error={:?} stop_requested_at={:?} released_at={:?}",
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?
             ))
         })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map(|rows| rows.join("; "))
-            .map_err(Into::into)
+        let rows = rows.collect::<Result<Vec<_>, _>>()?.join("; ");
+        let daemon_log = fs::read_to_string(&self.command.daemon_log).unwrap_or_default();
+        Ok(format!("{rows}; daemon_stderr={daemon_log:?}"))
     }
 
     fn database_files(&self) -> Result<Vec<PathBuf>> {
@@ -165,6 +169,101 @@ impl ConcurrencyFixture {
         files.sort();
         Ok(files)
     }
+
+    fn stop_and_verify(&self) -> Result<()> {
+        let pid = self.live_daemon_pid()?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            self.colay_home.clone(),
+        )?)?;
+        let endpoint = orchestrator_daemon::ipc_endpoint(&paths);
+        let stopped = self.run(&self.repository, &["daemon", "stop"])?;
+        if !stopped.status.success() {
+            bail!(
+                "daemon stop failed with {}: {}; stdout: {}",
+                stopped.status,
+                String::from_utf8_lossy(&stopped.stderr),
+                String::from_utf8_lossy(&stopped.stdout)
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let unreleased =
+                self.count("SELECT count(*) FROM daemon_instances WHERE released_at IS NULL")?;
+            #[cfg(unix)]
+            let endpoint_absent = endpoint_is_absent(&endpoint)?;
+            #[cfg(windows)]
+            let endpoint_absent = endpoint_is_absent(&endpoint);
+            let process_running = process_is_running(pid)?;
+            if unreleased == 0 && endpoint_absent && !process_running {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "daemon cleanup timed out: pid={pid} process_running={process_running} \
+                     endpoint_absent={endpoint_absent} unreleased_instances={unreleased}"
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn live_daemon_pid(&self) -> Result<u32> {
+        let pid = Connection::open(self.database())?.query_row(
+            "SELECT pid FROM daemon_instances WHERE released_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        u32::try_from(pid).context("live daemon PID is outside the u32 range")
+    }
+}
+
+#[cfg(unix)]
+fn endpoint_is_absent(endpoint: &Path) -> Result<bool> {
+    Ok(!endpoint.try_exists()?)
+}
+
+#[cfg(windows)]
+fn endpoint_is_absent(endpoint: &Path) -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    match ClientOptions::new().open(endpoint) {
+        Ok(client) => {
+            drop(client);
+            false
+        }
+        Err(error) => matches!(error.raw_os_error(), Some(2 | 3)),
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> Result<bool> {
+    Ok(PathBuf::from(format!("/proc/{pid}")).try_exists()?)
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> Result<bool> {
+    let system_root = env::var_os("SystemRoot").context("SystemRoot is not set")?;
+    let executable = PathBuf::from(system_root).join("System32/tasklist.exe");
+    let filter = format!("PID eq {pid}");
+    let output = Command::new(executable)
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .context("failed to query daemon process state")?;
+    if !output.status.success() {
+        bail!(
+            "tasklist failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pid = pid.to_string();
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split(',').map(|field| field.trim_matches('"'));
+        fields.next().is_some_and(|name| {
+            name.eq_ignore_ascii_case("colay.exe") && fields.next() == Some(pid.as_str())
+        })
+    }))
 }
 
 fn concurrency_fixture_guard() -> MutexGuard<'static, ()> {
@@ -188,6 +287,7 @@ impl CommandContext {
             .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
+            .env("COLAY_TEST_DAEMON_STDERR", &self.daemon_log)
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", &self.path)
             .env("PATHEXT", ".EXE;.CMD")
@@ -274,6 +374,7 @@ fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()
         fixture.count("SELECT count(*) FROM daemon_instances WHERE released_at IS NULL")?,
         1
     );
+    fixture.stop_and_verify()?;
     Ok(())
 }
 
@@ -292,6 +393,7 @@ fn windows_unicode_and_case_variants_share_one_global_workspace() -> Result<()> 
     assert_eq!(fixture.count("SELECT count(*) FROM workspaces")?, 1);
     assert_eq!(fixture.count("SELECT count(*) FROM workspace_paths")?, 1);
     assert_eq!(fixture.database_files()?, vec![fixture.database()]);
+    fixture.stop_and_verify()?;
     Ok(())
 }
 
@@ -312,5 +414,6 @@ fn unix_socket_is_private_and_owned_with_the_colay_home() -> Result<()> {
 
     assert_eq!(socket.permissions().mode() & 0o777, 0o600);
     assert_eq!(socket.uid(), home.uid());
+    fixture.stop_and_verify()?;
     Ok(())
 }

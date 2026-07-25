@@ -136,12 +136,16 @@ promote the release unless all of these are true:
   refuses a state root on `/mnt/<drive>`.
 - Thirty-two concurrent status/plan-only clients all succeed without SQLite
   busy/locked diagnostics, duplicate workspace/path rows, task creation, or a
-  second live daemon.
+  second live daemon. The test then explicitly stops the daemon and observes the
+  lease release, IPC endpoint removal, and process exit within its bounded wait.
+- Deterministic client tests prove one startup spawn attempt per client,
+  Windows `ERROR_PIPE_BUSY`-only bounded retry, and immediate propagation of
+  non-busy pipe-open failures.
 - The Windows named pipe grants access only to the current SID, while the WSL
   Unix socket is owned by the current user with mode `0600`.
 - Unicode/case-equivalent Windows paths, non-Git planning on both platforms,
-  idempotent legacy import, and platform-native junction/symlink redirect
-  refusal pass.
+  the complete legacy-import test binary, and platform-native junction/symlink
+  redirect refusal pass.
 - Provider doctor resolves Codex, Claude, Gemini, and Agy only to compiled fake
   provider fixtures. No provider login, model prompt, credential, or network
   inference is allowed in rollout verification.

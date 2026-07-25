@@ -89,27 +89,96 @@ Codex version is untested; writable work is disabled
 
 ### Task 8 Windows/WSL rollout 검증 (2026-07-26)
 
-- Windows 11 `10.0.26100` source build에서 전역 path 14/14, daemon/IPC 7/7,
-  non-Git plan 2/2, import 1/1, junction redirect 1/1, 32-client stress와
-  Unicode/case test 2/2가 통과했다. Named pipe DACL은 현재 SID ACE 하나만 포함하고
-  broad principal ACE를 포함하지 않았다.
-- WSL 2 Ubuntu 24.04 (`6.18.33.2-microsoft-standard-WSL2`)에서 Rust 1.95.0과
-  Linux-native Cargo target을 사용했다. XDG/분리 path 18/18, Unix socket와
-  32-client stress 2/2, non-Git plan 2/2, import 1/1, Unix symlink redirect 1/1이
-  통과했다. Unix socket은 `0600`이며 WSL `COLAY_HOME` 소유자 UID와 일치했다.
-- 모든 CLI fixture는 OS-native 임시 `COLAY_HOME`과 compiled fake provider만 사용했다.
-  Windows와 WSL은 동일 SQLite 파일을 열지 않았고 WSL의 `/mnt/<drive>` 상태 root 거부도
-  native test에서 통과했다. 실제 Codex, Claude, Gemini, Agy inference는 호출하지 않았다.
-- cold fan-in RED에서 client별 25ms daemon contender 재-spawn storm과 Windows named-pipe
-  `ERROR_PIPE_BUSY` 231을 확인했다. Client당 startup spawn 1회와 pipe-busy 전용 bounded
-  retry 후 Windows exact stress가 통과했다.
-- WSL 최초 compile 직후 stress readiness timeout 1회와 이후 plan client raw `ENOENT` 1회가
-  관찰됐지만, diagnostic exact 재실행 2회와 clean combined matrix에서 재현되지 않았다.
-  최종 clean stress는 32/32 성공했다. 향후 재현 시 persisted daemon phase/startup_error가
-  assertion에 포함된다.
-- WSL legacy-import 22-case batch는 한 test가 source DB journal을 연 상태로 5분 이상 futex
-  wait해 중단했다. rollout에 필요한 import-once와 symlink redirect exact cases는 각각
-  독립 실행으로 통과했다. 같은 batch stall이 다시 발생하면 별도 ID로 승격한다.
+검증 환경은 Windows 11 Home `10.0.26100` x86-64와 WSL 2 Ubuntu 24.04
+`6.18.33.2-microsoft-standard-WSL2` x86-64, Rust 1.95.0이다. WSL은 source만
+`/mnt/c`에서 읽고 아래 Linux-native cache를 사용했다. 모든 CLI fixture는 OS-native
+임시 `COLAY_HOME`, `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`, compiled fake provider만
+사용했다. 실제 Codex, Claude, Gemini, Agy inference는 호출하지 않았다.
+
+```text
+export RUSTUP_HOME=/home/kimohy/.cache/colay-task8-20260726/rustup
+export CARGO_HOME=/home/kimohy/.cache/colay-task8-20260726/cargo
+export CARGO_TARGET_DIR=/home/kimohy/.cache/colay-task8-20260726/target
+```
+
+#### 재현된 실패와 원인
+
+- 초기 WSL cold fan-in의 readiness timeout, 후속 raw `ENOENT`/connection reset은 같은
+  daemon endpoint 소실의 서로 다른 관찰이었다. test-only daemon stderr와 persisted
+  `daemon_instances`를 함께 수집한 재현에서 online owner가 stop 요청 없이 released되고
+  `optimistic update conflict for daemon instance ...`로 종료됨을 확인했다. 5초 lease보다
+  WSL virtual ext4 I/O가 늦어지면 기존 SQL의 `lease_expires_at > heartbeat_at` 조건이
+  아직 대체 owner가 없는 동일 owner의 늦은 heartbeat까지 거절한 것이 원인이었다.
+  동일 owner는 unreleased row를 갱신할 수 있게 하되, takeover가 먼저 old row를 release하면
+  old-owner heartbeat가 계속 거절되도록 수정했다.
+- heartbeat 수정 후 16개 plan-only client 가운데 하나가 10초 IPC response deadline을
+  넘기는 RED가 재현됐다. 각 client가 command status를 고정 25ms로 polling해 single IPC
+  writer에 최대 640 request/s를 넣은 것이 원인이었다. 전체 command deadline 2분은 유지하고
+  poll 간격만 25, 50, 100, 200, 400, 800, 1000ms로 지수 backoff/cap했다.
+- 과거 WSL full legacy-import를 5분에 중단했을 때 main thread의 `futex_do_wait`만 보고
+  deadlock으로 분류한 것은 잘못이었다. 다시 관찰한 worker들은 `jbd2_log_wait_commit`,
+  `submit_bio_wait`, `folio_wait_bit_common`에서 진행 중이었고, serial 22/22가 660.12초
+  (command 741.9초), default-parallel 22/22가 283.27초(command 331.8초)에 모두 끝났다.
+  원인은 WSL virtual ext4 journal I/O 지연이며 import deadlock이나 제품 실패가 아니다.
+
+#### 결정적 RED/GREEN 회귀
+
+```text
+cargo test -p colay --bin colay ipc_client::tests --all-features -- --nocapture
+cargo test -p orchestrator-state --lib daemon_instances::tests::same_owner_renews_an_expired_lease_before_any_takeover -- --nocapture --exact
+cargo test -p colay --bin colay app::tests::run_command_polling_backs_off_and_caps_at_one_second --all-features -- --nocapture --exact
+```
+
+첫 명령은 helper 추출 전 unresolved import RED 뒤 4/4 GREEN으로 startup spawn 1회,
+Windows `ERROR_PIPE_BUSY` busy→busy→success, non-busy 즉시 실패, deadline 종료를 고정했다.
+두 번째는 수정 전 `OptimisticConflict` RED, 수정 후 1/1 GREEN이었다. takeover test에도
+old-owner heartbeat 거절 assertion을 추가했다. 세 번째는 helper 부재 compile RED 뒤
+backoff sequence 1/1 GREEN이었다. 모두 exit code 0으로 재실행했다.
+
+#### Windows-native 최종 명령
+
+```text
+cargo test -p colay --bin colay ipc_client::tests --all-features
+cargo test -p orchestrator-state --lib daemon_instances::tests
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_daemon --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_resume --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_doctor --features test-fixtures doctor_reports_global_workspace_and_operational_checks -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+cargo test -p colay --test global_concurrency --features test-fixtures -- --nocapture --test-threads=1
+```
+
+위 순차 행렬은 각 명령 exit code 0이었다. 전역 path 14/14, daemon/IPC 7/7,
+non-Git plan 2/2, resume 3/3, doctor exact 1/1, full import 22/22, 32-client stress와
+Unicode/case 2/2가 통과했다. Named pipe DACL은 현재 SID ACE 하나만 포함하고 broad
+principal ACE를 포함하지 않았다.
+
+#### WSL-native 최종 명령
+
+```text
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_concurrency --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+for run in 1 2 3; do cargo test -p colay --test global_concurrency --features test-fixtures concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows -- --nocapture --exact || exit 1; done
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+```
+
+각 명령은 exit code 0이었다. path/XDG 18/18, clean combined concurrency 2/2
+(105.42초)와 plan-first 2/2(23.76초), exact 32-client stress 3회(67.89, 54.58,
+53.33초), final full import 22/22(293.87초)가 통과했다. Unix socket은 mode `0600`이며
+`COLAY_HOME` 소유자 UID와 일치했다. Windows와 WSL DB root는 서로 다른 OS-native
+임시 경로였고 WSL `/mnt/<drive>` state root 거부도 통과했다.
+
+모든 성공 경로 concurrency test는 `daemon stop` 성공 뒤 최대 10초 동안 unreleased
+lease 0건, IPC endpoint 부재, OS PID 종료를 확인한다. `Drop`은 실패 경로 fallback일
+뿐 성공 증거가 아니다. 이 원인 분석과 clean full matrix로 `WSL-010`을 fixed로 유지한다.
+
+최종 candidate에서 `cargo fmt --all -- --check`는 exit code 0(6.6초),
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`는 exit code
+0(28.2초), `cargo test --workspace --all-features`는 exit code 0(676.4초)이었다.
+마지막 전체 suite에서도 concurrency 2/2(45.49초), daemon 7/7(27.85초), doctor
+13/13(15.26초), plan-first 2/2(24.23초), resume 3/3(14.48초)와 full import
+22/22가 통과했다.
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 

@@ -80,6 +80,7 @@ const LEASE_RENEWAL_INTERVAL_SECONDS: u64 = 5;
 const RUN_SESSION_KEY: &str = "cli-run-session-v1";
 const RUN_REQUESTED_BY: &str = "local-cli-run";
 const RUN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RUN_COMMAND_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 
 struct ConfigRuntime {
@@ -1351,6 +1352,7 @@ async fn wait_for_client_command(
     command_id: ClientCommandId,
 ) -> Result<ClientCommand> {
     let started = Instant::now();
+    let mut poll_interval = RUN_COMMAND_POLL_INTERVAL;
     loop {
         if let Some(command) = load_client_command(client, Some(command_id), None).await? {
             match command.state {
@@ -1366,8 +1368,13 @@ async fn wait_for_client_command(
         if started.elapsed() >= RUN_COMMAND_TIMEOUT {
             bail!("user daemon did not complete command {command_id} within two minutes");
         }
-        tokio::time::sleep(RUN_COMMAND_POLL_INTERVAL).await;
+        tokio::time::sleep(poll_interval).await;
+        poll_interval = next_run_command_poll_interval(poll_interval);
     }
+}
+
+fn next_run_command_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(RUN_COMMAND_MAX_POLL_INTERVAL)
 }
 
 async fn load_client_command(
@@ -7037,6 +7044,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         sync::Arc,
+        time::Duration,
     };
 
     use crate::args::{EffortName, ProfileName, ProviderName};
@@ -7060,10 +7068,21 @@ mod tests {
         CheckStatus, ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
         acquire_task_coordinator, acquire_worker_lease, append_live_doctor_checks,
         block_for_unconfirmed_termination, initialize, load_config_runtime,
-        mixed_git_checkout_warning, provider_adapter, reset_model_profile,
-        rollback_resolution_context, run_with_coordinator_renewal, run_worker, set_model_profile,
-        set_provider_enabled, trusted_rollback_steps, worker_started_payload,
+        mixed_git_checkout_warning, next_run_command_poll_interval, provider_adapter,
+        reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
+        set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
+
+    #[test]
+    fn run_command_polling_backs_off_and_caps_at_one_second() {
+        let mut interval = Duration::from_millis(25);
+        let expected = [50_u64, 100, 200, 400, 800, 1_000, 1_000];
+
+        for expected_millis in expected {
+            interval = next_run_command_poll_interval(interval);
+            assert_eq!(interval, Duration::from_millis(expected_millis));
+        }
+    }
 
     fn test_with_database<T>(
         database: &Database,

@@ -186,10 +186,9 @@ async fn wait_until_ready(
             last_child_exit = Some(exit);
             child = None;
         }
-        if child.is_none() && !spawn_attempted {
-            child = Some(spawn_server(repository, explicit_config)?);
-            spawn_attempted = true;
-        }
+        spawn_contender_once(&mut child, &mut spawn_attempted, || {
+            spawn_server(repository, explicit_config)
+        })?;
         if started.elapsed() >= CONNECT_TIMEOUT {
             if let Some(process) = child.as_mut() {
                 let _ = process.kill();
@@ -203,6 +202,18 @@ async fn wait_until_ready(
     }
 }
 
+fn spawn_contender_once<T>(
+    child: &mut Option<T>,
+    spawn_attempted: &mut bool,
+    spawn: impl FnOnce() -> Result<T>,
+) -> Result<()> {
+    if child.is_none() && !*spawn_attempted {
+        *spawn_attempted = true;
+        *child = Some(spawn()?);
+    }
+    Ok(())
+}
+
 fn spawn_server(repository: &Path, explicit_config: Option<&Path>) -> Result<Child> {
     let executable = std::env::current_exe().context("cannot resolve current colay executable")?;
     let mut command = Command::new(executable);
@@ -214,10 +225,30 @@ fn spawn_server(repository: &Path, explicit_config: Option<&Path>) -> Result<Chi
         .arg("serve")
         .current_dir(repository)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    configure_daemon_stderr(&mut command)?;
     configure_background_process(&mut command);
     command.spawn().context("cannot spawn user daemon")
+}
+
+fn configure_daemon_stderr(command: &mut Command) -> Result<()> {
+    #[cfg(feature = "test-fixtures")]
+    if let Some(path) = std::env::var_os("COLAY_TEST_DAEMON_STDERR") {
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "cannot open test daemon stderr log {}",
+                    Path::new(&path).display()
+                )
+            })?;
+        command.stderr(stderr);
+        return Ok(());
+    }
+    command.stderr(Stdio::null());
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -258,20 +289,40 @@ async fn open_response_stream(
 
         let endpoint = ipc_endpoint(paths);
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
-        loop {
-            match ClientOptions::new().open(&endpoint) {
-                Ok(stream) => return response_stream(stream, &encoded).await,
-                Err(error) if error.raw_os_error() == Some(231) && Instant::now() < deadline => {
-                    tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
+        let stream = open_windows_pipe_with_retry(
+            deadline,
+            || ClientOptions::new().open(&endpoint),
+            tokio::time::sleep,
+        )
+        .await?;
+        response_stream(stream, &encoded).await
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, encoded);
         bail!("local IPC is unsupported on this platform")
+    }
+}
+
+#[cfg(windows)]
+async fn open_windows_pipe_with_retry<S, Open, Sleep, SleepFuture>(
+    deadline: Instant,
+    mut open: Open,
+    mut sleep: Sleep,
+) -> std::io::Result<S>
+where
+    Open: FnMut() -> std::io::Result<S>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
+    loop {
+        match open() {
+            Ok(stream) => return Ok(stream),
+            Err(error) if error.raw_os_error() == Some(231) && Instant::now() < deadline => {
+                sleep(CONNECT_POLL_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -285,4 +336,125 @@ where
     Ok(IpcResponseStream {
         lines: reader.lines(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    #[cfg(windows)]
+    use std::{future, io, time::Instant};
+
+    use super::spawn_contender_once;
+    #[cfg(windows)]
+    use super::{RESPONSE_TIMEOUT, open_windows_pipe_with_retry};
+
+    #[test]
+    fn startup_contender_is_spawned_at_most_once() -> anyhow::Result<()> {
+        let mut child = None;
+        let mut spawn_attempted = false;
+        let spawn_count = Cell::new(0_u32);
+
+        spawn_contender_once(&mut child, &mut spawn_attempted, || {
+            spawn_count.set(spawn_count.get() + 1);
+            Ok(())
+        })?;
+        child = None;
+        spawn_contender_once(&mut child, &mut spawn_attempted, || {
+            spawn_count.set(spawn_count.get() + 1);
+            Ok(())
+        })?;
+
+        assert_eq!(spawn_count.get(), 1);
+        assert!(child.is_none());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_busy_retries_until_success() -> io::Result<()> {
+        let open_count = Cell::new(0_u32);
+        let sleep_count = Cell::new(0_u32);
+
+        open_windows_pipe_with_retry(
+            Instant::now() + RESPONSE_TIMEOUT,
+            || {
+                let attempt = open_count.get() + 1;
+                open_count.set(attempt);
+                if attempt < 3 {
+                    Err(io::Error::from_raw_os_error(231))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                sleep_count.set(sleep_count.get() + 1);
+                future::ready(())
+            },
+        )
+        .await?;
+
+        assert_eq!(open_count.get(), 3);
+        assert_eq!(sleep_count.get(), 2);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_non_busy_error_fails_without_retry() -> io::Result<()> {
+        let open_count = Cell::new(0_u32);
+        let sleep_count = Cell::new(0_u32);
+
+        let result = open_windows_pipe_with_retry::<(), _, _, _>(
+            Instant::now() + RESPONSE_TIMEOUT,
+            || {
+                open_count.set(open_count.get() + 1);
+                Err(io::Error::from_raw_os_error(2))
+            },
+            |_| {
+                sleep_count.set(sleep_count.get() + 1);
+                future::ready(())
+            },
+        )
+        .await;
+        let Err(error) = result else {
+            return Err(io::Error::other(
+                "non-busy pipe open unexpectedly succeeded",
+            ));
+        };
+
+        assert_eq!(error.raw_os_error(), Some(2));
+        assert_eq!(open_count.get(), 1);
+        assert_eq!(sleep_count.get(), 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_busy_error_stops_at_the_deadline() -> io::Result<()> {
+        let open_count = Cell::new(0_u32);
+        let sleep_count = Cell::new(0_u32);
+
+        let result = open_windows_pipe_with_retry::<(), _, _, _>(
+            Instant::now(),
+            || {
+                open_count.set(open_count.get() + 1);
+                Err(io::Error::from_raw_os_error(231))
+            },
+            |_| {
+                sleep_count.set(sleep_count.get() + 1);
+                future::ready(())
+            },
+        )
+        .await;
+        let Err(error) = result else {
+            return Err(io::Error::other(
+                "expired busy pipe open unexpectedly succeeded",
+            ));
+        };
+
+        assert_eq!(error.raw_os_error(), Some(231));
+        assert_eq!(open_count.get(), 1);
+        assert_eq!(sleep_count.get(), 0);
+        Ok(())
+    }
 }

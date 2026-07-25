@@ -60,7 +60,10 @@ creates an absolute temporary `COLAY_HOME`, clears its child environment, sets
 `colay-e2e-fake-provider`. The 32-client test uses separated executable/argument
 arrays and rejects every failed client, `database is locked`, `database is busy`,
 `SQLITE_BUSY`, or `SQLITE_LOCKED`. It also requires exactly one database, one
-workspace/path, zero plan-only tasks, and one live daemon.
+workspace/path, zero plan-only tasks, and one live daemon. Before a successful
+test returns, it explicitly stops that daemon and waits at most ten seconds for
+the live lease row, IPC endpoint, and OS process to disappear. `Drop` cleanup is
+only a failure-path fallback and is not accepted as successful cleanup evidence.
 
 Resume coverage is deliberately split at deterministic boundaries. The CLI
 integration test `resume_reports_the_latest_published_revision` proves that an
@@ -73,13 +76,13 @@ same-connection live updates and reconnect replay without wall-clock sleeps.
 Windows-native PowerShell:
 
 ```text
+cargo test -p colay --bin colay ipc_client::tests --all-features
 cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
 cargo test -p colay --test global_daemon --features test-fixtures -- --nocapture --test-threads=1
 cargo test -p colay --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
 cargo test -p colay --test global_resume --features test-fixtures -- --nocapture --test-threads=1
 cargo test -p colay --test global_doctor --features test-fixtures doctor_reports_global_workspace_and_operational_checks -- --nocapture --exact
-cargo test -p orchestrator-state --test legacy_import legacy_repository_state_imports_once_without_source_mutation -- --nocapture --exact
-cargo test -p orchestrator-state --test legacy_import nested_link_in_artifact_path_is_refused_before_source_read -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
 cargo test -p colay --test global_concurrency --features test-fixtures -- --nocapture
 ```
 
@@ -99,8 +102,7 @@ mkdir -p /home/<user>/.cache/colay-task8-target
 export CARGO_TARGET_DIR=/home/<user>/.cache/colay-task8-target
 cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
 cargo test -p colay --test global_concurrency --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
-cargo test -p orchestrator-state --test legacy_import legacy_repository_state_imports_once_without_source_mutation -- --nocapture --exact
-cargo test -p orchestrator-state --test legacy_import nested_link_in_artifact_path_is_refused_before_source_read -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
 ```
 
 This covers XDG defaults and Windows-mount refusal, a mode-`0600` Unix socket
