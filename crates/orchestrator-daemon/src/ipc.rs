@@ -15,8 +15,8 @@ use orchestrator_domain::{
 };
 use orchestrator_state::{
     Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, ResumeDisposition,
-    RootConfig, SessionListFilter, StateError, TaskListFilter, WorkspaceId, WorkspaceReadRequest,
-    ensure_private_directory, ensure_private_file,
+    RootConfig, SessionListFilter, StateError, TaskListFilter, WorkspaceId, WorkspaceOutboxRecord,
+    WorkspaceReadRequest, ensure_private_directory, ensure_private_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,6 +36,38 @@ pub const IPC_SCHEMA_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TASK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+struct TaskStreamInterleaveHook {
+    request_id: String,
+    status_read: oneshot::Sender<()>,
+    resume_outbox_scan: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static TASK_STREAM_INTERLEAVE_HOOK: std::sync::Mutex<Option<TaskStreamInterleaveHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn pause_task_stream_after_status_read(request_id: &str) {
+    let hook = {
+        let mut hook = TASK_STREAM_INTERLEAVE_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hook
+            .as_ref()
+            .is_some_and(|hook| hook.request_id == request_id)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.status_read.send(());
+        let _ = hook.resume_outbox_scan.await;
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -426,19 +458,28 @@ where
     let mut sent_status = false;
     let mut idle_deadline = Instant::now() + TASK_STREAM_IDLE_TIMEOUT;
     loop {
-        let Some(status) = crate::execution::active_task_status(database, workspace_id, task_id)?
+        let Some(status) =
+            load_task_stream_status(output, database, workspace_id, task_id, &request.request_id)
+                .await?
         else {
-            write_response(
-                output,
-                &IpcResponse::failure(
-                    request.request_id.clone(),
-                    format!("task {task_id} no longer exists"),
-                ),
-            )
-            .await?;
             return Ok(());
         };
+        #[cfg(test)]
+        pause_task_stream_after_status_read(&request.request_id).await;
         let records = workspace.outbox_after(scan_cursor, 256)?;
+        let Some(status) = refresh_task_stream_status_after_scan(
+            output,
+            database,
+            workspace_id,
+            task_id,
+            &request.request_id,
+            status,
+            &records,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         for record in records {
             scan_cursor = record.sequence;
             if record.event.task_id != Some(task_id) {
@@ -490,6 +531,52 @@ where
             return Ok(());
         }
         tokio::time::sleep(TASK_STREAM_POLL_INTERVAL.min(idle_deadline - now)).await;
+    }
+}
+
+async fn load_task_stream_status<W>(
+    output: &mut W,
+    database: &Database,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+    request_id: &str,
+) -> Result<Option<crate::execution::ActiveTaskStatus>, IpcError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let status = crate::execution::active_task_status(database, workspace_id, task_id)?;
+    if status.is_none() {
+        write_response(
+            output,
+            &IpcResponse::failure(
+                request_id.to_owned(),
+                format!("task {task_id} no longer exists"),
+            ),
+        )
+        .await?;
+    }
+    Ok(status)
+}
+
+async fn refresh_task_stream_status_after_scan<W>(
+    output: &mut W,
+    database: &Database,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+    request_id: &str,
+    previous_status: crate::execution::ActiveTaskStatus,
+    records: &[WorkspaceOutboxRecord],
+) -> Result<Option<crate::execution::ActiveTaskStatus>, IpcError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if records
+        .iter()
+        .any(|record| record.event.task_id == Some(task_id))
+    {
+        load_task_stream_status(output, database, workspace_id, task_id, request_id).await
+    } else {
+        Ok(Some(previous_status))
     }
 }
 
@@ -1355,7 +1442,8 @@ mod tests {
 
     use super::{
         IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, MAX_REQUEST_BYTES,
-        handle_connection, resume_workspace_task, workspace_conversation, workspace_projection,
+        TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook, handle_connection,
+        resume_workspace_task, workspace_conversation, workspace_projection,
     };
     use orchestrator_state::{
         DaemonLeaseRequest, Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord,
@@ -1539,6 +1627,110 @@ mod tests {
         let completed =
             tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader)).await??;
         assert_eq!(completed.outcome["data"]["cursor"], 2);
+        assert_eq!(completed.outcome["data"]["status"]["state"], "completed");
+        tokio::time::timeout(Duration::from_secs(1), server_task).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_status_stream_never_pairs_terminal_event_with_stale_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(Database::open_in_memory()?);
+        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let repository = tempfile::tempdir()?;
+        let workspace_id = database
+            .resolve_repository_workspace(repository.path())?
+            .workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let task_id = TaskId::new();
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("status race", "status race", now);
+        workspace.create_task(&NewTaskRecord {
+            task_id,
+            schema_version: SchemaVersion::V1.to_owned(),
+            state: TaskState::Running,
+            objective: envelope.objective.clone(),
+            original_request_redacted: envelope.original_request_redacted.clone(),
+            envelope,
+            created_at: now,
+        })?;
+        workspace.transition_task_with_event(
+            task_id,
+            0,
+            TaskState::Running,
+            TaskState::Verifying,
+            None,
+            false,
+            &TransitionGuards::default(),
+            now,
+            transition_event(task_id, TaskState::Running, TaskState::Verifying, now),
+        )?;
+
+        let root = std::path::PathBuf::from("unused");
+        let paths = GlobalStatePaths {
+            database: root.join("state.db"),
+            backups: root.join("backups"),
+            workspaces: root.join("workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(handle_connection(
+            server,
+            Arc::clone(&database),
+            paths,
+            writer,
+        ));
+        let (reader, mut output) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+        let request_id = "task-stream-status-race";
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: request_id.to_owned(),
+            workspace_id: Some(workspace_id),
+            action: "workspace.task.stream".to_owned(),
+            payload: serde_json::json!({"task_id": task_id}),
+        };
+        output
+            .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
+            .await?;
+
+        let initial = read_response(&mut reader).await?;
+        assert_eq!(initial.outcome["data"]["status"]["state"], "verifying");
+        let (status_read, status_read_waiter) = tokio::sync::oneshot::channel();
+        let (resume_outbox_scan, outbox_scan_waiter) = tokio::sync::oneshot::channel();
+        *TASK_STREAM_INTERLEAVE_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TaskStreamInterleaveHook {
+            request_id: request_id.to_owned(),
+            status_read,
+            resume_outbox_scan: outbox_scan_waiter,
+        });
+        tokio::time::timeout(Duration::from_secs(1), status_read_waiter).await??;
+
+        workspace.transition_task_with_event(
+            task_id,
+            1,
+            TaskState::Verifying,
+            TaskState::Completed,
+            None,
+            false,
+            &TransitionGuards {
+                verification_passed: true,
+                ..TransitionGuards::default()
+            },
+            now,
+            transition_event(task_id, TaskState::Verifying, TaskState::Completed, now),
+        )?;
+        resume_outbox_scan
+            .send(())
+            .map_err(|()| "task stream closed before its outbox scan resumed")?;
+
+        let completed =
+            tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader)).await??;
+        assert_eq!(completed.outcome["data"]["event"]["to_state"], "completed");
         assert_eq!(completed.outcome["data"]["status"]["state"], "completed");
         tokio::time::timeout(Duration::from_secs(1), server_task).await???;
         Ok(())
