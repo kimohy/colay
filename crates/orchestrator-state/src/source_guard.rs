@@ -92,8 +92,18 @@ impl SourceOpenGuard {
         &self.canonical_root
     }
 
+    pub(crate) fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
     pub(crate) fn read_all(&self) -> StateResult<Vec<u8>> {
         self.revalidate()?;
+        let bytes = self.read_retained()?;
+        self.revalidate()?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_retained(&self) -> StateResult<Vec<u8>> {
         let mut file = self
             .final_component()
             .handle
@@ -105,34 +115,7 @@ impl SourceOpenGuard {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|error| StateError::io(&self.requested_path, error))?;
-        self.revalidate()?;
         Ok(bytes)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn sqlite_path(&self) -> StateResult<PathBuf> {
-        use std::os::fd::AsRawFd as _;
-
-        let parent = self
-            .components
-            .get(self.components.len().saturating_sub(2))
-            .ok_or_else(|| {
-                StateError::InvalidRecord("legacy database has no guarded parent".to_owned())
-            })?;
-        let file_name = self.canonical_path.file_name().ok_or_else(|| {
-            StateError::InvalidRecord("legacy database path has no file name".to_owned())
-        })?;
-        Ok(PathBuf::from(format!(
-            "/proc/self/fd/{}",
-            parent.handle.as_file().as_raw_fd()
-        ))
-        .join(file_name))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn sqlite_path(&self) -> StateResult<PathBuf> {
-        Ok(self.canonical_path.clone())
     }
 
     pub(crate) fn revalidate(&self) -> StateResult<()> {

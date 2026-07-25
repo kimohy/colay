@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    ops::Deref,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -26,7 +25,7 @@ use crate::{
     Database, GlobalStatePaths, MigrationManager, RepositoryStatePaths, StateError, StateResult,
     WorkspaceId, artifacts::LegacyImportStaging, database::append_workspace_event_in_transaction,
     ensure_private_directory, ensure_private_file, import_scratch::LegacyImportScratch,
-    reject_symlink_components, source_guard::SourceOpenGuard,
+    reject_symlink_components, source_guard::SourceOpenGuard, sqlite_snapshot::GuardedSqliteFamily,
 };
 
 const LAST_LEGACY_SCHEMA_VERSION: u32 = 13;
@@ -214,25 +213,6 @@ pub struct LegacyImportResult {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LegacyImporter;
 
-struct GuardedSourceConnection {
-    connection: Connection,
-    guard: SourceOpenGuard,
-}
-
-impl GuardedSourceConnection {
-    fn revalidate(&self) -> StateResult<()> {
-        self.guard.revalidate()
-    }
-}
-
-impl Deref for GuardedSourceConnection {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.connection
-    }
-}
-
 impl LegacyImporter {
     /// Inspects only the explicitly supplied repository-local state store. The source connection
     /// is read-only; migration and validation operate against online-backup copies.
@@ -243,9 +223,17 @@ impl LegacyImporter {
         if !source.database.exists() {
             return Ok(None);
         }
-        let connection = open_source_read_only(&source.root, &source.database)?;
+        let family = GuardedSqliteFamily::open(&source.root, &source.database)?;
+        let canonical_root = family.canonical_root().to_path_buf();
+        let scratch_fingerprint =
+            inspection_scratch_fingerprint(family.canonical_root(), family.canonical_database());
+        let scratch = LegacyImportScratch::acquire(paths, &scratch_fingerprint)?;
+        let captured_source = scratch.path().join("source.db");
+        family.capture(&captured_source)?;
+        drop(family);
+
+        let connection = open_snapshot_read_only(&captured_source)?;
         let status = MigrationManager::status(&connection)?;
-        connection.revalidate()?;
         if status.current_version == 0 {
             return Err(StateError::InvalidRecord(
                 "legacy database has no migration history".to_owned(),
@@ -258,23 +246,14 @@ impl LegacyImporter {
             });
         }
         validate_integrity(&connection, "legacy source")?;
-        connection.revalidate()?;
         reject_live_legacy_daemon(&connection, status.current_version)?;
-        connection.revalidate()?;
         let source_identity_hash = source_identity_hash(&connection)?;
-        connection.revalidate()?;
-
-        let scratch_fingerprint =
-            inspection_scratch_fingerprint(status.current_version, &source_identity_hash);
-        let scratch = LegacyImportScratch::acquire(paths, &scratch_fingerprint)?;
-        let raw_snapshot = scratch.path().join("source.db");
-        connection.revalidate()?;
-        backup_stable_source(&connection, &raw_snapshot)?;
-        connection.revalidate()?;
-        let database_sha256 = sha256_file(&raw_snapshot)?;
-        let database_length = file_length(&raw_snapshot)?;
+        let validated_snapshot = scratch.path().join("validated.db");
+        backup_stable_source(&connection, &validated_snapshot)?;
+        let database_sha256 = sha256_file(&validated_snapshot)?;
+        let database_length = file_length(&validated_snapshot)?;
         let migrated_path = scratch.path().join("migrated.db");
-        let migrated = migrate_snapshot(&raw_snapshot, &migrated_path)?;
+        let migrated = migrate_snapshot(&validated_snapshot, &migrated_path)?;
         if !legacy_workspace_exists(&migrated)? {
             if workspace_row_count(&migrated)? == 0 {
                 return Ok(None);
@@ -289,16 +268,11 @@ impl LegacyImporter {
         validate_jsonl_evidence(&source.root, &source.events, &migrated, &events)?;
         let event_evidence = event_evidence(&events)?;
         let files = collect_manifest_files(source, &migrated)?;
-        connection.revalidate()?;
         let manifest_hash = manifest_hash(&database_sha256, database_length, &files);
         let logical_content_hash = logical_workspace_hash(&migrated)?;
         let source_root_hash = hash_domain(
             b"colay/legacy-source-root/v1\0",
-            connection
-                .guard
-                .canonical_root()
-                .to_string_lossy()
-                .as_bytes(),
+            canonical_root.to_string_lossy().as_bytes(),
         );
         let source_fingerprint = source_fingerprint(
             status.current_version,
@@ -338,11 +312,11 @@ impl LegacyImporter {
             validate_published_import(&existing, target, paths)?;
             return Ok(existing);
         }
-        let scratch = LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?;
         let inspected = Self::inspect(&plan.source, paths)?.ok_or_else(|| {
             StateError::InvalidRecord("legacy source disappeared before import".to_owned())
         })?;
         ensure_plan_unchanged(plan, &inspected)?;
+        let scratch = LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?;
 
         let workspace_paths = paths.for_workspace(target);
         let mut staging =
@@ -352,16 +326,7 @@ impl LegacyImporter {
             return Ok(existing);
         }
         staging.prepare()?;
-        let source = open_source_read_only(&plan.source.root, &plan.source.database)?;
-        let staged_database = staging.root().join(SOURCE_SNAPSHOT_NAME);
-        source.revalidate()?;
-        backup_stable_source(&source, &staged_database)?;
-        source.revalidate()?;
-        verify_file(
-            &staged_database,
-            &plan.database_sha256,
-            plan.database_length,
-        )?;
+        let staged_database = capture_staged_database(plan, &scratch, &staging)?;
         for file in &plan.files {
             let source_file = SourceOpenGuard::open(
                 &plan.source.root,
@@ -2401,18 +2366,52 @@ fn ensure_plan_unchanged(
     Ok(())
 }
 
-fn open_source_read_only(root: &Path, path: &Path) -> StateResult<GuardedSourceConnection> {
-    let guard = SourceOpenGuard::open(root, path)?;
-    let sqlite_path = guard.sqlite_path()?;
+fn capture_staged_database(
+    plan: &LegacyImportPlan,
+    scratch: &LegacyImportScratch,
+    staging: &LegacyImportStaging,
+) -> StateResult<PathBuf> {
+    let family = GuardedSqliteFamily::open(&plan.source.root, &plan.source.database)?;
+    let captured_source = scratch.path().join("source.db");
+    family.capture(&captured_source)?;
+    drop(family);
+
+    let source = open_snapshot_read_only(&captured_source)?;
+    let status = MigrationManager::status(&source)?;
+    if status.current_version == 0 {
+        return Err(StateError::InvalidRecord(
+            "legacy database has no migration history".to_owned(),
+        ));
+    }
+    if status.current_version > LAST_LEGACY_SCHEMA_VERSION {
+        return Err(StateError::FutureSchema {
+            found: status.current_version,
+            supported: LAST_LEGACY_SCHEMA_VERSION,
+        });
+    }
+    validate_integrity(&source, "legacy source")?;
+    reject_live_legacy_daemon(&source, status.current_version)?;
+    let _ = source_identity_hash(&source)?;
+
+    let staged_database = staging.root().join(SOURCE_SNAPSHOT_NAME);
+    backup_stable_source(&source, &staged_database)?;
+    drop(source);
+    verify_file(
+        &staged_database,
+        &plan.database_sha256,
+        plan.database_length,
+    )?;
+    Ok(staged_database)
+}
+
+fn open_snapshot_read_only(path: &Path) -> StateResult<Connection> {
     let connection = Connection::open_with_flags(
-        &sqlite_path,
+        path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    guard.revalidate()?;
     connection.busy_timeout(Duration::ZERO)?;
     connection.pragma_update(None, "query_only", true)?;
-    guard.revalidate()?;
-    Ok(GuardedSourceConnection { connection, guard })
+    Ok(connection)
 }
 
 fn validate_integrity(connection: &Connection, label: &str) -> StateResult<()> {
@@ -3039,11 +3038,14 @@ fn update_digest_length(digest: &mut Sha256, length: usize) {
     digest.update(u64::try_from(length).unwrap_or(u64::MAX).to_le_bytes());
 }
 
-fn inspection_scratch_fingerprint(schema_version: u32, source_identity_hash: &str) -> String {
+fn inspection_scratch_fingerprint(root: &Path, database: &Path) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"colay/legacy-import-inspection-scratch/v1\0");
-    digest.update(schema_version.to_le_bytes());
-    digest.update(source_identity_hash.as_bytes());
+    digest.update(b"colay/legacy-import-inspection-scratch/v2\0");
+    for path in [root, database] {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        update_digest_length(&mut digest, normalized.len());
+        digest.update(normalized.as_bytes());
+    }
     hex::encode(digest.finalize())
 }
 
@@ -3085,13 +3087,16 @@ fn table_exists(connection: &Connection, name: &str) -> StateResult<bool> {
 
 #[cfg(test)]
 mod final_hardening_tests {
-    use std::fs;
+    use std::{cell::RefCell, fs, rc::Rc};
 
     use rusqlite::Connection;
 
     use crate::{
         Database, GlobalStatePaths, RepositoryStatePaths, RootConfig, StateEnvironment,
         source_guard::{SourceOpenHookPhase, clear_source_open_hook, set_source_open_hook},
+        sqlite_snapshot::{
+            SnapshotCaptureHookPhase, clear_snapshot_capture_hook, set_snapshot_capture_hook,
+        },
     };
 
     use super::{LegacyEventEvidence, LegacyImportPlan, LegacyImporter, sha256_file};
@@ -3183,6 +3188,177 @@ mod final_hardening_tests {
                 .exists()
         );
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_final_name_substitution_reads_retained_a_never_b()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
+        fs::create_dir_all(&source.root)?;
+        drop(Connection::open(&source.database)?);
+
+        let alternate = source.database.with_extension("alternate");
+        let saved = source.database.with_extension("saved");
+        fs::write(&alternate, b"replacement database B must never be consumed")?;
+        let source_hash = sha256_file(&source.database)?;
+        let alternate_hash = sha256_file(&alternate)?;
+
+        let environment = StateEnvironment::with_colay_home(temporary.path().join("global"))?;
+        let paths = GlobalStatePaths::resolve(&environment)?;
+        let global = Database::open(&paths.database)?;
+        global.migrate_with_backup(&paths.backups)?;
+        let workspace_id = global
+            .resolve_repository_workspace(&repository)?
+            .workspace_id;
+        let target_before = target_import_counts(&global, workspace_id)?;
+        let plan = dummy_plan(source.clone());
+
+        set_source_open_hook(|_, _| Ok(()));
+        let source_database_for_hook = source.database.clone();
+        let alternate_for_hook = alternate.clone();
+        let saved_for_hook = saved.clone();
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let phases_for_hook = Rc::clone(&phases);
+        set_snapshot_capture_hook(move |phase, database| {
+            if database != source_database_for_hook {
+                return Ok(());
+            }
+            phases_for_hook.borrow_mut().push(phase);
+            match phase {
+                SnapshotCaptureHookPhase::BeforeSnapshotCopy => {
+                    fs::rename(&source_database_for_hook, &saved_for_hook)
+                        .map_err(|error| crate::StateError::io(&source_database_for_hook, error))?;
+                    fs::rename(&alternate_for_hook, &source_database_for_hook)
+                        .map_err(|error| crate::StateError::io(&source_database_for_hook, error))?;
+                }
+                SnapshotCaptureHookPhase::AfterSnapshotCopy => {
+                    fs::rename(&source_database_for_hook, &alternate_for_hook)
+                        .map_err(|error| crate::StateError::io(&source_database_for_hook, error))?;
+                    fs::rename(&saved_for_hook, &source_database_for_hook)
+                        .map_err(|error| crate::StateError::io(&source_database_for_hook, error))?;
+                }
+            }
+            Ok(())
+        });
+
+        let result = LegacyImporter::apply(&global, workspace_id, &plan, &paths);
+        clear_snapshot_capture_hook();
+        clear_source_open_hook();
+
+        let Err(error) = result else {
+            return Err("final-name substitution was accepted".into());
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("legacy database has no migration history"),
+            "importer consumed replacement B or returned an unexpected error: {error}"
+        );
+        assert_eq!(sha256_file(&source.database)?, source_hash);
+        assert_eq!(sha256_file(&alternate)?, alternate_hash);
+        assert!(!saved.exists());
+        assert_eq!(
+            *phases.borrow(),
+            vec![
+                SnapshotCaptureHookPhase::BeforeSnapshotCopy,
+                SnapshotCaptureHookPhase::AfterSnapshotCopy,
+            ]
+        );
+        assert_eq!(target_import_counts(&global, workspace_id)?, target_before);
+        assert!(
+            !paths
+                .for_workspace(workspace_id)
+                .root
+                .join("imports")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_wal_sidecar_set_change_is_refused_before_target_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
+        fs::create_dir_all(&source.root)?;
+        drop(Connection::open(&source.database)?);
+        let source_hash = sha256_file(&source.database)?;
+
+        let mut wal_name = source
+            .database
+            .file_name()
+            .ok_or("source database has no file name")?
+            .to_os_string();
+        wal_name.push("-wal");
+        let wal = source.database.with_file_name(wal_name);
+        assert!(!wal.exists());
+
+        let environment = StateEnvironment::with_colay_home(temporary.path().join("global"))?;
+        let paths = GlobalStatePaths::resolve(&environment)?;
+        let global = Database::open(&paths.database)?;
+        global.migrate_with_backup(&paths.backups)?;
+        let workspace_id = global
+            .resolve_repository_workspace(&repository)?
+            .workspace_id;
+        let target_before = target_import_counts(&global, workspace_id)?;
+        let plan = dummy_plan(source.clone());
+
+        let source_database_for_hook = source.database.clone();
+        let wal_for_hook = wal.clone();
+        set_snapshot_capture_hook(move |phase, database| {
+            if database == source_database_for_hook
+                && phase == SnapshotCaptureHookPhase::BeforeSnapshotCopy
+            {
+                fs::write(&wal_for_hook, b"injected WAL sidecar")
+                    .map_err(|error| crate::StateError::io(&wal_for_hook, error))?;
+            }
+            Ok(())
+        });
+
+        let result = LegacyImporter::apply(&global, workspace_id, &plan, &paths);
+        clear_snapshot_capture_hook();
+
+        let Err(error) = result else {
+            return Err("WAL sidecar set change was accepted".into());
+        };
+        assert!(
+            error.to_string().contains("SQLite sidecar set changed"),
+            "unexpected WAL set-change error: {error}"
+        );
+        fs::remove_file(&wal)?;
+        assert_eq!(sha256_file(&source.database)?, source_hash);
+        assert_eq!(target_import_counts(&global, workspace_id)?, target_before);
+        assert!(
+            !paths
+                .for_workspace(workspace_id)
+                .root
+                .join("imports")
+                .exists()
+        );
+        Ok(())
+    }
+
+    fn dummy_plan(source: RepositoryStatePaths) -> LegacyImportPlan {
+        LegacyImportPlan {
+            source,
+            source_schema_version: 3,
+            source_fingerprint: "a".repeat(64),
+            source_root_hash: "b".repeat(64),
+            manifest_hash: "c".repeat(64),
+            event_evidence: LegacyEventEvidence {
+                count: 0,
+                root_hash: None,
+                tip_hash: None,
+            },
+            database_sha256: "d".repeat(64),
+            database_length: 0,
+            files: Vec::new(),
+        }
     }
 
     fn target_import_counts(

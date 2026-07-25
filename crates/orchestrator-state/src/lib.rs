@@ -28,6 +28,7 @@ mod records;
 mod scheduling;
 mod sessions;
 mod source_guard;
+mod sqlite_snapshot;
 mod workspace;
 mod workspace_registry;
 

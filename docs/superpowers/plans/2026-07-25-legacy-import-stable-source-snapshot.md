@@ -143,7 +143,7 @@ pub(crate) fn capture(&self, destination_main: &Path) -> StateResult<()> {
 }
 ```
 
-`read_pass` returns ordered `(suffix, Vec<u8>)` entries with `""` for the main file. `write_captured_family` uses `OpenOptions::new().write(true).create_new(true)`, `ensure_private_file`, `write_all`, and `sync_all`; destination sidecars are formed by appending the captured suffix to `destination_main.file_name()`. Any partial files remain only inside the owned scratch attempt.
+`read_pass` returns ordered `(suffix, Vec<u8>)` entries with `""` for the main file. `write_captured_family` uses `OpenOptions::new().write(true).create_new(true)`, `write_all`, and `sync_all`; destination sidecars are formed by appending the captured suffix to `destination_main.file_name()`. Unix creation requests mode `0600` and verifies it after close. Windows creation inherits the already-verified scratch attempt directory's protected trusted-only file ACEs, avoiding redundant per-file `icacls` subprocesses while preserving private scratch. Any partial files remain only inside the owned scratch attempt.
 
 - [ ] **Step 4: Add the thread-local two-phase test hook**
 

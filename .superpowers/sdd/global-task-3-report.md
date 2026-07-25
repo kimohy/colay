@@ -245,3 +245,70 @@ PASS: exit 0; 544.4 seconds on the final-code rerun
 ```
 
 The first full workspace-test attempt stopped during compilation, before tests ran, because the worktree drive had only 4.6 MB free (`os error 112`, followed by a PDB filesystem error). After verifying that the exact target was this worktree's `target` directory, `cargo clean` removed 14.4 GiB of recoverable build artifacts only. The unchanged full workspace command then rebuilt cleanly and passed in 651.6 seconds. After the high-level ABA assertion was strengthened to cover every relevant target row family and absence of an import directory, the final-code workspace rerun also passed in 544.4 seconds. This was not a test or code failure.
+
+## Stable Retained SQLite-Family Snapshot
+
+The final P1 review found that Linux SQLite still resolved the final database name through `/proc/self/fd/<parent>/<name>` after `SourceOpenGuard` construction. A final-component ABA could therefore bind rusqlite to replacement B even though the retained guard and later path revalidation identified original A.
+
+### Retained family capture
+
+- Added `GuardedSqliteFamily`, which retains guards for the main database and the exact present set of `-wal`, `-shm`, and `-journal` siblings.
+- Sidecar discovery accepts only exact regular-file siblings below the guarded source root. Links, reparse points, escapes, unexpected file types, identity changes, and set changes fail closed.
+- Capture validates the family, reads every member from retained handles, revalidates the complete identity/set boundary, reads every retained handle a second time, and requires ordered byte-for-byte equality before writing scratch.
+- The private recoverable attempt receives exact `source.db`, `source.db-wal`, `source.db-shm`, and `source.db-journal` sibling names for present members. Unix creation requests mode `0600` and verifies it. Windows create-new files inherit the already-hardened attempt directory's protected trusted-only file ACEs; no redundant per-file ACL subprocess is needed.
+- Removed `SourceOpenGuard::sqlite_path`, `GuardedSourceConnection`, and `open_source_read_only`. No production rusqlite open receives the mutable source database path or `/proc/self/fd` path.
+
+Inspection now acquires deterministic location-keyed recoverable scratch before SQLite opens, captures the raw family there, validates only scratch `source.db`, and online-backs it up to sidecar-independent `validated.db`. Hashing, migration, event/document validation, and plan sealing use that stable backup. Apply reinspects before taking the non-reentrant plan scratch lock, captures a fresh family under that lock, validates only scratch, and online-backs it up to staged immutable `legacy.db` before hash/manifest verification and the existing migration/rewrite flow.
+
+The two full-family retained reads detect observed identity, set, and byte changes during capture. They intentionally do not claim detection of an unobservable content ABA that returns to identical retained bytes between both complete passes; in that case the accepted evidence bytes are still the retained original content.
+
+### TDD race evidence
+
+```text
+cargo test -p orchestrator-state sqlite_final_name_substitution -- --nocapture
+RED: E0432, `crate::sqlite_snapshot` did not exist.
+GREEN: 1 passed, 0 failed.
+
+cargo test -p orchestrator-state sqlite_wal_sidecar_set_change -- --nocapture
+RED: E0432, the snapshot capture boundary/hook did not exist.
+GREEN: 1 passed, 0 failed.
+
+cargo test -p orchestrator-state sqlite_ -- --nocapture
+FINAL GREEN: 2 passed, 0 failed.
+```
+
+The final-name fixture installs its hook only after the complete family guard is constructed. It renames A aside, substitutes non-SQLite B, lets retained pass A proceed, and restores A before post-copy validation. The importer reaches A's expected `legacy database has no migration history` result rather than B's invalid-database result. Both hook phases ran; A and B hashes, target task/event/import/mapping counts, saved-name absence, and published-import absence were unchanged.
+
+The WAL fixture starts with no sidecar, creates the exact `-wal` sibling at `BeforeSnapshotCopy`, and leaves it through post-copy validation. Capture rejects `legacy SQLite sidecar set changed` before scratch SQLite or target mutation; the main hash, target counts, ledger/mappings, and published files remain unchanged after fixture cleanup.
+
+### Focused and final verification
+
+```text
+cargo test -p orchestrator-state source_parent_aba -- --nocapture
+PASS: 2 passed, 0 failed
+
+cargo test -p orchestrator-state --all-features --test legacy_import -- --nocapture
+PASS: 22 passed, 0 failed
+
+cargo test -p orchestrator-state --test migration_contract -- --nocapture
+PASS: 5 passed, 0 failed
+
+cargo test -p orchestrator-state --all-features
+PASS: 87 unit tests and every state integration/doc-test suite
+
+cargo fmt --all -- --check
+PASS
+
+cargo check --workspace --all-targets --all-features
+PASS
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+PASS
+
+cargo test --workspace --all-features
+PASS: exit 0; 454.8 seconds on the final unchanged rerun
+```
+
+An intermediate capture implementation invoked the full Windows `ensure_private_file` ACL rewrite for every new raw scratch member. Parallel import fixtures exposed `icacls.exe` spawn denials. The final implementation removes only those redundant child rewrites while retaining the already-verified private attempt-directory inheritance boundary; the affected parallel import binary then passed 22/22. A later full workspace attempt encountered the same transient OS denial in the untouched CLI resume fixture. Its exact all-features test immediately passed 1/1 in isolation, and the final exact unchanged workspace command passed completely. No unrelated production or fixture behavior was changed.
+
+Planned implementation commit subject: `fix: snapshot guarded legacy SQLite families`.
