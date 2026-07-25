@@ -174,6 +174,7 @@ async fn wait_until_ready(
 ) -> Result<()> {
     let started = Instant::now();
     let mut child: Option<Child> = None;
+    let mut spawn_attempted = false;
     let mut last_child_exit = None;
     loop {
         if ping(paths).await.is_ok() {
@@ -185,8 +186,9 @@ async fn wait_until_ready(
             last_child_exit = Some(exit);
             child = None;
         }
-        if child.is_none() {
+        if child.is_none() && !spawn_attempted {
             child = Some(spawn_server(repository, explicit_config)?);
+            spawn_attempted = true;
         }
         if started.elapsed() >= CONNECT_TIMEOUT {
             if let Some(process) = child.as_mut() {
@@ -255,8 +257,16 @@ async fn open_response_stream(
         use tokio::net::windows::named_pipe::ClientOptions;
 
         let endpoint = ipc_endpoint(paths);
-        let stream = ClientOptions::new().open(&endpoint)?;
-        response_stream(stream, &encoded).await
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            match ClientOptions::new().open(&endpoint) {
+                Ok(stream) => return response_stream(stream, &encoded).await,
+                Err(error) if error.raw_os_error() == Some(231) && Instant::now() < deadline => {
+                    tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

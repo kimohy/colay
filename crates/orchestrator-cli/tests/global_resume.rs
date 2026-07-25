@@ -5,8 +5,6 @@ use std::{
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    thread,
-    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -17,6 +15,7 @@ use orchestrator_domain::{
 };
 use orchestrator_state::{
     CoordinatorLeaseRequest, DaemonStatus, Database, NewTaskAttemptRecord, NewTaskRecord,
+    WorkspaceId,
 };
 
 struct ResumeFixture {
@@ -24,6 +23,7 @@ struct ResumeFixture {
     repository: PathBuf,
     colay_home: PathBuf,
     task_id: TaskId,
+    workspace_id: Option<WorkspaceId>,
 }
 
 impl ResumeFixture {
@@ -50,6 +50,7 @@ impl ResumeFixture {
             repository,
             colay_home,
             task_id: TaskId::new(),
+            workspace_id: None,
         };
         let started = fixture.colay(["status"])?;
         if !started.status.success() {
@@ -107,6 +108,7 @@ impl ResumeFixture {
         let workspace_id = database
             .resolve_repository_workspace(&self.repository)?
             .workspace_id;
+        self.workspace_id = Some(workspace_id);
         let daemon_instance = match database.daemon_status(Utc::now())? {
             DaemonStatus::Online(instance) => instance.instance_id,
             status => bail!("fixture daemon is not online: {status:?}"),
@@ -175,9 +177,9 @@ impl ResumeFixture {
 
     fn transition_active_task_to_verifying(&self) -> Result<()> {
         let database = Database::open(self.global_database())?;
-        let workspace_id = database
-            .resolve_repository_workspace(&self.repository)?
-            .workspace_id;
+        let workspace_id = self
+            .workspace_id
+            .context("active resume fixture omitted its workspace")?;
         let workspace = database.workspace(workspace_id);
         let task = workspace
             .load_task(self.task_id)?
@@ -272,17 +274,11 @@ fn pause_mutation_uses_global_daemon_without_opening_repository_sqlite() -> Resu
 }
 
 #[test]
-fn resume_reports_a_revision_published_after_the_initial_attachment() -> Result<()> {
+fn resume_reports_the_latest_published_revision() -> Result<()> {
     let fixture = ResumeFixture::active_task()?;
     let task_id = fixture.task_id.to_string();
-    let output = thread::scope(|scope| -> Result<Output> {
-        let resumed = scope.spawn(|| fixture.colay(["--json", "resume", task_id.as_str()]));
-        thread::sleep(Duration::from_millis(500));
-        fixture.transition_active_task_to_verifying()?;
-        resumed
-            .join()
-            .map_err(|_| anyhow::anyhow!("resume command thread panicked"))?
-    })?;
+    fixture.transition_active_task_to_verifying()?;
+    let output = fixture.colay(["--json", "resume", task_id.as_str()])?;
     assert!(
         output.status.success(),
         "{}",

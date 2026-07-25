@@ -125,6 +125,31 @@ that requires a trusted publisher signature as an unsupported deployment until t
 organization signs its internal build or approves the verified digest. Do not interpret
 npm provenance or the checksum as an Authenticode substitute.
 
+## User-global state rollout gate
+
+A release that changes global paths, workspace registration, daemon ownership,
+IPC, migration/import, or plan-first behavior must include fresh Windows-native
+and WSL evidence from the exact matrix in [`testing.md`](testing.md). Do not
+promote the release unless all of these are true:
+
+- Windows and WSL resolve databases beneath different OS-native roots; WSL
+  refuses a state root on `/mnt/<drive>`.
+- Thirty-two concurrent status/plan-only clients all succeed without SQLite
+  busy/locked diagnostics, duplicate workspace/path rows, task creation, or a
+  second live daemon.
+- The Windows named pipe grants access only to the current SID, while the WSL
+  Unix socket is owned by the current user with mode `0600`.
+- Unicode/case-equivalent Windows paths, non-Git planning on both platforms,
+  idempotent legacy import, and platform-native junction/symlink redirect
+  refusal pass.
+- Provider doctor resolves Codex, Claude, Gemini, and Agy only to compiled fake
+  provider fixtures. No provider login, model prompt, credential, or network
+  inference is allowed in rollout verification.
+
+Record the exact commands, exit codes, failures/retries, OS/toolchain identity,
+and temporary-root strategy in the WSL/Windows QA tracker. A prose-only claim is
+not release evidence.
+
 ## Operator release procedure
 
 1. Prepare a beta or stable workspace/npm version, run the required checks,

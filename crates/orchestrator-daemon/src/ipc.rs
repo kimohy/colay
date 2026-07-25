@@ -21,6 +21,7 @@ use orchestrator_state::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(windows)]
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{

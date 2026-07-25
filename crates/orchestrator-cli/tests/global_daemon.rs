@@ -372,12 +372,19 @@ fn old_schema_migrates_before_untrusted_provider_is_evaluated() -> Result<()> {
     );
     assert_eq!(fixture.schema_version()?, STATE_SCHEMA_VERSION);
     let observation_deadline = Instant::now() + Duration::from_secs(5);
-    while !observation.exists() && Instant::now() < observation_deadline {
+    let observation: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(&observation)
+            && let Ok(value) = serde_json::from_slice(&bytes)
+        {
+            break value;
+        }
+        if Instant::now() >= observation_deadline {
+            let bytes = fs::read(&observation)
+                .context("fake provider did not record its schema observation")?;
+            break serde_json::from_slice(&bytes)?;
+        }
         std::thread::sleep(Duration::from_millis(25));
-    }
-    let observation: serde_json::Value = serde_json::from_slice(
-        &fs::read(observation).context("fake provider did not record its schema observation")?,
-    )?;
+    };
     assert_eq!(observation["observed_schema_version"], STATE_SCHEMA_VERSION);
     assert_eq!(observation["guard_passed"], true);
     Ok(())

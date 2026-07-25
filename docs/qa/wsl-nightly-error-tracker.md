@@ -8,7 +8,7 @@
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-24
+- 마지막 갱신: 2026-07-26
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
@@ -28,7 +28,7 @@
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
-| `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
+| `WSL-010` | critical | fixed | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
@@ -86,6 +86,30 @@ Codex version is untested; writable work is disabled
 - 기존 repository-local 상태가 정확히 한 번 import되고 원본과 audit evidence가 보존된다.
 - active lease의 `resume`은 충돌 오류 대신 기존 실행에 연결된다.
 - fake provider만 사용한 Windows/WSL QA와 전체 Rust 품질 게이트가 통과한다.
+
+### Task 8 Windows/WSL rollout 검증 (2026-07-26)
+
+- Windows 11 `10.0.26100` source build에서 전역 path 14/14, daemon/IPC 7/7,
+  non-Git plan 2/2, import 1/1, junction redirect 1/1, 32-client stress와
+  Unicode/case test 2/2가 통과했다. Named pipe DACL은 현재 SID ACE 하나만 포함하고
+  broad principal ACE를 포함하지 않았다.
+- WSL 2 Ubuntu 24.04 (`6.18.33.2-microsoft-standard-WSL2`)에서 Rust 1.95.0과
+  Linux-native Cargo target을 사용했다. XDG/분리 path 18/18, Unix socket와
+  32-client stress 2/2, non-Git plan 2/2, import 1/1, Unix symlink redirect 1/1이
+  통과했다. Unix socket은 `0600`이며 WSL `COLAY_HOME` 소유자 UID와 일치했다.
+- 모든 CLI fixture는 OS-native 임시 `COLAY_HOME`과 compiled fake provider만 사용했다.
+  Windows와 WSL은 동일 SQLite 파일을 열지 않았고 WSL의 `/mnt/<drive>` 상태 root 거부도
+  native test에서 통과했다. 실제 Codex, Claude, Gemini, Agy inference는 호출하지 않았다.
+- cold fan-in RED에서 client별 25ms daemon contender 재-spawn storm과 Windows named-pipe
+  `ERROR_PIPE_BUSY` 231을 확인했다. Client당 startup spawn 1회와 pipe-busy 전용 bounded
+  retry 후 Windows exact stress가 통과했다.
+- WSL 최초 compile 직후 stress readiness timeout 1회와 이후 plan client raw `ENOENT` 1회가
+  관찰됐지만, diagnostic exact 재실행 2회와 clean combined matrix에서 재현되지 않았다.
+  최종 clean stress는 32/32 성공했다. 향후 재현 시 persisted daemon phase/startup_error가
+  assertion에 포함된다.
+- WSL legacy-import 22-case batch는 한 test가 source DB journal을 연 상태로 5분 이상 futex
+  wait해 중단했다. rollout에 필요한 import-once와 symlink redirect exact cases는 각각
+  독립 실행으로 통과했다. 같은 batch stall이 다시 발생하면 별도 ID로 승격한다.
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 

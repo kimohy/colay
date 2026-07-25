@@ -52,6 +52,63 @@ remains read-only, exact approval applies two verified sources only to the
 dedicated integration worktree, session state completes, and the user plus task
 worktrees remain unchanged.
 
+## User-global state platform matrix
+
+Run this matrix before rolling out a user-global state change. Every CLI fixture
+creates an absolute temporary `COLAY_HOME`, clears its child environment, sets
+`COLAY_TEST_FAKE_PROVIDERS_ONLY=1`, and configures only the compiled
+`colay-e2e-fake-provider`. The 32-client test uses separated executable/argument
+arrays and rejects every failed client, `database is locked`, `database is busy`,
+`SQLITE_BUSY`, or `SQLITE_LOCKED`. It also requires exactly one database, one
+workspace/path, zero plan-only tasks, and one live daemon.
+
+Resume coverage is deliberately split at deterministic boundaries. The CLI
+integration test `resume_reports_the_latest_published_revision` proves that an
+attachment projects the latest revision already committed before the request.
+The daemon tests `task_status_stream_emits_new_revisions_and_closes_after_terminal_state`,
+`task_status_stream_never_pairs_terminal_event_with_stale_status`, and
+`task_status_stream_replays_intervening_events_after_reconnect_cursor` exercise
+same-connection live updates and reconnect replay without wall-clock sleeps.
+
+Windows-native PowerShell:
+
+```text
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_daemon --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_resume --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_doctor --features test-fixtures doctor_reports_global_workspace_and_operational_checks -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import legacy_repository_state_imports_once_without_source_mutation -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import nested_link_in_artifact_path_is_refused_before_source_read -- --nocapture --exact
+cargo test -p colay --test global_concurrency --features test-fixtures -- --nocapture
+```
+
+This covers Windows native path validation, Unicode/case-equivalent workspace
+registration, the current-SID-only named-pipe DACL, singleton ownership,
+non-Git plan-first behavior, all four fake provider doctor fixtures, idempotent
+legacy import, junction redirect rejection, and the 32-client cold-start fan-in.
+
+Run the Linux commands inside WSL with Cargo build output on the Linux-native
+filesystem, not under `/mnt/<drive>`. A native checkout is preferred; when the
+source checkout is mounted read-only or used only as source, set
+`CARGO_TARGET_DIR` to a WSL-native temporary directory:
+
+```text
+export COLAY_TEST_FAKE_PROVIDERS_ONLY=1
+mkdir -p /home/<user>/.cache/colay-task8-target
+export CARGO_TARGET_DIR=/home/<user>/.cache/colay-task8-target
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_concurrency --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p orchestrator-state --test legacy_import legacy_repository_state_imports_once_without_source_mutation -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import nested_link_in_artifact_path_is_refused_before_source_read -- --nocapture --exact
+```
+
+This covers XDG defaults and Windows-mount refusal, a mode-`0600` Unix socket
+owned by the same user as `COLAY_HOME`, a non-Git home plan, idempotent import,
+Unix symlink redirect rejection, and the same 32-client stress contract. Windows
+and WSL evidence is valid only when their resolved databases are under separate
+native temporary roots; a WSL database under `/mnt/<drive>` is a test failure.
+
 ## Required local verification
 
 ```text

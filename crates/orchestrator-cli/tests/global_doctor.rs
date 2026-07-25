@@ -123,7 +123,9 @@ impl DoctorFixture {
             format!(
                 "config_version = 4\n\
                  [orchestrator.providers.codex]\nexecutable = {executable}\n\
-                 [orchestrator.providers.claude]\nexecutable = {executable}\n"
+                 [orchestrator.providers.claude]\nexecutable = {executable}\n\
+                 [orchestrator.providers.gemini]\nexecutable = {executable}\n\
+                 [orchestrator.providers.agy]\nexecutable = {executable}\n"
             ),
         )?;
         Ok(())
@@ -404,8 +406,26 @@ fn doctor_reports_global_workspace_and_operational_checks() -> Result<()> {
         "runtime",
         "provider_codex",
         "provider_claude",
+        "provider_gemini",
+        "provider_agy",
     ] {
         check_named(&document, name)?;
+    }
+    for provider in [
+        "provider_codex",
+        "provider_claude",
+        "provider_gemini",
+        "provider_agy",
+    ] {
+        assert_eq!(
+            PathBuf::from(
+                check_named(&document, provider)?["data"]["configured_executable"]
+                    .as_str()
+                    .with_context(|| format!("{provider} did not resolve a fake provider"))?
+            ),
+            fake_provider_binary(),
+            "{provider} did not exercise the configured fake provider"
+        );
     }
     assert_eq!(
         PathBuf::from(

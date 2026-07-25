@@ -117,13 +117,13 @@ impl StateEnvironment {
                 "COLAY_HOME must not be empty".to_owned(),
             ));
         }
-        self.reject_wsl_windows_mount("COLAY_HOME", colay_home)?;
-        if !colay_home.is_absolute() {
+        if !self.path_is_absolute(colay_home) {
             return Err(StateError::InvalidConfig(format!(
                 "COLAY_HOME must be absolute: {}",
                 colay_home.display()
             )));
         }
+        self.reject_wsl_windows_mount("COLAY_HOME", colay_home)?;
         Ok(())
     }
 
@@ -165,6 +165,12 @@ impl StateEnvironment {
         self.is_wsl
             || kernel_indicates_wsl(self.kernel_release.as_deref())
             || kernel_indicates_wsl(self.kernel_version.as_deref())
+    }
+
+    fn path_is_absolute(&self, path: &Path) -> bool {
+        path.is_absolute()
+            || ((self.is_wsl() || self.mountinfo.is_some())
+                && path.to_string_lossy().starts_with('/'))
     }
 }
 
