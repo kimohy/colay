@@ -6,7 +6,8 @@ use orchestrator_domain::{
     CorrelationId, EventActor, EventId, EventType, GraphRevisionId, GraphValidationAuthority,
     GraphValidationPolicy, MessageId, MessageKind, MessageRole, MessageState, PlanningAttemptId,
     ProviderId, RepoValidationEvidence, RequestPlanCommandPayload, SandboxMode, SchemaVersion,
-    SessionId, SessionState, TaskEvent, ValidatedTaskGraph, validate_task_graph_with_authority,
+    SessionId, SessionState, TaskEvent, ValidatedTaskGraph, canonical_sha256,
+    validate_task_graph_with_authority,
 };
 use orchestrator_engine::{
     ConversationOrchestrator, PlannerRequest, TaskPlanner, collect_planner_response,
@@ -18,6 +19,11 @@ use orchestrator_state::{
 };
 
 use crate::{CommandProcessingResult, DaemonError, MessageRedactor};
+
+const DEFERRED_BASE_COMMIT: &str = "0000000000000000000000000000000000000000";
+const DEFERRED_GIT_ROOT: &str = "deferred until exact writable approval";
+const DEFERRED_GIT_CHECK: &str = "writable_git_preflight_deferred";
+const PLAN_ONLY_REQUESTER: &str = "local-cli-run-plan-only";
 
 #[derive(Clone)]
 pub struct PlanningServices {
@@ -54,7 +60,9 @@ pub async fn process_next_orchestration_command(
             .await
             .map_err(map_conversation_error)
         }
-        ClientCommandAction::ApproveGraph => approve_graph(database, services, &command, now).await,
+        ClientCommandAction::ApproveGraph => {
+            approve_graph(database, services, redactor, &command, now).await
+        }
         ClientCommandAction::ReviseGraph | ClientCommandAction::CancelPlan => Err(
             ExecutionError::Rejected("revise/cancel planning commands are not enabled".to_owned()),
         ),
@@ -288,6 +296,7 @@ async fn propose_validated_graph(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn validate_candidate_authority(
     database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
@@ -309,13 +318,7 @@ async fn validate_candidate_authority(
                 .to_owned(),
         );
     }
-    let readiness = inspect_git_repository(&services.repository_root)
-        .await
-        .map_err(|error| {
-            format!(
-                "Repository validation failed before approval: {error}. Initialize Git and create a HEAD commit, then continue this conversation."
-            )
-        })?;
+    let readiness = inspect_git_repository(&services.repository_root).await.ok();
     let mut normalized_write_scopes = graph
         .proposal
         .nodes
@@ -353,8 +356,14 @@ async fn validate_candidate_authority(
         requirement_revision_id: requirement.requirement_revision_id,
         requirement_snapshot_hash: requirement.snapshot_hash,
         graph_revision_id: graph.proposal.revision_id,
-        git_root_redacted: redactor.redact(&readiness.repository_root.to_string_lossy()),
-        base_commit: readiness.base_commit,
+        git_root_redacted: readiness.as_ref().map_or_else(
+            || DEFERRED_GIT_ROOT.to_owned(),
+            |readiness| redactor.redact(&readiness.repository_root.to_string_lossy()),
+        ),
+        base_commit: readiness.as_ref().map_or_else(
+            || DEFERRED_BASE_COMMIT.to_owned(),
+            |readiness| readiness.base_commit.clone(),
+        ),
         eligible_providers: services
             .validation_policy
             .eligible_providers
@@ -373,7 +382,9 @@ async fn validate_candidate_authority(
         verification_plan: requirement.snapshot.verification_plan,
         required_approvals,
         checks: vec![
-            "git_ready".to_owned(),
+            readiness
+                .as_ref()
+                .map_or_else(|| DEFERRED_GIT_CHECK.to_owned(), |_| "git_ready".to_owned()),
             "graph_valid".to_owned(),
             "write_scopes_valid".to_owned(),
             "provider_profile_eligible".to_owned(),
@@ -396,9 +407,11 @@ async fn validate_candidate_authority(
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn approve_graph(
     database: &WorkspaceDatabase<'_>,
     services: &PlanningServices,
+    redactor: &dyn MessageRedactor,
     command: &ClientCommand,
     now: DateTime<Utc>,
 ) -> Result<String, ExecutionError> {
@@ -415,6 +428,12 @@ async fn approve_graph(
     payload
         .validate()
         .map_err(|error| ExecutionError::Rejected(error.to_string()))?;
+    if command.requested_by == PLAN_ONLY_REQUESTER {
+        return Err(ExecutionError::Rejected(
+            "plan-only run invocation cannot promote a graph; submit a later explicit exact approval"
+                .to_owned(),
+        ));
+    }
     let revision = database
         .load_graph_revision(payload.revision_id)?
         .ok_or_else(|| {
@@ -456,22 +475,67 @@ async fn approve_graph(
             "validated graph requirement revision is stale".to_owned(),
         ));
     }
+    let proposal = revision.proposal.as_ref().ok_or_else(|| {
+        ExecutionError::Rejected("approved graph revision has no proposal".to_owned())
+    })?;
+    if proposal.nodes.iter().any(|node| {
+        !services
+            .validation_policy
+            .eligible_providers
+            .contains(&node.provider.unwrap_or(proposal.planner_provider))
+            || !services
+                .validation_policy
+                .eligible_profiles
+                .contains(&node.profile)
+    }) {
+        return Err(ExecutionError::Rejected(
+            "provider writable eligibility changed after graph validation; run provider diagnostics and request a new plan"
+                .to_owned(),
+        ));
+    }
     let readiness = inspect_git_repository(&services.repository_root)
         .await
         .map_err(|error| {
             ExecutionError::Rejected(format!(
-                "repository changed or is unavailable since validation: {error}"
+                "writable approval requires a committed Git repository: {error}. Initialize Git and create a HEAD commit, then retry the exact approval"
             ))
         })?;
-    if readiness.base_commit != authority.base_commit {
+    if !authority_is_deferred(&authority) && readiness.base_commit != authority.base_commit {
         return Err(ExecutionError::Rejected(
             "repository HEAD changed after validation; generate a new proposal".to_owned(),
         ));
     }
+    let materialization_authority = if authority_is_deferred(&authority) {
+        GraphValidationAuthority {
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: canonical_sha256(&serde_json::json!({
+                "graph_revision_id": revision.revision_id,
+                "proposal_hash": revision.proposal_hash,
+                "plan_validation_hash": authority.validation_hash,
+                "git_root_redacted": redactor.redact(
+                    &readiness.repository_root.to_string_lossy()
+                ),
+                "base_commit": readiness.base_commit,
+                "eligible_providers": services.validation_policy.eligible_providers,
+                "eligible_profiles": services.validation_policy.eligible_profiles,
+            }))
+            .map_err(|error| ExecutionError::Rejected(error.to_string()))?,
+            base_commit: readiness.base_commit,
+            git_root_redacted: redactor.redact(&readiness.repository_root.to_string_lossy()),
+            validation_checks: vec![
+                "git_ready".to_owned(),
+                "head_resolved".to_owned(),
+                "provider_profile_eligible".to_owned(),
+                "exact_graph_approval".to_owned(),
+            ],
+        }
+    } else {
+        authority
+    };
     let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: payload.revision_id,
         expected_proposal_hash: payload.proposal_hash,
-        authority: Some(authority),
+        authority: Some(materialization_authority),
         approved_by: payload.approved_by,
         approved_at: now,
     })?;
@@ -481,6 +545,15 @@ async fn approve_graph(
         approved.revision_id,
         approved.task_ids.len()
     ))
+}
+
+fn authority_is_deferred(authority: &GraphValidationAuthority) -> bool {
+    authority.base_commit == DEFERRED_BASE_COMMIT
+        && authority.git_root_redacted == DEFERRED_GIT_ROOT
+        && authority
+            .validation_checks
+            .iter()
+            .any(|check| check == DEFERRED_GIT_CHECK)
 }
 
 fn transition_approved_session(

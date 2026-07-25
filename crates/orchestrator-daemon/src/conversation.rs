@@ -237,7 +237,7 @@ fn plan_command(
             .map_err(StateError::from)?,
         idempotency_key: format!("conversation-plan-{}", source.command_id),
         state: ClientCommandState::Pending,
-        requested_by: "conversation-orchestrator".to_owned(),
+        requested_by: source.requested_by.clone(),
         requested_at: source.requested_at,
         claimed_at: None,
         completed_at: None,

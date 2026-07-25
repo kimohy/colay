@@ -489,7 +489,11 @@ impl $database {
                 ))
             })?;
         let stored_authority = authority_from_validation(&revision.validation);
-        if stored_authority != request.authority {
+        if stored_authority != request.authority
+            && !stored_authority.as_ref().is_some_and(|stored| {
+                deferred_authority_can_promote(stored, request.authority.as_ref())
+            })
+        {
             return Err(StateError::InvalidRecord(
                 "graph approval authority does not match the sealed graph validation".to_owned(),
             ));
@@ -758,12 +762,45 @@ impl $database {
         })
     }
 }
+
     };
 }
 
 impl_workspace_database!(WorkspaceDatabase<'_>);
 #[cfg(test)]
 impl_workspace_database!(crate::Database);
+
+fn deferred_authority_can_promote(
+    stored: &orchestrator_domain::GraphValidationAuthority,
+    promoted: Option<&orchestrator_domain::GraphValidationAuthority>,
+) -> bool {
+    const DEFERRED_BASE_COMMIT: &str = "0000000000000000000000000000000000000000";
+    let Some(promoted) = promoted else {
+        return false;
+    };
+    stored.base_commit == DEFERRED_BASE_COMMIT
+        && stored
+            .validation_checks
+            .iter()
+            .any(|check| check == "writable_git_preflight_deferred")
+        && promoted.requirement_revision_id == stored.requirement_revision_id
+        && promoted.base_commit != DEFERRED_BASE_COMMIT
+        && matches!(promoted.base_commit.len(), 40 | 64)
+        && promoted
+            .base_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && promoted.validation_hash.len() == 64
+        && promoted
+            .validation_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && !promoted.git_root_redacted.trim().is_empty()
+        && promoted
+            .validation_checks
+            .iter()
+            .any(|check| check == "git_ready")
+}
 
 fn authority_from_validation(
     validation: &serde_json::Value,

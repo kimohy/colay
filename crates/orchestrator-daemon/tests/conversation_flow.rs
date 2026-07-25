@@ -368,7 +368,7 @@ async fn provider_failure_is_redacted_and_preserves_the_session()
 }
 
 #[tokio::test]
-async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_approval()
+async fn complete_candidate_in_non_git_directory_preserves_plan_until_writable_approval()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
@@ -395,13 +395,49 @@ async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_appro
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
-    assert_eq!(graph.revision.status, GraphRevisionStatus::Invalid);
-    assert!(graph.revision.proposal_hash.is_none());
-    let messages = database.messages_after(session_id, 0, 10)?;
+    assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);
+    let proposal_hash = graph
+        .revision
+        .proposal_hash
+        .clone()
+        .ok_or("missing proposal hash")?;
+    let authority = serde_json::from_value::<orchestrator_domain::GraphValidationSummary>(
+        graph.revision.validation.clone(),
+    )?
+    .authority
+    .ok_or("missing deferred graph authority")?;
+    let approval_id = ClientCommandId::new();
+    database.submit_client_command(&ClientCommand {
+        command_id: approval_id,
+        session_id: Some(session_id),
+        task_id: None,
+        action: ClientCommandAction::ApproveGraph,
+        payload: serde_json::to_value(ApproveGraphCommandPayload {
+            revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash,
+            base_commit: authority.base_commit,
+            proposal_hash,
+            approved_by: "operator".to_owned(),
+        })?,
+        idempotency_key: "non-git-writable-approval".to_owned(),
+        state: ClientCommandState::Pending,
+        requested_by: "operator".to_owned(),
+        requested_at: Utc::now(),
+        claimed_at: None,
+        completed_at: None,
+        outcome: None,
+    })?;
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let approval = database
+        .load_client_command(approval_id)?
+        .ok_or("missing approval command")?;
+    assert_eq!(approval.state, ClientCommandState::Failed);
     assert!(
-        messages
-            .iter()
-            .any(|(_, message)| { message.content_redacted.contains("Initialize Git") })
+        approval
+            .outcome
+            .unwrap_or_default()
+            .contains("committed Git repository")
     );
     assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
@@ -413,7 +449,11 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
     let (database, workspace_id, database_path) = database()?;
     let database = database.workspace(workspace_id);
     let session_id = seed_session(&database_path, &database)?;
-    database.submit_client_command(&append_command(session_id, "candidate"))?;
+    let mut append = append_command(session_id, "candidate");
+    append.requested_by = "local-cli-run-plan-only".to_owned();
+    let message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    database.submit_client_command(&append)?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
     let services = services(
@@ -433,6 +473,10 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
         },
     );
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let plan = database
+        .load_client_command_by_idempotency_key(&format!("conversation-plan-{message_id}"))?
+        .ok_or("missing plan-only planning command")?;
+    assert_eq!(plan.requested_by, "local-cli-run-plan-only");
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
     assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);

@@ -7,7 +7,7 @@ use std::{
 
 use chrono::Utc;
 use fs2::FileExt as _;
-use orchestrator_domain::TaskId;
+use orchestrator_domain::{ClientCommand, ClientCommandId, SessionId, TaskId};
 use orchestrator_state::{
     Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig, StateError,
     TaskListFilter, WorkspaceId, ensure_private_directory, ensure_private_file,
@@ -417,7 +417,21 @@ async fn dispatch_request(
                 Err(_) => IpcResponse::failure(request_id, "workspace status is unavailable"),
             }
         }
-        "workspace.register" | "daemon.stop" => {
+        "workspace.command.status" => {
+            let request_id = request.request_id.clone();
+            match workspace_command_status(database, &request) {
+                Ok(status) => IpcResponse::success(request_id, &status),
+                Err(_) => IpcResponse::failure(request_id, "workspace command is unavailable"),
+            }
+        }
+        "workspace.conversation" => {
+            let request_id = request.request_id.clone();
+            match workspace_conversation(database, &request) {
+                Ok(conversation) => IpcResponse::success(request_id, &conversation),
+                Err(_) => IpcResponse::failure(request_id, "workspace conversation is unavailable"),
+            }
+        }
+        "workspace.register" | "workspace.command.submit" | "daemon.stop" => {
             let request_id = request.request_id.clone();
             let (response, reply) = oneshot::channel();
             let command = WriterRequest { request, response };
@@ -430,6 +444,60 @@ async fn dispatch_request(
         }
         _ => IpcResponse::failure(request.request_id, "unsupported IPC action"),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceCommandStatusPayload {
+    command_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+fn workspace_command_status(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.command.status requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceCommandStatusPayload>(request.payload.clone())?;
+    let workspace = database.workspace(workspace_id);
+    let command = match (payload.command_id, payload.idempotency_key) {
+        (Some(command_id), None) => {
+            let command_id = ClientCommandId::from_str(&command_id)
+                .map_err(|error| IpcError::Protocol(error.to_string()))?;
+            workspace.load_client_command(command_id)?
+        }
+        (None, Some(idempotency_key)) if !idempotency_key.trim().is_empty() => {
+            workspace.load_client_command_by_idempotency_key(&idempotency_key)?
+        }
+        _ => {
+            return Err(IpcError::Protocol(
+                "workspace.command.status requires exactly one command identifier".to_owned(),
+            ));
+        }
+    };
+    Ok(json!({"command": command}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceConversationPayload {
+    session_id: String,
+}
+
+fn workspace_conversation(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.conversation requires a registered workspace".to_owned())
+    })?;
+    let payload = serde_json::from_value::<WorkspaceConversationPayload>(request.payload.clone())?;
+    let session_id = SessionId::from_str(&payload.session_id)
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let workspace = database.workspace(workspace_id);
+    let session = workspace.load_session(session_id)?;
+    let messages = workspace.messages_after(session_id, 0, 200)?;
+    Ok(json!({
+        "session": session,
+        "messages": messages,
+        "graph": workspace.current_graph(session_id)?,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -501,6 +569,7 @@ fn process_writer_request(
 ) -> IpcResponse {
     let result = match request.action.as_str() {
         "workspace.register" => register_workspace(database, paths, &request),
+        "workspace.command.submit" => submit_workspace_command(database, &request),
         "daemon.stop" => request_daemon_stop(database),
         _ => Err(IpcError::Protocol("unsupported writer action".to_owned())),
     };
@@ -508,6 +577,22 @@ fn process_writer_request(
         Ok(data) => IpcResponse::success(request.request_id, &data),
         Err(_) => IpcResponse::failure(request.request_id, "daemon mutation was rejected"),
     }
+}
+
+fn submit_workspace_command(database: &Database, request: &IpcRequest) -> Result<Value, IpcError> {
+    let workspace_id = request.workspace_id.ok_or_else(|| {
+        IpcError::Protocol("workspace.command.submit requires a registered workspace".to_owned())
+    })?;
+    if database.load_workspace(workspace_id)?.is_none() {
+        return Err(IpcError::Protocol(
+            "workspace.command.submit targets an unknown workspace".to_owned(),
+        ));
+    }
+    let command = serde_json::from_value::<ClientCommand>(request.payload.clone())?;
+    let stored = database
+        .workspace(workspace_id)
+        .submit_client_command(&command)?;
+    Ok(json!({"command": stored}))
 }
 
 #[derive(Deserialize)]

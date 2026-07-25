@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     str::FromStr as _,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -16,22 +16,24 @@ use codex_compat::{
     CapabilityProbe, CapabilitySource, CodexProbeReport, ProbeCommand, ProbeOutput,
 };
 use orchestrator_domain::{
-    AcceptanceEvidence, AttemptId, CapabilitySupport, CommandEvidence, CommandEvidenceId,
-    CorrelationId, DecisionRecord, EventActor, EventId, EventType, FailureRecord,
-    HandoverAcknowledgement, HealthStatus, ModelProfile, PlanStep, PlanStepStatus,
-    ProviderCapabilities, ProviderHealth, ProviderId, QuotaPeriod, QuotaScope, ReasoningEffort,
-    RepoPath, RiskTag, RoutingDecision, SandboxMode, SchemaVersion, TaskEnvelope, TaskEvent,
-    TaskId, TaskState, TestEvidence, TestStatus, UsageConfidence, UsageSnapshot, UsageSource,
-    UsageUnit, VerificationStatus, WorkerEvent, WorkerOutcome, WorkerRequest, WorkerResult,
+    AcceptanceEvidence, AppendMessageCommandPayload, AttemptId, CapabilitySupport, ClientCommand,
+    ClientCommandAction, ClientCommandId, ClientCommandState, CommandEvidence, CommandEvidenceId,
+    CorrelationId, CreateSessionCommandPayload, DecisionRecord, EventActor, EventId, EventType,
+    FailureRecord, HandoverAcknowledgement, HealthStatus, MessageId, ModelProfile, PlanStep,
+    PlanStepStatus, ProviderCapabilities, ProviderHealth, ProviderId, QuotaPeriod, QuotaScope,
+    ReasoningEffort, RepoPath, RoutingDecision, SandboxMode, SchemaVersion, SessionId,
+    TaskEnvelope, TaskEvent, TaskId, TaskState, TestEvidence, TestStatus, UsageConfidence,
+    UsageSnapshot, UsageSource, UsageUnit, VerificationStatus, WorkerEvent, WorkerOutcome,
+    WorkerRequest, WorkerResult,
 };
 use orchestrator_engine::{
     CheckpointInput, CheckpointManager, CodexExecutionPolicy, GitCheckpointEvidence, GitWorktree,
     GitWorktreeManager, HandoverInput, HandoverManager, StartupGuard, VerificationEngine,
-    VerificationInput, canonicalize_directory, inspect_git_repository,
+    VerificationInput, canonicalize_directory,
 };
 use orchestrator_policy::{
-    AnalysisHints, BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig,
-    RoutingContext, RoutingEngine, TaskAnalysisInput, TaskAnalyzer, TaskRole, period_window,
+    BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig, RoutingContext,
+    RoutingEngine, TaskRole, period_window,
 };
 use orchestrator_process::{
     CommandSpec, ProcessError, ProcessRunner, RedactionConfig, Redactor, ResolvedExecutable,
@@ -73,6 +75,11 @@ const LEGACY_CONFIG_PATH: &str = ".codex/orchestrator/config.toml";
 const COORDINATOR_LEASE_TTL_SECONDS: i64 = 30;
 const WORKER_LEASE_TTL_SECONDS: i64 = 20;
 const LEASE_RENEWAL_INTERVAL_SECONDS: u64 = 5;
+const RUN_SESSION_KEY: &str = "cli-run-session-v1";
+const RUN_REQUESTED_BY: &str = "local-cli-run";
+const RUN_PLAN_ONLY_REQUESTED_BY: &str = "local-cli-run-plan-only";
+const RUN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -129,7 +136,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Run(arguments) => {
-            run_task(&repository, &runtime.effective, arguments, cli.json).await
+            run_conversation(
+                &repository,
+                cli.config.as_deref(),
+                &runtime.effective,
+                arguments,
+                cli.json,
+            )
+            .await
         }
         Command::Status(selector) => {
             status(&repository, cli.config.as_deref(), &selector, cli.json).await
@@ -796,9 +810,9 @@ fn sync_override_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run_task(
+async fn run_conversation(
     repository: &Path,
+    explicit_config: Option<&Path>,
     effective: &EffectiveConfig,
     arguments: RunArgs,
     json_output: bool,
@@ -807,171 +821,164 @@ async fn run_task(
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
-    if !arguments.plan_only {
-        inspect_git_repository(repository).await.with_context(|| {
-            "direct `colay run` executes a writable task and requires a committed Git repository; `run --plan-only` remains static assessment, not conversation mode"
-        })?;
-    }
-    let state = StatePaths::from_config(repository, document.config())?;
-    let global_database = if state.database.exists() {
-        open_ready_database(&state)?
-    } else {
-        initialize_repository_state(&state)?
-    };
-    let database = workspace_for_repository(&global_database, repository)?;
-    reconcile_events(&state, &database)?;
+    let structured_input = arguments.task_file.is_some();
     let input = load_task_input(&arguments)?;
-    let redactor = Redactor::new(&process_redaction(&document.config().orchestrator))?;
-    let runtime_prompt = input.original_request.clone();
-    let role = infer_role(&input.objective);
-    let now = Utc::now();
-    let assessment = TaskAnalyzer::assess(&TaskAnalysisInput {
-        objective: input.objective.clone(),
-        constraints: input.constraints.clone(),
-        acceptance_criteria: input.acceptance_criteria.clone(),
-        hints: derive_analysis_hints(&input),
-    })?;
-    let mut envelope = TaskEnvelope::new(
-        redactor.redact(&input.objective),
-        redactor.redact(&input.original_request),
-        now,
-    );
-    envelope.constraints = input
-        .constraints
-        .iter()
-        .map(|value| redactor.redact(value))
-        .collect();
-    envelope.acceptance_criteria = input
-        .acceptance_criteria
-        .iter()
-        .map(|value| redactor.redact(value))
-        .collect();
-    envelope.allowed_write_paths = input.allowed_write_paths.clone();
-    envelope.repository_wide_write_scope = input.repository_wide_write_scope;
-    envelope.assessment = Some(assessment.clone());
-    let correlation_id = CorrelationId::new();
-    persist_task(&database, &envelope, correlation_id)?;
-    transition_task(
-        &database,
-        envelope.task_id,
-        TaskState::Analyzing,
-        orchestrator_domain::TransitionGuards::default(),
-        correlation_id,
-        "task analysis started",
-    )?;
-    append_event(
-        &database,
-        Some(envelope.task_id),
-        EventType::AssessmentCompleted,
-        Some(TaskState::Queued),
-        Some(TaskState::Analyzing),
-        EventActor::Orchestrator,
-        correlation_id,
-        serde_json::to_value(&assessment)?,
-    )?;
-
-    let candidates = routing_candidates(
-        &document.config().orchestrator,
-        &global_database,
-        &database,
-        &assessment,
-        arguments.provider.map(ProviderId::from),
-        envelope.task_id,
-        correlation_id,
-    )
-    .await?;
-    let routing = RoutingEngine::route(
-        &RoutingContext {
-            task_id: envelope.task_id,
-            assessment,
-            role,
-            writable: true,
-            candidates,
-            current_provider: None,
-            implementation_provider: None,
-            manually_requested_provider: arguments.provider.map(ProviderId::from),
-            conserve_budget: false,
-        },
-        &RoutingConfig {
-            // Writable ownership is currently task-wide; parallelism is reduced before
-            // model-tier downgrade as required by the conservation policy.
-            max_parallel_workers: 1,
-            allow_amber: true,
-        },
-        now,
-    )?;
-    persist_routing(&database, &routing, &envelope)?;
-    append_event(
-        &database,
-        Some(envelope.task_id),
-        EventType::RouteSelected,
-        Some(TaskState::Analyzing),
-        Some(if routing.selected_provider.is_some() {
-            TaskState::Planned
-        } else {
-            TaskState::Blocked
-        }),
-        EventActor::Orchestrator,
-        correlation_id,
-        serde_json::to_value(&routing)?,
-    )?;
-
-    if routing.selected_provider.is_none() {
-        transition_task(
-            &database,
-            envelope.task_id,
-            TaskState::Blocked,
-            orchestrator_domain::TransitionGuards::default(),
-            correlation_id,
-            "no provider satisfies routing gates",
-        )?;
+    let requested_provider = arguments.provider.map(ProviderId::from);
+    let content = conversation_requirement_input(&input, structured_input, requested_provider)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let session_id = ensure_run_session(&client).await?;
+    let message_id = MessageId::new();
+    let requested_by = if arguments.plan_only {
+        RUN_PLAN_ONLY_REQUESTED_BY
     } else {
-        transition_task(
-            &database,
-            envelope.task_id,
-            TaskState::Planned,
-            orchestrator_domain::TransitionGuards::default(),
-            correlation_id,
-            "routing plan selected",
-        )?;
-    }
-    reconcile_events(&state, &database)?;
-
-    let plan = PlannedTask {
-        task: envelope,
-        routing,
-        plan_only: arguments.plan_only,
+        RUN_REQUESTED_BY
     };
-    if arguments.plan_only || plan.routing.selected_provider.is_none() {
-        return emit(json_output, "run_plan", &plan);
-    }
-
-    // The execution coordinator is deliberately entered only after all persisted safety
-    // gates above have passed. It uses public CLI adapters and never provider SDK tokens.
-    let coordinator = acquire_task_coordinator(&database, plan.task.task_id)?;
-    let result = run_with_coordinator_renewal(
-        &database,
-        &coordinator,
-        Box::pin(execute_planned_task(
-            repository,
-            &state,
-            document.config(),
-            &global_database,
-            &database,
-            plan,
-            correlation_id,
-            runtime_prompt,
-            json_output,
-            None,
-            None,
-            false,
-            coordinator.lease_id,
-        )),
+    let command = pending_client_command(
+        Some(session_id),
+        ClientCommandAction::AppendMessage,
+        serde_json::to_value(AppendMessageCommandPayload {
+            message_id,
+            content,
+        })?,
+        format!("cli-run-message-{message_id}"),
+        requested_by,
+    );
+    client
+        .request("workspace.command.submit", serde_json::to_value(&command)?)
+        .await?;
+    wait_for_client_command(&client, command.command_id).await?;
+    let conversation_command_id = ClientCommandId::from_uuid(message_id.into_uuid());
+    wait_for_client_command(&client, conversation_command_id).await?;
+    let response = client
+        .request("workspace.conversation", json!({"session_id": session_id}))
+        .await?;
+    emit(
+        json_output,
+        "run_conversation",
+        &json!({
+            "session_id": session_id,
+            "source_message_id": message_id,
+            "plan_only": arguments.plan_only,
+            "requested_provider": requested_provider,
+            "conversation": response.outcome["data"],
+        }),
     )
-    .await;
-    let released =
-        database.release_coordinator_lease(coordinator.lease_id, coordinator.owner_id, Utc::now());
-    coordinated_result(result, released)
+}
+
+fn conversation_requirement_input(
+    input: &TaskInput,
+    structured_input: bool,
+    requested_provider: Option<ProviderId>,
+) -> Result<String> {
+    if !structured_input && requested_provider.is_none() {
+        return Ok(input.original_request.clone());
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "original_request": input.original_request,
+        "objective": input.objective,
+        "constraints": input.constraints,
+        "acceptance_criteria": input.acceptance_criteria,
+        "allowed_write_paths": input.allowed_write_paths,
+        "repository_wide_write_scope": input.repository_wide_write_scope,
+        "requested_provider": requested_provider,
+    }))?)
+}
+
+async fn ensure_run_session(client: &crate::ipc_client::DaemonClient) -> Result<SessionId> {
+    let command =
+        if let Some(command) = load_client_command(client, None, Some(RUN_SESSION_KEY)).await? {
+            command
+        } else {
+            let session_id = SessionId::new();
+            let command = pending_client_command(
+                None,
+                ClientCommandAction::CreateSession,
+                serde_json::to_value(CreateSessionCommandPayload {
+                    session_id,
+                    title: "Colay plan conversation".to_owned(),
+                })?,
+                RUN_SESSION_KEY.to_owned(),
+                RUN_REQUESTED_BY,
+            );
+            match client
+                .request("workspace.command.submit", serde_json::to_value(&command)?)
+                .await
+            {
+                Ok(_) => command,
+                Err(submit_error) => load_client_command(client, None, Some(RUN_SESSION_KEY))
+                    .await?
+                    .ok_or(submit_error)?,
+            }
+        };
+    let payload: CreateSessionCommandPayload = serde_json::from_value(command.payload.clone())
+        .context("stored run session command has an invalid payload")?;
+    wait_for_client_command(client, command.command_id).await?;
+    Ok(payload.session_id)
+}
+
+fn pending_client_command(
+    session_id: Option<SessionId>,
+    action: ClientCommandAction,
+    payload: Value,
+    idempotency_key: String,
+    requested_by: &str,
+) -> ClientCommand {
+    ClientCommand {
+        command_id: ClientCommandId::new(),
+        session_id,
+        task_id: None,
+        action,
+        payload,
+        idempotency_key,
+        state: ClientCommandState::Pending,
+        requested_by: requested_by.to_owned(),
+        requested_at: Utc::now(),
+        claimed_at: None,
+        completed_at: None,
+        outcome: None,
+    }
+}
+
+async fn wait_for_client_command(
+    client: &crate::ipc_client::DaemonClient,
+    command_id: ClientCommandId,
+) -> Result<ClientCommand> {
+    let started = Instant::now();
+    loop {
+        if let Some(command) = load_client_command(client, Some(command_id), None).await? {
+            match command.state {
+                ClientCommandState::Completed => return Ok(command),
+                ClientCommandState::Failed => bail!(
+                    "user daemon rejected {:?}: {}",
+                    command.action,
+                    command.outcome.as_deref().unwrap_or("unknown failure")
+                ),
+                ClientCommandState::Pending | ClientCommandState::Claimed => {}
+            }
+        }
+        if started.elapsed() >= RUN_COMMAND_TIMEOUT {
+            bail!("user daemon did not complete command {command_id} within two minutes");
+        }
+        tokio::time::sleep(RUN_COMMAND_POLL_INTERVAL).await;
+    }
+}
+
+async fn load_client_command(
+    client: &crate::ipc_client::DaemonClient,
+    command_id: Option<ClientCommandId>,
+    idempotency_key: Option<&str>,
+) -> Result<Option<ClientCommand>> {
+    let response = client
+        .request(
+            "workspace.command.status",
+            json!({
+                "command_id": command_id,
+                "idempotency_key": idempotency_key,
+            }),
+        )
+        .await?;
+    serde_json::from_value(response.outcome["data"]["command"].clone()).map_err(Into::into)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5877,43 +5884,6 @@ where
         .map_err(Into::into)
 }
 
-fn persist_task(
-    database: &WorkspaceDatabase<'_>,
-    task: &TaskEnvelope,
-    correlation_id: CorrelationId,
-) -> Result<()> {
-    database.create_task_with_event(
-        &orchestrator_state::NewTaskRecord {
-            task_id: task.task_id,
-            schema_version: task.schema_version.to_string(),
-            state: TaskState::Queued,
-            objective: task.objective.clone(),
-            original_request_redacted: task.original_request_redacted.clone(),
-            envelope: task,
-            created_at: task.created_at,
-        },
-        TaskEvent {
-            schema_version: SchemaVersion::state_current(),
-            sequence: 0,
-            event_id: EventId::new(),
-            session_id: None,
-            task_id: Some(task.task_id),
-            occurred_at: task.created_at,
-            event_type: EventType::TaskCreated,
-            from_state: None,
-            to_state: Some(TaskState::Queued),
-            reason: None,
-            actor: EventActor::User,
-            correlation_id,
-            causation_id: None,
-            payload: json!({"objective": task.objective}),
-            previous_hash: None,
-            event_hash: String::new(),
-        },
-    )?;
-    Ok(())
-}
-
 fn transition_task(
     database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
@@ -6274,80 +6244,6 @@ fn explicitly_repository_wide(task: &str) -> bool {
     )
 }
 
-fn derive_analysis_hints(input: &TaskInput) -> AnalysisHints {
-    let text = format!(
-        "{} {} {}",
-        input.objective,
-        input.constraints.join(" "),
-        input.acceptance_criteria.join(" ")
-    )
-    .to_lowercase();
-    let repository_wide = contains_any(
-        &text,
-        &["repository", "workspace", "codebase", "저장소", "전체"],
-    );
-    let cross_component = repository_wide
-        || contains_any(
-            &text,
-            &[
-                "multi-provider",
-                "database",
-                "tui",
-                "cli",
-                "migration",
-                "통합",
-            ],
-        );
-    let advanced_technical_concerns = [
-        "architecture",
-        "security",
-        "concurrency",
-        "protocol",
-        "migration",
-        "아키텍처",
-        "보안",
-    ]
-    .iter()
-    .filter(|needle| text.contains(**needle))
-    .count()
-    .min(3);
-    let advanced_technical_concerns = u32::try_from(advanced_technical_concerns).unwrap_or(3);
-    let production_impact = contains_any(&text, &["production", "enterprise", "프로덕션", "운영"]);
-    let needs_e2e = contains_any(&text, &["e2e", "end-to-end", "통합 테스트"]);
-    AnalysisHints {
-        estimated_files: repository_wide.then_some(12),
-        estimated_components: cross_component.then_some(4),
-        repository_wide,
-        cross_component,
-        unclear_requirements: u32::from(input.acceptance_criteria.is_empty()),
-        advanced_technical_concerns,
-        production_impact,
-        rollback_difficult: contains_any(&text, &["destructive", "data loss", "파괴", "손실"]),
-        verification_layers: if needs_e2e { 3 } else { 1 },
-        needs_e2e,
-        lacks_clear_oracle: input.acceptance_criteria.is_empty(),
-        risk_tags: explicit_risk_tags(&text),
-    }
-}
-
-fn explicit_risk_tags(text: &str) -> Vec<RiskTag> {
-    let mappings = [
-        (RiskTag::Security, &["security", "보안"][..]),
-        (RiskTag::Authentication, &["authentication", "인증"]),
-        (RiskTag::Production, &["production", "프로덕션"]),
-        (RiskTag::Infrastructure, &["infrastructure", "인프라"]),
-        (RiskTag::DataLoss, &["data loss", "데이터 손실"]),
-        (RiskTag::Billing, &["billing", "결제"]),
-        (RiskTag::Privacy, &["privacy", "개인정보"]),
-        (RiskTag::Compliance, &["compliance", "규정 준수"]),
-    ];
-    mappings
-        .into_iter()
-        .filter(|(_, needles)| needles.iter().any(|needle| text.contains(needle)))
-        .map(|(risk, _)| risk)
-        .collect()
-}
-
 fn infer_role(text: &str) -> TaskRole {
     let text = text.to_lowercase();
     if contains_any(&text, &["security review", "보안 검토"]) {
@@ -6493,12 +6389,6 @@ fn open_ready_database(state: &StatePaths) -> Result<Database> {
             status.pending_versions
         );
     }
-    Ok(database)
-}
-
-fn initialize_repository_state(state: &StatePaths) -> Result<Database> {
-    let database = Database::open(&state.database)?;
-    database.migrate_with_backup(&state.backups)?;
     Ok(database)
 }
 

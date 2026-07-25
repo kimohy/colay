@@ -96,16 +96,16 @@ pub struct InitArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
-    /// Task text. Mutually exclusive with --task-file.
+    /// Conversation goal. Mutually exclusive with --task-file.
     #[arg(value_name = "TASK", required_unless_present = "task_file")]
     pub task: Option<String>,
     /// Versioned JSON task envelope input.
     #[arg(long, conflicts_with = "task")]
     pub task_file: Option<PathBuf>,
-    /// Force one approved provider while retaining all quality and safety gates.
+    /// Record one preferred provider for later exact graph validation and approval.
     #[arg(long, value_enum)]
     pub provider: Option<ProviderName>,
-    /// Analyze and route without creating a worktree or invoking a provider.
+    /// Persist a promotion fence so this invocation cannot create writable tasks.
     #[arg(long)]
     pub plan_only: bool,
 }
