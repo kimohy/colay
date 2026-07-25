@@ -614,32 +614,39 @@ async fn doctor_state_checks(
     };
     match crate::daemon::acquire_maintenance() {
         Ok(maintenance) => {
-            let schema_version = match Database::preflight_schema(&maintenance.paths.database) {
-                Ok(version) => version,
+            let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
+                Ok(Some(database)) => database,
+                Ok(None) => {
+                    checks.push(Check::with_status_data(
+                        "state",
+                        CheckStatus::Warn,
+                        "user-global database does not exist; run a writable command or `colay migrate apply` to create it",
+                        json!({
+                            "root": maintenance.paths.root,
+                            "database": maintenance.paths.database,
+                            "backups": maintenance.paths.backups,
+                            "current_schema_version": Value::Null,
+                            "target_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                        }),
+                    ));
+                    checks.push(daemon_runtime_check(&DaemonStatus::Stopped, executable));
+                    push_unavailable_workspace_checks(
+                        checks,
+                        "user-global database is not initialized",
+                    );
+                    return;
+                }
                 Err(error) => {
                     checks.push(Check::fail("state", error.to_string()));
                     return;
                 }
             };
-            let Some(schema_version) = schema_version else {
-                checks.push(Check::with_status_data(
-                    "state",
-                    CheckStatus::Warn,
-                    "user-global database does not exist; run a writable command or `colay migrate apply` to create it",
-                    json!({
-                        "root": maintenance.paths.root,
-                        "database": maintenance.paths.database,
-                        "backups": maintenance.paths.backups,
-                        "current_schema_version": Value::Null,
-                        "target_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
-                    }),
-                ));
-                checks.push(daemon_runtime_check(&DaemonStatus::Stopped, executable));
-                push_unavailable_workspace_checks(
-                    checks,
-                    "user-global database is not initialized",
-                );
-                return;
+            let schema_version = match database.migration_status() {
+                Ok(status) => status.current_version,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
             };
             if schema_version != orchestrator_state::STATE_SCHEMA_VERSION {
                 checks.push(Check::with_status_data(
@@ -664,13 +671,6 @@ async fn doctor_state_checks(
                 );
                 return;
             }
-            let database = match Database::open_read_only(&maintenance.paths.database) {
-                Ok(database) => database,
-                Err(error) => {
-                    checks.push(Check::fail("state", error.to_string()));
-                    return;
-                }
-            };
             let health = match database.health() {
                 Ok(health) => health,
                 Err(error) => {

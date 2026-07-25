@@ -68,6 +68,15 @@ struct FutureWalState {
     shm: Vec<u8>,
 }
 
+struct CurrentWalState {
+    _writer: Connection,
+    database: Vec<u8>,
+    wal: Vec<u8>,
+    shm: Vec<u8>,
+    last_seen_at: String,
+    workspace_root: PathBuf,
+}
+
 impl DoctorFixture {
     fn new() -> Result<Self> {
         let temp = tempfile::tempdir()?;
@@ -224,6 +233,47 @@ impl DoctorFixture {
         })
     }
 
+    fn seed_current_schema_in_wal_mode(&self) -> Result<CurrentWalState> {
+        let database_path = self.global_database();
+        let database = Database::open(&database_path)?;
+        database.migrate_with_backup(&self.colay_home.join("state/backups"))?;
+        let workspace_id = database
+            .resolve_repository_workspace(&self.repository)?
+            .workspace_id;
+        drop(database);
+
+        let connection = Connection::open(&database_path)?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        assert_eq!(journal_mode, "wal");
+        connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+        let last_seen_at = "2099-01-02T03:04:05Z".to_owned();
+        let workspace_changed = connection.execute(
+            "UPDATE workspaces SET last_seen_at = ?2 WHERE workspace_id = ?1",
+            params![workspace_id.to_string(), last_seen_at],
+        )?;
+        assert_eq!(workspace_changed, 1);
+        let path_changed = connection.execute(
+            "UPDATE workspace_paths SET last_seen_at = ?2 \
+             WHERE workspace_id = ?1 AND is_current = 1",
+            params![workspace_id.to_string(), last_seen_at],
+        )?;
+        assert_eq!(path_changed, 1);
+        let wal = sqlite_sidecar(&database_path, "-wal");
+        let shm = sqlite_sidecar(&database_path, "-shm");
+        Ok(CurrentWalState {
+            _writer: connection,
+            database: fs::read(database_path)?,
+            wal: fs::read(wal)?,
+            shm: fs::read(shm)?,
+            last_seen_at,
+            workspace_root: self
+                .colay_home
+                .join("data/workspaces")
+                .join(workspace_id.to_string()),
+        })
+    }
+
     fn read_only_journal_mode(&self) -> Result<String> {
         let connection = Connection::open_with_flags(
             self.global_database(),
@@ -290,6 +340,21 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut sidecar = path.as_os_str().to_os_string();
     sidecar.push(suffix);
     PathBuf::from(sidecar)
+}
+
+fn temporary_directory_entries(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    Ok(entries)
 }
 
 fn check_named<'a>(document: &'a Value, name: &str) -> Result<&'a Value> {
@@ -362,6 +427,49 @@ fn doctor_reports_global_workspace_and_operational_checks() -> Result<()> {
         check_named(&document, "workspace")?["data"]["workspace_id"]
             .as_str()
             .is_some_and(|value| !value.is_empty())
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_preserves_current_schema_wal_database_and_sidecars() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let before = fixture.seed_current_schema_in_wal_mode()?;
+    let database = fixture.global_database();
+    let wal = sqlite_sidecar(&database, "-wal");
+    let shm = sqlite_sidecar(&database, "-shm");
+    let journal = sqlite_sidecar(&database, "-journal");
+    let temporary_entries = temporary_directory_entries(&fixture.root)?;
+    assert!(!fixture.colay_home.join("state/backups").exists());
+    assert!(!before.workspace_root.exists());
+    assert!(!journal.exists());
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    for name in ["state", "workspace", "audit", "artifacts"] {
+        let check = check_named(&document, name)?;
+        assert_eq!(check["status"], "pass", "{name} check failed: {check}");
+    }
+    assert_eq!(
+        check_named(&document, "workspace")?["data"]["last_seen_at"],
+        Value::String(before.last_seen_at.clone())
+    );
+    assert_eq!(fs::read(database)?, before.database);
+    assert_eq!(fs::read(wal)?, before.wal);
+    assert_eq!(fs::read(shm)?, before.shm);
+    assert!(!journal.exists());
+    assert!(!fixture.colay_home.join("state/backups").exists());
+    assert!(!before.workspace_root.exists());
+    assert_eq!(
+        temporary_directory_entries(&fixture.root)?,
+        temporary_entries
     );
     Ok(())
 }
@@ -452,6 +560,46 @@ fn migrate_preflight_does_not_change_existing_future_wal_sidecars() -> Result<()
     assert_eq!(fs::read(wal)?, before.wal);
     assert_eq!(fs::read(shm)?, before.shm);
     assert!(!fixture.colay_home.join("state/backups").exists());
+    Ok(())
+}
+
+#[test]
+fn doctor_rejects_future_schema_wal_without_changing_source_or_leaking_snapshot() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    let before = fixture.seed_future_schema_in_wal_mode()?;
+    let database = fixture.global_database();
+    let wal = sqlite_sidecar(&database, "-wal");
+    let shm = sqlite_sidecar(&database, "-shm");
+    let journal = sqlite_sidecar(&database, "-journal");
+    let temporary_entries = temporary_directory_entries(&fixture.root)?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["data"]["passed"], false);
+    let state = check_named(&document, "state")?;
+    assert_eq!(state["status"], "fail", "unexpected state check: {state}");
+    assert!(
+        state["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("newer than supported")),
+        "unexpected state detail: {state}"
+    );
+    assert_eq!(fs::read(database)?, before.database);
+    assert_eq!(fs::read(wal)?, before.wal);
+    assert_eq!(fs::read(shm)?, before.shm);
+    assert!(!journal.exists());
+    assert!(!fixture.colay_home.join("state/backups").exists());
+    assert!(!fixture.colay_home.join("data/workspaces").exists());
+    assert_eq!(
+        temporary_directory_entries(&fixture.root)?,
+        temporary_entries
+    );
     Ok(())
 }
 

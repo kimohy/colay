@@ -44,6 +44,7 @@ pub struct Database {
     connection: Mutex<Connection>,
     #[cfg(test)]
     test_workspace: Mutex<Option<WorkspaceId>>,
+    _snapshot_owner: Option<crate::CanonicalTempDir>,
 }
 
 /// Workspace-bound access to all durable task, session, graph, and audit state.
@@ -147,17 +148,34 @@ fn sqlite_recovery_sidecar_exists(path: &Path) -> StateResult<bool> {
     Ok(false)
 }
 
-fn snapshot_schema(path: &Path) -> StateResult<u32> {
-    let temporary = crate::CanonicalTempDir::new("database-schema-preflight")?;
-    let snapshot = temporary.path().join("state.db");
-    copy_database_component(path, &snapshot, false)?;
+struct CapturedDatabaseSnapshot {
+    directory: crate::CanonicalTempDir,
+    database: PathBuf,
+}
+
+fn capture_database_snapshot(
+    path: &Path,
+    context: &'static str,
+) -> StateResult<CapturedDatabaseSnapshot> {
+    let directory = crate::CanonicalTempDir::new(context)?;
+    ensure_private_directory(directory.path())?;
+    let database = directory.path().join("state.db");
+    copy_database_component(path, &database, false)?;
     for suffix in ["-wal", "-journal"] {
         let source = sqlite_sidecar(path, suffix);
-        let destination = sqlite_sidecar(&snapshot, suffix);
+        let destination = sqlite_sidecar(&database, suffix);
         copy_database_component(&source, &destination, true)?;
     }
+    Ok(CapturedDatabaseSnapshot {
+        directory,
+        database,
+    })
+}
+
+fn snapshot_schema(path: &Path) -> StateResult<u32> {
+    let snapshot = capture_database_snapshot(path, "database-schema-preflight")?;
     let connection = Connection::open_with_flags(
-        &snapshot,
+        &snapshot.database,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection
@@ -178,9 +196,8 @@ fn copy_database_component(source: &Path, destination: &Path, optional: bool) ->
             source.display()
         )));
     }
-    fs::copy(source, destination)
-        .map(|_| ())
-        .map_err(|error| StateError::io(destination, error))
+    fs::copy(source, destination).map_err(|error| StateError::io(destination, error))?;
+    ensure_private_file(destination)
 }
 
 fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -206,6 +223,7 @@ impl Database {
             connection: Mutex::new(connection),
             #[cfg(test)]
             test_workspace: Mutex::new(None),
+            _snapshot_owner: None,
         })
     }
 
@@ -234,34 +252,44 @@ impl Database {
         Ok(Some(found))
     }
 
-    /// Opens an existing current-schema database without creating files, changing permissions,
-    /// or applying persistent connection settings. Callers must remain read-only.
-    pub fn open_read_only(path: impl Into<PathBuf>) -> StateResult<Self> {
-        let path = path.into();
-        let found = Self::preflight_schema(&path)?.ok_or_else(|| {
-            StateError::InvalidRecord(format!("database does not exist: {}", path.display()))
-        })?;
-        if found != STATE_SCHEMA_VERSION {
-            return Err(StateError::InvalidRecord(format!(
-                "database schema version {found} requires migration to {STATE_SCHEMA_VERSION}"
-            )));
+    /// Captures an existing database and its recovery sidecars into owner-private temporary
+    /// storage. The returned connection reads only that snapshot and retains its cleanup guard.
+    pub fn open_read_only_snapshot(path: impl Into<PathBuf>) -> StateResult<Option<Self>> {
+        let source = path.into();
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StateError::io(&source, error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::UnsafeArtifactPath(source.display().to_string()));
         }
+        reject_symlink_components(&source)?;
+        let snapshot = capture_database_snapshot(&source, "database-read-only-snapshot")?;
         let connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            &snapshot.database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        let found: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if found > STATE_SCHEMA_VERSION {
+            return Err(StateError::FutureSchema {
+                found,
+                supported: STATE_SCHEMA_VERSION,
+            });
+        }
         register_workspace_function(&connection)?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;\
              PRAGMA temp_store = MEMORY;\
              PRAGMA busy_timeout = 5000;",
         )?;
-        Ok(Self {
-            path,
+        Ok(Some(Self {
+            path: snapshot.database,
             connection: Mutex::new(connection),
             #[cfg(test)]
             test_workspace: Mutex::new(None),
-        })
+            _snapshot_owner: Some(snapshot.directory),
+        }))
     }
 
     pub fn open_in_memory() -> StateResult<Self> {
@@ -272,6 +300,7 @@ impl Database {
             connection: Mutex::new(connection),
             #[cfg(test)]
             test_workspace: Mutex::new(None),
+            _snapshot_owner: None,
         })
     }
 
@@ -1041,6 +1070,36 @@ mod tests {
                 .map_err(StateError::from)
         })?;
         assert_eq!(marker_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_snapshot_is_retained_until_database_drop() -> StateResult<()> {
+        let temporary = crate::CanonicalTempDir::new("diagnostic-snapshot-source")?;
+        let source_path = temporary.path().join("state.db");
+        let source = Database::open(&source_path)?;
+        source.migrate_with_backup(&temporary.path().join("migration-backups"))?;
+        drop(source);
+
+        let snapshot = Database::open_read_only_snapshot(&source_path)?.ok_or_else(|| {
+            StateError::InvalidRecord("existing source did not produce a snapshot".to_owned())
+        })?;
+        let snapshot_path = snapshot.path().to_path_buf();
+        let snapshot_directory = snapshot_path
+            .parent()
+            .ok_or_else(|| StateError::InvalidRecord("snapshot path has no parent".to_owned()))?
+            .to_path_buf();
+        assert_ne!(snapshot_path, source_path);
+        assert!(snapshot_path.exists());
+        assert_eq!(
+            snapshot.health()?.current_schema_version,
+            STATE_SCHEMA_VERSION
+        );
+
+        drop(snapshot);
+
+        assert!(!snapshot_directory.exists());
+        assert!(source_path.exists());
         Ok(())
     }
 }

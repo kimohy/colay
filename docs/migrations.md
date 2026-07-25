@@ -77,8 +77,10 @@ open first reads the existing database header directly. When recovery sidecars a
 the database and WAL or rollback journal into private temporary scratch and asks SQLite for the
 effective schema only from that copy. Future-schema refusal therefore completes before SQLite opens
 the source or changes its journal/shared-memory state, and before any migration audit append, so an
-unknown future database and its sidecars are not modified. After an explicit migration, `doctor`
-reports global integrity, foreign keys, current workspace audit head, and artifact-reference
+unknown future database and its sidecars are not modified. Offline `doctor` retains the same kind of
+owner-private snapshot for its complete schema, integrity, workspace, and audit diagnosis, so even a
+current-schema WAL database is never opened by SQLite at the source. After an explicit migration,
+`doctor` reports global integrity, foreign keys, current workspace audit head, and artifact-reference
 integrity. Doctor itself never applies a migration or creates a backup.
 
 `migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. Integration contracts verify the complete plan through v15, prove dry-run non-mutation, preserve historical event hashes, reject checksum tampering/future schemas, and exercise the workspace-partition and command-fence migrations. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
