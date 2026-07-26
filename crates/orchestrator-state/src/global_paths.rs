@@ -231,8 +231,7 @@ impl GlobalStatePaths {
         let config_home = xdg_or_home(config_home, home.as_deref(), ".config")?;
         let root = state_home.join("colay");
         let runtime = configured_path(environment.xdg_runtime_dir.as_ref(), "XDG_RUNTIME_DIR")?
-            .map(|directory| directory.join("colay"))
-            .unwrap_or_else(|| root.join("runtime"));
+            .map_or_else(|| root.join("runtime"), |directory| directory.join("colay"));
         let paths = Self {
             database: root.join("state.db"),
             backups: root.join("backups"),
