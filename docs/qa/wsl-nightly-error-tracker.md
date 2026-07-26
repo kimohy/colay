@@ -10,7 +10,8 @@
 - 최초 작성: 2026-07-22 (Asia/Seoul)
 - 마지막 갱신: 2026-07-26
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
-- 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`
+- 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
+  `0.1.1-nightly.20260726.7a45d97`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -28,7 +29,8 @@
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
-| `WSL-010` | critical | fixed | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
+| `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
+| `WSL-011` | high | open | migration 대기 DB에서 `doctor`가 미래 schema 컬럼을 먼저 조회해 raw SQL 오류 반환 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
@@ -179,6 +181,62 @@ lease 0건, IPC endpoint 부재, OS PID 종료를 확인한다. `Drop`은 실패
 마지막 전체 suite에서도 concurrency 2/2(45.49초), daemon 7/7(27.85초), doctor
 13/13(15.26초), plan-first 2/2(24.23초), resume 3/3(14.48초)와 full import
 22/22가 통과했다.
+
+### 배포 nightly 재검증 (2026-07-26)
+
+`main` merge commit `7a45d976d89274fd575babeabbedf9438c183452`에서 배포된
+`0.1.1-nightly.20260726.7a45d97`을 WSL Ubuntu 24.04의 NVM Node 22.23.1에
+정확한 버전으로 설치했다. npm root와 중첩 Linux native package 버전은 일치했고,
+native binary는 x86-64 static PIE였으며 `colay --version`도 일치했다. 실제 provider
+inference는 호출하지 않았다.
+
+배포본에는 이 브랜치의 전역 상태 변경이 아직 포함되지 않았다. 격리 HOME 아래 두 Git
+workspace에서 `colay init`을 실행하자 각각 `.colay/config.toml`,
+`.colay/events.jsonl`, `.colay/orchestrator.db`가 생성됐고 사용자당 공용 DB는 생성되지
+않았다. non-Git `run --plan-only hello`도 provider를 호출하지 않고 성공했지만 같은
+경로에 별도 `.colay/orchestrator.db`를 만들었으며 출력 계약은 계속
+`static assessment, not conversation mode`였다.
+
+실사용 schema 8 DB에서 `migrate plan`은 9, 10, 11의 비파괴 순차 계획을 만들었지만
+`migrate apply`는 Codex 0.145.0을 `untested`로 분류한 safe mode에 의해 다시 거부됐다.
+호출 전후 DB SHA-256은 같아 사용자 상태는 변경되지 않았다. `compatibility`는 exec,
+App Server, read-only/workspace-write sandbox와 reasoning effort를 공개 probe로 확인했지만
+최종 상태는 `generic_untested`, writable unsupported였다.
+
+반면 신규 schema 11 격리 workspace에서는 `init`, `doctor`, `migrate status`, `status`,
+daemon start/status/restart/stop이 모두 성공했다. restart는 PID를 교체했고 CLI/daemon의
+native 경로, nightly 버전, `linux/x86_64` identity가 일치했다. non-Git과 unborn HEAD의
+writable `run`은 상태 파일을 만들기 전에 구체적인 Git 준비 오류로 차단됐다.
+
+따라서 source candidate의 Windows/WSL 검증은 유지하되, 사용자에게 배포된 nightly에서
+완료 조건이 확인될 때까지 `WSL-010` 상태를 `fix-in-progress`로 되돌린다. 다음 완료
+조건은 이 브랜치를 `main`에 통합하고 새 nightly에서 사용자당 DB 1개, schema 8 자동
+유지보수, capability-qualified Codex 0.145.0, conversation-first non-Git 진입을 재검증하는
+것이다.
+
+## WSL-011: migration 대기 DB의 `doctor` 선행 schema 조회
+
+### 관찰
+
+nightly `0.1.1-nightly.20260726.7a45d97`에서 schema 8 사용자 DB를 대상으로
+`colay --json doctor`를 실행하면 migration-required 진단 대신 다음 SQL 오류로 종료한다.
+
+```text
+error: SQLite operation failed: no such column: phase in SELECT ...
+FROM daemon_instances WHERE released_at IS NULL ...
+```
+
+같은 DB에서 `migrate plan`은 pending 9, 10, 11을 정상 보고하고 `daemon status`와
+`status`는 `state schema migration is required`로 올바르게 차단된다. `phase`는 schema 9에서
+추가되는 컬럼이므로 `doctor`만 migration guard보다 daemon runtime 조회를 먼저 수행한다.
+
+### 영향 및 완료 조건
+
+- 사용자가 migration 필요성을 진단하려는 명령에서 내부 SQL과 schema 세부가 노출된다.
+- `doctor`가 migration을 적용하지 않더라도 현재/목표 schema와 pending step을 안전하게
+  보고하고, 현재 schema에 없는 컬럼을 조회하지 않아야 한다.
+- schema 8 fixture에서 `doctor`가 raw SQLite 오류 없이 구조화된 migration-required 또는
+  제한된 진단을 반환하는 회귀 테스트가 필요하다.
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 
