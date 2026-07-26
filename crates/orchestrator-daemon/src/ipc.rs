@@ -103,6 +103,22 @@ pub struct WorkspaceDoctorDiagnostics {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkspaceDoctorLookup {
+    pub registered: bool,
+    pub database: DatabaseHealth,
+    pub daemon: orchestrator_state::DaemonStatus,
+    pub diagnostics: Option<WorkspaceDoctorDiagnostics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceActivation {
+    pub workspace_id: WorkspaceId,
+    pub repository: PathBuf,
+    pub explicit_config: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceAuditDiagnostics {
     pub workspace_id: WorkspaceId,
     pub verified_events: i64,
@@ -273,6 +289,7 @@ pub struct IpcServer {
     pipe_owner_sid: String,
     database: Arc<Database>,
     paths: GlobalStatePaths,
+    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
 }
 
 impl IpcServer {
@@ -308,6 +325,7 @@ impl IpcServer {
                 listener,
                 database,
                 paths: paths.clone(),
+                workspace_activations: None,
             })
         }
         #[cfg(windows)]
@@ -317,6 +335,7 @@ impl IpcServer {
                 pipe_owner_sid: orchestrator_state::current_windows_user_sid()?,
                 database,
                 paths: paths.clone(),
+                workspace_activations: None,
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -328,12 +347,28 @@ impl IpcServer {
         }
     }
 
+    #[must_use]
+    pub fn with_workspace_activations(
+        mut self,
+        workspace_activations: mpsc::UnboundedSender<WorkspaceActivation>,
+    ) -> Self {
+        self.workspace_activations = Some(workspace_activations);
+        self
+    }
+
     pub async fn serve(self, cancellation: CancellationToken) -> Result<(), IpcError> {
         let (writer, receiver) = mpsc::channel(64);
         let writer_database = Arc::clone(&self.database);
         let writer_paths = self.paths.clone();
+        let workspace_activations = self.workspace_activations.clone();
         let writer_task = tokio::spawn(async move {
-            writer_loop(writer_database, writer_paths, receiver).await;
+            writer_loop(
+                writer_database,
+                writer_paths,
+                receiver,
+                workspace_activations,
+            )
+            .await;
         });
         let result = self.accept_loop(writer, cancellation).await;
         writer_task.abort();
@@ -734,6 +769,7 @@ fn dispatch_read_request(
             .map(|status| json!({"status": status}))
             .map_err(IpcError::from),
         "workspace.status" => workspace_status(database, paths, request),
+        "workspace.doctor.lookup" => workspace_doctor_lookup(database, paths, request),
         "workspace.doctor" => workspace_doctor(database, paths, request),
         "workspace.task.stream" => workspace_task_stream(database, request),
         "workspace.checkpoint" => workspace_checkpoint(database, request),
@@ -764,6 +800,48 @@ fn workspace_doctor(
     let registration = database.load_workspace(workspace_id)?.ok_or_else(|| {
         IpcError::Protocol("workspace.doctor targets an unknown workspace".to_owned())
     })?;
+    let diagnostics = workspace_doctor_diagnostics(database, paths, registration)?;
+    serde_json::to_value(diagnostics).map_err(IpcError::from)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDoctorLookupPayload {
+    repository: PathBuf,
+}
+
+fn workspace_doctor_lookup(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Result<Value, IpcError> {
+    if request.workspace_id.is_some() {
+        return Err(IpcError::Protocol(
+            "workspace.doctor.lookup must not register or bind a workspace".to_owned(),
+        ));
+    }
+    let payload = serde_json::from_value::<WorkspaceDoctorLookupPayload>(request.payload.clone())?;
+    let database_health = database.health()?;
+    let daemon = database.daemon_status(Utc::now())?;
+    let diagnostics = database
+        .find_repository_workspace(&payload.repository)?
+        .map(|registration| workspace_doctor_diagnostics(database, paths, registration))
+        .transpose()?;
+    serde_json::to_value(WorkspaceDoctorLookup {
+        registered: diagnostics.is_some(),
+        database: database_health,
+        daemon,
+        diagnostics,
+    })
+    .map_err(IpcError::from)
+}
+
+fn workspace_doctor_diagnostics(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    registration: WorkspaceRegistration,
+) -> Result<WorkspaceDoctorDiagnostics, IpcError> {
+    let workspace_id = registration.workspace_id;
     let workspace = database.workspace(workspace_id);
     let workspace_paths = paths.for_workspace(workspace_id);
     let diagnostics = WorkspaceDoctorDiagnostics {
@@ -779,7 +857,7 @@ fn workspace_doctor(
         &diagnostics.workspace.canonical_path,
         &workspace_paths.root,
     )?;
-    serde_json::to_value(diagnostics).map_err(IpcError::from)
+    Ok(diagnostics)
 }
 
 fn verify_workspace_audit(
@@ -956,11 +1034,55 @@ async fn writer_loop(
     database: Arc<Database>,
     paths: GlobalStatePaths,
     mut receiver: mpsc::Receiver<WriterRequest>,
+    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
 ) {
     while let Some(command) = receiver.recv().await {
-        let response = process_writer_request(&database, &paths, command.request);
+        let activation_request = command.request.clone();
+        let mut response = process_writer_request(&database, &paths, command.request);
+        if response.outcome.get("status").and_then(Value::as_str) == Some("ok")
+            && activation_request.action == "workspace.register"
+            && let Some(sender) = workspace_activations.as_ref()
+        {
+            match workspace_activation(&database, &activation_request, &response).and_then(
+                |activation| {
+                    sender
+                        .send(activation)
+                        .map_err(|_| IpcError::WriterUnavailable)
+                },
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    response = IpcResponse::failure(response.request_id, error.to_string());
+                }
+            }
+        }
         let _ = command.response.send(response);
     }
+}
+
+fn workspace_activation(
+    database: &Database,
+    request: &IpcRequest,
+    response: &IpcResponse,
+) -> Result<WorkspaceActivation, IpcError> {
+    let payload = serde_json::from_value::<RegisterWorkspacePayload>(request.payload.clone())?;
+    let workspace_id = response
+        .outcome
+        .pointer("/data/workspace_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            IpcError::Protocol("workspace registration omitted its identity".to_owned())
+        })?
+        .parse::<WorkspaceId>()
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+    let registration = database.load_workspace(workspace_id)?.ok_or_else(|| {
+        IpcError::Protocol("registered workspace disappeared before activation".to_owned())
+    })?;
+    Ok(WorkspaceActivation {
+        workspace_id,
+        repository: registration.canonical_path,
+        explicit_config: payload.explicit_config,
+    })
 }
 
 fn process_writer_request(
@@ -1553,6 +1675,7 @@ fn submit_run_command(database: &Database, request: &IpcRequest) -> Result<Value
 struct RegisterWorkspacePayload {
     repository: PathBuf,
     state_dir: PathBuf,
+    explicit_config: Option<PathBuf>,
 }
 
 fn register_workspace(

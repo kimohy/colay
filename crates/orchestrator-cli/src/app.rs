@@ -128,13 +128,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init(_) => initialize(&repository, &runtime, cli.json),
         Command::Daemon(arguments) => {
-            crate::daemon::run(
+            Box::pin(crate::daemon::run(
                 &repository,
                 runtime.effective.config(),
                 cli.config.as_deref(),
                 arguments.action,
                 cli.json,
-            )
+            ))
             .await
         }
         Command::Run(arguments) => {
@@ -522,7 +522,7 @@ fn initialize(_repository: &Path, runtime: &ConfigRuntime, json_output: bool) ->
 async fn doctor(
     repository: &Path,
     effective: &EffectiveConfig,
-    explicit_config: Option<&Path>,
+    _explicit_config: Option<&Path>,
     json_output: bool,
 ) -> Result<()> {
     let mut checks = vec![Check::pass("config", "schema and values are valid")];
@@ -541,7 +541,7 @@ async fn doctor(
     if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
         checks.push(Check::warn("wsl_mixed_git_checkout", warning));
     }
-    doctor_state_checks(repository, explicit_config, &executable, &mut checks).await;
+    doctor_state_checks(repository, &executable, &mut checks).await;
     checks.push(git_health_check(repository));
     for report in collect_provider_reports(effective).await {
         let status = match report.health.status {
@@ -600,12 +600,7 @@ async fn doctor(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn doctor_state_checks(
-    repository: &Path,
-    explicit_config: Option<&Path>,
-    executable: &Path,
-    checks: &mut Vec<Check>,
-) {
+async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut Vec<Check>) {
     let paths = match GlobalStatePaths::resolve(&StateEnvironment::from_process()) {
         Ok(paths) => paths,
         Err(error) => {
@@ -735,13 +730,8 @@ async fn doctor_state_checks(
             );
         }
         Err(lock_error) => {
-            let client = match crate::ipc_client::DaemonClient::connect_with_config(
-                repository,
-                explicit_config,
-            )
-            .await
-            {
-                Ok(client) => client,
+            let response = match crate::ipc_client::DaemonClient::doctor_lookup(repository).await {
+                Ok(response) => response,
                 Err(ipc_error) => {
                     checks.push(Check::fail(
                         "state",
@@ -752,18 +742,49 @@ async fn doctor_state_checks(
                     return;
                 }
             };
-            let diagnostics = match client.request("workspace.doctor", json!({})).await {
-                Ok(diagnostics) => diagnostics,
+            let lookup = match response
+                .outcome
+                .get("data")
+                .cloned()
+                .ok_or_else(|| anyhow!("workspace doctor lookup response omitted data"))
+                .and_then(|data| {
+                    serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorLookup>(data)
+                        .context("workspace doctor lookup response is malformed")
+                }) {
+                Ok(lookup) => lookup,
                 Err(error) => {
                     checks.push(Check::fail("state", error.to_string()));
                     return;
                 }
             };
-            append_live_doctor_checks(
+            let Some(diagnostics) = lookup.diagnostics else {
+                let healthy = lookup.database.integrity_ok
+                    && lookup.database.foreign_key_violations == 0
+                    && lookup.database.current_schema_version
+                        == orchestrator_state::STATE_SCHEMA_VERSION;
+                checks.push(Check::with_data(
+                    "state",
+                    healthy,
+                    json!({
+                        "root": paths.root,
+                        "database": paths.database,
+                        "backups": paths.backups,
+                        "health": lookup.database,
+                        "via": "daemon_ipc",
+                    }),
+                ));
+                checks.push(daemon_runtime_check(&lookup.daemon, executable));
+                push_unavailable_workspace_checks(
+                    checks,
+                    "current repository is not registered; run a writable command to register it",
+                );
+                return;
+            };
+            append_live_doctor_diagnostics(
                 checks,
                 &diagnostics,
                 &paths,
-                client.workspace_id(),
+                diagnostics.workspace.workspace_id,
                 repository,
                 executable,
             );
@@ -771,43 +792,25 @@ async fn doctor_state_checks(
     }
 }
 
-fn append_live_doctor_checks(
+fn append_live_doctor_diagnostics(
     checks: &mut Vec<Check>,
-    diagnostics: &orchestrator_daemon::IpcResponse,
+    diagnostics: &orchestrator_daemon::WorkspaceDoctorDiagnostics,
     paths: &GlobalStatePaths,
     expected_workspace_id: orchestrator_state::WorkspaceId,
     expected_repository: &Path,
     executable: &Path,
 ) {
-    let parsed = diagnostics
-        .outcome
-        .get("data")
-        .cloned()
-        .ok_or_else(|| anyhow!("workspace doctor response omitted data"))
-        .and_then(|data| {
-            serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorDiagnostics>(data)
-                .context("workspace doctor response is malformed")
-        })
-        .and_then(|parsed| {
-            parsed
-                .validate(
-                    expected_workspace_id,
-                    expected_repository,
-                    &paths.for_workspace(expected_workspace_id).root,
-                )
-                .map_err(anyhow::Error::from)?;
-            Ok(parsed)
-        });
-    let diagnostics = match parsed {
-        Ok(diagnostics) => diagnostics,
-        Err(error) => {
-            let detail = format!("invalid workspace doctor IPC response: {error}");
-            for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
-                checks.push(Check::fail(name, &detail));
-            }
-            return;
+    if let Err(error) = diagnostics.validate(
+        expected_workspace_id,
+        expected_repository,
+        &paths.for_workspace(expected_workspace_id).root,
+    ) {
+        let detail = format!("invalid workspace doctor IPC response: {error}");
+        for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+            checks.push(Check::fail(name, &detail));
         }
-    };
+        return;
+    }
     let health = &diagnostics.database;
     let healthy = health.integrity_ok
         && health.foreign_key_violations == 0
@@ -835,6 +838,42 @@ fn append_live_doctor_checks(
         true,
         json!(diagnostics.artifacts),
     ));
+}
+
+#[cfg(test)]
+fn append_live_doctor_checks(
+    checks: &mut Vec<Check>,
+    response: &orchestrator_daemon::IpcResponse,
+    paths: &GlobalStatePaths,
+    expected_workspace_id: orchestrator_state::WorkspaceId,
+    expected_repository: &Path,
+    executable: &Path,
+) {
+    let diagnostics = response
+        .outcome
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow!("workspace doctor response omitted data"))
+        .and_then(|data| {
+            serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorDiagnostics>(data)
+                .context("workspace doctor response is malformed")
+        });
+    match diagnostics {
+        Ok(diagnostics) => append_live_doctor_diagnostics(
+            checks,
+            &diagnostics,
+            paths,
+            expected_workspace_id,
+            expected_repository,
+            executable,
+        ),
+        Err(error) => {
+            let detail = format!("invalid workspace doctor IPC response: {error}");
+            for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+                checks.push(Check::fail(name, &detail));
+            }
+        }
+    }
 }
 
 fn push_unavailable_workspace_checks(checks: &mut Vec<Check>, detail: &str) {

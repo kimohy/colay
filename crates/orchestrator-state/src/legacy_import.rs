@@ -24,8 +24,8 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     Database, GlobalStatePaths, MigrationManager, RepositoryStatePaths, StateError, StateResult,
     WorkspaceId, artifacts::LegacyImportStaging, database::append_workspace_event_in_transaction,
-    ensure_private_directory, ensure_private_file, import_scratch::LegacyImportScratch,
-    reject_symlink_components, source_guard::SourceOpenGuard, sqlite_snapshot::GuardedSqliteFamily,
+    ensure_private_file, import_scratch::LegacyImportScratch, reject_symlink_components,
+    source_guard::SourceOpenGuard, sqlite_snapshot::GuardedSqliteFamily,
 };
 
 const LAST_LEGACY_SCHEMA_VERSION: u32 = 13;
@@ -369,6 +369,7 @@ impl LegacyImporter {
             "ATTACH DATABASE ?1 AS legacy_import_source",
             [rewrite_path_text],
         )?;
+        backup_import_target(&connection, &paths.backups, &plan.source_fingerprint)?;
         let transaction_result = apply_transaction(
             &mut connection,
             target,
@@ -376,7 +377,6 @@ impl LegacyImporter {
             &published_path,
             imported_at,
             &mut staging,
-            &paths.backups,
         );
         let detach_result = connection.execute_batch("DETACH DATABASE legacy_import_source;");
         let result = transaction_result?;
@@ -388,6 +388,24 @@ impl LegacyImporter {
     }
 }
 
+fn backup_import_target(
+    connection: &Connection,
+    backups: &Path,
+    source_fingerprint: &str,
+) -> StateResult<PathBuf> {
+    if !connection.is_autocommit() {
+        return Err(StateError::InvalidRecord(
+            "legacy import backup must run outside a SQLite transaction".to_owned(),
+        ));
+    }
+    let backup_path = backups.join(format!(
+        "legacy-import-{}-{}.before.db",
+        source_fingerprint,
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    MigrationManager::backup(connection, &backup_path)
+}
+
 fn apply_transaction(
     connection: &mut Connection,
     target: WorkspaceId,
@@ -395,7 +413,6 @@ fn apply_transaction(
     published_path: &Path,
     imported_at: DateTime<Utc>,
     staging: &mut LegacyImportStaging,
-    backups: &Path,
 ) -> StateResult<LegacyImportResult> {
     let transaction = connection.transaction()?;
     if let Some(existing) = load_existing_result_in(&transaction, target, plan)? {
@@ -414,13 +431,6 @@ fn apply_transaction(
     }
     let target_events = validate_event_chain_for_workspace(&transaction, &target_string)?;
     validate_event_log_cursor(&transaction, &target_string, &target_events)?;
-    ensure_private_directory(backups)?;
-    let backup_path = backups.join(format!(
-        "legacy-import-{}-{}.before.db",
-        plan.source_fingerprint,
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    MigrationManager::backup(&transaction, &backup_path)?;
     let target_event_count = i64::try_from(target_events.len())
         .map_err(|_| StateError::InvalidRecord("target event count overflow".to_owned()))?;
     let (imported_rows, target_events, id_mappings) =
@@ -3099,7 +3109,26 @@ mod final_hardening_tests {
         },
     };
 
-    use super::{LegacyEventEvidence, LegacyImportPlan, LegacyImporter, sha256_file};
+    use super::{
+        LegacyEventEvidence, LegacyImportPlan, LegacyImporter, backup_import_target, sha256_file,
+    };
+
+    #[test]
+    fn import_backup_refuses_to_run_inside_an_active_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let mut connection = Connection::open_in_memory()?;
+        let transaction = connection.transaction()?;
+
+        let Err(error) = backup_import_target(&transaction, temporary.path(), &"a".repeat(64))
+        else {
+            return Err("filesystem backup unexpectedly ran inside a SQLite transaction".into());
+        };
+
+        assert!(error.to_string().contains("outside a SQLite transaction"));
+        assert!(fs::read_dir(temporary.path())?.next().is_none());
+        Ok(())
+    }
 
     #[test]
     fn source_parent_aba_refuses_import_without_source_or_target_mutation()

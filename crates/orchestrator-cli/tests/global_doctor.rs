@@ -1,6 +1,7 @@
 #![cfg(feature = "test-fixtures")]
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
@@ -131,22 +132,11 @@ impl DoctorFixture {
         Ok(())
     }
 
-    fn seed_corrupt_explicit_legacy_config(&self) -> Result<PathBuf> {
-        let config = self.repository.join("doctor-explicit.toml");
-        fs::write(
-            &config,
-            "config_version = 4\n[orchestrator]\nstate_dir = \"chosen-state\"\n",
-        )?;
-        let selected_state = self.repository.join("chosen-state");
-        fs::create_dir_all(&selected_state)?;
-        fs::write(
-            selected_state.join("orchestrator.db"),
-            b"not a SQLite database",
-        )?;
-        Ok(config)
+    fn colay<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+        self.colay_in(&self.repository, args)
     }
 
-    fn colay<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
+    fn colay_in<const N: usize>(&self, repository: &Path, args: [&str; N]) -> Result<Output> {
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
         #[cfg(windows)]
@@ -155,7 +145,7 @@ impl DoctorFixture {
         let system_root = "/";
         let status = Command::new(env!("CARGO_BIN_EXE_colay"))
             .args(args)
-            .current_dir(&self.repository)
+            .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
@@ -732,30 +722,85 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
 }
 
 #[test]
-fn live_doctor_registration_honors_the_explicit_config_state_dir() -> Result<()> {
+fn live_doctor_in_unregistered_legacy_workspace_is_read_only() -> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.configure_fake_providers()?;
-    let explicit = fixture.seed_corrupt_explicit_legacy_config()?;
     let started = fixture.colay(["daemon", "start"])?;
     assert!(
         started.status.success(),
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
+    let registered_workspace_id: String = Connection::open(fixture.global_database())?.query_row(
+        "SELECT workspace_id FROM workspace_paths WHERE is_current = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let registered_workspace_root = fixture
+        .colay_home
+        .join("data/workspaces")
+        .join(registered_workspace_id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !registered_workspace_root.exists() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("startup workspace runtime did not initialize its artifact root");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let unregistered = fixture.root.join("unregistered");
+    fs::create_dir_all(&unregistered)?;
+    let explicit = unregistered.join("doctor-explicit.toml");
+    fs::write(
+        &explicit,
+        "config_version = 4\n[orchestrator]\nstate_dir = \"chosen-state\"\n",
+    )?;
+    let selected_state = unregistered.join("chosen-state");
+    fs::create_dir_all(&selected_state)?;
+    let legacy_database = selected_state.join("orchestrator.db");
+    let legacy_bytes = b"not a SQLite database";
+    fs::write(&legacy_database, legacy_bytes)?;
+    let before_rows = Connection::open(fixture.global_database())?.query_row(
+        "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let workspace_root = fixture.colay_home.join("data/workspaces");
+    fs::create_dir_all(&workspace_root)?;
+    let before_workspace_directories = fs::read_dir(&workspace_root)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
 
-    let output = fixture.colay([
-        "--config",
-        explicit
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("explicit config filename is invalid")?,
-        "--json",
-        "doctor",
-    ])?;
+    let output = fixture.colay_in(
+        &unregistered,
+        [
+            "--config",
+            explicit
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("explicit config filename is invalid")?,
+            "--json",
+            "doctor",
+        ],
+    )?;
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let document: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(check_named(&document, "state")?["status"], "fail");
+    assert_eq!(check_named(&document, "workspace")?["status"], "warn");
+    assert_eq!(fs::read(&legacy_database)?, legacy_bytes);
+    let after_rows = Connection::open(fixture.global_database())?.query_row(
+        "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    assert_eq!(after_rows, before_rows);
+    let after_workspace_directories = fs::read_dir(workspace_root)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
+    assert_eq!(after_workspace_directories, before_workspace_directories);
     Ok(())
 }
 

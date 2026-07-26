@@ -9,7 +9,7 @@ use orchestrator_domain::{
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{StateError, StateResult, WorkspaceDatabase};
+use crate::{StateError, StateResult, WorkspaceDatabase, WorkspaceId};
 
 #[derive(Clone, Debug)]
 pub struct ClaimReadyTaskRequest {
@@ -22,6 +22,7 @@ pub struct ClaimReadyTaskRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClaimedTask {
+    pub workspace_id: WorkspaceId,
     pub schedule_claim_id: ScheduleClaimId,
     pub daemon_instance_id: DaemonInstanceId,
     pub session_id: SessionId,
@@ -33,16 +34,19 @@ pub struct ClaimedTask {
     pub profile: ModelProfile,
     pub envelope: TaskEnvelope,
     pub scope: ResourceScope,
+    pub approved_base_commit: String,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
 struct CandidateRecord {
+    workspace_id: WorkspaceId,
     candidate: ScheduleCandidate,
     node_key: String,
     profile: ModelProfile,
     envelope: TaskEnvelope,
+    approved_base_commit: String,
 }
 
 macro_rules! impl_workspace_database {
@@ -138,21 +142,12 @@ impl $database {
             expires_at,
         )?;
         transaction.commit()?;
-        Ok(Some(ClaimedTask {
+        Ok(Some(claimed_task(
+            record,
+            request,
             schedule_claim_id,
-            daemon_instance_id: request.daemon_instance_id,
-            session_id: record.candidate.session_id,
-            revision_id: record.candidate.revision_id,
-            task_id,
-            node_key: record.node_key,
-            display_order: record.candidate.graph_order,
-            provider: record.candidate.provider,
-            profile: record.profile,
-            envelope: record.envelope,
-            scope: record.candidate.scope,
-            acquired_at: request.now,
             expires_at,
-        }))
+        )))
     }
 
     pub fn renew_schedule_claim(
@@ -249,6 +244,31 @@ impl_workspace_database!(WorkspaceDatabase<'_>);
 #[cfg(test)]
 impl_workspace_database!(crate::Database);
 
+fn claimed_task(
+    record: CandidateRecord,
+    request: &ClaimReadyTaskRequest,
+    schedule_claim_id: ScheduleClaimId,
+    expires_at: DateTime<Utc>,
+) -> ClaimedTask {
+    ClaimedTask {
+        workspace_id: record.workspace_id,
+        schedule_claim_id,
+        daemon_instance_id: request.daemon_instance_id,
+        session_id: record.candidate.session_id,
+        revision_id: record.candidate.revision_id,
+        task_id: record.candidate.task_id,
+        node_key: record.node_key,
+        display_order: record.candidate.graph_order,
+        provider: record.candidate.provider,
+        profile: record.profile,
+        envelope: record.envelope,
+        scope: record.candidate.scope,
+        approved_base_commit: record.approved_base_commit,
+        acquired_at: request.now,
+        expires_at,
+    }
+}
+
 fn queued_schedule_candidate_exists(connection: &Connection) -> StateResult<bool> {
     connection
         .query_row(
@@ -332,15 +352,16 @@ fn ensure_daemon_owner(
 
 fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRecord>> {
     let mut statement = transaction.prepare(
-        "SELECT st.session_id, st.revision_id, st.task_id, st.node_key, st.display_order,
+        "SELECT current_workspace(), st.session_id, st.revision_id, st.task_id, st.node_key, st.display_order,
                 coalesce(st.provider_id_v2, st.provider_id), st.model_profile,
                 t.state, t.paused, t.task_envelope_json,
-                t.created_at
+                t.created_at, approval.base_commit
          FROM session_tasks st
          JOIN tasks t ON t.task_id = st.task_id
          JOIN graph_revisions gr ON gr.revision_id = st.revision_id
          JOIN session_graph_heads gh ON gh.session_id = st.session_id
                                     AND gh.revision_id = st.revision_id
+         LEFT JOIN graph_approvals approval ON approval.revision_id = st.revision_id
          WHERE gr.status = 'approved' AND t.archived_at IS NULL
          ORDER BY t.created_at, st.display_order, st.task_id",
     )?;
@@ -350,18 +371,21 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
-            row.get::<_, i64>(8)?,
-            row.get::<_, String>(9)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
             row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, Option<String>>(12)?,
         ))
     })?;
     let mut candidates = Vec::new();
     for row in rows {
         let (
+            workspace_id,
             session_id,
             revision_id,
             task_id,
@@ -373,7 +397,22 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
             paused,
             envelope_json,
             created_at,
+            approved_base_commit,
         ) = row?;
+        let approved_base_commit = approved_base_commit.ok_or_else(|| {
+            StateError::InvalidRecord(format!(
+                "approved graph revision {revision_id} has no sealed approval base"
+            ))
+        })?;
+        if !matches!(approved_base_commit.len(), 40 | 64)
+            || !approved_base_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(StateError::InvalidRecord(format!(
+                "approved graph revision {revision_id} has an invalid sealed approval base"
+            )));
+        }
         let task_id = parse_id("task id", &task_id)?;
         let envelope: TaskEnvelope = serde_json::from_str(&envelope_json)?;
         let scope = ResourceScope {
@@ -382,6 +421,7 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
         };
         let dependencies = load_dependencies(transaction, task_id)?;
         candidates.push(CandidateRecord {
+            workspace_id: parse_id("workspace id", &workspace_id)?,
             candidate: ScheduleCandidate {
                 task_id,
                 session_id: parse_id("session id", &session_id)?,
@@ -400,6 +440,7 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
             node_key,
             profile: parse_enum("model profile", &profile)?,
             envelope,
+            approved_base_commit,
         });
     }
     Ok(candidates)
@@ -705,6 +746,19 @@ mod tests {
                  VALUES (?1, ?2, ?3)",
                 params![session.to_string(), revision.to_string(), now().to_rfc3339()],
             )?;
+            transaction.execute(
+                "INSERT INTO main.graph_approvals(
+                    revision_id, proposal_hash, approved_by, approved_at, session_id,
+                    requirement_revision_id, validation_hash, base_commit)
+                 VALUES (?1, ?2, 'scheduler-test', ?3, ?4, NULL, NULL, ?5)",
+                params![
+                    revision.to_string(),
+                    "0".repeat(64),
+                    now().to_rfc3339(),
+                    session.to_string(),
+                    "a".repeat(40),
+                ],
+            )?;
             Ok(())
         })?;
         Ok((session, revision))
@@ -740,6 +794,7 @@ mod tests {
             .claim_next_ready_task(&request(daemon))?
             .ok_or("claim missing")?;
         assert_eq!(claimed.task_id, task);
+        assert_eq!(claimed.approved_base_commit, "a".repeat(40));
         assert!(other.claim_next_ready_task(&request(daemon))?.is_none());
         assert!(database.release_schedule_claim(
             claimed.schedule_claim_id,

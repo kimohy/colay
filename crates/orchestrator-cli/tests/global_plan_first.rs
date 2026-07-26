@@ -186,7 +186,12 @@ fn run_in_non_git_directory_creates_conversation_without_writable_state() -> Res
 #[test]
 fn plan_only_session_cannot_be_promoted_by_same_command() -> Result<()> {
     let fixture = PlanFixture::committed_git()?;
-    fixture.colay(["run", "--plan-only", "change code"])?;
+    let output = fixture.colay(["run", "--plan-only", "change code"])?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(fixture.tasks()?, 0);
     assert_eq!(fixture.worktrees()?, 0);
     Ok(())

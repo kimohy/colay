@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     future::Future,
     path::Path,
     sync::Arc,
@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
 use orchestrator_daemon::{
     DaemonOwnerLock, DaemonSettings, ExecutionServices, IntegrationServices, IpcServer,
-    MessageRedactor, PlanningServices, serve_with_full_orchestration_on_owned_lease,
+    MessageRedactor, PlanningServices, WorkspaceActivation,
+    serve_with_full_orchestration_on_owned_lease, serve_workspace_runtime_on_owned_daemon,
 };
 use orchestrator_domain::{DaemonInstanceId, GraphValidationPolicy, ModelProfile, ProviderId};
 use orchestrator_engine::{
@@ -67,21 +68,19 @@ pub async fn run(
         }
         DaemonAction::Serve => serve_global(repository, explicit_config).await,
         DaemonAction::Status => {
-            let status = match DaemonClient::connect(repository).await {
-                Ok(client) => {
-                    client.request("daemon.status", json!({})).await?.outcome["data"]["status"]
-                        .clone()
-                }
-                Err(_) => json!(DaemonStatus::Stopped),
+            let status = match DaemonClient::request_global("daemon.status", json!({})).await {
+                Ok(response) => response.outcome["data"]["status"].clone(),
+                Err(error) if stopped_endpoint_error(&error) => json!(DaemonStatus::Stopped),
+                Err(error) => return Err(error),
             };
             emit(json_output, "daemon_status", &json!({"status": status}))
         }
         DaemonAction::Stop => {
-            let status = stop_global(repository).await?;
+            let status = stop_global().await?;
             emit(json_output, "daemon_stop", &json!({"status": status}))
         }
         DaemonAction::Restart => {
-            stop_global(repository).await?;
+            stop_global().await?;
             let client = DaemonClient::connect_or_start(repository, explicit_config).await?;
             let response = client.request("daemon.status", json!({})).await?;
             emit(json_output, "daemon_restart", &response.outcome["data"])
@@ -246,7 +245,9 @@ async fn serve_foreground(
             }
         }
     });
-    let ipc_server = IpcServer::bind(&paths, Arc::clone(&database))?;
+    let (activation_sender, activation_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let ipc_server = IpcServer::bind(&paths, Arc::clone(&database))?
+        .with_workspace_activations(activation_sender);
     let ipc_cancellation = cancellation.clone();
     let ipc_task = tokio::spawn(async move { ipc_server.serve(ipc_cancellation).await });
     let redaction = RedactionConfig {
@@ -389,53 +390,248 @@ async fn serve_foreground(
     startup_heartbeat.abort();
     let _ = startup_heartbeat.await;
     let runtime_cancellation = cancellation.clone();
+    let activation_cancellation = cancellation.clone();
+    let activation_database = Arc::clone(&database);
+    let activation_paths = paths.clone();
     let runtime = async move {
         let mut startup_lease = startup_lease;
-        let result = serve_with_full_orchestration_on_owned_lease(
-            database,
-            workspace_id,
-            instance_id,
-            runtime_cancellation,
-            settings,
-            redactor,
-            PlanningServices {
-                conversation,
-                repository_root: repository_root.clone(),
-                planner,
-                planner_provider,
-                validation_policy: GraphValidationPolicy {
-                    eligible_providers: BTreeSet::from([planner_provider]),
-                    eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
-                    max_parallel_workers: usize::try_from(config.orchestrator.max_parallel_workers)
+        let base_cancellation = runtime_cancellation.clone();
+        let base_runtime = async move {
+            let result = serve_with_full_orchestration_on_owned_lease(
+                database,
+                workspace_id,
+                instance_id,
+                runtime_cancellation,
+                settings,
+                redactor,
+                PlanningServices {
+                    conversation,
+                    repository_root: repository_root.clone(),
+                    planner,
+                    planner_provider,
+                    validation_policy: GraphValidationPolicy {
+                        eligible_providers: BTreeSet::from([planner_provider]),
+                        eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                        max_parallel_workers: usize::try_from(
+                            config.orchestrator.max_parallel_workers,
+                        )
                         .unwrap_or(usize::MAX)
                         .max(1),
-                    per_provider_limits: BTreeMap::new(),
+                        per_provider_limits: BTreeMap::new(),
+                    },
+                    integration: Some(integration),
                 },
-                integration: Some(integration),
-            },
-            ExecutionServices {
-                executor,
-                repository_root,
-                state_root: workspace_paths.root.clone(),
-                global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
-                    .unwrap_or(usize::MAX)
-                    .max(1),
-                provider_limits,
-                claim_ttl: TimeDelta::minutes(
-                    i64::try_from(config.orchestrator.default_timeout_minutes)
-                        .unwrap_or(i64::MAX)
-                        .saturating_add(10),
-                ),
-            },
-        )
-        .await;
+                ExecutionServices {
+                    executor,
+                    repository_root,
+                    state_root: workspace_paths.root.clone(),
+                    global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
+                        .unwrap_or(usize::MAX)
+                        .max(1),
+                    provider_limits,
+                    claim_ttl: TimeDelta::minutes(
+                        i64::try_from(config.orchestrator.default_timeout_minutes)
+                            .unwrap_or(i64::MAX)
+                            .saturating_add(10),
+                    ),
+                },
+            )
+            .await;
+            base_cancellation.cancel();
+            result
+        };
+        let activations = serve_workspace_activations(
+            activation_database,
+            workspace_id,
+            instance_id,
+            activation_cancellation,
+            settings,
+            activation_paths,
+            activation_receiver,
+        );
+        let (base_result, activation_result) = tokio::join!(base_runtime, activations);
         startup_lease.handoff();
-        result?;
+        base_result?;
+        activation_result?;
         Ok(())
     };
     let result = supervise_daemon_runtime(cancellation.clone(), ipc_task, runtime).await;
     signal_task.abort();
     result
+}
+
+async fn serve_workspace_activations(
+    database: Arc<Database>,
+    startup_workspace_id: WorkspaceId,
+    instance_id: DaemonInstanceId,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    paths: GlobalStatePaths,
+    mut activations: tokio::sync::mpsc::UnboundedReceiver<WorkspaceActivation>,
+) -> Result<()> {
+    let mut active = HashSet::from([startup_workspace_id]);
+    let mut jobs = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            activation = activations.recv() => {
+                let Some(activation) = activation else {
+                    cancellation.cancel();
+                    bail!("workspace runtime activation queue closed while the daemon was online");
+                };
+                if !active.insert(activation.workspace_id) {
+                    continue;
+                }
+                let workspace_paths = paths.for_workspace(activation.workspace_id);
+                let (redactor, planning, execution) = build_workspace_runtime(
+                    &activation.repository,
+                    activation.explicit_config.as_deref(),
+                    &workspace_paths,
+                )
+                .await
+                .inspect_err(|_| cancellation.cancel())?;
+                let job_database = Arc::clone(&database);
+                let job_cancellation = cancellation.clone();
+                jobs.spawn(async move {
+                    let result = serve_workspace_runtime_on_owned_daemon(
+                        job_database,
+                        activation.workspace_id,
+                        instance_id,
+                        job_cancellation,
+                        settings,
+                        redactor,
+                        planning,
+                        execution,
+                    )
+                    .await;
+                    (activation.workspace_id, result)
+                });
+            }
+            joined = jobs.join_next(), if !jobs.is_empty() => {
+                let (workspace_id, result) = joined
+                    .ok_or_else(|| anyhow::anyhow!("workspace runtime disappeared"))?
+                    .map_err(|error| anyhow::anyhow!("workspace runtime task failed: {error}"))?;
+                active.remove(&workspace_id);
+                if !cancellation.is_cancelled() {
+                    cancellation.cancel();
+                    result?;
+                    bail!("workspace runtime {workspace_id} stopped unexpectedly");
+                }
+                result?;
+            }
+        }
+    }
+    while let Some(joined) = jobs.join_next().await {
+        let (_, result) = joined
+            .map_err(|error| anyhow::anyhow!("workspace runtime shutdown failed: {error}"))?;
+        result?;
+    }
+    Ok(())
+}
+
+async fn build_workspace_runtime(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    workspace_paths: &orchestrator_state::WorkspaceStatePaths,
+) -> Result<(
+    Arc<dyn MessageRedactor>,
+    PlanningServices,
+    ExecutionServices,
+)> {
+    let config = load_daemon_config(repository, explicit_config)?;
+    let repository_root = std::fs::canonicalize(repository)?;
+    let redaction = RedactionConfig {
+        literals: Vec::new(),
+        patterns: config.orchestrator.redaction.patterns.clone(),
+    };
+    let redactor: Arc<dyn MessageRedactor> =
+        Arc::new(ProcessMessageRedactor(Redactor::new(&redaction)?));
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
+    let (planner, planner_provider, conversation): (
+        Arc<dyn TaskPlanner>,
+        ProviderId,
+        Arc<dyn ConversationOrchestrator>,
+    ) = match OfficialCliTaskPlanner::probe_from_config(
+        &config,
+        repository,
+        Arc::clone(&runtime),
+        ModelProfile::Standard,
+    )
+    .await
+    {
+        Ok(planner) => {
+            let provider = planner.primary_provider();
+            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
+                &planner,
+            ));
+            (Arc::new(planner), provider, conversation)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            (
+                Arc::new(UnavailablePlanner {
+                    reason: reason.clone(),
+                }),
+                ProviderId::Codex,
+                Arc::new(UnavailableConversation { reason }),
+            )
+        }
+    };
+    let executor = Arc::new(OfficialCliTaskExecutor::new(&config, repository, runtime)?);
+    let integration = IntegrationServices {
+        manager: Arc::new(GitIntegrationManager::new(
+            repository,
+            &workspace_paths.root,
+        )?),
+        repository_root: repository_root.clone(),
+        state_root: workspace_paths.root.clone(),
+    };
+    let provider_limits = config
+        .orchestrator
+        .provider_parallel_limits
+        .iter()
+        .filter_map(|(provider, limit)| {
+            let provider = match provider.as_str() {
+                "agy" => ProviderId::Agy,
+                "codex" => ProviderId::Codex,
+                "claude" => ProviderId::Claude,
+                "gemini" => ProviderId::Gemini,
+                _ => return None,
+            };
+            Some((provider, usize::try_from(*limit).unwrap_or(usize::MAX)))
+        })
+        .collect();
+    let global_limit = usize::try_from(config.orchestrator.max_parallel_workers)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    Ok((
+        redactor,
+        PlanningServices {
+            conversation,
+            repository_root: repository_root.clone(),
+            planner,
+            planner_provider,
+            validation_policy: GraphValidationPolicy {
+                eligible_providers: BTreeSet::from([planner_provider]),
+                eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                max_parallel_workers: global_limit,
+                per_provider_limits: BTreeMap::new(),
+            },
+            integration: Some(integration),
+        },
+        ExecutionServices {
+            executor,
+            repository_root,
+            state_root: workspace_paths.root.clone(),
+            global_limit,
+            provider_limits,
+            claim_ttl: TimeDelta::minutes(
+                i64::try_from(config.orchestrator.default_timeout_minutes)
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(10),
+            ),
+        },
+    ))
 }
 
 async fn supervise_daemon_runtime<F>(
@@ -533,20 +729,54 @@ fn fail_startup_without_heartbeat(
     Err(anyhow::anyhow!(diagnostic))
 }
 
-async fn stop_global(repository: &Path) -> Result<DaemonStatus> {
-    let Ok(client) = DaemonClient::connect(repository).await else {
-        return Ok(DaemonStatus::Stopped);
-    };
-    client.request("daemon.stop", json!({})).await?;
+async fn stop_global() -> Result<DaemonStatus> {
+    match DaemonClient::request_global("daemon.stop", json!({})).await {
+        Ok(_) => {}
+        Err(error) if stopped_endpoint_error(&error) => return Ok(DaemonStatus::Stopped),
+        Err(error) => return Err(error),
+    }
     let deadline = Instant::now() + STOP_TIMEOUT;
     loop {
-        if DaemonClient::connect(repository).await.is_err() {
-            return Ok(DaemonStatus::Stopped);
+        match DaemonClient::ping_global().await {
+            Ok(()) => {}
+            Err(error) if stopped_endpoint_error(&error) => return Ok(DaemonStatus::Stopped),
+            Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
             bail!("user daemon did not release its IPC endpoint within ten seconds");
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn stopped_endpoint_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(stopped_endpoint_io_error)
+    })
+}
+
+fn stopped_endpoint_io_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_BROKEN_PIPE: i32 = 109;
+        const ERROR_NO_DATA: i32 = 232;
+        const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
+        matches!(
+            error.raw_os_error(),
+            Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -614,8 +844,32 @@ mod tests {
 
     use super::{
         StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
-        supervise_daemon_runtime,
+        stopped_endpoint_error, supervise_daemon_runtime,
     };
+
+    #[test]
+    fn only_endpoint_absence_or_refusal_is_classified_as_stopped() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::from(kind));
+            assert!(stopped_endpoint_error(&error));
+        }
+
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!stopped_endpoint_error(&denied));
+
+        #[cfg(windows)]
+        for raw_os_error in [109, 232, 233] {
+            let disconnected = anyhow::Error::new(std::io::Error::from_raw_os_error(raw_os_error));
+            assert!(stopped_endpoint_error(&disconnected));
+        }
+
+        let schema_mismatch =
+            anyhow::anyhow!("user daemon returned IPC schema 2; supported schema is 1");
+        assert!(!stopped_endpoint_error(&schema_mismatch));
+    }
 
     struct IdentityRedactor;
 

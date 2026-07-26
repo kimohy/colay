@@ -4,6 +4,7 @@ use std::{
     env, fs,
     path::PathBuf,
     process::{Command, ExitStatus, Output, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -16,7 +17,7 @@ use orchestrator_domain::{
     MessageId, SessionId, TaskState,
 };
 use orchestrator_state::{
-    Database, GraphRevisionStatus, RootConfig, TaskListFilter, WorkspaceDatabase,
+    DaemonStatus, Database, GraphRevisionStatus, RootConfig, TaskListFilter, WorkspaceDatabase,
 };
 
 mod support;
@@ -37,18 +38,23 @@ fn git(repository: &std::path::Path, args: &[&str]) -> Result<()> {
 }
 
 struct Fixture {
+    _serial: MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
     root: PathBuf,
+    startup_repository: PathBuf,
     repository: PathBuf,
     colay_home: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Result<Self> {
+        let serial = fixture_guard();
         let temp = tempfile::tempdir()?;
         let root = fs::canonicalize(temp.path())?;
+        let startup_repository = root.join("startup-repository");
         let repository = root.join("repository");
         let colay_home = root.join("home/.colay");
+        fs::create_dir_all(&startup_repository)?;
         fs::create_dir_all(&repository)?;
         fs::write(repository.join(".gitignore"), ".colay/\n")?;
         git(&repository, &["init"])?;
@@ -60,14 +66,20 @@ impl Fixture {
         git(&repository, &["add", "."])?;
         git(&repository, &["commit", "-m", "fixture base"])?;
         Ok(Self {
+            _serial: serial,
             _temp: temp,
             root,
+            startup_repository,
             repository,
             colay_home,
         })
     }
 
     fn command(&self) -> Result<Command> {
+        self.command_in(&self.repository)
+    }
+
+    fn command_in(&self, repository: &std::path::Path) -> Result<Command> {
         #[cfg(windows)]
         let system_root = env::var_os("SystemRoot").context("SystemRoot must be set")?;
         #[cfg(not(windows))]
@@ -83,9 +95,11 @@ impl Fixture {
         )?;
         let mut command = Command::new(executable);
         command
-            .current_dir(&self.repository)
+            .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
+            .env("COLAY_TEST_DAEMON_STDERR", self.root.join("daemon.stderr"))
+            .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", command_path)
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
@@ -96,6 +110,13 @@ impl Fixture {
 
     fn output(&self, args: &[&str]) -> Result<Output> {
         self.command()?.args(args).output().map_err(Into::into)
+    }
+
+    fn output_in(&self, repository: &std::path::Path, args: &[&str]) -> Result<Output> {
+        self.command_in(repository)?
+            .args(args)
+            .output()
+            .map_err(Into::into)
     }
 
     fn status_without_capture(&self, args: &[&str]) -> Result<ExitStatus> {
@@ -139,9 +160,13 @@ impl Fixture {
     }
 
     fn wait_online(&self) -> Result<()> {
+        self.wait_online_in(&self.repository)
+    }
+
+    fn wait_online_in(&self, repository: &std::path::Path) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let output = self.output(&["--json", "daemon", "status"])?;
+            let output = self.output_in(repository, &["--json", "daemon", "status"])?;
             if output.status.success()
                 && serde_json::from_slice::<serde_json::Value>(&output.stdout)?["data"]["status"]["state"]
                     == "online"
@@ -171,6 +196,13 @@ impl Fixture {
             thread::sleep(Duration::from_millis(25));
         }
     }
+}
+
+fn fixture_guard() -> MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Drop for Fixture {
@@ -246,7 +278,10 @@ fn wait_for_approval_candidate(
     }
 }
 
-fn wait_for_task_completion(database: &WorkspaceDatabase<'_>) -> Result<()> {
+fn wait_for_task_completion(
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let tasks = database.list_tasks(&TaskListFilter {
@@ -254,14 +289,33 @@ fn wait_for_task_completion(database: &WorkspaceDatabase<'_>) -> Result<()> {
             include_archived: false,
             limit: 10,
         })?;
-        if tasks.len() == 2 && tasks.iter().all(|task| task.state == TaskState::Completed) {
+        let active_schedule_claims =
+            with_workspace(global_database.path(), database, |connection| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })?;
+        if tasks.len() == 2
+            && tasks.iter().all(|task| task.state == TaskState::Completed)
+            && active_schedule_claims == 0
+        {
             return Ok(());
         }
         if tasks.iter().any(|task| task.state == TaskState::Failed) {
             bail!("approved conversation graph produced a failed task: {tasks:?}");
         }
+        let daemon = global_database.daemon_status(Utc::now())?;
+        if matches!(daemon, DaemonStatus::Stopped) {
+            bail!("daemon stopped before approved tasks completed: {tasks:?}");
+        }
         if Instant::now() >= deadline {
-            bail!("approved conversation graph did not complete through worktree execution");
+            bail!(
+                "approved conversation graph did not complete through worktree execution: {tasks:?}; active schedule claims: {active_schedule_claims}; daemon: {daemon:?}"
+            );
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -411,7 +465,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     );
     let stored = workspace.submit_client_command(&replay)?;
     assert_eq!(stored.command_id, exact.command_id);
-    wait_for_task_completion(&workspace)?;
+    wait_for_task_completion(&database, &workspace)?;
     let completed_counts = mutation_counts(&database_path, &workspace)?;
     assert_eq!(completed_counts.0, 2);
     assert_eq!(completed_counts.1, 2);
@@ -469,6 +523,107 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
     );
 
     assert!(fixture.output(&["daemon", "stop"])?.status.success());
+    fixture.wait_stopped()?;
+    Ok(())
+}
+
+#[test]
+fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspace() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.initialize_with_fake_planner()?;
+    let started = fixture
+        .command_in(&fixture.startup_repository)?
+        .args(["daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(started.success());
+    fixture.wait_online_in(&fixture.startup_repository)?;
+
+    let registered = fixture.output(&["status"])?;
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let database = fixture.database()?;
+    let database_path = database.path().to_path_buf();
+    let registration = database
+        .find_repository_workspace(&fixture.repository)?
+        .context("run did not register the execution workspace")?;
+    let workspace = database.workspace(registration.workspace_id);
+    let session_id = SessionId::new();
+    let create = pending_command(
+        ClientCommandAction::CreateSession,
+        None,
+        serde_json::to_value(CreateSessionCommandPayload {
+            session_id,
+            title: "Cross-workspace plan approval".to_owned(),
+        })?,
+        "cross-workspace-session",
+    );
+    assert_eq!(
+        submit_and_wait(&database_path, &workspace, &create)?.state,
+        ClientCommandState::Completed
+    );
+    let goal = pending_command(
+        ClientCommandAction::AppendMessage,
+        Some(session_id),
+        serde_json::to_value(AppendMessageCommandPayload {
+            message_id: MessageId::new(),
+            content: "candidate: implement a local task graph".to_owned(),
+        })?,
+        "cross-workspace-goal",
+    );
+    assert_eq!(
+        submit_and_wait(&database_path, &workspace, &goal)?.state,
+        ClientCommandState::Completed
+    );
+    wait_for_approval_candidate(&workspace, session_id)?;
+    let graph = workspace
+        .current_graph(session_id)?
+        .context("workspace runtime did not create an approvable graph")?;
+    let authority =
+        serde_json::from_value::<GraphValidationSummary>(graph.revision.validation.clone())?
+            .authority
+            .context("approvable graph omitted validation authority")?;
+    let approval = pending_command(
+        ClientCommandAction::ApproveGraph,
+        Some(session_id),
+        serde_json::to_value(ApproveGraphCommandPayload {
+            revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash,
+            base_commit: authority.base_commit,
+            proposal_hash: graph
+                .revision
+                .proposal_hash
+                .context("approvable graph omitted proposal hash")?,
+            approved_by: "operator".to_owned(),
+        })?,
+        "cross-workspace-exact-approval",
+    );
+    let approved = submit_and_wait(&database_path, &workspace, &approval).map_err(|error| {
+        let daemon_stderr = fs::read_to_string(fixture.root.join("daemon.stderr"))
+            .unwrap_or_else(|read_error| format!("<cannot read daemon stderr: {read_error}>"));
+        anyhow::anyhow!("{error}; daemon stderr: {daemon_stderr}")
+    })?;
+    assert_eq!(approved.state, ClientCommandState::Completed);
+    if let Err(error) = wait_for_task_completion(&database, &workspace) {
+        let daemon_stderr = fs::read_to_string(fixture.root.join("daemon.stderr"))
+            .unwrap_or_else(|read_error| format!("<cannot read daemon stderr: {read_error}>"));
+        bail!("{error}; daemon stderr: {daemon_stderr}");
+    }
+    assert_eq!(mutation_counts(&database_path, &workspace)?.1, 2);
+    let stopped = fixture.output(&["daemon", "stop"])?;
+    assert!(
+        stopped.status.success(),
+        "daemon stop failed: stdout={} stderr={} daemon_stderr={}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr),
+        fs::read_to_string(fixture.root.join("daemon.stderr")).unwrap_or_default()
+    );
     fixture.wait_stopped()?;
     Ok(())
 }

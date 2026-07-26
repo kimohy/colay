@@ -156,14 +156,36 @@ async fn run_claimed_task(
     cancellation: CancellationToken,
 ) -> Result<(), DaemonError> {
     let workspace = database.workspace(workspace_id);
-    let result = run_claimed_task_inner(
-        &workspace,
-        instance_id,
-        &claim,
-        &services,
-        redactor.as_ref(),
-        cancellation,
-    )
+    let result = async {
+        if claim.workspace_id != workspace_id {
+            return Err(DaemonError::InvalidSettings(
+                "claimed task workspace identity does not match its execution runtime".to_owned(),
+            ));
+        }
+        let registration = database.load_workspace(workspace_id)?.ok_or_else(|| {
+            DaemonError::InvalidSettings(
+                "claimed task workspace registration disappeared".to_owned(),
+            )
+        })?;
+        let runtime_repository = canonicalize_directory(&services.repository_root)
+            .map_err(|error| DaemonError::InvalidSettings(error.to_string()))?;
+        let registered_repository = canonicalize_directory(&registration.canonical_path)
+            .map_err(|error| DaemonError::InvalidSettings(error.to_string()))?;
+        if runtime_repository != registered_repository {
+            return Err(DaemonError::InvalidSettings(
+                "claimed task repository identity does not match its execution runtime".to_owned(),
+            ));
+        }
+        run_claimed_task_inner(
+            &workspace,
+            instance_id,
+            &claim,
+            &services,
+            redactor.as_ref(),
+            cancellation,
+        )
+        .await
+    }
     .await;
     let reason = if result.is_ok() {
         "task execution finished"
@@ -503,7 +525,7 @@ mod tests {
 
     use super::{ExecutionServices, reap_finished_tasks, spawn_ready_tasks, stop_execution_jobs};
     use crate::MessageRedactor;
-    use crate::test_support::{with_database, with_workspace, with_workspace_transaction};
+    use crate::test_support::{with_workspace, with_workspace_transaction};
 
     struct IdentityRedactor;
 
@@ -592,6 +614,19 @@ mod tests {
                  VALUES (current_workspace(), ?1, ?2, ?3)",
                 params![session.to_string(), revision.to_string(), now],
             )?;
+            transaction.execute(
+                "INSERT INTO main.graph_approvals(
+                    workspace_id, revision_id, proposal_hash, approved_by, approved_at,
+                    session_id, base_commit)
+                 VALUES (current_workspace(), ?1, ?2, 'daemon-execution-test', ?3, ?4, ?5)",
+                params![
+                    revision.to_string(),
+                    "0".repeat(64),
+                    now,
+                    session.to_string(),
+                    "0".repeat(40),
+                ],
+            )?;
             Ok(())
         })?;
         Ok((session, revision))
@@ -656,15 +691,8 @@ mod tests {
         let database_path = root.join("state.db");
         let database = Arc::new(Database::open(&database_path)?);
         database.migrate_with_backup(&root.join("backups"))?;
-        with_database(&database, |connection| {
-            connection.execute(
-                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
-                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
-                [Utc::now().to_rfc3339()],
-            )?;
-            Ok(())
-        })?;
-        let workspace = database.legacy_workspace()?;
+        let workspace_id = database.resolve_repository_workspace(&root)?.workspace_id;
+        let workspace = database.workspace(workspace_id);
         let daemon = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: daemon,

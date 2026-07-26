@@ -27,8 +27,9 @@ pub use integration::IntegrationServices;
 pub use ipc::windows_named_pipe_security_descriptor;
 pub use ipc::{
     DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, IpcServer,
-    WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceArtifactDiagnostics, WorkspaceArtifactScope,
-    WorkspaceAuditDiagnostics, WorkspaceDoctorDiagnostics, ipc_endpoint,
+    WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceActivation, WorkspaceArtifactDiagnostics,
+    WorkspaceArtifactScope, WorkspaceAuditDiagnostics, WorkspaceDoctorDiagnostics,
+    WorkspaceDoctorLookup, ipc_endpoint,
 };
 pub use planning::{PlanningServices, process_next_orchestration_command};
 
@@ -263,6 +264,81 @@ pub async fn serve_with_full_orchestration_on_owned_lease(
         Some(lease),
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_workspace_runtime_on_owned_daemon(
+    database: Arc<Database>,
+    workspace_id: WorkspaceId,
+    instance_id: DaemonInstanceId,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    redactor: Arc<dyn MessageRedactor>,
+    planning: PlanningServices,
+    execution: ExecutionServices,
+) -> Result<(), DaemonError> {
+    validate_settings(settings)?;
+    execution::validate_execution_services(&execution)?;
+    reconcile_daemon_startup(&database, workspace_id, Utc::now())?;
+    let workspace = database.workspace(workspace_id);
+    let mut command_interval = tokio::time::interval(settings.command_poll_interval);
+    command_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut active_planning = None;
+    let execution_cancellation = cancellation.child_token();
+    let mut execution_jobs = Vec::new();
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            _ = command_interval.tick() => {
+                process_next_client_command(&workspace, redactor.as_ref(), Utc::now())?;
+                execution::reap_finished_tasks(&mut execution_jobs).await?;
+                if active_planning
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    let finished = active_planning.take().ok_or_else(|| {
+                        DaemonError::InvalidSettings("finished planning job disappeared".to_owned())
+                    })?;
+                    finished.await.map_err(|error| {
+                        DaemonError::InvalidSettings(format!("planning job failed: {error}"))
+                    })??;
+                }
+                if active_planning.is_none() {
+                    let job_database = Arc::clone(&database);
+                    let job_redactor = Arc::clone(&redactor);
+                    let job_services = planning.clone();
+                    active_planning = Some(tokio::spawn(async move {
+                        let workspace = job_database.workspace(workspace_id);
+                        process_next_orchestration_command(
+                            &workspace,
+                            &job_services,
+                            job_redactor.as_ref(),
+                            Utc::now(),
+                        )
+                        .await
+                    }));
+                }
+                execution::spawn_ready_tasks(
+                    &database,
+                    workspace_id,
+                    instance_id,
+                    &execution,
+                    &redactor,
+                    &execution_cancellation,
+                    &mut execution_jobs,
+                )?;
+            }
+        }
+    }
+    if let Some(job) = active_planning {
+        job.abort();
+        let _ = job.await;
+    }
+    workspace.reconcile_interrupted_conversation_attempts(
+        Utc::now(),
+        "conversation attempt was interrupted by daemon shutdown",
+    )?;
+    execution::stop_execution_jobs(&execution_cancellation, execution_jobs).await
 }
 
 #[allow(clippy::too_many_arguments)]

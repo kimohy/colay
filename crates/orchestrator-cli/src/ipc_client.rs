@@ -49,21 +49,47 @@ impl DaemonClient {
         })
     }
 
-    pub async fn connect(repository: &Path) -> Result<Self> {
-        Self::connect_with_config(repository, None).await
-    }
-
-    pub async fn connect_with_config(
-        repository: &Path,
-        explicit_config: Option<&Path>,
-    ) -> Result<Self> {
+    pub async fn doctor_lookup(repository: &Path) -> Result<IpcResponse> {
         let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
         ping(&paths).await?;
-        let workspace_id = register_workspace(&paths, repository, explicit_config).await?;
-        Ok(Self {
-            paths,
-            workspace_id,
-        })
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: Uuid::now_v7().to_string(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: json!({"repository": repository}),
+        };
+        let mut stream = open_response_stream(&paths, &request).await?;
+        let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+            .await
+            .context("timed out waiting for read-only workspace doctor lookup")??
+            .ok_or_else(|| anyhow!("user daemon closed doctor IPC without replying"))?;
+        ensure_success(&response)?;
+        Ok(response)
+    }
+
+    pub async fn request_global(action: &str, payload: Value) -> Result<IpcResponse> {
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
+        ping(&paths).await?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: Uuid::now_v7().to_string(),
+            workspace_id: None,
+            action: action.to_owned(),
+            payload,
+        };
+        let mut stream = open_response_stream(&paths, &request).await?;
+        let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+            .await
+            .context("timed out waiting for the user daemon")??
+            .ok_or_else(|| endpoint_refused("user daemon closed global IPC without replying"))?;
+        ensure_success(&response)?;
+        Ok(response)
+    }
+
+    pub async fn ping_global() -> Result<()> {
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
+        ping(&paths).await
     }
 
     pub async fn request(&self, action: &str, payload: Value) -> Result<IpcResponse> {
@@ -119,8 +145,12 @@ async fn ping(paths: &GlobalStatePaths) -> Result<()> {
     let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
         .await
         .context("timed out waiting for the user daemon readiness response")??
-        .ok_or_else(|| anyhow!("user daemon closed readiness IPC without replying"))?;
+        .ok_or_else(|| endpoint_refused("user daemon closed readiness IPC without replying"))?;
     ensure_success(&response)
+}
+
+fn endpoint_refused(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, message)
 }
 
 async fn register_workspace(
@@ -137,6 +167,7 @@ async fn register_workspace(
         payload: json!({
             "repository": repository,
             "state_dir": config.orchestrator.state_dir,
+            "explicit_config": explicit_config,
         }),
     };
     let mut stream = open_response_stream(paths, &request).await?;

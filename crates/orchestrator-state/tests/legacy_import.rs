@@ -709,7 +709,7 @@ fn corrupt_earlier_target_event_is_refused_before_any_target_mutation() -> TestR
         .ok_or("gapped target event chain was accepted")?;
 
     assert!(error.to_string().contains("audit event chain is invalid"));
-    assert_eq!(before, target_mutation_counts(&fixture)?);
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
     assert_no_published_import(&fixture, &plan.source_fingerprint);
     Ok(())
 }
@@ -738,7 +738,7 @@ fn inconsistent_target_event_cursor_is_refused_before_any_target_mutation() -> T
         .ok_or("inconsistent target event cursor was accepted")?;
 
     assert!(error.to_string().contains("event cursor"));
-    assert_eq!(before, target_mutation_counts(&fixture)?);
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
     assert_no_published_import(&fixture, &plan.source_fingerprint);
     Ok(())
 }
@@ -1747,6 +1747,17 @@ fn target_mutation_counts(fixture: &ImportFixture) -> TestResult<(i64, i64, i64,
         )?,
         regular_file_count(&fixture.paths.backups)?,
     ))
+}
+
+fn assert_only_pretransaction_backup_added(
+    before: (i64, i64, i64, i64, usize),
+    after: (i64, i64, i64, i64, usize),
+) {
+    assert_eq!(before.0, after.0);
+    assert_eq!(before.1, after.1);
+    assert_eq!(before.2, after.2);
+    assert_eq!(before.3, after.3);
+    assert_eq!(before.4 + 1, after.4);
 }
 
 fn assert_no_published_import(fixture: &ImportFixture, fingerprint: &str) {
