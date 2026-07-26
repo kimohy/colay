@@ -344,6 +344,28 @@ fn slow_fake_provider_probe_does_not_make_start_fail() -> Result<()> {
 }
 
 #[test]
+fn restart_cancels_slow_startup_workspace_probe() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    let slow_fake = fixture.slow_fake_codex(15_000)?;
+    let probe_marker = fake_probe_marker(&slow_fake)?;
+    fixture.configure_fake_codex_executable(&slow_fake)?;
+    let initialized = fixture.colay(["init"])?;
+    assert!(initialized.status.success());
+    assert!(
+        fixture
+            .invoke_without_capture(&["daemon", "start"])?
+            .success()
+    );
+    CliFixture::wait_for_path(&probe_marker, Duration::from_secs(5))?;
+
+    fixture.configure_fake_codex_executable(&fake_provider_binary())?;
+    let restarted = fixture.invoke_without_capture(&["daemon", "restart"])?;
+    assert!(restarted.success(), "restart waited for the startup probe");
+    fixture.wait_for_state("online", Duration::from_secs(5))?;
+    Ok(())
+}
+
+#[test]
 fn restart_cancels_slow_secondary_workspace_activation() -> Result<()> {
     let fixture = CliFixture::new()?;
     fixture.configure_fake_codex_executable(&fake_provider_binary())?;
