@@ -4,6 +4,8 @@
 /.codex/orchestrator/
 /.codex-orchestrator-worktrees/
 /.worktrees/
+__pycache__/
+*.py[cod]
 *.db-shm
 *.db-wal
 *.backup.*

@@ -35,6 +35,16 @@ Executable resolution is platform-specific but shared by diagnostics and executi
 
 Codex incompatibility does not disable a usable Claude, Agy, or Gemini adapter. Agy and Gemini are configured and routed independently. An incompatible state, config, or handover schema blocks task execution rather than attempting an implicit downgrade.
 
+The scheduled stable compatibility monitor inspects the official
+`codex-package-x86_64-unknown-linux-musl.tar.gz` asset for the resolved exact
+`rust-v*` release. It downloads `codex-package_SHA256SUMS`, requires exactly
+one entry for that asset, verifies the digest before extraction, and rejects
+archive traversal, links, special files, duplicate paths, or a missing or
+non-executable `bin/codex`. The resulting report records the release tag,
+upstream source commit, asset filename, and verified digest. A download,
+checksum, or archive validation failure stops the monitor before any provider
+probe; the monitor never supplies credentials or starts inference.
+
 When `.colay/config.toml` is absent, Colay can continue using a legacy `.codex/orchestrator/config.toml` in place and emits a warning. It never moves or copies live state automatically because persisted worktree and rollback paths may be absolute. If both config locations exist, startup fails closed and requires an explicit `--config` path; `colay init` also refuses to create a second state root over a legacy installation.
 
 ## Running and inspecting tasks
