@@ -39,6 +39,9 @@ struct CommandContext {
 impl ConcurrencyFixture {
     fn new() -> Result<Self> {
         let serial = concurrency_fixture_guard();
+        #[cfg(target_os = "macos")]
+        let temp = tempfile::tempdir_in("/tmp")?;
+        #[cfg(not(target_os = "macos"))]
         let temp = tempfile::tempdir()?;
         let root = fs::canonicalize(temp.path())?;
         let repository = root.join("Workspace-한글-Σ");
