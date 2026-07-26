@@ -42,7 +42,7 @@ migration이 성공했으며 기존 사용자 DB SHA-256
 ## WSL-013: 느린 secondary workspace activation이 daemon restart 종료를 차단
 
 - 심각도: high
-- 상태: fix-in-progress
+- 상태: fixed
 - 발견 nightly: `0.1.1-nightly.20260726.209e6d2`
 
 ### 관찰 및 원인
@@ -67,13 +67,28 @@ branch 내부 await는 daemon cancellation을 관찰하지 않아 restart의 10�
 - cancellation이 이미 발생한 경우 pending activation future가 drop되는 단위 테스트를
   추가했다.
 - 두 번째 workspace에 15초 지연 fake Codex를 설정하고 activation 직후 restart하는 CLI
-  subprocess 회귀 테스트를 추가했다. 수정 후 Windows에서 9.43초에 성공했다.
+  subprocess 회귀 테스트를 추가했다. 수정 후 Windows에서 9.36초, WSL에서 8.36초에
+  성공했다.
 - 실제 provider inference는 호출하지 않는다.
 
-### 남은 완료 조건
+### 배포 완료 검증
 
-전체 Windows/WSL 검증과 CI를 통과해 PR을 병합한 뒤 새 nightly에서 동일한 두 workspace
-start/status/restart/status/stop 시나리오가 성공하는지 확인한다.
+PR #9를 merge commit `b0864483f6bfa2da2a9f34b00786f11355edc4ce`로 병합했다. push/PR
+CI의 Ubuntu, Windows, macOS 작업 6개와 merge commit CI, 세 플랫폼 release build/smoke,
+attestation, npm publish가 모두 성공했다.
+
+nightly `0.1.1-nightly.20260726.b086448`를 WSL Ubuntu 24.04에 정확한 버전으로 설치하고,
+격리된 `COLAY_HOME`에서 schema 0→15 migration 후 두 directory workspace를 활성화했다.
+두 번째 workspace의 공개 provider probe가 진행 중인 상태에서 `daemon restart`는 약 3초
+안에 exit 0으로 완료됐고 PID `1501`→`1792`의 새 instance가 online이 됐다. 이어지는
+status와 stop도 성공했다.
+
+상태 DB는 사용자 전역 경로의 `home/state/state.db` 하나뿐이었고, `ws-one`과 `ws-two`는
+각각 별도 `workspace_id` (`019fa004-aca4-7583-ac55-e251e08d00d2`,
+`019fa004-d7ae-7be0-b248-21e7aee9d9f0`)로 분리됐다. workspace 내부 DB는 없었다. 실제
+Codex `0.145.0` 공개 compatibility probe는 minimum `0.144.5; met=true`, writable
+`verified`, `inference_requests: 0`을 보고했다. 기존 사용자 DB SHA-256도
+`d6a7c0dbd90b0109fa500c80ef77963726a6659eb87e52520c05e0b57aed22bc`로 유지됐다.
 
 이 문서는 WSL Linux와 Windows에서 nightly Colay를 실제 사용하면서 발견한 오류와 개선
 후보를 지속적으로 누적하는 메모다. 오류를 재현했다고 해서 수정 완료로 간주하지 않으며,
@@ -86,7 +101,8 @@ start/status/restart/status/stop 시나리오가 성공하는지 확인한다.
 - 마지막 갱신: 2026-07-26
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
-  `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`
+  `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
+  `0.1.1-nightly.20260726.b086448`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -107,7 +123,7 @@ start/status/restart/status/stop 시나리오가 성공하는지 확인한다.
 | `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
 | `WSL-011` | high | open | migration 대기 DB에서 `doctor`가 미래 schema 컬럼을 먼저 조회해 raw SQL 오류 반환 |
 | `WSL-012` | high | fixed | 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨 |
-| `WSL-013` | high | fix-in-progress | 느린 secondary workspace activation이 daemon restart 종료를 차단 |
+| `WSL-013` | high | fixed | 느린 secondary workspace activation이 daemon restart 종료를 차단 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
