@@ -352,7 +352,13 @@ fn windows_pipe_dacl_grants_access_only_to_the_current_user_sid() -> Result<()> 
     })?;
     let sid = current_windows_user_sid()?;
 
-    assert!(descriptor.contains(&format!(";;;{sid})")));
+    let grants_current_user = descriptor.contains(&format!(";;;{sid})"))
+        // Windows may render the well-known local Administrator SID with its SDDL alias.
+        || (sid.rsplit('-').next() == Some("500") && descriptor.contains(";;;LA)"));
+    assert!(
+        grants_current_user,
+        "pipe descriptor {descriptor:?} does not grant the current user SID {sid}"
+    );
     assert_eq!(descriptor.matches("(A;").count(), 1);
     for broad_principal in ["WD", "AN", "AU", "BU"] {
         assert!(!descriptor.contains(&format!(";;;{broad_principal})")));

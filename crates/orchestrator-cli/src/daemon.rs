@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
 use orchestrator_daemon::{
-    DaemonOwnerLock, DaemonSettings, ExecutionServices, IntegrationServices, IpcServer,
+    DaemonOwnerLock, DaemonSettings, ExecutionServices, IntegrationServices, IpcError, IpcServer,
     MessageRedactor, PlanningServices, WorkspaceActivation,
     serve_with_full_orchestration_on_owned_lease, serve_workspace_runtime_on_owned_daemon,
 };
@@ -736,16 +736,16 @@ async fn stop_global() -> Result<DaemonStatus> {
         Err(error) if stop_response_disconnect(&error) => {}
         Err(error) => return Err(error),
     }
+    let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
     let deadline = Instant::now() + STOP_TIMEOUT;
     loop {
-        match DaemonClient::ping_global().await {
-            Ok(()) => {}
-            Err(error) if stopped_endpoint_error(&error) => return Ok(DaemonStatus::Stopped),
-            Err(error) if stop_response_disconnect(&error) => {}
-            Err(error) => return Err(error),
+        match DaemonOwnerLock::acquire(&paths) {
+            Ok(_released) => return Ok(DaemonStatus::Stopped),
+            Err(IpcError::AlreadyOwned) => {}
+            Err(error) => return Err(error.into()),
         }
         if Instant::now() >= deadline {
-            bail!("user daemon did not release its IPC endpoint within ten seconds");
+            bail!("user daemon did not release its singleton ownership within ten seconds");
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }

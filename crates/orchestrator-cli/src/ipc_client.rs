@@ -87,11 +87,6 @@ impl DaemonClient {
         Ok(response)
     }
 
-    pub async fn ping_global() -> Result<()> {
-        let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
-        ping(&paths).await
-    }
-
     pub async fn request(&self, action: &str, payload: Value) -> Result<IpcResponse> {
         let mut stream = self.stream(action, payload).await?;
         let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
