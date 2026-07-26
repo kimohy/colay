@@ -42,7 +42,7 @@ migration이 성공했으며 기존 사용자 DB SHA-256
 ## WSL-013: 느린 startup/secondary workspace probe가 daemon restart 종료를 차단
 
 - 심각도: high
-- 상태: fix-in-progress
+- 상태: fixed
 - 발견 nightly: `0.1.1-nightly.20260726.209e6d2`
 - 추가 재현 nightly: `0.1.1-nightly.20260726.20b7654`
 
@@ -102,8 +102,20 @@ cancellation 경계 밖이었다. `start`가 online을 반환한 직후 restart�
 두 번째 수정은 startup workspace planner probe도 cancellation 우선 경계로 감싸고,
 cancellation 시 startup lease를 해제한 뒤 정상 종료한다. 초기 workspace에 15초 지연 fake
 Codex를 설정하고 probe 시작 marker 직후 restart하는 회귀 테스트를 추가했다. 수정 전에는
-실패했고 수정 후 Windows에서 통과했다. 새 PR 병합 및 nightly WSL 지연 없는 재검증 전까지
-상태는 `fix-in-progress`로 유지한다.
+실패했고 수정 후 Windows에서 통과했다.
+
+PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하고 nightly
+`0.1.1-nightly.20260726.b2daed0`를 WSL에 정확한 버전으로 설치했다. 새 격리
+`COLAY_HOME`에서 schema 0→15 migration, 첫 workspace start, 두 번째 workspace status,
+지연 없는 즉시 restart, status, stop을 한 shell에서 실행해 11초 전체 안에 모두 exit 0을
+확인했다. restart 뒤 instance는 online이었고 새 PID `1499`를 보고했다.
+
+전역 DB는 `home/state/state.db` 하나였으며 workspace 내부 DB는 없었다. 두 workspace는
+각각 `019fa059-aab7-7d70-8e58-e757c22121d0`,
+`019fa059-ae91-70e3-8482-b0cc625b3ffc`로 분리됐다. 공개 compatibility probe는 Codex
+`0.145.0`, minimum `0.144.5; met=true`, writable `verified`, `inference_requests: 0`을
+보고했고 기존 사용자 DB SHA-256도
+`d6a7c0dbd90b0109fa500c80ef77963726a6659eb87e52520c05e0b57aed22bc`로 유지됐다.
 
 이 문서는 WSL Linux와 Windows에서 nightly Colay를 실제 사용하면서 발견한 오류와 개선
 후보를 지속적으로 누적하는 메모다. 오류를 재현했다고 해서 수정 완료로 간주하지 않으며,
@@ -117,7 +129,8 @@ Codex를 설정하고 probe 시작 marker 직후 restart하는 회귀 테스트�
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
-  `0.1.1-nightly.20260726.b086448`
+  `0.1.1-nightly.20260726.b086448`, `0.1.1-nightly.20260726.20b7654`,
+  `0.1.1-nightly.20260726.b2daed0`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -138,7 +151,7 @@ Codex를 설정하고 probe 시작 marker 직후 restart하는 회귀 테스트�
 | `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
 | `WSL-011` | high | open | migration 대기 DB에서 `doctor`가 미래 schema 컬럼을 먼저 조회해 raw SQL 오류 반환 |
 | `WSL-012` | high | fixed | 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨 |
-| `WSL-013` | high | fix-in-progress | startup/secondary workspace probe가 daemon restart 종료를 차단 |
+| `WSL-013` | high | fixed | startup/secondary workspace probe가 daemon restart 종료를 차단 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
