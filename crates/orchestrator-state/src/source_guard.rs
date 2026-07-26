@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn source_parent_aba_is_rejected_and_restored() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        let root = temporary.path().join("source");
+        let root = fs::canonicalize(temporary.path())?.join("source");
         let parent = root.join("evidence");
         let saved = root.join("evidence-saved");
         let alternate = root.join("evidence-alternate");
