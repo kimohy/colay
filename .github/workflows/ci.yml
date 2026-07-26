@@ -29,6 +29,8 @@ jobs:
         run: rustup show
       - name: Verify generated compatibility matrix
         run: python scripts/generate_codex_matrix.py --check
+      - name: Test release asset preparation
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

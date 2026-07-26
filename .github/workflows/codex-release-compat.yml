@@ -25,6 +25,8 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       report_name: ${{ steps.report.outputs.name }}
+      asset_name: ${{ steps.asset.outputs.asset_name }}
+      asset_sha256: ${{ steps.asset.outputs.asset_sha256 }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -50,10 +52,36 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch "$TAG" --filter=blob:none https://github.com/openai/codex.git "$RUNNER_TEMP/codex"
           git -C "$RUNNER_TEMP/codex" rev-parse HEAD | tee "$RUNNER_TEMP/upstream-sha.txt"
-      - name: Build upstream CLI without credentials
+      - id: asset
+        name: Download and verify official release package
         env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        run: cargo build --locked -p codex-cli --manifest-path "$RUNNER_TEMP/codex/codex-rs/Cargo.toml"
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          download="$RUNNER_TEMP/codex-release-download"
+          provenance="$RUNNER_TEMP/codex-release-provenance.json"
+          mkdir -p "$download"
+          gh release download "$TAG" --repo openai/codex \
+            --pattern codex-package-x86_64-unknown-linux-musl.tar.gz \
+            --pattern codex-package_SHA256SUMS \
+            --dir "$download"
+          python scripts/prepare_codex_release_asset.py \
+            --archive "$download/codex-package-x86_64-unknown-linux-musl.tar.gz" \
+            --checksums "$download/codex-package_SHA256SUMS" \
+            --output "$RUNNER_TEMP/codex-release" \
+            --provenance "$provenance"
+          python - "$provenance" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          provenance_path, output_path = map(Path, sys.argv[1:])
+          evidence = json.loads(provenance_path.read_text(encoding="utf-8"))
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(f"asset_name={evidence['asset_name']}\n")
+              output.write(f"asset_sha256={evidence['asset_sha256']}\n")
+          PY
       - name: Capture non-inference capability contract
         env:
           TAG: ${{ steps.resolve.outputs.tag }}
@@ -61,7 +89,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/report/$TAG"
           mkdir -p "$out/schema"
-          codex_bin="$RUNNER_TEMP/codex/codex-rs/target/debug/codex"
+          codex_bin="$RUNNER_TEMP/codex-release/bin/codex"
           capture() {
             name="$1"
             shift
@@ -82,8 +110,28 @@ jobs:
           schema_code="$?"
           set -e
           printf '%s\n' "$schema_code" > "$out/app-server-schema.exit-code"
-          printf '{"tag":"%s","commit":"%s","inference_executed":false}\n' \
-            "$TAG" "$(cat "$RUNNER_TEMP/upstream-sha.txt")" > "$out/report.json"
+          python - \
+            "$TAG" \
+            "$(cat "$RUNNER_TEMP/upstream-sha.txt")" \
+            "$RUNNER_TEMP/codex-release-provenance.json" \
+            "$out/report.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          tag, commit, provenance_path, report_path = sys.argv[1:]
+          report = json.loads(Path(provenance_path).read_text(encoding="utf-8"))
+          report.update(
+              {
+                  "tag": tag,
+                  "commit": commit,
+                  "inference_executed": False,
+              }
+          )
+          Path(report_path).write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
           find "$out" -type f ! -name SHA256SUMS -print0 \
             | sort -z | xargs -0 sha256sum > "$out/SHA256SUMS"
       - name: Build actionable compatibility report
