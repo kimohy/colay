@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use uuid::Uuid;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -227,7 +227,10 @@ async fn wait_until_ready(
             if let Some(exit) = last_child_exit {
                 bail!("user daemon contenders exited before IPC readiness; last exit: {exit}");
             }
-            bail!("user daemon did not publish IPC within ten seconds");
+            bail!(
+                "user daemon did not publish IPC within {} seconds",
+                CONNECT_TIMEOUT.as_secs()
+            );
         }
         tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
     }
