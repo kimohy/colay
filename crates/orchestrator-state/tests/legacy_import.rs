@@ -914,13 +914,14 @@ struct IntegrationSeed {
 impl ImportFixture {
     fn new() -> TestResult<Self> {
         let root = tempfile::tempdir()?;
-        let repository = root.path().join("repository");
+        let canonical_root = fs::canonicalize(root.path())?;
+        let repository = canonical_root.join("repository");
         fs::create_dir_all(&repository)?;
         let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
         fs::create_dir_all(&source.root)?;
         let task_id = seed_v3_source(&source)?;
 
-        let environment = StateEnvironment::with_colay_home(root.path().join("global"))?;
+        let environment = StateEnvironment::with_colay_home(canonical_root.join("global"))?;
         let paths = GlobalStatePaths::resolve(&environment)?;
         let global = Database::open(&paths.database)?;
         global.migrate_with_backup(&paths.backups)?;

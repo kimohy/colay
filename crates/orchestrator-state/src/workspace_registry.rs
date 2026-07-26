@@ -560,11 +560,13 @@ mod tests {
         let root = tempfile::tempdir().map_err(|error| {
             crate::StateError::InvalidRecord(format!("test tempdir failed: {error}"))
         })?;
-        let repository = root.path().join("repository");
+        let canonical_root = std::fs::canonicalize(root.path())
+            .map_err(|error| crate::StateError::io(root.path(), error))?;
+        let repository = canonical_root.join("repository");
         std::fs::create_dir_all(&repository)
             .map_err(|error| crate::StateError::io(&repository, error))?;
-        let database = Database::open(root.path().join("state.db"))?;
-        database.migrate_with_backup(&root.path().join("backups"))?;
+        let database = Database::open(canonical_root.join("state.db"))?;
+        database.migrate_with_backup(&canonical_root.join("backups"))?;
         Ok((root, database, repository))
     }
 

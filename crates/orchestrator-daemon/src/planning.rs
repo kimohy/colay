@@ -834,6 +834,9 @@ fn is_rejected_state_error(error: &StateError) -> bool {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1082,6 +1085,34 @@ mod tests {
         )
     }
 
+    fn git(repository: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+        let output = Command::new("git")
+            .current_dir(repository)
+            .args(args)
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(String::from_utf8_lossy(&output.stderr).into_owned().into())
+    }
+
+    fn committed_repository() -> Result<(tempfile::TempDir, PathBuf), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let repository = root.join("repository");
+        fs::create_dir_all(&repository)?;
+        fs::write(repository.join("fixture.txt"), "committed fixture\n")?;
+        git(&repository, &["init"])?;
+        git(&repository, &["config", "user.name", "Planning Test"])?;
+        git(
+            &repository,
+            &["config", "user.email", "planning-test@example.invalid"],
+        )?;
+        git(&repository, &["add", "."])?;
+        git(&repository, &["commit", "-m", "fixture"])?;
+        Ok((directory, repository))
+    }
+
     #[tokio::test]
     async fn explicit_plan_without_requirement_cannot_reach_approval()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1181,7 +1212,9 @@ mod tests {
         let (session_id, goal) = seed_goal(&database_path, &workspace)?;
         seed_ready_requirement(&workspace, session_id, goal)?;
         workspace.submit_client_command(&plan_command(session_id, goal, "approval-plan"))?;
-        let (services, _) = services(FakeMode::Valid, Duration::ZERO);
+        let (_repository, repository_root) = committed_repository()?;
+        let (mut services, _) = services(FakeMode::Valid, Duration::ZERO);
+        services.repository_root = repository_root;
         process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
             .await?;
         let graph = workspace
@@ -1226,8 +1259,15 @@ mod tests {
             "exact-approval",
         );
         workspace.submit_client_command(&approve)?;
-        process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
-            .await?;
+        let approval_result =
+            process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
+                .await?;
+        assert_eq!(
+            approval_result,
+            Some(CommandProcessingResult::Completed(approve.command_id)),
+            "stored command: {:?}",
+            workspace.load_client_command(approve.command_id)?
+        );
         assert_eq!(
             workspace
                 .load_session(session_id)?

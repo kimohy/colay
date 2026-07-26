@@ -180,7 +180,9 @@ impl TaskPlanner for FakePlanner {
 }
 
 fn database() -> Result<(Database, WorkspaceId, std::path::PathBuf), Box<dyn std::error::Error>> {
-    let root = tempfile::tempdir()?.keep();
+    let temporary = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(temporary.path())?;
+    let _persisted = temporary.keep();
     let database_path = root.join("state.db");
     let database = Database::open(&database_path)?;
     database.migrate_with_backup(&root.join("backups"))?;

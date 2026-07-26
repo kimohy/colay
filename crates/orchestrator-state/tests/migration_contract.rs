@@ -129,11 +129,12 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
 fn v14_plan_only_requester_is_backfilled_into_authoritative_invocation_fence()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let database_path = directory.path().join("state.db");
-    let backup_directory = directory.path().join("backups");
+    let root = std::fs::canonicalize(directory.path())?;
+    let database_path = root.join("state.db");
+    let backup_directory = root.join("backups");
     let database = Database::open(&database_path)?;
     database.migrate_with_backup(&backup_directory)?;
-    let workspace_root = directory.path().join("workspace");
+    let workspace_root = root.join("workspace");
     std::fs::create_dir_all(&workspace_root)?;
     let workspace_id = database
         .resolve_repository_workspace(&workspace_root)?

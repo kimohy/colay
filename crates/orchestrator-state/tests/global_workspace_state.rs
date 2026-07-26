@@ -315,14 +315,15 @@ fn fresh_repository_resolution_creates_a_uuid_v7_workspace() -> TestResult {
 #[test]
 fn migrated_reserved_workspace_is_attached_once_and_never_reused() -> TestResult {
     let root = tempfile::tempdir()?;
-    let first = root.path().join("first");
-    let second = root.path().join("second");
+    let canonical_root = fs::canonicalize(root.path())?;
+    let first = canonical_root.join("first");
+    let second = canonical_root.join("second");
     fs::create_dir_all(&first)?;
     fs::create_dir_all(&second)?;
-    let database_path = root.path().join("state/state.db");
+    let database_path = canonical_root.join("state/state.db");
     {
         let database = Database::open(&database_path)?;
-        database.migrate_with_backup(&root.path().join("backups"))?;
+        database.migrate_with_backup(&canonical_root.join("backups"))?;
     }
     let connection = Connection::open(&database_path)?;
     connection.execute(
@@ -418,7 +419,8 @@ fn absolute_unix_environment() -> StateEnvironmentTestInput {
 }
 
 struct GlobalFixture {
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
+    canonical_root: PathBuf,
     database: Database,
     first: PathBuf,
     second: PathBuf,
@@ -428,17 +430,19 @@ struct GlobalFixture {
 impl GlobalFixture {
     fn new() -> TestResult<Self> {
         let root = tempfile::tempdir()?;
-        let first = root.path().join("first");
-        let second = root.path().join("second");
-        let moved = root.path().join("moved");
+        let canonical_root = fs::canonicalize(root.path())?;
+        let first = canonical_root.join("first");
+        let second = canonical_root.join("second");
+        let moved = canonical_root.join("moved");
         fs::create_dir_all(&first)?;
         fs::create_dir_all(&second)?;
         fs::create_dir_all(&moved)?;
 
-        let database = Database::open(root.path().join("state/state.db"))?;
-        database.migrate_with_backup(&root.path().join("backups"))?;
+        let database = Database::open(canonical_root.join("state/state.db"))?;
+        database.migrate_with_backup(&canonical_root.join("backups"))?;
         Ok(Self {
-            root,
+            _root: root,
+            canonical_root,
             database,
             first,
             second,
@@ -447,6 +451,6 @@ impl GlobalFixture {
     }
 
     fn root_path(&self) -> &std::path::Path {
-        self.root.path()
+        &self.canonical_root
     }
 }

@@ -3134,13 +3134,14 @@ mod final_hardening_tests {
     fn source_parent_aba_refuses_import_without_source_or_target_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        let repository = temporary.path().join("repository");
+        let root = fs::canonicalize(temporary.path())?;
+        let repository = root.join("repository");
         fs::create_dir_all(&repository)?;
         let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
         fs::create_dir_all(&source.root)?;
         drop(Connection::open(&source.database)?);
 
-        let environment = StateEnvironment::with_colay_home(temporary.path().join("global"))?;
+        let environment = StateEnvironment::with_colay_home(root.join("global"))?;
         let paths = GlobalStatePaths::resolve(&environment)?;
         let global = Database::open(&paths.database)?;
         global.migrate_with_backup(&paths.backups)?;
@@ -3223,7 +3224,8 @@ mod final_hardening_tests {
     fn sqlite_final_name_substitution_reads_retained_a_never_b()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        let repository = temporary.path().join("repository");
+        let root = fs::canonicalize(temporary.path())?;
+        let repository = root.join("repository");
         fs::create_dir_all(&repository)?;
         let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
         fs::create_dir_all(&source.root)?;
@@ -3235,7 +3237,7 @@ mod final_hardening_tests {
         let source_hash = sha256_file(&source.database)?;
         let alternate_hash = sha256_file(&alternate)?;
 
-        let environment = StateEnvironment::with_colay_home(temporary.path().join("global"))?;
+        let environment = StateEnvironment::with_colay_home(root.join("global"))?;
         let paths = GlobalStatePaths::resolve(&environment)?;
         let global = Database::open(&paths.database)?;
         global.migrate_with_backup(&paths.backups)?;
@@ -3311,7 +3313,8 @@ mod final_hardening_tests {
     fn sqlite_wal_sidecar_set_change_is_refused_before_target_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        let repository = temporary.path().join("repository");
+        let root = fs::canonicalize(temporary.path())?;
+        let repository = root.join("repository");
         fs::create_dir_all(&repository)?;
         let source = RepositoryStatePaths::from_config(&repository, &RootConfig::default())?;
         fs::create_dir_all(&source.root)?;
@@ -3327,7 +3330,7 @@ mod final_hardening_tests {
         let wal = source.database.with_file_name(wal_name);
         assert!(!wal.exists());
 
-        let environment = StateEnvironment::with_colay_home(temporary.path().join("global"))?;
+        let environment = StateEnvironment::with_colay_home(root.join("global"))?;
         let paths = GlobalStatePaths::resolve(&environment)?;
         let global = Database::open(&paths.database)?;
         global.migrate_with_backup(&paths.backups)?;

@@ -6,11 +6,15 @@ use orchestrator_state::{Database, StateResult, WorkspaceDatabase, WorkspaceId, 
 use rusqlite::{Connection, Transaction, functions::FunctionFlags};
 
 pub(crate) fn fresh_database() -> StateResult<(Database, WorkspaceId)> {
-    let root = tempfile::tempdir()
-        .map_err(|error| {
-            orchestrator_state::StateError::InvalidRecord(format!("test tempdir failed: {error}"))
-        })?
-        .keep();
+    let temporary = tempfile::tempdir().map_err(|error| {
+        orchestrator_state::StateError::InvalidRecord(format!("test tempdir failed: {error}"))
+    })?;
+    let root = std::fs::canonicalize(temporary.path()).map_err(|error| {
+        orchestrator_state::StateError::InvalidRecord(format!(
+            "test tempdir canonicalization failed: {error}"
+        ))
+    })?;
+    let _persisted = temporary.keep();
     let database = Database::open(root.join("state.db"))?;
     database.migrate_with_backup(&root.join("backups"))?;
     let workspace_path = root.join("workspace");

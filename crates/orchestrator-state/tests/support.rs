@@ -6,7 +6,9 @@ use orchestrator_state::{Database, StateResult, WorkspaceDatabase, WorkspaceId, 
 use rusqlite::{Connection, functions::FunctionFlags};
 
 pub fn fresh_database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
-    let root = tempfile::tempdir()?.keep();
+    let temporary = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(temporary.path())?;
+    let _persisted = temporary.keep();
     let database = Database::open(root.join("state.db"))?;
     database.migrate_with_backup(&root.join("backups"))?;
     let workspace_path = root.join("workspace");
