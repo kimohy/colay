@@ -1238,7 +1238,9 @@ mod tests {
     }
 
     fn database() -> anyhow::Result<Database> {
-        let root = tempfile::tempdir()?.keep();
+        let temporary = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temporary.path())?;
+        let _persisted = temporary.keep();
         let database = Database::open(root.join("state.db"))?;
         database.migrate_with_backup(&root.join("backups"))?;
         test_with_database(&database, |connection| {

@@ -11,14 +11,17 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
+use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse, ipc_endpoint};
 use orchestrator_domain::{
     AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand, ClientCommandAction,
     ClientCommandId, ClientCommandState, CreateSessionCommandPayload, GraphValidationSummary,
     MessageId, SessionId, TaskState,
 };
 use orchestrator_state::{
-    DaemonStatus, Database, GraphRevisionStatus, RootConfig, TaskListFilter, WorkspaceDatabase,
+    DaemonStatus, Database, GlobalStatePaths, GraphRevisionStatus, RootConfig, StateEnvironment,
+    TaskListFilter, WorkspaceDatabase, WorkspaceId,
 };
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
 
 mod support;
 use support::with_workspace;
@@ -159,6 +162,25 @@ impl Fixture {
         Database::open(self.colay_home.join("state/state.db")).map_err(Into::into)
     }
 
+    fn ipc_request(
+        &self,
+        workspace_id: WorkspaceId,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<IpcResponse> {
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            self.colay_home.clone(),
+        )?)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: uuid::Uuid::now_v7().to_string(),
+            workspace_id: Some(workspace_id),
+            action: action.to_owned(),
+            payload,
+        };
+        tokio::runtime::Runtime::new()?.block_on(send_ipc_request(ipc_endpoint(&paths), request))
+    }
+
     fn wait_online(&self) -> Result<()> {
         self.wait_online_in(&self.repository)
     }
@@ -198,6 +220,59 @@ impl Fixture {
     }
 }
 
+async fn exchange_ipc<S>(mut stream: S, request: &IpcRequest) -> Result<IpcResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut encoded = serde_json::to_vec(request)?;
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await?;
+    stream.flush().await?;
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        BufReader::new(stream).read_line(&mut response),
+    )
+    .await
+    .context("timed out waiting for daemon IPC")??;
+    let response = serde_json::from_str::<IpcResponse>(&response)?;
+    if response
+        .outcome
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("ok")
+    {
+        bail!(
+            "daemon IPC rejected {}: {}",
+            request.action,
+            response.outcome
+        );
+    }
+    Ok(response)
+}
+
+#[cfg(unix)]
+async fn send_ipc_request(endpoint: PathBuf, request: IpcRequest) -> Result<IpcResponse> {
+    exchange_ipc(tokio::net::UnixStream::connect(endpoint).await?, &request).await
+}
+
+#[cfg(windows)]
+async fn send_ipc_request(endpoint: PathBuf, request: IpcRequest) -> Result<IpcResponse> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let client = loop {
+        match ClientOptions::new().open(&endpoint) {
+            Ok(client) => break client,
+            Err(error) if error.raw_os_error() == Some(231) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    exchange_ipc(client, &request).await
+}
+
 fn fixture_guard() -> MutexGuard<'static, ()> {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
     TEST_LOCK
@@ -234,28 +309,35 @@ fn pending_command(
 }
 
 fn wait_command(
-    database_path: &std::path::Path,
-    database: &WorkspaceDatabase<'_>,
+    fixture: &Fixture,
+    workspace_id: WorkspaceId,
     command_id: ClientCommandId,
 ) -> Result<ClientCommand> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
-        if let Some(command) = database.load_client_command(command_id)?
+        let response = fixture.ipc_request(
+            workspace_id,
+            "workspace.command.status",
+            serde_json::json!({"command_id": command_id, "idempotency_key": null}),
+        )?;
+        let command = serde_json::from_value::<Option<ClientCommand>>(
+            response.outcome["data"]["command"].clone(),
+        )?;
+        if let Some(command) = command.as_ref()
             && matches!(
                 command.state,
                 ClientCommandState::Completed | ClientCommandState::Failed
             )
         {
-            return Ok(command);
+            return Ok(command.clone());
         }
         if Instant::now() >= deadline {
-            let command = database.load_client_command(command_id)?;
-            let daemon = Database::open(database_path)?.daemon_status(Utc::now())?;
+            let daemon = fixture.database()?.daemon_status(Utc::now())?;
             bail!(
                 "client command {command_id} did not finish: {command:?}; daemon status: {daemon:?}"
             );
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -306,7 +388,10 @@ fn wait_for_task_completion(
             return Ok(());
         }
         if tasks.iter().any(|task| task.state == TaskState::Failed) {
-            bail!("approved conversation graph produced a failed task: {tasks:?}");
+            let events = database.outbox_after(0, 256)?;
+            bail!(
+                "approved conversation graph produced a failed task: {tasks:?}; events: {events:?}"
+            );
         }
         let daemon = global_database.daemon_status(Utc::now())?;
         if matches!(daemon, DaemonStatus::Stopped) {
@@ -322,12 +407,16 @@ fn wait_for_task_completion(
 }
 
 fn submit_and_wait(
-    database_path: &std::path::Path,
-    database: &WorkspaceDatabase<'_>,
+    fixture: &Fixture,
+    workspace_id: WorkspaceId,
     command: &ClientCommand,
 ) -> Result<ClientCommand> {
-    database.submit_client_command(command)?;
-    wait_command(database_path, database, command.command_id)
+    fixture.ipc_request(
+        workspace_id,
+        "workspace.command.submit",
+        serde_json::to_value(command)?,
+    )?;
+    wait_command(fixture, workspace_id, command.command_id)
 }
 
 fn mutation_counts(
@@ -352,17 +441,18 @@ fn mutation_counts(
 fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.initialize_with_fake_planner()?;
+    let database = fixture.database()?;
+    database.migrate_with_backup(&fixture.colay_home.join("state/backups"))?;
+    let database_path = database.path().to_path_buf();
+    let workspace_id = database
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
     assert!(
         fixture
             .status_without_capture(&["daemon", "start"])?
             .success()
     );
     fixture.wait_online()?;
-    let database = fixture.database()?;
-    let database_path = database.path().to_path_buf();
-    let workspace_id = database
-        .resolve_repository_workspace(&fixture.repository)?
-        .workspace_id;
     let workspace = database.workspace(workspace_id);
 
     let session_id = SessionId::new();
@@ -376,7 +466,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-session",
     );
     assert_eq!(
-        submit_and_wait(&database_path, &workspace, &create)?.state,
+        submit_and_wait(&fixture, workspace_id, &create)?.state,
         ClientCommandState::Completed
     );
 
@@ -391,7 +481,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-goal",
     );
     assert_eq!(
-        submit_and_wait(&database_path, &workspace, &goal)?.state,
+        submit_and_wait(&fixture, workspace_id, &goal)?.state,
         ClientCommandState::Completed
     );
 
@@ -424,7 +514,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         })?,
         "plan-e2e-wrong-approval",
     );
-    let wrong = submit_and_wait(&database_path, &workspace, &wrong)?;
+    let wrong = submit_and_wait(&fixture, workspace_id, &wrong)?;
     assert_eq!(wrong.state, ClientCommandState::Failed);
     assert_eq!(mutation_counts(&database_path, &workspace)?, (0, 0, 0, 0));
 
@@ -443,7 +533,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         "plan-e2e-exact-approval",
     );
     assert_eq!(
-        submit_and_wait(&database_path, &workspace, &exact)?.state,
+        submit_and_wait(&fixture, workspace_id, &exact)?.state,
         ClientCommandState::Completed
     );
     assert_eq!(
@@ -531,6 +621,9 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
 fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspace() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.initialize_with_fake_planner()?;
+    let database = fixture.database()?;
+    database.migrate_with_backup(&fixture.colay_home.join("state/backups"))?;
+    let database_path = database.path().to_path_buf();
     let started = fixture
         .command_in(&fixture.startup_repository)?
         .args(["daemon", "start"])
@@ -547,8 +640,6 @@ fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspac
         "{}",
         String::from_utf8_lossy(&registered.stderr)
     );
-    let database = fixture.database()?;
-    let database_path = database.path().to_path_buf();
     let registration = database
         .find_repository_workspace(&fixture.repository)?
         .context("run did not register the execution workspace")?;
@@ -564,7 +655,7 @@ fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspac
         "cross-workspace-session",
     );
     assert_eq!(
-        submit_and_wait(&database_path, &workspace, &create)?.state,
+        submit_and_wait(&fixture, registration.workspace_id, &create)?.state,
         ClientCommandState::Completed
     );
     let goal = pending_command(
@@ -577,7 +668,7 @@ fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspac
         "cross-workspace-goal",
     );
     assert_eq!(
-        submit_and_wait(&database_path, &workspace, &goal)?.state,
+        submit_and_wait(&fixture, registration.workspace_id, &goal)?.state,
         ClientCommandState::Completed
     );
     wait_for_approval_candidate(&workspace, session_id)?;
@@ -604,11 +695,12 @@ fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspac
         })?,
         "cross-workspace-exact-approval",
     );
-    let approved = submit_and_wait(&database_path, &workspace, &approval).map_err(|error| {
-        let daemon_stderr = fs::read_to_string(fixture.root.join("daemon.stderr"))
-            .unwrap_or_else(|read_error| format!("<cannot read daemon stderr: {read_error}>"));
-        anyhow::anyhow!("{error}; daemon stderr: {daemon_stderr}")
-    })?;
+    let approved =
+        submit_and_wait(&fixture, registration.workspace_id, &approval).map_err(|error| {
+            let daemon_stderr = fs::read_to_string(fixture.root.join("daemon.stderr"))
+                .unwrap_or_else(|read_error| format!("<cannot read daemon stderr: {read_error}>"));
+            anyhow::anyhow!("{error}; daemon stderr: {daemon_stderr}")
+        })?;
     assert_eq!(approved.state, ClientCommandState::Completed);
     if let Err(error) = wait_for_task_completion(&database, &workspace) {
         let daemon_stderr = fs::read_to_string(fixture.root.join("daemon.stderr"))

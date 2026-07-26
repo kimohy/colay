@@ -733,6 +733,7 @@ async fn stop_global() -> Result<DaemonStatus> {
     match DaemonClient::request_global("daemon.stop", json!({})).await {
         Ok(_) => {}
         Err(error) if stopped_endpoint_error(&error) => return Ok(DaemonStatus::Stopped),
+        Err(error) if stop_response_disconnect(&error) => {}
         Err(error) => return Err(error),
     }
     let deadline = Instant::now() + STOP_TIMEOUT;
@@ -740,6 +741,7 @@ async fn stop_global() -> Result<DaemonStatus> {
         match DaemonClient::ping_global().await {
             Ok(()) => {}
             Err(error) if stopped_endpoint_error(&error) => return Ok(DaemonStatus::Stopped),
+            Err(error) if stop_response_disconnect(&error) => {}
             Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
@@ -747,6 +749,19 @@ async fn stop_global() -> Result<DaemonStatus> {
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+fn stop_response_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 fn stopped_endpoint_error(error: &anyhow::Error) -> bool {
@@ -844,7 +859,7 @@ mod tests {
 
     use super::{
         StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
-        stopped_endpoint_error, supervise_daemon_runtime,
+        stop_response_disconnect, stopped_endpoint_error, supervise_daemon_runtime,
     };
 
     #[test]
@@ -860,6 +875,9 @@ mod tests {
         let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(!stopped_endpoint_error(&denied));
 
+        let reset = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!stopped_endpoint_error(&reset));
+
         #[cfg(windows)]
         for raw_os_error in [109, 232, 233] {
             let disconnected = anyhow::Error::new(std::io::Error::from_raw_os_error(raw_os_error));
@@ -869,6 +887,23 @@ mod tests {
         let schema_mismatch =
             anyhow::anyhow!("user daemon returned IPC schema 2; supported schema is 1");
         assert!(!stopped_endpoint_error(&schema_mismatch));
+    }
+
+    #[test]
+    fn stop_response_disconnect_is_recoverable_only_for_transport_shutdown() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::from(kind));
+            assert!(stop_response_disconnect(&error));
+        }
+
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!stop_response_disconnect(&denied));
+        let protocol = anyhow::anyhow!("daemon returned an invalid stop response");
+        assert!(!stop_response_disconnect(&protocol));
     }
 
     struct IdentityRedactor;
