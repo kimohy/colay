@@ -3,7 +3,7 @@
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
-- 상태: fix-in-progress
+- 상태: fixed
 - 발견 nightly: `0.1.1-nightly.20260726.5b1a207`
 
 ### 관찰 및 원인
@@ -30,12 +30,50 @@ generic adapter 판정에는 연결되지 않은 것이 원인이었다.
   모두 통과했다. WSL Ubuntu 24.04/Rust 1.95에서도 대상 통합 테스트와 전체 Clippy가
   통과했다.
 
+### 배포 완료 검증
+
+PR #8을 merge commit `209e6d25c7025784f8a0245da59bcbbf4d15dc66`으로 병합하고 nightly
+`0.1.1-nightly.20260726.209e6d2`를 WSL에 설치했다. 실제 Codex `0.145.0` 공개 probe는
+`degraded`와 writable `verified`, minimum version `0.144.5; met=true`를 보고했고
+`inference_requests`는 0이었다. 격리된 `COLAY_HOME`에서 config 파일 없이 schema 0→15
+migration이 성공했으며 기존 사용자 DB SHA-256
+`d6a7c0dbd90b0109fa500c80ef77963726a6659eb87e52520c05e0b57aed22bc`는 유지됐다.
+
+## WSL-013: 느린 secondary workspace activation이 daemon restart 종료를 차단
+
+- 심각도: high
+- 상태: fix-in-progress
+- 발견 nightly: `0.1.1-nightly.20260726.209e6d2`
+
+### 관찰 및 원인
+
+격리된 사용자 전역 DB에서 첫 workspace로 daemon을 시작하고 두 번째 workspace에서
+`status`를 호출한 직후 `daemon restart`를 실행하면 다음 오류가 두 번 재현됐다.
+
+```text
+error: user daemon did not release its singleton ownership within ten seconds
+```
+
+두 번째 workspace 등록 응답 후 activation 루프가 해당 workspace의 provider 공개 probe를
+동기적으로 기다리고 있었다. WSL의 실제 probe는 약 50초가 걸릴 수 있는데, activation
+branch 내부 await는 daemon cancellation을 관찰하지 않아 restart의 10초 종료 한도를
+넘겼다. 오류 뒤 기존 daemon은 stopped가 됐지만 새 daemon은 시작되지 않아 restart 계약이
+깨졌다.
+
+### 수정 및 검증
+
+- workspace runtime 준비 future와 daemon cancellation을 cancellation 우선 `select` 경계로
+  감싸 stop/restart 시 진행 중인 공개 probe future를 즉시 drop한다.
+- cancellation이 이미 발생한 경우 pending activation future가 drop되는 단위 테스트를
+  추가했다.
+- 두 번째 workspace에 15초 지연 fake Codex를 설정하고 activation 직후 restart하는 CLI
+  subprocess 회귀 테스트를 추가했다. 수정 후 Windows에서 9.43초에 성공했다.
+- 실제 provider inference는 호출하지 않는다.
+
 ### 남은 완료 조건
 
-수정 PR을 병합하고 새 nightly를 WSL에 설치한 뒤 실제 Codex `0.145.0` 공개 probe에서
-`untested` 문구가 사라지고, 격리된 `COLAY_HOME`에서 migration 및 daemon lifecycle이
-정상이며 사용자 기존 DB가 변경되지 않는지 확인한다. 실제 provider inference는 호출하지
-않는다.
+전체 Windows/WSL 검증과 CI를 통과해 PR을 병합한 뒤 새 nightly에서 동일한 두 workspace
+start/status/restart/status/stop 시나리오가 성공하는지 확인한다.
 
 이 문서는 WSL Linux와 Windows에서 nightly Colay를 실제 사용하면서 발견한 오류와 개선
 후보를 지속적으로 누적하는 메모다. 오류를 재현했다고 해서 수정 완료로 간주하지 않으며,
@@ -48,7 +86,7 @@ generic adapter 판정에는 연결되지 않은 것이 원인이었다.
 - 마지막 갱신: 2026-07-26
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
-  `0.1.1-nightly.20260726.7a45d97`
+  `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -68,6 +106,8 @@ generic adapter 판정에는 연결되지 않은 것이 원인이었다.
 | `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
 | `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
 | `WSL-011` | high | open | migration 대기 DB에서 `doctor`가 미래 schema 컬럼을 먼저 조회해 raw SQL 오류 반환 |
+| `WSL-012` | high | fixed | 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨 |
+| `WSL-013` | high | fix-in-progress | 느린 secondary workspace activation이 daemon restart 종료를 차단 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
