@@ -491,6 +491,7 @@ where
     if args.iter().any(|arg| arg == "--version")
         && let Some(delay) = fake_probe_delay()
     {
+        mark_fake_probe_started();
         std::thread::sleep(Duration::from_millis(delay));
     }
     if args.iter().any(|arg| arg == "--version" || arg == "--help") || app_server_probe {
@@ -646,6 +647,19 @@ fn fake_probe_delay() -> Option<u64> {
     let executable = std::env::current_exe().ok()?;
     let stem = executable.file_stem()?.to_string_lossy();
     stem.rsplit_once("probe-delay-")?.1.parse().ok()
+}
+
+fn mark_fake_probe_started() {
+    let Ok(mut executable) = std::env::current_exe() else {
+        return;
+    };
+    let Some(file_name) = executable.file_name() else {
+        return;
+    };
+    let mut marker_name = file_name.to_os_string();
+    marker_name.push(".probe-started");
+    executable.set_file_name(marker_name);
+    let _ = std::fs::write(executable, b"started");
 }
 
 fn planning_prompt(stdin: &str) -> Option<serde_json::Value> {

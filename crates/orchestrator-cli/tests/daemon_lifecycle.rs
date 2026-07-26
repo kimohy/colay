@@ -38,6 +38,19 @@ impl CliFixture {
     }
 
     fn colay_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Result<Output> {
+        self.colay_from_with_env(&self.repository, args, extra_env)
+    }
+
+    fn colay_from(&self, repository: &Path, args: &[&str]) -> Result<Output> {
+        self.colay_from_with_env(repository, args, &[])
+    }
+
+    fn colay_from_with_env(
+        &self,
+        repository: &Path,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Output> {
         #[cfg(windows)]
         let system_root = system_root()?;
         #[cfg(not(windows))]
@@ -49,7 +62,7 @@ impl CliFixture {
         let mut command = Command::new(&executable);
         command
             .args(args)
-            .current_dir(&self.repository)
+            .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
@@ -65,6 +78,11 @@ impl CliFixture {
     }
 
     fn configure_slow_fake_codex(&self, delay_ms: u64) -> Result<()> {
+        let executable = self.slow_fake_codex(delay_ms)?;
+        self.configure_fake_codex_executable(&executable)
+    }
+
+    fn slow_fake_codex(&self, delay_ms: u64) -> Result<PathBuf> {
         let source = fake_provider_binary();
         let extension = source.extension().and_then(|value| value.to_str());
         let file_name = extension.map_or_else(
@@ -73,13 +91,26 @@ impl CliFixture {
         );
         let executable = self.temp_root.join(file_name);
         fs::copy(source, &executable)?;
-        self.configure_fake_codex_executable(&executable)
+        Ok(executable)
     }
 
     fn configure_fake_codex_executable(&self, executable: &Path) -> Result<()> {
         fs::create_dir_all(&self.colay_home)?;
         fs::write(
             self.colay_home.join("config.toml"),
+            format!(
+                "config_version = 4\n[orchestrator.providers.codex]\nexecutable = {}\n",
+                toml_path(executable)
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn configure_repository_fake_codex(repository: &Path, executable: &Path) -> Result<()> {
+        let config_dir = repository.join(".colay");
+        fs::create_dir_all(&config_dir)?;
+        fs::write(
+            config_dir.join("config.toml"),
             format!(
                 "config_version = 4\n[orchestrator.providers.codex]\nexecutable = {}\n",
                 toml_path(executable)
@@ -124,6 +155,19 @@ impl CliFixture {
         args: &[&str],
         extra_env: &[(&str, &str)],
     ) -> Result<ExitStatus> {
+        self.invoke_from_with_env_without_capture(&self.repository, args, extra_env)
+    }
+
+    fn invoke_from_without_capture(&self, repository: &Path, args: &[&str]) -> Result<ExitStatus> {
+        self.invoke_from_with_env_without_capture(repository, args, &[])
+    }
+
+    fn invoke_from_with_env_without_capture(
+        &self,
+        repository: &Path,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<ExitStatus> {
         #[cfg(windows)]
         let system_root = system_root()?;
         #[cfg(not(windows))]
@@ -135,7 +179,7 @@ impl CliFixture {
         let mut command = Command::new(&executable);
         command
             .args(args)
-            .current_dir(&self.repository)
+            .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
@@ -167,6 +211,17 @@ impl CliFixture {
             thread::sleep(Duration::from_millis(25));
         }
     }
+
+    fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        while !path.exists() {
+            if started.elapsed() >= timeout {
+                bail!("path did not appear before timeout: {}", path.display());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
+    }
 }
 
 fn fake_provider_binary() -> PathBuf {
@@ -180,6 +235,17 @@ fn toml_path(path: &Path) -> String {
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
     )
+}
+
+fn fake_probe_marker(executable: &Path) -> Result<PathBuf> {
+    let mut marker = executable.to_path_buf();
+    let mut file_name = marker
+        .file_name()
+        .context("fake provider path has no file name")?
+        .to_os_string();
+    file_name.push(".probe-started");
+    marker.set_file_name(file_name);
+    Ok(marker)
 }
 
 impl Drop for CliFixture {
@@ -274,5 +340,41 @@ fn slow_fake_provider_probe_does_not_make_start_fail() -> Result<()> {
     assert!(started.success());
     let status = fixture.json(&["daemon", "status"])?;
     assert_eq!(status["data"]["status"]["state"], "online");
+    Ok(())
+}
+
+#[test]
+fn restart_cancels_slow_secondary_workspace_activation() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    fixture.configure_fake_codex_executable(&fake_provider_binary())?;
+    let initialized = fixture.colay(["init"])?;
+    assert!(initialized.status.success());
+    assert!(
+        fixture
+            .invoke_without_capture(&["daemon", "start"])?
+            .success()
+    );
+
+    let second_repository = fixture.temp_root.join("repository-two");
+    fs::create_dir_all(&second_repository)?;
+    let slow_fake = fixture.slow_fake_codex(15_000)?;
+    let probe_marker = fake_probe_marker(&slow_fake)?;
+    CliFixture::configure_repository_fake_codex(&second_repository, &slow_fake)?;
+    let activation = fixture.colay_from(&second_repository, &["status"])?;
+    assert!(
+        activation.status.success(),
+        "secondary workspace activation failed: {}",
+        String::from_utf8_lossy(&activation.stderr)
+    );
+    CliFixture::wait_for_path(&probe_marker, Duration::from_secs(5))?;
+
+    CliFixture::configure_repository_fake_codex(&second_repository, &fake_provider_binary())?;
+    let restarted =
+        fixture.invoke_from_without_capture(&second_repository, &["daemon", "restart"])?;
+    assert!(
+        restarted.success(),
+        "restart waited for the cancelled activation"
+    );
+    fixture.wait_for_state("online", Duration::from_secs(5))?;
     Ok(())
 }

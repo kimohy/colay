@@ -483,13 +483,20 @@ async fn serve_workspace_activations(
                     continue;
                 }
                 let workspace_paths = paths.for_workspace(activation.workspace_id);
-                let (redactor, planning, execution) = build_workspace_runtime(
-                    &activation.repository,
-                    activation.explicit_config.as_deref(),
-                    &workspace_paths,
+                let Some(runtime) = finish_unless_daemon_cancelled(
+                    &cancellation,
+                    Box::pin(build_workspace_runtime(
+                        &activation.repository,
+                        activation.explicit_config.as_deref(),
+                        &workspace_paths,
+                    )),
                 )
                 .await
-                .inspect_err(|_| cancellation.cancel())?;
+                else {
+                    break;
+                };
+                let (redactor, planning, execution) =
+                    runtime.inspect_err(|_| cancellation.cancel())?;
                 let job_database = Arc::clone(&database);
                 let job_cancellation = cancellation.clone();
                 jobs.spawn(async move {
@@ -527,6 +534,20 @@ async fn serve_workspace_activations(
         result?;
     }
     Ok(())
+}
+
+async fn finish_unless_daemon_cancelled<F>(
+    cancellation: &CancellationToken,
+    future: F,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        output = future => Some(output),
+    }
 }
 
 async fn build_workspace_runtime(
@@ -850,7 +871,13 @@ fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        future::pending,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use chrono::{TimeDelta, Utc};
     use orchestrator_domain::DaemonInstanceId;
@@ -859,8 +886,36 @@ mod tests {
 
     use super::{
         StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
-        stop_response_disconnect, stopped_endpoint_error, supervise_daemon_runtime,
+        finish_unless_daemon_cancelled, stop_response_disconnect, stopped_endpoint_error,
+        supervise_daemon_runtime,
     };
+
+    #[tokio::test]
+    async fn workspace_activation_setup_is_dropped_when_daemon_is_cancelled() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancellation = CancellationToken::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let drop_signal = DropSignal(Arc::clone(&dropped));
+        let activation = async move {
+            let _drop_signal = drop_signal;
+            pending::<()>().await;
+        };
+        cancellation.cancel();
+
+        assert!(
+            finish_unless_daemon_cancelled(&cancellation, activation)
+                .await
+                .is_none()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn only_endpoint_absence_or_refusal_is_classified_as_stopped() {
