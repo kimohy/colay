@@ -114,7 +114,7 @@ impl AdapterRuntime for FakeAdapterRuntime {
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let stdout = fake_probe_output(&args).into_bytes();
+        let stdout = fake_probe_output(&args, None).into_bytes();
         Ok(RuntimeOutput {
             resolved_executable: None,
             exit_code: Some(0),
@@ -302,9 +302,10 @@ impl AdapterRuntime for FakeAdapterRuntime {
     }
 }
 
-fn fake_probe_output(args: &[String]) -> String {
+fn fake_probe_output(args: &[String], codex_version: Option<&str>) -> String {
     if args == ["--version"] {
-        "codex-cli 0.144.5\n".to_owned()
+        let version = codex_version.unwrap_or("0.144.5");
+        format!("codex-cli {version}\n")
     } else if args == ["exec", "--help"] {
         "--json --output-schema --sandbox read-only workspace-write -c model_reasoning_effort=[low|medium|high]\n".to_owned()
     } else if args == ["exec", "resume", "--help"] {
@@ -475,7 +476,7 @@ fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn run_fake_cli<I>(args: I)
+pub(crate) fn run_fake_cli<I>(args: I, codex_version: Option<&str>)
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -493,7 +494,7 @@ where
         std::thread::sleep(Duration::from_millis(delay));
     }
     if args.iter().any(|arg| arg == "--version" || arg == "--help") || app_server_probe {
-        print!("{}", fake_probe_output(&args));
+        print!("{}", fake_probe_output(&args, codex_version));
         return;
     }
     if args.first().is_some_and(|arg| arg == "app-server") {

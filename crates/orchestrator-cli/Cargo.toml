@@ -19,6 +19,11 @@ name = "colay-e2e-fake-provider"
 path = "src/bin/fake-provider-cli.rs"
 required-features = ["test-fixtures"]
 
+[[bin]]
+name = "colay-e2e-future-codex"
+path = "src/bin/future-codex-cli.rs"
+required-features = ["test-fixtures"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
