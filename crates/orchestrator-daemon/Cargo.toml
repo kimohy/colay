@@ -9,16 +9,22 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 hex.workspace = true
 orchestrator-domain = { path = "../orchestrator-domain" }
 orchestrator-engine = { path = "../orchestrator-engine" }
 orchestrator-state = { path = "../orchestrator-state" }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+orchestrator-windows-ipc = { path = "../orchestrator-windows-ipc" }
 
 [dev-dependencies]
 rusqlite.workspace = true

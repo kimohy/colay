@@ -10,7 +10,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     GitIntegrationManager, GitWorktree, IntegrationCandidate, IntegrationPreviewRequest,
 };
-use orchestrator_state::{Database, IntegrationBatchStatus, StateError};
+use orchestrator_state::{IntegrationBatchStatus, StateError, WorkspaceDatabase};
 
 #[derive(Clone)]
 pub struct IntegrationServices {
@@ -28,7 +28,7 @@ pub enum IntegrationCommandError {
 }
 
 pub async fn request_integration(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &IntegrationServices,
     command: &ClientCommand,
     now: DateTime<Utc>,
@@ -70,7 +70,7 @@ pub async fn request_integration(
 
 #[allow(clippy::too_many_lines)]
 pub async fn approve_integration(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &IntegrationServices,
     command: &ClientCommand,
     now: DateTime<Utc>,
@@ -191,7 +191,7 @@ pub async fn approve_integration(
 }
 
 pub fn create_resolution_task(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     now: DateTime<Utc>,
 ) -> Result<String, IntegrationCommandError> {
@@ -231,7 +231,7 @@ pub fn create_resolution_task(
 }
 
 fn transition_session(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     next: SessionState,
@@ -275,7 +275,7 @@ fn transition_session(
 }
 
 async fn build_request(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     services: &IntegrationServices,
     session_id: orchestrator_domain::SessionId,
     batch_id: IntegrationBatchId,

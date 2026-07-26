@@ -11,13 +11,15 @@ use orchestrator_domain::{
     ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState,
     CreateResolutionTaskCommandPayload, CreateSessionCommandPayload, GraphRevisionId,
     GraphValidationSummary, IntegrationBatchId, IntegrationBlocker, MessageId, MessageKind,
-    MessageRole, ProviderId, RequestPlanCommandPayload, SessionId, TaskId, TaskState,
+    MessageRole, ProviderId, RequestPlanCommandPayload, RequirementRevision, SessionId, TaskId,
+    TaskState,
 };
 use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_state::{
-    ControlAction as StateControlAction, DaemonStatus, Database, IntegrationBatchStatus,
-    RepositoryStatePaths, RootConfig, SessionListFilter, StoredIntegrationBatch,
-    WorkspaceAttentionKind, WorkspaceProjection, WorkspaceReadRequest,
+    ControlAction as StateControlAction, DaemonStatus, Database, GlobalStatePaths,
+    IntegrationBatchStatus, RootConfig, StateEnvironment, StoredIntegrationBatch,
+    WorkspaceAttentionKind, WorkspaceDatabase, WorkspaceId, WorkspaceProjection,
+    WorkspaceReadRequest,
 };
 use orchestrator_tui::chat::{
     ActionFeedback, AttentionItem, AttentionSeverity, ComposerTarget, DaemonConnectivity,
@@ -26,7 +28,7 @@ use orchestrator_tui::chat::{
     WorkspaceCursor, WorkspaceDriver, WorkspaceSnapshot,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 const DEFAULT_SESSION_KEY: &str = "chat-default-session-v1";
 const COMMAND_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -35,10 +37,12 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) struct SqliteWorkspaceDriver {
     repository: PathBuf,
     state_root: PathBuf,
-    database: Database,
+    database: Option<Database>,
+    workspace_id: WorkspaceId,
     session_id: SessionId,
     selected_task_id: Option<TaskId>,
     redactor: Redactor,
+    client: Option<crate::ipc_client::DaemonClient>,
 }
 
 impl SqliteWorkspaceDriver {
@@ -48,29 +52,37 @@ impl SqliteWorkspaceDriver {
         explicit_config: Option<&Path>,
         selected_task: Option<&str>,
     ) -> Result<Self> {
-        crate::daemon::ensure_started(repository, config, explicit_config).await?;
-        let paths = RepositoryStatePaths::from_config(repository, config)?;
-        let database = crate::daemon::open_ready_database(&paths)?;
+        let client =
+            crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
+        let workspace_id = client.workspace_id();
         let redactor = Redactor::new(&RedactionConfig {
             literals: Vec::new(),
             patterns: config.orchestrator.redaction.patterns.clone(),
         })?;
-        let session_id = ensure_default_session(&database, &redactor).await?;
+        let session_id = ensure_default_session(&client, &redactor).await?;
         let selected_task_id = match selected_task {
             Some(task_id) => {
                 let task_id = TaskId::from_str(task_id)?;
-                database.save_workspace_selected_task(session_id, Some(task_id), Utc::now())?;
+                client
+                    .request(
+                        "workspace.selection",
+                        json!({"session_id": session_id, "task_id": task_id}),
+                    )
+                    .await?;
                 Some(task_id)
             }
-            None => database.load_workspace_selected_task(session_id)?,
+            None => None,
         };
         Ok(Self {
             repository: repository.to_path_buf(),
-            state_root: paths.root,
-            database,
+            state_root: paths.for_workspace(workspace_id).root,
+            database: None,
+            workspace_id,
             session_id,
             selected_task_id,
             redactor,
+            client: Some(client),
         })
     }
 
@@ -81,22 +93,81 @@ impl SqliteWorkspaceDriver {
         session_id: SessionId,
         selected_task_id: Option<TaskId>,
         redactor: Redactor,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let workspace_id = database.legacy_workspace()?.workspace_id();
+        Ok(Self {
             state_root: repository.join(".colay"),
             repository,
-            database,
+            database: Some(database),
+            workspace_id,
             session_id,
             selected_task_id,
             redactor,
-        }
+            client: None,
+        })
     }
 
     fn online(&self) -> Result<bool, DriverError> {
+        if self.client.is_some() {
+            Ok(true)
+        } else {
+            self.database
+                .as_ref()
+                .ok_or_else(|| DriverError::new("test database is unavailable"))?
+                .daemon_status(Utc::now())
+                .map(|status| matches!(status, DaemonStatus::Online(_)))
+                .map_err(driver_error)
+        }
+    }
+
+    fn workspace(&self) -> Result<WorkspaceDatabase<'_>, DriverError> {
         self.database
-            .daemon_status(Utc::now())
-            .map(|status| matches!(status, DaemonStatus::Online(_)))
-            .map_err(driver_error)
+            .as_ref()
+            .map(|database| database.workspace(self.workspace_id))
+            .ok_or_else(|| DriverError::new("workspace database is test-only"))
+    }
+
+    fn request_ipc(
+        &self,
+        action: &'static str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, DriverError> {
+        let Some(client) = self.client.clone() else {
+            return Err(DriverError::new("test driver has no daemon IPC client"));
+        };
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::from)?
+                .block_on(client.request(action, payload))
+                .map(|response| response.outcome["data"].clone())
+        })
+        .join()
+        .map_err(|_| DriverError::new("daemon IPC worker panicked"))?
+        .map_err(driver_error)
+    }
+
+    fn submit_ipc(
+        &self,
+        action: &'static str,
+        payload: serde_json::Value,
+    ) -> Result<(), DriverError> {
+        self.request_ipc(action, payload).map(|_| ())
+    }
+
+    fn submit_command(&self, command: &ClientCommand) -> Result<(), DriverError> {
+        if self.client.is_some() {
+            self.submit_ipc(
+                "workspace.command.submit",
+                serde_json::to_value(command).map_err(driver_error)?,
+            )
+        } else {
+            self.workspace()?
+                .submit_client_command(command)
+                .map(|_| ())
+                .map_err(driver_error)
+        }
     }
 
     fn submit_message(
@@ -116,34 +187,30 @@ impl SqliteWorkspaceDriver {
                     .map_err(|error| DriverError::new(format!("invalid task target: {error}")))?,
             ),
             ComposerTarget::AllRunning => {
-                let task_ids: Vec<TaskId> = self
-                    .database
-                    .with_connection(|connection| {
-                        let mut statement = connection.prepare(
-                            "SELECT st.task_id FROM session_tasks st
-                             JOIN session_graph_heads gh ON gh.session_id = st.session_id
-                                                        AND gh.revision_id = st.revision_id
-                             JOIN tasks t ON t.task_id = st.task_id
-                             WHERE st.session_id = ?1 AND t.state = 'running'
-                             ORDER BY st.display_order",
-                        )?;
-                        let values = statement
-                            .query_map([self.session_id.to_string()], |row| {
-                                row.get::<_, String>(0)
-                            })?
-                            .collect::<Result<Vec<_>, _>>()?;
-                        values
-                            .into_iter()
-                            .map(|value| {
-                                TaskId::from_str(&value).map_err(|error| {
-                                    orchestrator_state::StateError::InvalidRecord(format!(
-                                        "invalid running task ID: {error}"
-                                    ))
-                                })
-                            })
-                            .collect()
-                    })
-                    .map_err(driver_error)?;
+                let task_ids = if self.client.is_some() {
+                    let data = self.request_ipc(
+                        "workspace.projection",
+                        serde_json::to_value(WorkspaceReadRequest {
+                            session_id: self.session_id,
+                            selected_task_id: None,
+                            before_ordinal: None,
+                            message_limit: 1,
+                            task_limit: 100,
+                        })
+                        .map_err(driver_error)?,
+                    )?;
+                    serde_json::from_value::<WorkspaceProjection>(data["projection"].clone())
+                        .map_err(driver_error)?
+                        .recent_tasks
+                        .into_iter()
+                        .filter(|task| task.task.state == TaskState::Running)
+                        .map(|task| task.task.task_id)
+                        .collect()
+                } else {
+                    self.workspace()?
+                        .running_graph_task_ids(self.session_id)
+                        .map_err(driver_error)?
+                };
                 if task_ids.is_empty() {
                     return Ok(ActionFeedback::unavailable(
                         "broadcast messaging: no running graph tasks",
@@ -186,9 +253,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
-            .submit_client_command(&command)
-            .map_err(driver_error)?;
+        self.submit_command(&command)?;
         Ok(())
     }
 
@@ -222,9 +287,16 @@ impl SqliteWorkspaceDriver {
                 return Ok(ActionFeedback::unavailable("chat provider selection"));
             }
         };
-        self.database
-            .request_control(task_id, action, payload, "local-tui", Utc::now())
-            .map_err(driver_error)?;
+        if self.client.is_some() {
+            self.submit_ipc(
+                "workspace.control",
+                json!({"task_id": task_id, "action": action, "payload": payload}),
+            )?;
+        } else {
+            self.workspace()?
+                .request_control(task_id, action, payload, "local-tui", Utc::now())
+                .map_err(driver_error)?;
+        }
         Ok(ActionFeedback::info("task control accepted"))
     }
 
@@ -252,9 +324,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
-            .submit_client_command(&command)
-            .map_err(driver_error)?;
+        self.submit_command(&command)?;
         Ok(ActionFeedback::info("task graph planning requested"))
     }
 
@@ -271,11 +341,18 @@ impl SqliteWorkspaceDriver {
         }
         let revision_id = GraphRevisionId::from_str(revision_id)
             .map_err(|error| DriverError::new(format!("invalid graph revision ID: {error}")))?;
-        let revision = self
-            .database
-            .load_graph_revision(revision_id)
-            .map_err(driver_error)?
-            .ok_or_else(|| DriverError::new("graph revision no longer exists"))?;
+        let revision = if self.client.is_some() {
+            let data = self.request_ipc(
+                "workspace.graph.revision",
+                json!({"revision_id": revision_id}),
+            )?;
+            serde_json::from_value(data["revision"].clone()).map_err(driver_error)?
+        } else {
+            self.workspace()?
+                .load_graph_revision(revision_id)
+                .map_err(driver_error)?
+                .ok_or_else(|| DriverError::new("graph revision no longer exists"))?
+        };
         if revision.proposal_hash.as_deref() != Some(proposal_hash) {
             return Err(DriverError::new(
                 "approval card proposal hash is stale; refresh the workspace",
@@ -315,9 +392,7 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
-            .submit_client_command(&command)
-            .map_err(driver_error)?;
+        self.submit_command(&command)?;
         Ok(ActionFeedback::info("exact task graph approval accepted"))
     }
 
@@ -414,79 +489,96 @@ impl SqliteWorkspaceDriver {
             completed_at: None,
             outcome: None,
         };
-        self.database
-            .submit_client_command(&command)
-            .map(|_| ())
-            .map_err(driver_error)
+        self.submit_command(&command)
     }
 }
 
 impl WorkspaceDriver for SqliteWorkspaceDriver {
     fn refresh(&mut self, _cursor: &WorkspaceCursor) -> Result<WorkspaceSnapshot, DriverError> {
-        let projection = self
-            .database
-            .read_workspace_projection(WorkspaceReadRequest {
-                session_id: self.session_id,
-                selected_task_id: self.selected_task_id,
-                before_ordinal: None,
-                message_limit: 200,
-                task_limit: 100,
-            })
-            .map_err(driver_error)?;
-        let daemon = self
-            .database
-            .daemon_status(Utc::now())
-            .map_err(driver_error)?;
+        let read = WorkspaceReadRequest {
+            session_id: self.session_id,
+            selected_task_id: self.selected_task_id,
+            before_ordinal: None,
+            message_limit: 200,
+            task_limit: 100,
+        };
+        let (projection, daemon, requirement, integration) = if self.client.is_some() {
+            let data = self.request_ipc(
+                "workspace.projection",
+                serde_json::to_value(read).map_err(driver_error)?,
+            )?;
+            (
+                serde_json::from_value::<WorkspaceProjection>(data["projection"].clone())
+                    .map_err(driver_error)?,
+                serde_json::from_value::<DaemonStatus>(data["daemon"].clone())
+                    .map_err(driver_error)?,
+                serde_json::from_value::<Option<RequirementRevision>>(data["requirement"].clone())
+                    .map_err(driver_error)?,
+                serde_json::from_value::<Option<StoredIntegrationBatch>>(
+                    data["integration"].clone(),
+                )
+                .map_err(driver_error)?,
+            )
+        } else {
+            let database = self
+                .database
+                .as_ref()
+                .ok_or_else(|| DriverError::new("test database is unavailable"))?;
+            (
+                self.workspace()?
+                    .read_workspace_projection(read)
+                    .map_err(driver_error)?,
+                database.daemon_status(Utc::now()).map_err(driver_error)?,
+                self.workspace()?
+                    .current_requirement_revision(self.session_id)
+                    .map_err(driver_error)?,
+                self.workspace()?
+                    .current_integration_batch(self.session_id)
+                    .map_err(driver_error)?,
+            )
+        };
         let mut snapshot =
             projection_to_snapshot(&self.repository, projection, &daemon).map_err(driver_error)?;
-        if let Some(plan) = snapshot.plan_approval.as_mut() {
-            let requirement = self
-                .database
-                .current_requirement_revision(self.session_id)
-                .map_err(driver_error)?;
-            if let Some(requirement) = requirement.filter(|requirement| {
+        if let Some(plan) = snapshot.plan_approval.as_mut()
+            && let Some(requirement) = requirement.filter(|requirement| {
                 plan.requirement_revision_id.as_deref()
                     == Some(requirement.requirement_revision_id.to_string().as_str())
-            }) {
-                plan.objective = requirement.snapshot.objective;
-                plan.in_scope = requirement.snapshot.in_scope;
-                plan.out_of_scope = requirement.snapshot.out_of_scope;
-                plan.acceptance_criteria = requirement.snapshot.acceptance_criteria;
-                plan.verification_commands = requirement
-                    .snapshot
-                    .verification_plan
-                    .into_iter()
-                    .map(|command| {
-                        format!(
-                            "{} {}",
-                            command.executable,
-                            serde_json::to_string(&command.args)
-                                .unwrap_or_else(|_| "[]".to_owned())
-                        )
-                    })
-                    .collect();
-                plan.risks.extend(requirement.snapshot.risks);
-                plan.risks.sort();
-                plan.risks.dedup();
-                plan.required_approvals = vec!["exact validated graph approval".to_owned()];
-                if plan
-                    .nodes
-                    .iter()
-                    .any(|node| node.repository_wide_write_scope)
-                {
-                    plan.required_approvals
-                        .push("repository-wide write scope acknowledgement".to_owned());
-                }
-                if !plan.risks.is_empty() {
-                    plan.required_approvals
-                        .push("recorded risk acknowledgement".to_owned());
-                }
+            })
+        {
+            plan.objective = requirement.snapshot.objective;
+            plan.in_scope = requirement.snapshot.in_scope;
+            plan.out_of_scope = requirement.snapshot.out_of_scope;
+            plan.acceptance_criteria = requirement.snapshot.acceptance_criteria;
+            plan.verification_commands = requirement
+                .snapshot
+                .verification_plan
+                .into_iter()
+                .map(|command| {
+                    format!(
+                        "{} {}",
+                        command.executable,
+                        serde_json::to_string(&command.args).unwrap_or_else(|_| "[]".to_owned())
+                    )
+                })
+                .collect();
+            plan.risks.extend(requirement.snapshot.risks);
+            plan.risks.sort();
+            plan.risks.dedup();
+            plan.required_approvals = vec!["exact validated graph approval".to_owned()];
+            if plan
+                .nodes
+                .iter()
+                .any(|node| node.repository_wide_write_scope)
+            {
+                plan.required_approvals
+                    .push("repository-wide write scope acknowledgement".to_owned());
+            }
+            if !plan.risks.is_empty() {
+                plan.required_approvals
+                    .push("recorded risk acknowledgement".to_owned());
             }
         }
-        snapshot.integration_approval = self
-            .database
-            .current_integration_batch(self.session_id)
-            .map_err(driver_error)?
+        snapshot.integration_approval = integration
             .as_ref()
             .and_then(|batch| integration_to_card(&self.state_root, batch));
         snapshot.validate().map_err(driver_error)?;
@@ -528,25 +620,41 @@ impl WorkspaceDriver for SqliteWorkspaceDriver {
             .map(TaskId::from_str)
             .transpose()
             .map_err(driver_error)?;
-        self.database
-            .save_workspace_selected_task(self.session_id, task_id, Utc::now())
-            .map_err(driver_error)?;
+        if self.client.is_some() {
+            self.submit_ipc(
+                "workspace.selection",
+                json!({"session_id": self.session_id, "task_id": task_id}),
+            )?;
+        } else {
+            self.workspace()?
+                .save_workspace_selected_task(self.session_id, task_id, Utc::now())
+                .map_err(driver_error)?;
+        }
         self.selected_task_id = task_id;
         Ok(())
     }
 }
 
-async fn ensure_default_session(database: &Database, redactor: &Redactor) -> Result<SessionId> {
-    if let Some(session) = database
-        .list_sessions(&SessionListFilter {
-            include_archived: false,
-            limit: 1,
-        })?
-        .pop()
-    {
+async fn ensure_default_session(
+    client: &crate::ipc_client::DaemonClient,
+    redactor: &Redactor,
+) -> Result<SessionId> {
+    let response = client.request("workspace.sessions", json!({})).await?;
+    let mut sessions = serde_json::from_value::<Vec<orchestrator_state::StoredSession>>(
+        response.outcome["data"]["sessions"].clone(),
+    )?;
+    if let Some(session) = sessions.pop() {
         return Ok(session.session_id);
     }
-    let existing = database.load_client_command_by_idempotency_key(DEFAULT_SESSION_KEY)?;
+    let response = client
+        .request(
+            "workspace.command.status",
+            json!({"command_id": Value::Null, "idempotency_key": DEFAULT_SESSION_KEY}),
+        )
+        .await?;
+    let existing = serde_json::from_value::<Option<ClientCommand>>(
+        response.outcome["data"]["command"].clone(),
+    )?;
     let session_id = if let Some(command) = existing.as_ref() {
         serde_json::from_value::<CreateSessionCommandPayload>(command.payload.clone())?.session_id
     } else {
@@ -568,24 +676,32 @@ async fn ensure_default_session(database: &Database, redactor: &Redactor) -> Res
             completed_at: None,
             outcome: None,
         };
-        database.submit_client_command(&command)?;
+        client
+            .request("workspace.command.submit", serde_json::to_value(&command)?)
+            .await?;
         session_id
     };
     let deadline = Instant::now() + COMMAND_WAIT_TIMEOUT;
     loop {
-        if database.load_session(session_id)?.is_some() {
-            return Ok(session_id);
-        }
-        if let Some(command) =
-            database.load_client_command_by_idempotency_key(DEFAULT_SESSION_KEY)?
-            && command.state == ClientCommandState::Failed
-        {
-            bail!(
-                "daemon rejected default session creation: {}",
-                command
-                    .outcome
-                    .unwrap_or_else(|| "unknown failure".to_owned())
-            );
+        let response = client
+            .request(
+                "workspace.command.status",
+                json!({"command_id": Value::Null, "idempotency_key": DEFAULT_SESSION_KEY}),
+            )
+            .await?;
+        if let Some(command) = serde_json::from_value::<Option<ClientCommand>>(
+            response.outcome["data"]["command"].clone(),
+        )? {
+            match command.state {
+                ClientCommandState::Completed => return Ok(session_id),
+                ClientCommandState::Failed => bail!(
+                    "daemon rejected default session creation: {}",
+                    command
+                        .outcome
+                        .unwrap_or_else(|| "unknown failure".to_owned())
+                ),
+                ClientCommandState::Pending | ClientCommandState::Claimed => {}
+            }
         }
         if Instant::now() >= deadline {
             bail!("daemon did not create the default chat session within three seconds");
@@ -1066,13 +1182,52 @@ mod tests {
     use orchestrator_process::{RedactionConfig, Redactor};
     use orchestrator_state::{
         DaemonLeaseRequest, Database, GraphApprovalRequest, IntegrationBatchStatus,
-        NewGraphAttempt, StoredIntegrationBatch, WorkspaceReadRequest,
+        NewGraphAttempt, StoredIntegrationBatch, WorkspaceDatabase, WorkspaceReadRequest,
     };
     use orchestrator_tui::chat::{
         ComposerTarget, DaemonConnectivity, WorkspaceAction, WorkspaceCursor, WorkspaceDriver,
     };
 
     use super::{SqliteWorkspaceDriver, integration_to_card};
+
+    fn test_with_database<T>(
+        database: &Database,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        let connection = open_test_connection(database.path())?;
+        operation(&connection)
+    }
+
+    fn test_with_workspace<T>(
+        database_path: &std::path::Path,
+        database: &WorkspaceDatabase<'_>,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        use rusqlite::functions::FunctionFlags;
+        let connection = open_test_connection(database_path)?;
+        let workspace_id = database.workspace_id().to_string();
+        connection.create_scalar_function(
+            "current_workspace",
+            0,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            move |_| Ok(workspace_id.clone()),
+        )?;
+        operation(&connection)
+    }
+
+    fn open_test_connection(
+        path: &std::path::Path,
+    ) -> orchestrator_state::StateResult<rusqlite::Connection> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;\
+             PRAGMA journal_mode = WAL;\
+             PRAGMA synchronous = FULL;\
+             PRAGMA temp_store = MEMORY;\
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(connection)
+    }
 
     struct Adapter(Redactor);
 
@@ -1083,12 +1238,26 @@ mod tests {
     }
 
     fn database() -> anyhow::Result<Database> {
-        let database = Database::open_in_memory()?;
-        database.migrate_with_backup(std::path::Path::new("unused"))?;
+        let temporary = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temporary.path())?;
+        let _persisted = temporary.keep();
+        let database = Database::open(root.join("state.db"))?;
+        database.migrate_with_backup(&root.join("backups"))?;
+        test_with_database(&database, |connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         Ok(database)
     }
 
-    fn create_session(database: &Database, redactor: &Adapter) -> anyhow::Result<SessionId> {
+    fn create_session(
+        database: &WorkspaceDatabase<'_>,
+        redactor: &Adapter,
+    ) -> anyhow::Result<SessionId> {
         let session_id = SessionId::new();
         let command = ClientCommand {
             command_id: ClientCommandId::new(),
@@ -1115,9 +1284,10 @@ mod tests {
     #[test]
     fn chat_tui_driver_redacts_persists_and_becomes_read_only_offline() -> anyhow::Result<()> {
         let database = database()?;
+        let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
-        let session_id = create_session(&database, &adapter)?;
+        let session_id = create_session(&workspace, &adapter)?;
         let instance = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: instance,
@@ -1131,14 +1301,14 @@ mod tests {
             session_id,
             None,
             redactor,
-        );
+        )?;
         let initial = driver.refresh(&WorkspaceCursor::default())?;
         assert_eq!(initial.daemon, DaemonConnectivity::Online);
         driver.dispatch(WorkspaceAction::SubmitMessage {
             target: ComposerTarget::Orchestrator,
             content: "api_key=secret-value".to_owned(),
         })?;
-        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        process_next_client_command(&driver.workspace()?, &adapter, chrono::Utc::now())?;
         let refreshed = driver.refresh(&WorkspaceCursor::default())?;
         assert_eq!(refreshed.messages.len(), 1);
         assert!(!refreshed.messages[0].content.contains("secret-value"));
@@ -1146,6 +1316,8 @@ mod tests {
 
         driver
             .database
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("test database disappeared"))?
             .release_daemon(instance, chrono::Utc::now())?;
         let offline = driver.refresh(&WorkspaceCursor::default())?;
         assert_eq!(offline.daemon, DaemonConnectivity::Offline);
@@ -1164,9 +1336,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn chat_tui_projects_full_plan_card_and_dependency_labels() -> anyhow::Result<()> {
         let database = database()?;
+        let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
-        let session_id = create_session(&database, &adapter)?;
+        let session_id = create_session(&workspace, &adapter)?;
         let instance = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: instance,
@@ -1180,14 +1353,14 @@ mod tests {
             session_id,
             None,
             redactor,
-        );
+        )?;
         driver.dispatch(WorkspaceAction::SubmitMessage {
             target: ComposerTarget::Orchestrator,
             content: "build graph".to_owned(),
         })?;
-        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        process_next_client_command(&driver.workspace()?, &adapter, chrono::Utc::now())?;
         let goal_id = driver
-            .database
+            .workspace()?
             .read_workspace_projection(WorkspaceReadRequest {
                 session_id,
                 selected_task_id: None,
@@ -1238,7 +1411,7 @@ mod tests {
             },
         )?;
         driver
-            .database
+            .workspace()?
             .record_graph_attempt(&NewGraphAttempt::from_validated(
                 PlanningAttemptId::new(),
                 graph.clone(),
@@ -1264,11 +1437,12 @@ mod tests {
         proposed.validate()?;
 
         driver
-            .database
+            .workspace()?
             .approve_graph_and_materialize_tasks(&GraphApprovalRequest {
                 revision_id: graph.proposal.revision_id,
                 expected_proposal_hash: graph.proposal_hash,
                 authority: None,
+                promotion: None,
                 approved_by: "test".to_owned(),
                 approved_at: chrono::Utc::now(),
             })?;
@@ -1290,7 +1464,7 @@ mod tests {
             target: ComposerTarget::Task(target.clone()),
             content: "also update the focused tests".to_owned(),
         })?;
-        process_next_client_command(&driver.database, &adapter, chrono::Utc::now())?;
+        process_next_client_command(&driver.workspace()?, &adapter, chrono::Utc::now())?;
         driver.selection_changed(Some(&target))?;
         let instructed = driver.refresh(&WorkspaceCursor::default())?;
         assert!(
@@ -1311,9 +1485,11 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn chat_tui_submits_typed_plan_and_exact_approval_commands() -> anyhow::Result<()> {
         let database = database()?;
+        let database_path = database.path().to_path_buf();
+        let workspace = database.legacy_workspace()?;
         let redactor = Redactor::new(&RedactionConfig::default())?;
         let adapter = Adapter(redactor.clone());
-        let session_id = create_session(&database, &adapter)?;
+        let session_id = create_session(&workspace, &adapter)?;
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: DaemonInstanceId::new(),
             pid: 42,
@@ -1326,14 +1502,14 @@ mod tests {
             session_id,
             None,
             redactor,
-        );
+        )?;
         let goal_message_id = orchestrator_domain::MessageId::new();
-        driver.database.with_connection(|connection| {
+        test_with_workspace(&database_path, &driver.workspace()?, |connection| {
             connection.execute(
-                "INSERT INTO conversation_messages(
-                    message_id, session_id, ordinal, role, kind, state,
+                "INSERT INTO main.conversation_messages(
+                    workspace_id, message_id, session_id, ordinal, role, kind, state,
                     content_redacted, created_at, finalized_at
-                 ) VALUES (?1, ?2, 1, 'user', 'user_message', 'final', ?3, ?4, ?4)",
+                 ) VALUES (current_workspace(), ?1, ?2, 1, 'user', 'user_message', 'final', ?3, ?4, ?4)",
                 rusqlite::params![
                     goal_message_id.to_string(),
                     session_id.to_string(),
@@ -1363,7 +1539,9 @@ mod tests {
             },
             chrono::Utc::now(),
         )?;
-        driver.database.record_requirement_revision(&requirement)?;
+        driver
+            .workspace()?
+            .record_requirement_revision(&requirement)?;
         let authority = GraphValidationAuthority {
             requirement_revision_id: requirement.requirement_revision_id,
             validation_hash: "b".repeat(64),
@@ -1403,7 +1581,7 @@ mod tests {
             authority.clone(),
         )?;
         driver
-            .database
+            .workspace()?
             .record_graph_attempt(&NewGraphAttempt::from_validated(
                 PlanningAttemptId::new(),
                 graph.clone(),
@@ -1432,7 +1610,7 @@ mod tests {
             batch_id: batch_id.to_string(),
         })?;
 
-        driver.database.with_connection(|connection| {
+        test_with_workspace(&database_path, &driver.workspace()?, |connection| {
             let mut statement = connection.prepare(
                 "SELECT action, payload_json, requested_by FROM client_commands
                  WHERE action IN ('request_plan', 'approve_graph', 'request_integration',

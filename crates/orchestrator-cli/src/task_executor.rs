@@ -116,6 +116,7 @@ impl TaskExecutor for OfficialCliTaskExecutor {
         let worktree = if let Some(worktree) = request.existing_worktree.clone() {
             if worktree.task_id != request.claim.task_id
                 || worktree.repository_root != self.repository_root
+                || worktree.base_revision != request.claim.approved_base_commit
             {
                 return Err(EngineError::IntegrityMismatch {
                     artifact: "continued task worktree identity",
@@ -125,7 +126,9 @@ impl TaskExecutor for OfficialCliTaskExecutor {
             worktree
         } else {
             let _creation_guard = self.worktree_creation.lock().await;
-            manager.create(request.claim.task_id, "HEAD").await?
+            manager
+                .create(request.claim.task_id, &request.claim.approved_base_commit)
+                .await?
         };
         let attempt_id = AttemptId::new();
         let worker_request = self.worker_request(&request, worktree.path.clone(), attempt_id)?;

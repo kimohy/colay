@@ -4,12 +4,14 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 use anyhow::{Context as _, Result};
 use chrono::Utc;
+use orchestrator_state::STATE_SCHEMA_VERSION;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -81,8 +83,9 @@ impl CliFixture {
         #[cfg(not(windows))]
         let system_root = system_root();
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_colay"));
-        command
+        let mut stdout = tempfile::tempfile()?;
+        let mut stderr = tempfile::tempfile()?;
+        let status = Command::new(env!("CARGO_BIN_EXE_colay"))
             .args(args)
             .current_dir(&self.repository)
             .env_clear()
@@ -92,8 +95,22 @@ impl CliFixture {
             .env("PATHEXT", ".EXE;.CMD")
             .env("SystemRoot", system_root)
             .env("TEMP", &self.temp_root)
-            .env("TMP", &self.temp_root);
-        command.output().context("failed to invoke colay")
+            .env("TMP", &self.temp_root)
+            .stdout(Stdio::from(stdout.try_clone()?))
+            .stderr(Stdio::from(stderr.try_clone()?))
+            .status()
+            .context("failed to invoke colay")?;
+        stdout.seek(SeekFrom::Start(0))?;
+        stderr.seek(SeekFrom::Start(0))?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout.read_to_end(&mut stdout_bytes)?;
+        stderr.read_to_end(&mut stderr_bytes)?;
+        Ok(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
     }
 
     fn configure_fake_codex(&self) -> Result<()> {
@@ -109,9 +126,9 @@ impl CliFixture {
     }
 
     fn seed_v8_database(&self) -> Result<PathBuf> {
-        let state = self.repository.join(".colay");
+        let state = self.colay_home.join("state");
         fs::create_dir_all(&state)?;
-        let database_path = state.join("orchestrator.db");
+        let database_path = state.join("state.db");
         let connection = Connection::open(&database_path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         for (version, name, sql) in MIGRATIONS_THROUGH_V8 {
@@ -128,14 +145,6 @@ impl CliFixture {
             )?;
         }
         Ok(database_path)
-    }
-
-    fn git<const N: usize>(&self, args: [&str; N]) -> Result<Output> {
-        Command::new("git")
-            .args(args)
-            .current_dir(&self.repository)
-            .output()
-            .context("failed to invoke git")
     }
 }
 
@@ -208,16 +217,22 @@ fn doctor_uses_defaults_without_creating_repository_state() -> Result<()> {
     );
     assert_eq!(runtime["data"]["target_os"], std::env::consts::OS);
     assert_eq!(runtime["data"]["target_arch"], std::env::consts::ARCH);
-    let database = json["data"]["checks"]
+    let state = json["data"]["checks"]
         .as_array()
         .context("doctor checks must be an array")?
         .iter()
-        .find(|check| check["name"] == "database")
-        .context("doctor must report absent database state")?;
+        .find(|check| check["name"] == "state")
+        .context("doctor must report user-global database state")?;
+    assert_eq!(state["status"], "warn");
     assert_eq!(
-        database["detail"],
-        "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas"
+        PathBuf::from(
+            state["data"]["database"]
+                .as_str()
+                .context("state check omitted the global database path")?
+        ),
+        fixture.colay_home.join("state/state.db")
     );
+    assert!(!fixture.colay_home.join("state/state.db").exists());
     Ok(())
 }
 
@@ -249,19 +264,31 @@ fn doctor_reports_fake_provider_executable_resolution() -> Result<()> {
 }
 
 #[test]
-fn first_plan_only_run_initializes_local_state() -> Result<()> {
+fn first_plan_only_run_initializes_global_state() -> Result<()> {
     let fixture = CliFixture::new()?;
 
-    let output = fixture.colay(["run", "inspect repository", "--plan-only"])?;
+    let first = fixture.colay(["run", "inspect repository", "--plan-only"])?;
 
     assert!(
-        output.status.success(),
+        first.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&first.stderr)
     );
-    assert!(fixture.repository.join(".colay/orchestrator.db").is_file());
-    assert!(fixture.repository.join(".colay/events.jsonl").is_file());
+    assert!(!fixture.repository.join(".colay").exists());
+    let connection = Connection::open(fixture.colay_home.join("state/state.db"))?;
+    let workspace_id: String = connection.query_row(
+        "SELECT workspace_id FROM workspaces WHERE status = 'active'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_ne!(workspace_id, "00000000-0000-0000-0000-000000000001");
     Ok(())
+}
+
+impl Drop for CliFixture {
+    fn drop(&mut self) {
+        let _ = self.colay(["daemon", "stop"]);
+    }
 }
 
 #[test]
@@ -302,97 +329,16 @@ fn migrate_apply_upgrades_existing_database_without_repository_config() -> Resul
     let connection = Connection::open(database_path)?;
     assert_eq!(
         connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-        11
+        STATE_SCHEMA_VERSION
     );
     let applied = connection
         .prepare("SELECT version FROM schema_migrations WHERE version >= 9 ORDER BY version")?
         .query_map([], |row| row.get::<_, u32>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(applied, vec![9, 10, 11]);
+    assert_eq!(applied, (9..=STATE_SCHEMA_VERSION).collect::<Vec<_>>());
     let backups =
-        fs::read_dir(fixture.repository.join(".colay/backups"))?.collect::<Result<Vec<_>, _>>()?;
+        fs::read_dir(fixture.colay_home.join("state/backups"))?.collect::<Result<Vec<_>, _>>()?;
     assert_eq!(backups.len(), 1);
     assert!(backups[0].file_type()?.is_file());
-    Ok(())
-}
-
-#[test]
-fn failed_event_reconciliation_blocks_retries_before_task_mutation() -> Result<()> {
-    let fixture = CliFixture::new()?;
-    let state = fixture.repository.join(".colay");
-    fs::create_dir_all(&state)?;
-    fs::write(state.join("events.jsonl"), "not valid jsonl\n")?;
-
-    for attempt in 1..=2 {
-        let output = fixture.colay(["run", "inspect repository", "--plan-only"])?;
-        assert!(
-            !output.status.success(),
-            "attempt {attempt} unexpectedly succeeded: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    let status = fixture.colay(["--json", "status"])?;
-    assert!(
-        status.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status: Value = serde_json::from_slice(&status.stdout)?;
-    assert_eq!(status["data"]["tasks"], Value::Array(Vec::new()));
-    assert_eq!(status["data"]["database"]["last_event_sequence"], 0);
-
-    let database = Connection::open(state.join("orchestrator.db"))?;
-    let tasks: i64 = database.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
-    let events: i64 =
-        database.query_row("SELECT count(*) FROM task_events", [], |row| row.get(0))?;
-    let exported: i64 = database.query_row(
-        "SELECT last_exported_sequence FROM event_log_state WHERE singleton = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(tasks, 0);
-    assert_eq!(events, 0);
-    assert_eq!(exported, 0);
-    Ok(())
-}
-
-#[test]
-fn direct_run_rejects_non_git_before_state_mutation() -> Result<()> {
-    let fixture = CliFixture::new()?;
-    fixture.configure_fake_codex()?;
-
-    let output = fixture.colay(["run", "hello"])?;
-
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("requires a Git repository"),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!fixture.repository.join(".colay").exists());
-    Ok(())
-}
-
-#[test]
-fn direct_run_rejects_unborn_head_before_state_mutation() -> Result<()> {
-    let fixture = CliFixture::new()?;
-    let git = fixture.git(["init", "--quiet"])?;
-    assert!(
-        git.status.success(),
-        "git stderr: {}",
-        String::from_utf8_lossy(&git.stderr)
-    );
-    fixture.configure_fake_codex()?;
-
-    let output = fixture.colay(["run", "hello"])?;
-
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no base commit"),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!fixture.repository.join(".colay").exists());
     Ok(())
 }

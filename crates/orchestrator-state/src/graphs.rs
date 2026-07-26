@@ -2,15 +2,16 @@ use std::{collections::BTreeMap, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use orchestrator_domain::{
-    ConversationMessage, CorrelationId, EventActor, EventId, EventType, GraphRevisionId,
-    GraphValidationSummary, MessageId, MessageKind, MessageRole, MessageState, ModelProfile,
-    PlanningAttemptId, ProviderId, SchemaVersion, SessionId, TaskEnvelope, TaskEvent,
+    ConversationMessage, CorrelationId, EventActor, EventId, EventType, GraphAuthorityPromotion,
+    GraphRevisionId, GraphValidationSummary, MessageId, MessageKind, MessageRole, MessageState,
+    ModelProfile, PlanningAttemptId, ProviderId, SchemaVersion, SessionId, TaskEnvelope, TaskEvent,
     TaskGraphProposal, TaskId, TaskState, task_graph_proposal_hash,
+    validate_task_graph_with_authority,
 };
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult, database::append_event_in_transaction};
+use crate::{StateError, StateResult, WorkspaceDatabase, database::append_event_in_transaction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +149,7 @@ pub struct GraphApprovalRequest {
     pub revision_id: GraphRevisionId,
     pub expected_proposal_hash: String,
     pub authority: Option<orchestrator_domain::GraphValidationAuthority>,
+    pub promotion: Option<GraphAuthorityPromotion>,
     pub approved_by: String,
     pub approved_at: DateTime<Utc>,
 }
@@ -160,7 +162,9 @@ pub struct ApprovedGraph {
     pub replayed: bool,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn begin_graph_attempt(
         &self,
         attempt: &NewPlanningAttempt,
@@ -187,13 +191,14 @@ impl Database {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "UPDATE graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
-             WHERE revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
+            "UPDATE main.graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
+             WHERE workspace_id = current_workspace() \
+             AND revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
              AND status IN ('planning', 'awaiting_approval', 'approved')",
             params![attempt.started_at.to_rfc3339(), attempt.session_id.to_string()],
         )?;
         transaction.execute(
-            "INSERT INTO graph_revisions(
+            "INSERT INTO main.graph_revisions(
                 revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
                 proposal_json, validation_json, planner_provider, planner_provider_v2,
                 created_at, completed_at
@@ -209,7 +214,7 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO planning_attempts(
+            "INSERT INTO main.planning_attempts(
                 attempt_id, revision_id, session_id, goal_message_id, planner_provider,
                 planner_provider_v2,
                 outcome, error_redacted, started_at, completed_at
@@ -225,9 +230,9 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+            "INSERT INTO main.session_graph_heads(session_id, revision_id, updated_at)
              VALUES (?1, ?2, ?3)
-             ON CONFLICT(session_id) DO UPDATE SET revision_id = excluded.revision_id,
+             ON CONFLICT(workspace_id, session_id) DO UPDATE SET revision_id = excluded.revision_id,
                  updated_at = excluded.updated_at",
             params![
                 attempt.session_id.to_string(),
@@ -272,10 +277,10 @@ impl Database {
         }
         let authority = authority_from_validation(&attempt.validation);
         let changed = transaction.execute(
-            "UPDATE graph_revisions SET status = ?1, proposal_hash = ?2, proposal_json = ?3,
+            "UPDATE main.graph_revisions SET status = ?1, proposal_hash = ?2, proposal_json = ?3,
                     validation_json = ?4, completed_at = ?5, requirement_revision_id = ?6,
                     validation_hash = ?7, base_commit = ?8
-             WHERE revision_id = ?9 AND status = 'planning'",
+             WHERE workspace_id = current_workspace() AND revision_id = ?9 AND status = 'planning'",
             params![
                 enum_text(&attempt.status)?,
                 attempt.proposal_hash,
@@ -300,8 +305,9 @@ impl Database {
             });
         }
         let changed = transaction.execute(
-            "UPDATE planning_attempts SET outcome = ?1, error_redacted = ?2, completed_at = ?3
-             WHERE attempt_id = ?4 AND revision_id = ?5 AND outcome = 'planning'",
+            "UPDATE main.planning_attempts SET outcome = ?1, error_redacted = ?2, completed_at = ?3
+             WHERE workspace_id = current_workspace() \
+             AND attempt_id = ?4 AND revision_id = ?5 AND outcome = 'planning'",
             params![
                 enum_text(&attempt.status)?,
                 attempt.error_redacted,
@@ -348,14 +354,15 @@ impl Database {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "UPDATE graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
-             WHERE revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
+            "UPDATE main.graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
+             WHERE workspace_id = current_workspace() \
+             AND revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
              AND status IN ('planning', 'awaiting_approval', 'approved')",
             params![attempt.completed_at.to_rfc3339(), attempt.session_id.to_string()],
         )?;
         let authority = authority_from_validation(&attempt.validation);
         transaction.execute(
-            "INSERT INTO graph_revisions(
+            "INSERT INTO main.graph_revisions(
                 revision_id, session_id, goal_message_id, ordinal, status, proposal_hash,
                 proposal_json, validation_json, planner_provider, planner_provider_v2,
                 created_at, completed_at,
@@ -386,7 +393,7 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO planning_attempts(
+            "INSERT INTO main.planning_attempts(
                 attempt_id, revision_id, session_id, goal_message_id, planner_provider,
                 planner_provider_v2,
                 outcome, error_redacted, started_at, completed_at
@@ -405,9 +412,9 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+            "INSERT INTO main.session_graph_heads(session_id, revision_id, updated_at)
              VALUES (?1, ?2, ?3)
-             ON CONFLICT(session_id) DO UPDATE SET revision_id = excluded.revision_id,
+             ON CONFLICT(workspace_id, session_id) DO UPDATE SET revision_id = excluded.revision_id,
                  updated_at = excluded.updated_at",
             params![
                 attempt.session_id.to_string(),
@@ -483,12 +490,7 @@ impl Database {
                     request.revision_id
                 ))
             })?;
-        let stored_authority = authority_from_validation(&revision.validation);
-        if stored_authority != request.authority {
-            return Err(StateError::InvalidRecord(
-                "graph approval authority does not match the sealed graph validation".to_owned(),
-            ));
-        }
+        validate_approval_authority(&revision, request)?;
 
         if let Some((
             stored_hash,
@@ -629,7 +631,7 @@ impl Database {
             insert_task(&transaction, &envelope)?;
             let provider = node.provider.unwrap_or(proposal.planner_provider);
             transaction.execute(
-                "INSERT INTO session_tasks(
+                "INSERT INTO main.session_tasks(
                     session_id, revision_id, task_id, node_key, display_order,
                     provider_id, provider_id_v2, model_profile
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -661,7 +663,7 @@ impl Database {
             let task_id = key_to_id[&node.key];
             for dependency in &node.dependencies {
                 transaction.execute(
-                    "INSERT INTO task_dependencies(
+                    "INSERT INTO main.task_dependencies(
                         session_id, revision_id, task_id, depends_on_task_id
                      ) VALUES (?1, ?2, ?3, ?4)",
                     params![
@@ -674,7 +676,7 @@ impl Database {
             }
         }
         transaction.execute(
-            "INSERT INTO graph_approvals(
+            "INSERT INTO main.graph_approvals(
                 revision_id, proposal_hash, approved_by, approved_at, session_id,
                 requirement_revision_id, validation_hash, base_commit)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -699,8 +701,9 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "UPDATE graph_revisions SET status = 'approved', completed_at = ?1
-             WHERE revision_id = ?2 AND status = 'awaiting_approval'",
+            "UPDATE main.graph_revisions SET status = 'approved', completed_at = ?1
+             WHERE workspace_id = current_workspace() \
+             AND revision_id = ?2 AND status = 'awaiting_approval'",
             params![
                 request.approved_at.to_rfc3339(),
                 request.revision_id.to_string()
@@ -751,6 +754,80 @@ impl Database {
             replayed: false,
         })
     }
+}
+
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
+
+fn validate_approval_authority(
+    revision: &StoredGraphRevision,
+    request: &GraphApprovalRequest,
+) -> StateResult<()> {
+    const DEFERRED_BASE_COMMIT: &str = "0000000000000000000000000000000000000000";
+    const DEFERRED_GIT_ROOT: &str = "deferred until exact writable approval";
+    let stored = authority_from_validation(&revision.validation);
+    if stored == request.authority {
+        return if request.promotion.is_none() {
+            Ok(())
+        } else {
+            Err(StateError::InvalidRecord(
+                "unchanged graph approval authority cannot carry promotion evidence".to_owned(),
+            ))
+        };
+    }
+    let (Some(stored), Some(promotion), Some(requested)) = (
+        stored.as_ref(),
+        request.promotion.as_ref(),
+        request.authority.as_ref(),
+    ) else {
+        return Err(StateError::InvalidRecord(
+            "graph approval authority does not match the sealed graph validation".to_owned(),
+        ));
+    };
+    let proposal = revision.proposal.as_ref().ok_or_else(|| {
+        StateError::InvalidRecord("promoted graph revision has no proposal".to_owned())
+    })?;
+    let proposal_hash = revision.proposal_hash.as_deref().ok_or_else(|| {
+        StateError::InvalidRecord("promoted graph revision has no proposal hash".to_owned())
+    })?;
+    if stored.base_commit != DEFERRED_BASE_COMMIT
+        || stored.git_root_redacted != DEFERRED_GIT_ROOT
+        || !stored
+            .validation_checks
+            .iter()
+            .any(|check| check == "writable_git_preflight_deferred")
+        || promotion.graph_revision_id != revision.revision_id
+        || promotion.proposal_hash != proposal_hash
+        || promotion.proposal_hash != request.expected_proposal_hash
+        || &promotion.prior_authority != stored
+    {
+        return Err(StateError::InvalidRecord(
+            "graph authority promotion does not bind the stored deferred validation".to_owned(),
+        ));
+    }
+    let expected = promotion
+        .promoted_authority()
+        .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+    if &expected != requested {
+        return Err(StateError::InvalidRecord(
+            "graph authority promotion seal does not match the requested authority".to_owned(),
+        ));
+    }
+    validate_task_graph_with_authority(
+        proposal.clone(),
+        &promotion.validation_policy,
+        stored.clone(),
+    )
+    .map_err(|error| {
+        StateError::InvalidRecord(format!(
+            "graph authority promotion policy rejects the stored proposal: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn authority_from_validation(
@@ -941,7 +1018,7 @@ fn insert_task(
 ) -> StateResult<()> {
     let timestamp = envelope.created_at.to_rfc3339();
     transaction.execute(
-        "INSERT INTO tasks(
+        "INSERT INTO main.tasks(
             task_id, schema_version, revision, state, resume_state, paused, objective,
             original_request_redacted, task_envelope_json, created_at, updated_at, archived_at
          ) VALUES (?1, ?2, 0, 'queued', NULL, 0, ?3, ?4, ?5, ?6, ?6, NULL)",
@@ -970,7 +1047,7 @@ fn insert_message(
         |row| row.get(0),
     )?;
     transaction.execute(
-        "INSERT INTO conversation_messages(
+        "INSERT INTO main.conversation_messages(
             message_id, session_id, task_id, ordinal, role, kind, state,
             content_redacted, created_at, finalized_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",

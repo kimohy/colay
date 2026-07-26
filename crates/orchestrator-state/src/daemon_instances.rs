@@ -196,10 +196,12 @@ impl Database {
         let lease_expires_at = heartbeat_at
             .checked_add_signed(ttl)
             .ok_or_else(|| StateError::InvalidRecord("daemon lease expiry overflow".to_owned()))?;
+        // A delayed owner may renew after expiry until acquisition atomically releases this row.
+        // Once takeover wins, `released_at IS NULL` still rejects the former owner's heartbeat.
         let changed = self.lock()?.execute(
             "UPDATE daemon_instances SET heartbeat_at = ?1, lease_expires_at = ?2
              WHERE instance_id = ?3 AND released_at IS NULL
-               AND lease_expires_at > ?1 AND heartbeat_at <= ?1",
+               AND heartbeat_at <= ?1",
             params![
                 heartbeat_at.to_rfc3339(),
                 lease_expires_at.to_rfc3339(),
@@ -510,6 +512,31 @@ mod tests {
     }
 
     #[test]
+    fn same_owner_renews_an_expired_lease_before_any_takeover() -> StateResult<()> {
+        let database = migrated_database();
+        let lease = request(timestamp());
+        let acquired = database.acquire_daemon_lease(&lease)?;
+        let delayed_heartbeat = acquired.lease_expires_at + TimeDelta::seconds(1);
+
+        let renewed = database.heartbeat_daemon(
+            acquired.instance_id,
+            delayed_heartbeat,
+            TimeDelta::seconds(10),
+        )?;
+
+        assert_eq!(renewed.heartbeat_at, delayed_heartbeat);
+        assert_eq!(
+            renewed.lease_expires_at,
+            delayed_heartbeat + TimeDelta::seconds(10)
+        );
+        assert_eq!(
+            database.daemon_status(delayed_heartbeat)?,
+            DaemonStatus::Online(renewed)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn startup_phase_transitions_are_owned_and_monotonic() -> StateResult<()> {
         let database = migrated_database();
         let lease = request(timestamp());
@@ -627,6 +654,15 @@ mod tests {
                 .map_err(StateError::from)
         })?;
         assert_eq!(first_released, 1);
+        assert!(
+            database
+                .heartbeat_daemon(
+                    first.instance_id,
+                    second.started_at + TimeDelta::seconds(1),
+                    TimeDelta::seconds(10),
+                )
+                .is_err()
+        );
         Ok(())
     }
 

@@ -1,159 +1,167 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
+    future::Future,
     path::Path,
-    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{TimeDelta, Utc};
 use orchestrator_daemon::{
-    DaemonSettings, ExecutionServices, IntegrationServices, MessageRedactor, PlanningServices,
-    serve_with_full_orchestration_on_owned_lease,
+    DaemonOwnerLock, DaemonSettings, ExecutionServices, IntegrationServices, IpcError, IpcServer,
+    MessageRedactor, PlanningServices, WorkspaceActivation,
+    serve_with_full_orchestration_on_owned_lease, serve_workspace_runtime_on_owned_daemon,
 };
 use orchestrator_domain::{DaemonInstanceId, GraphValidationPolicy, ModelProfile, ProviderId};
 use orchestrator_engine::{
     ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
     GitIntegrationManager, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
 };
-use orchestrator_process::{RedactionConfig, Redactor, terminate_child_tree};
+use orchestrator_process::{RedactionConfig, Redactor};
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{
-    DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database, EventLog, RepositoryStatePaths,
-    RootConfig,
+    ConfigEnvironment, ConfigRequest, DaemonLeaseRequest, DaemonPhase, DaemonStatus, Database,
+    GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig, StateEnvironment,
+    WorkspaceId, load_effective_config,
 };
 use serde::Serialize;
 use serde_json::json;
-use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::DaemonAction;
+use crate::ipc_client::DaemonClient;
 use colay::conversation_orchestrator::OfficialCliConversationOrchestrator;
 use colay::task_executor::OfficialCliTaskExecutor;
 use colay::task_planner::OfficialCliTaskPlanner;
 
-const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const STARTUP_MARGIN: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-struct SpawnedDaemon {
-    child: Child,
-    pid: u32,
+
+pub(crate) struct MaintenanceOwnership {
+    _owner_lock: DaemonOwnerLock,
+    pub(crate) paths: GlobalStatePaths,
+}
+
+pub(crate) fn acquire_maintenance() -> Result<MaintenanceOwnership> {
+    let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
+    let owner_lock = DaemonOwnerLock::acquire(&paths)?;
+    Ok(MaintenanceOwnership {
+        _owner_lock: owner_lock,
+        paths,
+    })
 }
 
 pub async fn run(
     repository: &Path,
-    config: &RootConfig,
+    _config: &RootConfig,
     explicit_config: Option<&Path>,
     action: DaemonAction,
     json_output: bool,
 ) -> Result<()> {
     match action {
         DaemonAction::Start => {
-            let status = ensure_started(repository, config, explicit_config).await?;
-            emit(json_output, "daemon_start", &json!({"status": status}))
+            let client = DaemonClient::connect_or_start(repository, explicit_config).await?;
+            let response = client.request("daemon.status", json!({})).await?;
+            emit(json_output, "daemon_start", &response.outcome["data"])
         }
-        DaemonAction::Serve => serve_foreground(repository, config).await,
+        DaemonAction::Serve => serve_global(repository, explicit_config).await,
         DaemonAction::Status => {
-            let status = status(repository, config)?;
+            let status = match DaemonClient::request_global("daemon.status", json!({})).await {
+                Ok(response) => response.outcome["data"]["status"].clone(),
+                Err(error) if stopped_endpoint_error(&error) => json!(DaemonStatus::Stopped),
+                Err(error) => return Err(error),
+            };
             emit(json_output, "daemon_status", &json!({"status": status}))
         }
         DaemonAction::Stop => {
-            let status = stop(repository, config).await?;
+            let status = stop_global().await?;
             emit(json_output, "daemon_stop", &json!({"status": status}))
         }
         DaemonAction::Restart => {
-            stop(repository, config).await?;
-            let status = ensure_started(repository, config, explicit_config).await?;
-            emit(json_output, "daemon_restart", &json!({"status": status}))
+            stop_global().await?;
+            let client = DaemonClient::connect_or_start(repository, explicit_config).await?;
+            let response = client.request("daemon.status", json!({})).await?;
+            emit(json_output, "daemon_restart", &response.outcome["data"])
         }
     }
 }
 
-pub(crate) async fn ensure_started(
+pub(crate) async fn serve_global(repository: &Path, explicit_config: Option<&Path>) -> Result<()> {
+    let bootstrap = GlobalDaemonBootstrap::prepare(repository)?;
+    let config = load_daemon_config(repository, explicit_config)?;
+    let workspace_id = bootstrap.register_workspace(repository, &config)?;
+    serve_foreground(repository, &config, bootstrap, workspace_id).await
+}
+
+pub(crate) fn load_daemon_config(
     repository: &Path,
-    config: &RootConfig,
     explicit_config: Option<&Path>,
-) -> Result<DaemonStatus> {
-    let paths = RepositoryStatePaths::from_config(repository, config)?;
-    let database = initialize_database(&paths)?;
-    if let DaemonStatus::Online(instance) = database.daemon_status(Utc::now())? {
-        return Ok(DaemonStatus::Online(instance));
+) -> Result<RootConfig> {
+    let explicit_config = explicit_config.map(|path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repository.join(path)
+        }
+    });
+    let environment = ConfigEnvironment {
+        colay_home: std::env::var_os("COLAY_HOME").map(Into::into),
+        user_home: platform_user_home(),
+        colay_config: std::env::var_os("COLAY_CONFIG").map(Into::into),
+    };
+    let effective = load_effective_config(&ConfigRequest {
+        repository,
+        cli_config: explicit_config.as_deref(),
+        environment,
+    })?;
+    Ok(effective.config().clone())
+}
+
+#[cfg(windows)]
+fn platform_user_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE").map(Into::into)
+}
+
+#[cfg(not(windows))]
+fn platform_user_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(Into::into)
+}
+
+struct GlobalDaemonBootstrap {
+    _owner_lock: DaemonOwnerLock,
+    paths: GlobalStatePaths,
+    database: Arc<Database>,
+}
+
+impl GlobalDaemonBootstrap {
+    fn prepare(_repository: &Path) -> Result<Self> {
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
+        let owner_lock = DaemonOwnerLock::acquire(&paths)?;
+        let database = Arc::new(Database::open(&paths.database)?);
+        database.migrate_with_backup(&paths.backups)?;
+        Ok(Self {
+            _owner_lock: owner_lock,
+            paths,
+            database,
+        })
     }
 
-    let mut spawned = spawn_server(repository, explicit_config)?;
-    let startup_timeout = startup_timeout(config);
-    let deadline = Instant::now() + startup_timeout;
-    loop {
-        match database.daemon_status(Utc::now())? {
-            online @ DaemonStatus::Online(_) => return Ok(online),
-            DaemonStatus::Booting(_)
-            | DaemonStatus::Probing(_)
-            | DaemonStatus::Failed(_)
-            | DaemonStatus::Stopped
-            | DaemonStatus::Stale(_) => {}
+    fn register_workspace(&self, repository: &Path, config: &RootConfig) -> Result<WorkspaceId> {
+        let workspace_id = self
+            .database
+            .resolve_repository_workspace(repository)?
+            .workspace_id;
+        let legacy = RepositoryStatePaths::from_config(repository, config)?;
+        if let Some(plan) = LegacyImporter::inspect(&legacy, &self.paths)? {
+            LegacyImporter::apply(&self.database, workspace_id, &plan, &self.paths)?;
         }
-        if let Some(exit) = spawned
-            .child
-            .try_wait()
-            .context("cannot inspect daemon child")?
-        {
-            fail_and_release_spawned_lease(
-                &database,
-                spawned.pid,
-                "daemon child exited during startup",
-            )?;
-            let diagnostic = database
-                .daemon_startup_diagnostic_for_pid(spawned.pid)?
-                .unwrap_or_default();
-            bail!(
-                "daemon child exited before becoming healthy: {exit}{}",
-                format_startup_diagnostic(&diagnostic)
-            );
-        }
-        if Instant::now() >= deadline {
-            let status = database.daemon_status(Utc::now())?;
-            if let online @ DaemonStatus::Online(_) = status {
-                return Ok(online);
-            }
-            let phase = daemon_phase_name(&status);
-            let (_, tree_error) = terminate_child_tree(&mut spawned.child)
-                .await
-                .context("cannot terminate timed-out daemon child")?;
-            fail_and_release_spawned_lease(
-                &database,
-                spawned.pid,
-                "daemon startup exceeded its bounded deadline",
-            )?;
-            let diagnostic = database
-                .daemon_startup_diagnostic_for_pid(spawned.pid)?
-                .unwrap_or_default();
-            let tree_error = tree_error
-                .map(|error| format!("; process-tree cleanup warning: {error}"))
-                .unwrap_or_default();
-            bail!(
-                "daemon did not become online within {} seconds (last phase: {phase}){tree_error}{}",
-                startup_timeout.as_secs(),
-                format_startup_diagnostic(&diagnostic)
-            );
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        Ok(workspace_id)
     }
 }
 
-fn daemon_phase_name(status: &DaemonStatus) -> &'static str {
-    match status {
-        DaemonStatus::Stopped => "stopped",
-        DaemonStatus::Booting(_) => "booting",
-        DaemonStatus::Probing(_) => "probing",
-        DaemonStatus::Online(_) => "online",
-        DaemonStatus::Failed(_) => "failed",
-        DaemonStatus::Stale(_) => "stale",
-    }
-}
-
+#[cfg(test)]
 fn fail_and_release_spawned_lease(database: &Database, pid: u32, diagnostic: &str) -> Result<()> {
     let instance = match database.daemon_status(Utc::now())? {
         DaemonStatus::Booting(instance)
@@ -180,36 +188,20 @@ fn fail_and_release_spawned_lease(database: &Database, pid: u32, diagnostic: &st
     Ok(())
 }
 
-fn format_startup_diagnostic(diagnostic: &str) -> String {
-    if diagnostic.is_empty() {
-        String::new()
-    } else {
-        format!("; startup diagnostic: {diagnostic}")
-    }
-}
-
-fn startup_timeout(config: &RootConfig) -> Duration {
-    let providers = &config.orchestrator.providers;
-    let enabled_count = [
-        providers.gemini.as_ref(),
-        providers.agy.as_ref(),
-        providers.codex.as_ref(),
-        providers.claude.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|provider| provider.enabled)
-    .count();
-    let probe_budget =
-        PROVIDER_PROBE_TIMEOUT.saturating_mul(u32::try_from(enabled_count).unwrap_or(u32::MAX));
-    probe_budget.saturating_add(STARTUP_MARGIN)
-}
-
 #[allow(clippy::too_many_lines)]
-async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> {
-    let paths = RepositoryStatePaths::from_config(repository, config)?;
+async fn serve_foreground(
+    repository: &Path,
+    config: &RootConfig,
+    bootstrap: GlobalDaemonBootstrap,
+    workspace_id: WorkspaceId,
+) -> Result<()> {
+    let GlobalDaemonBootstrap {
+        _owner_lock,
+        paths,
+        database,
+    } = bootstrap;
     let repository_root = std::fs::canonicalize(repository)?;
-    let database = Arc::new(open_ready_database(&paths)?);
+    let workspace_paths = paths.for_workspace(workspace_id);
     let settings = DaemonSettings::default();
     let instance_id = DaemonInstanceId::new();
     database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
@@ -218,6 +210,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         started_at: Utc::now(),
         ttl: settings.lease_ttl,
     })?;
+    let startup_lease = StartupLeaseGuard::new(Arc::clone(&database), instance_id);
     database.record_daemon_runtime_identity(
         instance_id,
         &std::env::current_exe()?.to_string_lossy(),
@@ -252,6 +245,11 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             }
         }
     });
+    let (activation_sender, activation_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let ipc_server = IpcServer::bind(&paths, Arc::clone(&database))?
+        .with_workspace_activations(activation_sender);
+    let ipc_cancellation = cancellation.clone();
+    let ipc_task = tokio::spawn(async move { ipc_server.serve(ipc_cancellation).await });
     let redaction = RedactionConfig {
         literals: Vec::new(),
         patterns: config.orchestrator.redaction.patterns.clone(),
@@ -270,6 +268,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     let redactor: Arc<dyn MessageRedactor> = Arc::new(process_redactor);
     let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
     database.transition_daemon_phase(instance_id, DaemonPhase::Probing, None)?;
+    database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
     let (planner, planner_provider, conversation): (
         Arc<dyn TaskPlanner>,
         ProviderId,
@@ -313,7 +312,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             );
         }
     };
-    let integration_manager = match GitIntegrationManager::new(repository, &paths.root) {
+    let integration_manager = match GitIntegrationManager::new(repository, &workspace_paths.root) {
         Ok(manager) => Arc::new(manager),
         Err(error) => {
             return fail_startup(
@@ -329,7 +328,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
     let integration = IntegrationServices {
         manager: integration_manager,
         repository_root: repository_root.clone(),
-        state_root: paths.root.clone(),
+        state_root: workspace_paths.root.clone(),
     };
     let provider_limits = config
         .orchestrator
@@ -388,13 +387,224 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             }
         }
     }
-    database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
     startup_heartbeat.abort();
-    let result = serve_with_full_orchestration_on_owned_lease(
-        database,
-        instance_id,
-        cancellation,
-        settings,
+    let _ = startup_heartbeat.await;
+    let runtime_cancellation = cancellation.clone();
+    let activation_cancellation = cancellation.clone();
+    let activation_database = Arc::clone(&database);
+    let activation_paths = paths.clone();
+    let runtime = async move {
+        let mut startup_lease = startup_lease;
+        let base_cancellation = runtime_cancellation.clone();
+        let base_runtime = async move {
+            let result = serve_with_full_orchestration_on_owned_lease(
+                database,
+                workspace_id,
+                instance_id,
+                runtime_cancellation,
+                settings,
+                redactor,
+                PlanningServices {
+                    conversation,
+                    repository_root: repository_root.clone(),
+                    planner,
+                    planner_provider,
+                    validation_policy: GraphValidationPolicy {
+                        eligible_providers: BTreeSet::from([planner_provider]),
+                        eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
+                        max_parallel_workers: usize::try_from(
+                            config.orchestrator.max_parallel_workers,
+                        )
+                        .unwrap_or(usize::MAX)
+                        .max(1),
+                        per_provider_limits: BTreeMap::new(),
+                    },
+                    integration: Some(integration),
+                },
+                ExecutionServices {
+                    executor,
+                    repository_root,
+                    state_root: workspace_paths.root.clone(),
+                    global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
+                        .unwrap_or(usize::MAX)
+                        .max(1),
+                    provider_limits,
+                    claim_ttl: TimeDelta::minutes(
+                        i64::try_from(config.orchestrator.default_timeout_minutes)
+                            .unwrap_or(i64::MAX)
+                            .saturating_add(10),
+                    ),
+                },
+            )
+            .await;
+            base_cancellation.cancel();
+            result
+        };
+        let activations = serve_workspace_activations(
+            activation_database,
+            workspace_id,
+            instance_id,
+            activation_cancellation,
+            settings,
+            activation_paths,
+            activation_receiver,
+        );
+        let (base_result, activation_result) = tokio::join!(base_runtime, activations);
+        startup_lease.handoff();
+        base_result?;
+        activation_result?;
+        Ok(())
+    };
+    let result = supervise_daemon_runtime(cancellation.clone(), ipc_task, runtime).await;
+    signal_task.abort();
+    result
+}
+
+async fn serve_workspace_activations(
+    database: Arc<Database>,
+    startup_workspace_id: WorkspaceId,
+    instance_id: DaemonInstanceId,
+    cancellation: CancellationToken,
+    settings: DaemonSettings,
+    paths: GlobalStatePaths,
+    mut activations: tokio::sync::mpsc::UnboundedReceiver<WorkspaceActivation>,
+) -> Result<()> {
+    let mut active = HashSet::from([startup_workspace_id]);
+    let mut jobs = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            activation = activations.recv() => {
+                let Some(activation) = activation else {
+                    cancellation.cancel();
+                    bail!("workspace runtime activation queue closed while the daemon was online");
+                };
+                if !active.insert(activation.workspace_id) {
+                    continue;
+                }
+                let workspace_paths = paths.for_workspace(activation.workspace_id);
+                let (redactor, planning, execution) = build_workspace_runtime(
+                    &activation.repository,
+                    activation.explicit_config.as_deref(),
+                    &workspace_paths,
+                )
+                .await
+                .inspect_err(|_| cancellation.cancel())?;
+                let job_database = Arc::clone(&database);
+                let job_cancellation = cancellation.clone();
+                jobs.spawn(async move {
+                    let result = serve_workspace_runtime_on_owned_daemon(
+                        job_database,
+                        activation.workspace_id,
+                        instance_id,
+                        job_cancellation,
+                        settings,
+                        redactor,
+                        planning,
+                        execution,
+                    )
+                    .await;
+                    (activation.workspace_id, result)
+                });
+            }
+            joined = jobs.join_next(), if !jobs.is_empty() => {
+                let (workspace_id, result) = joined
+                    .ok_or_else(|| anyhow::anyhow!("workspace runtime disappeared"))?
+                    .map_err(|error| anyhow::anyhow!("workspace runtime task failed: {error}"))?;
+                active.remove(&workspace_id);
+                if !cancellation.is_cancelled() {
+                    cancellation.cancel();
+                    result?;
+                    bail!("workspace runtime {workspace_id} stopped unexpectedly");
+                }
+                result?;
+            }
+        }
+    }
+    while let Some(joined) = jobs.join_next().await {
+        let (_, result) = joined
+            .map_err(|error| anyhow::anyhow!("workspace runtime shutdown failed: {error}"))?;
+        result?;
+    }
+    Ok(())
+}
+
+async fn build_workspace_runtime(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    workspace_paths: &orchestrator_state::WorkspaceStatePaths,
+) -> Result<(
+    Arc<dyn MessageRedactor>,
+    PlanningServices,
+    ExecutionServices,
+)> {
+    let config = load_daemon_config(repository, explicit_config)?;
+    let repository_root = std::fs::canonicalize(repository)?;
+    let redaction = RedactionConfig {
+        literals: Vec::new(),
+        patterns: config.orchestrator.redaction.patterns.clone(),
+    };
+    let redactor: Arc<dyn MessageRedactor> =
+        Arc::new(ProcessMessageRedactor(Redactor::new(&redaction)?));
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
+    let (planner, planner_provider, conversation): (
+        Arc<dyn TaskPlanner>,
+        ProviderId,
+        Arc<dyn ConversationOrchestrator>,
+    ) = match OfficialCliTaskPlanner::probe_from_config(
+        &config,
+        repository,
+        Arc::clone(&runtime),
+        ModelProfile::Standard,
+    )
+    .await
+    {
+        Ok(planner) => {
+            let provider = planner.primary_provider();
+            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
+                &planner,
+            ));
+            (Arc::new(planner), provider, conversation)
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            (
+                Arc::new(UnavailablePlanner {
+                    reason: reason.clone(),
+                }),
+                ProviderId::Codex,
+                Arc::new(UnavailableConversation { reason }),
+            )
+        }
+    };
+    let executor = Arc::new(OfficialCliTaskExecutor::new(&config, repository, runtime)?);
+    let integration = IntegrationServices {
+        manager: Arc::new(GitIntegrationManager::new(
+            repository,
+            &workspace_paths.root,
+        )?),
+        repository_root: repository_root.clone(),
+        state_root: workspace_paths.root.clone(),
+    };
+    let provider_limits = config
+        .orchestrator
+        .provider_parallel_limits
+        .iter()
+        .filter_map(|(provider, limit)| {
+            let provider = match provider.as_str() {
+                "agy" => ProviderId::Agy,
+                "codex" => ProviderId::Codex,
+                "claude" => ProviderId::Claude,
+                "gemini" => ProviderId::Gemini,
+                _ => return None,
+            };
+            Some((provider, usize::try_from(*limit).unwrap_or(usize::MAX)))
+        })
+        .collect();
+    let global_limit = usize::try_from(config.orchestrator.max_parallel_workers)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    Ok((
         redactor,
         PlanningServices {
             conversation,
@@ -404,9 +614,7 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
             validation_policy: GraphValidationPolicy {
                 eligible_providers: BTreeSet::from([planner_provider]),
                 eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
-                max_parallel_workers: usize::try_from(config.orchestrator.max_parallel_workers)
-                    .unwrap_or(usize::MAX)
-                    .max(1),
+                max_parallel_workers: global_limit,
                 per_provider_limits: BTreeMap::new(),
             },
             integration: Some(integration),
@@ -414,10 +622,8 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
         ExecutionServices {
             executor,
             repository_root,
-            state_root: paths.root.clone(),
-            global_limit: usize::try_from(config.orchestrator.max_parallel_workers)
-                .unwrap_or(usize::MAX)
-                .max(1),
+            state_root: workspace_paths.root.clone(),
+            global_limit,
             provider_limits,
             claim_ttl: TimeDelta::minutes(
                 i64::try_from(config.orchestrator.default_timeout_minutes)
@@ -425,11 +631,69 @@ async fn serve_foreground(repository: &Path, config: &RootConfig) -> Result<()> 
                     .saturating_add(10),
             ),
         },
-    )
-    .await;
-    signal_task.abort();
-    result?;
-    Ok(())
+    ))
+}
+
+async fn supervise_daemon_runtime<F>(
+    cancellation: CancellationToken,
+    mut ipc_task: tokio::task::JoinHandle<Result<(), orchestrator_daemon::IpcError>>,
+    runtime: F,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::pin!(runtime);
+    tokio::select! {
+        runtime_result = &mut runtime => {
+            cancellation.cancel();
+            let ipc_result = ipc_task
+                .await
+                .map_err(|error| anyhow::anyhow!("IPC task failed: {error}"))?;
+            ipc_result?;
+            runtime_result
+        }
+        ipc_join = &mut ipc_task => {
+            let ipc_result = ipc_join
+                .map_err(|error| anyhow::anyhow!("IPC task failed: {error}"))?;
+            if cancellation.is_cancelled() {
+                let runtime_result = runtime.await;
+                ipc_result?;
+                runtime_result
+            } else {
+                cancellation.cancel();
+                ipc_result?;
+                bail!("IPC server stopped unexpectedly while the daemon was online")
+            }
+        }
+    }
+}
+
+struct StartupLeaseGuard {
+    database: Arc<Database>,
+    instance_id: DaemonInstanceId,
+    armed: bool,
+}
+
+impl StartupLeaseGuard {
+    const fn new(database: Arc<Database>, instance_id: DaemonInstanceId) -> Self {
+        Self {
+            database,
+            instance_id,
+            armed: true,
+        }
+    }
+
+    const fn handoff(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupLeaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.database.release_daemon(self.instance_id, Utc::now());
+        }
+    }
 }
 
 fn fail_startup(
@@ -452,123 +716,84 @@ fn fail_startup_without_heartbeat(
     error: &dyn std::fmt::Display,
 ) -> Result<()> {
     let diagnostic = redactor.redact(&error.to_string());
-    database.transition_daemon_phase(instance_id, DaemonPhase::Failed, Some(&diagnostic))?;
-    database.release_daemon(instance_id, Utc::now())?;
     signal_task.abort();
+    let status = database.daemon_status(Utc::now())?;
+    if matches!(
+        status,
+        DaemonStatus::Booting(ref instance) | DaemonStatus::Probing(ref instance)
+            if instance.instance_id == instance_id
+    ) {
+        database.transition_daemon_phase(instance_id, DaemonPhase::Failed, Some(&diagnostic))?;
+    }
+    database.release_daemon(instance_id, Utc::now())?;
     Err(anyhow::anyhow!(diagnostic))
 }
 
-pub(crate) fn status(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
-    let paths = RepositoryStatePaths::from_config(repository, config)?;
-    if !paths.database.exists() {
-        return Ok(DaemonStatus::Stopped);
+async fn stop_global() -> Result<DaemonStatus> {
+    match DaemonClient::request_global("daemon.stop", json!({})).await {
+        Ok(_) => {}
+        Err(error) if stopped_endpoint_error(&error) => return Ok(DaemonStatus::Stopped),
+        Err(error) if stop_response_disconnect(&error) => {}
+        Err(error) => return Err(error),
     }
-    open_ready_database(&paths)?
-        .daemon_status(Utc::now())
-        .map_err(Into::into)
-}
-
-async fn stop(repository: &Path, config: &RootConfig) -> Result<DaemonStatus> {
-    let paths = RepositoryStatePaths::from_config(repository, config)?;
-    if !paths.database.exists() {
-        return Ok(DaemonStatus::Stopped);
-    }
-    let database = open_ready_database(&paths)?;
-    match database.daemon_status(Utc::now())? {
-        DaemonStatus::Stopped => return Ok(DaemonStatus::Stopped),
-        DaemonStatus::Stale(instance) => {
-            database.release_daemon(instance.instance_id, Utc::now())?;
-            return Ok(DaemonStatus::Stopped);
-        }
-        DaemonStatus::Booting(instance)
-        | DaemonStatus::Probing(instance)
-        | DaemonStatus::Online(instance)
-        | DaemonStatus::Failed(instance) => {
-            database.request_daemon_stop(instance.instance_id, Utc::now())?;
-        }
-    }
-
+    let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
     let deadline = Instant::now() + STOP_TIMEOUT;
     loop {
-        match database.daemon_status(Utc::now())? {
-            DaemonStatus::Stopped => return Ok(DaemonStatus::Stopped),
-            DaemonStatus::Stale(instance) => {
-                database.release_daemon(instance.instance_id, Utc::now())?;
-                return Ok(DaemonStatus::Stopped);
-            }
-            DaemonStatus::Booting(_)
-            | DaemonStatus::Probing(_)
-            | DaemonStatus::Online(_)
-            | DaemonStatus::Failed(_) => {}
+        match DaemonOwnerLock::acquire(&paths) {
+            Ok(_released) => return Ok(DaemonStatus::Stopped),
+            Err(IpcError::AlreadyOwned) => {}
+            Err(error) => return Err(error.into()),
         }
         if Instant::now() >= deadline {
-            bail!("daemon did not release its lease within ten seconds");
+            bail!("user daemon did not release its singleton ownership within ten seconds");
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
-pub(crate) fn initialize_database(paths: &RepositoryStatePaths) -> Result<Database> {
-    let database = Database::open(&paths.database)?;
-    database.migrate_with_backup(&paths.backups)?;
-    EventLog::open(&paths.events)?.reconcile(&database)?;
-    Ok(database)
+fn stop_response_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
-pub(crate) fn open_ready_database(paths: &RepositoryStatePaths) -> Result<Database> {
-    if !paths.database.exists() {
-        bail!(
-            "state database does not exist at {}; run `colay init` or `colay daemon start`",
-            paths.database.display()
-        );
+fn stopped_endpoint_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(stopped_endpoint_io_error)
+    })
+}
+
+fn stopped_endpoint_io_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) {
+        return true;
     }
-    let database = Database::open(&paths.database)?;
-    let migration = database.migration_status()?;
-    if !migration.pending_versions.is_empty() {
-        bail!(
-            "state schema migration is required ({:?}); run `colay migrate apply`",
-            migration.pending_versions
-        );
+    #[cfg(windows)]
+    {
+        const ERROR_BROKEN_PIPE: i32 = 109;
+        const ERROR_NO_DATA: i32 = 232;
+        const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
+        matches!(
+            error.raw_os_error(),
+            Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
+        )
     }
-    Ok(database)
-}
-
-fn spawn_server(repository: &Path, explicit_config: Option<&Path>) -> Result<SpawnedDaemon> {
-    let executable = std::env::current_exe().context("cannot resolve current colay executable")?;
-    let mut command = Command::new(executable);
-    if let Some(config) = explicit_config {
-        command.arg("--config").arg(config);
+    #[cfg(not(windows))]
+    {
+        false
     }
-    command
-        .arg("daemon")
-        .arg("serve")
-        .current_dir(repository)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    configure_background_process(&mut command);
-    let child = command.spawn().context("cannot spawn repository daemon")?;
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("spawned repository daemon has no process ID"))?;
-    Ok(SpawnedDaemon { child, pid })
 }
-
-#[cfg(windows)]
-fn configure_background_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(unix)]
-fn configure_background_process(command: &mut Command) {
-    command.process_group(0);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_background_process(_command: &mut Command) {}
 
 struct ProcessMessageRedactor(Redactor);
 
@@ -625,11 +850,69 @@ fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{TimeDelta, Utc};
     use orchestrator_domain::DaemonInstanceId;
     use orchestrator_state::{DaemonLeaseRequest, DaemonStatus, Database};
+    use tokio_util::sync::CancellationToken;
 
-    use super::fail_and_release_spawned_lease;
+    use super::{
+        StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
+        stop_response_disconnect, stopped_endpoint_error, supervise_daemon_runtime,
+    };
+
+    #[test]
+    fn only_endpoint_absence_or_refusal_is_classified_as_stopped() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::from(kind));
+            assert!(stopped_endpoint_error(&error));
+        }
+
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!stopped_endpoint_error(&denied));
+
+        let reset = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!stopped_endpoint_error(&reset));
+
+        #[cfg(windows)]
+        for raw_os_error in [109, 232, 233] {
+            let disconnected = anyhow::Error::new(std::io::Error::from_raw_os_error(raw_os_error));
+            assert!(stopped_endpoint_error(&disconnected));
+        }
+
+        let schema_mismatch =
+            anyhow::anyhow!("user daemon returned IPC schema 2; supported schema is 1");
+        assert!(!stopped_endpoint_error(&schema_mismatch));
+    }
+
+    #[test]
+    fn stop_response_disconnect_is_recoverable_only_for_transport_shutdown() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = anyhow::Error::new(std::io::Error::from(kind));
+            assert!(stop_response_disconnect(&error));
+        }
+
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!stop_response_disconnect(&denied));
+        let protocol = anyhow::anyhow!("daemon returned an invalid stop response");
+        assert!(!stop_response_disconnect(&protocol));
+    }
+
+    struct IdentityRedactor;
+
+    impl orchestrator_daemon::MessageRedactor for IdentityRedactor {
+        fn redact(&self, value: &str) -> String {
+            value.to_owned()
+        }
+    }
 
     fn database() -> Result<Database, Box<dyn std::error::Error>> {
         let database = Database::open_in_memory()?;
@@ -661,6 +944,97 @@ mod tests {
             database.daemon_startup_diagnostic_for_pid(42)?.as_deref(),
             Some("bounded timeout")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failure_after_ipc_readiness_releases_an_online_startup_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = database()?;
+        let instance_id = DaemonInstanceId::new();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: TimeDelta::seconds(5),
+        })?;
+        database.transition_daemon_phase(
+            instance_id,
+            orchestrator_state::DaemonPhase::Probing,
+            None,
+        )?;
+        database.transition_daemon_phase(
+            instance_id,
+            orchestrator_state::DaemonPhase::Online,
+            None,
+        )?;
+        let signal_task = tokio::spawn(std::future::pending::<()>());
+
+        let error = match fail_startup_without_heartbeat(
+            &database,
+            instance_id,
+            &signal_task,
+            &IdentityRedactor,
+            &"service setup failed",
+        ) {
+            Ok(()) => {
+                return Err(std::io::Error::other("online setup failure must be reported").into());
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "service setup failed");
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_failure_cancels_runtime_and_releases_online_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Arc::new(database()?);
+        let instance_id = DaemonInstanceId::new();
+        database.acquire_daemon_startup_lease(&DaemonLeaseRequest {
+            instance_id,
+            pid: 42,
+            started_at: Utc::now(),
+            ttl: TimeDelta::seconds(5),
+        })?;
+        database.transition_daemon_phase(
+            instance_id,
+            orchestrator_state::DaemonPhase::Probing,
+            None,
+        )?;
+        database.transition_daemon_phase(
+            instance_id,
+            orchestrator_state::DaemonPhase::Online,
+            None,
+        )?;
+        let cancellation = CancellationToken::new();
+        let runtime_cancellation = cancellation.clone();
+        let guard = StartupLeaseGuard::new(Arc::clone(&database), instance_id);
+        let runtime = async move {
+            let _guard = guard;
+            runtime_cancellation.cancelled().await;
+            Ok(())
+        };
+        let ipc_task = tokio::spawn(async {
+            Err(orchestrator_daemon::IpcError::Protocol(
+                "injected accept failure".to_owned(),
+            ))
+        });
+
+        let error = match supervise_daemon_runtime(cancellation.clone(), ipc_task, runtime).await {
+            Ok(()) => {
+                return Err(
+                    std::io::Error::other("IPC failure must stop the daemon runtime").into(),
+                );
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("injected accept failure"));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(database.daemon_status(Utc::now())?, DaemonStatus::Stopped);
         Ok(())
     }
 }

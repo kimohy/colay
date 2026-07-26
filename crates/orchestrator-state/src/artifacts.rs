@@ -1,15 +1,19 @@
 use std::{
     fs::{self, OpenOptions},
     io::{Read as _, Write as _},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
+use fs2::FileExt as _;
 use orchestrator_domain::RepoPath;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{StateError, StateResult, ensure_private_directory, ensure_private_file};
+use crate::{
+    StateError, StateResult, WorkspaceStatePaths, ensure_private_directory, ensure_private_file,
+    reject_symlink_components,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredArtifact {
@@ -28,6 +32,27 @@ impl ArtifactStore {
         let root = root.into();
         ensure_private_directory(&root)?;
         let root = fs::canonicalize(&root).map_err(|error| StateError::io(&root, error))?;
+        Ok(Self { root })
+    }
+
+    /// Opens the artifact namespace rooted at one global workspace. Newly written artifacts use
+    /// their ordinary relative paths; read-only legacy imports remain isolated below `imports/`.
+    pub fn open_workspace(paths: &WorkspaceStatePaths) -> StateResult<Self> {
+        Self::open(&paths.root)
+    }
+
+    /// Opens an existing workspace artifact root without creating it or changing permissions.
+    pub fn open_workspace_read_only(paths: &WorkspaceStatePaths) -> StateResult<Self> {
+        reject_symlink_components(&paths.root)?;
+        let metadata = fs::symlink_metadata(&paths.root)
+            .map_err(|error| StateError::io(&paths.root, error))?;
+        if !metadata.is_dir() {
+            return Err(StateError::UnsafeArtifactPath(
+                paths.root.display().to_string(),
+            ));
+        }
+        let root =
+            fs::canonicalize(&paths.root).map_err(|error| StateError::io(&paths.root, error))?;
         Ok(Self { root })
     }
 
@@ -143,23 +168,188 @@ impl ArtifactStore {
 
     fn read_path(&self, relative_path: &RepoPath) -> StateResult<(PathBuf, Vec<u8>)> {
         let path = relative_path.join_to(&self.root);
-        self.ensure_safe_parent(path.parent().unwrap_or(&self.root))?;
-        if fs::symlink_metadata(&path)
-            .map_err(|error| StateError::io(&path, error))?
-            .file_type()
-            .is_symlink()
-        {
+        // This shared guard is reparse-aware on Windows, unlike `FileType::is_symlink`, and
+        // rejects every existing redirecting component before canonical containment is checked.
+        reject_symlink_components(&path)?;
+        let canonical = fs::canonicalize(&path).map_err(|error| StateError::io(&path, error))?;
+        if !canonical.starts_with(&self.root) {
             return Err(StateError::SymlinkEscape(path));
         }
         let mut file = OpenOptions::new()
             .read(true)
-            .open(&path)
-            .map_err(|error| StateError::io(&path, error))?;
+            .open(&canonical)
+            .map_err(|error| StateError::io(&canonical, error))?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
-            .map_err(|error| StateError::io(&path, error))?;
+            .map_err(|error| StateError::io(&canonical, error))?;
         Ok((path, contents))
     }
+}
+
+/// Owns the only writable import directory until both its atomic publication and the matching
+/// `SQLite` transaction commit. Dropping an unfinished value removes only that scoped directory.
+pub(crate) struct LegacyImportStaging {
+    _lock_file: fs::File,
+    staging: PathBuf,
+    published: PathBuf,
+    published_on_disk: bool,
+    committed: bool,
+}
+
+impl LegacyImportStaging {
+    pub(crate) fn acquire(workspace_root: &Path, fingerprint: &str) -> StateResult<Self> {
+        validate_fingerprint(fingerprint)?;
+        ensure_private_directory(workspace_root)?;
+        let imports = workspace_root.join("imports");
+        ensure_private_directory(&imports)?;
+        reject_symlink_components(&imports)?;
+        let lock_path = imports.join(format!("{fingerprint}.lock"));
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| StateError::io(&lock_path, error))?;
+        ensure_private_file(&lock_path)?;
+        lock_file.try_lock_exclusive().map_err(|error| {
+            StateError::RollbackGuard(format!(
+                "legacy import {fingerprint} is already active: {error}"
+            ))
+        })?;
+        let staging = imports.join(format!("{fingerprint}.staging"));
+        let published = imports.join(fingerprint);
+        Ok(Self {
+            _lock_file: lock_file,
+            staging,
+            published,
+            published_on_disk: false,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn prepare(&self) -> StateResult<()> {
+        remove_orphaned_import_directory(&self.staging)?;
+        remove_orphaned_import_directory(&self.published)?;
+        fs::create_dir(&self.staging).map_err(|error| StateError::io(&self.staging, error))?;
+        ensure_private_directory(&self.staging)
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.staging
+    }
+
+    pub(crate) fn published_path(&self) -> &Path {
+        &self.published
+    }
+
+    pub(crate) fn stage_verified_bytes(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        expected_sha256: &str,
+        expected_length: u64,
+    ) -> StateResult<()> {
+        validate_relative_path(relative)?;
+        if bytes.len() as u64 != expected_length
+            || hex::encode(Sha256::digest(bytes)) != expected_sha256
+        {
+            return Err(StateError::ArtifactConflict(relative.to_path_buf()));
+        }
+        let destination = self.staging.join(relative);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| StateError::UnsafeArtifactPath(destination.display().to_string()))?;
+        ensure_private_directory(parent)?;
+        reject_symlink_components(parent)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|error| StateError::io(&destination, error))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| StateError::io(&destination, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn publish(&mut self) -> StateResult<()> {
+        sync_directory(&self.staging)?;
+        fs::rename(&self.staging, &self.published)
+            .map_err(|error| StateError::io(&self.published, error))?;
+        self.published_on_disk = true;
+        if let Some(parent) = self.published.parent() {
+            sync_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> PathBuf {
+        self.committed = true;
+        self.published.clone()
+    }
+}
+
+fn remove_orphaned_import_directory(path: &Path) -> StateResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| StateError::io(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(StateError::SymlinkEscape(path.to_path_buf()));
+    }
+    if !metadata.is_dir() {
+        return Err(StateError::ArtifactConflict(path.to_path_buf()));
+    }
+    fs::remove_dir_all(path).map_err(|error| StateError::io(path, error))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+impl Drop for LegacyImportStaging {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let target = if self.published_on_disk {
+            &self.published
+        } else {
+            &self.staging
+        };
+        if target.exists() {
+            let _ = fs::remove_dir_all(target);
+        }
+    }
+}
+
+fn validate_fingerprint(fingerprint: &str) -> StateResult<()> {
+    if fingerprint.len() != 64
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy import fingerprint must be 64 lowercase hexadecimal characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &Path) -> StateResult<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(StateError::UnsafeArtifactPath(path.display().to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

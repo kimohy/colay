@@ -7,7 +7,7 @@ This repository versions Colay and its persisted/public contracts independently.
 | Colay | `0.1.0` | workspace `Cargo.toml` |
 | Tested Codex | `0.144.5`, `0.144.6` | `compatibility/codex-version.toml` |
 | Recommended Codex | `0.144.6` | `compatibility/codex-version.toml` |
-| SQLite state schema | `11` | `STATE_SCHEMA_VERSION` and migrations |
+| SQLite state schema | `15` | `STATE_SCHEMA_VERSION` and migrations |
 | Config schema | `4` | `CONFIG_SCHEMA_VERSION` |
 | Checkpoint/handover schema | `1` | domain writers |
 
@@ -124,6 +124,35 @@ The expected status for the current release line is `NotSigned`; treat any polic
 that requires a trusted publisher signature as an unsupported deployment until the
 organization signs its internal build or approves the verified digest. Do not interpret
 npm provenance or the checksum as an Authenticode substitute.
+
+## User-global state rollout gate
+
+A release that changes global paths, workspace registration, daemon ownership,
+IPC, migration/import, or plan-first behavior must include fresh Windows-native
+and WSL evidence from the exact matrix in [`testing.md`](testing.md). Do not
+promote the release unless all of these are true:
+
+- Windows and WSL resolve databases beneath different OS-native roots; WSL
+  refuses a state root on `/mnt/<drive>`.
+- Thirty-two concurrent status/plan-only clients all succeed without SQLite
+  busy/locked diagnostics, duplicate workspace/path rows, task creation, or a
+  second live daemon. The test then explicitly stops the daemon and observes the
+  lease release, IPC endpoint removal, and process exit within its bounded wait.
+- Deterministic client tests prove one startup spawn attempt per client,
+  Windows `ERROR_PIPE_BUSY`-only bounded retry, and immediate propagation of
+  non-busy pipe-open failures.
+- The Windows named pipe grants access only to the current SID, while the WSL
+  Unix socket is owned by the current user with mode `0600`.
+- Unicode/case-equivalent Windows paths, non-Git planning on both platforms,
+  the complete legacy-import test binary, and platform-native junction/symlink
+  redirect refusal pass.
+- Provider doctor resolves Codex, Claude, Gemini, and Agy only to compiled fake
+  provider fixtures. No provider login, model prompt, credential, or network
+  inference is allowed in rollout verification.
+
+Record the exact commands, exit codes, failures/retries, OS/toolchain identity,
+and temporary-root strategy in the WSL/Windows QA tracker. A prose-only claim is
+not release evidence.
 
 ## Operator release procedure
 

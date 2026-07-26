@@ -17,10 +17,11 @@ use orchestrator_daemon::{
 };
 use orchestrator_domain::{
     ConversationMessage, CorrelationId, DaemonInstanceId, EventActor, EventId, EventType,
-    GraphRevisionId, GraphValidationPolicy, MessageId, MessageKind, MessageRole, MessageState,
-    ModelProfile, PlanningAttemptId, ProviderId, RepoPath, RiskTag, SchemaVersion, SessionId,
-    SessionState, TaskEvent, TaskGraphNode, TaskGraphProposal, TaskInstructionState, TaskState,
-    validate_task_graph,
+    GraphRevisionId, GraphValidationAuthority, GraphValidationPolicy, MessageId, MessageKind,
+    MessageRole, MessageState, ModelProfile, PlanningAttemptId, ProviderId, RepoPath,
+    RequirementRevision, RequirementRevisionId, RequirementSnapshot, RiskTag, SchemaVersion,
+    SessionId, SessionState, TaskEvent, TaskGraphNode, TaskGraphProposal, TaskInstructionState,
+    TaskState, VerificationCommand, validate_task_graph_with_authority,
 };
 use orchestrator_engine::{
     ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
@@ -30,11 +31,14 @@ use orchestrator_process::RedactionConfig;
 use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::{
     Database, GraphApprovalRequest, NewGraphAttempt, NewSessionRecord, RepositoryStatePaths,
-    RootConfig, TaskListFilter,
+    RootConfig, TaskListFilter, WorkspaceDatabase,
 };
 use tokio_util::sync::CancellationToken;
 
 use colay::task_executor::OfficialCliTaskExecutor;
+
+mod support;
+use support::with_workspace;
 
 fn fake_provider_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_colay-e2e-fake-provider"))
@@ -53,6 +57,17 @@ fn git(repository: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error
         .into());
     }
     Ok(())
+}
+
+fn git_text(repository: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .current_dir(repository)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 fn repository() -> Result<(tempfile::TempDir, PathBuf), Box<dyn std::error::Error>> {
@@ -128,7 +143,8 @@ fn event(
 }
 
 fn seed_approved_graph(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
+    approved_base_commit: &str,
 ) -> Result<(SessionId, Vec<orchestrator_domain::TaskId>), Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     database.create_session_with_event(
@@ -169,7 +185,35 @@ fn seed_approved_graph(
         risks: vec![RiskTag::Concurrency],
         parallel_safety: "disjoint worktree and write scope".to_owned(),
     };
-    let graph = validate_task_graph(
+    let requirement_revision_id = RequirementRevisionId::new();
+    database.record_requirement_revision(&RequirementRevision::seal(
+        requirement_revision_id,
+        session_id,
+        goal_message_id,
+        1,
+        RequirementSnapshot {
+            objective: "execute two independent tasks".to_owned(),
+            in_scope: vec!["parallel task execution".to_owned()],
+            out_of_scope: Vec::new(),
+            constraints: vec!["preserve exact approval base".to_owned()],
+            acceptance_criteria: vec!["both tasks complete".to_owned()],
+            verification_plan: vec![VerificationCommand {
+                executable: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+            }],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        },
+        Utc::now(),
+    )?)?;
+    let authority = GraphValidationAuthority {
+        requirement_revision_id,
+        validation_hash: "a".repeat(64),
+        base_commit: approved_base_commit.to_owned(),
+        git_root_redacted: "parallel-e2e-repository".to_owned(),
+        validation_checks: vec!["exact_graph_approval".to_owned()],
+    };
+    let graph = validate_task_graph_with_authority(
         TaskGraphProposal {
             schema_version: SchemaVersion::v1(),
             revision_id: GraphRevisionId::new(),
@@ -185,6 +229,7 @@ fn seed_approved_graph(
             max_parallel_workers: 2,
             per_provider_limits: BTreeMap::from([(ProviderId::Codex, 2)]),
         },
+        authority.clone(),
     )?;
     database.record_graph_attempt(&NewGraphAttempt::from_validated(
         PlanningAttemptId::new(),
@@ -195,7 +240,8 @@ fn seed_approved_graph(
     let approved = database.approve_graph_and_materialize_tasks(&GraphApprovalRequest {
         revision_id: graph.proposal.revision_id,
         expected_proposal_hash: graph.proposal_hash,
-        authority: None,
+        authority: Some(authority),
+        promotion: None,
         approved_by: "parallel-e2e".to_owned(),
         approved_at: Utc::now(),
     })?;
@@ -203,7 +249,7 @@ fn seed_approved_graph(
 }
 
 fn queue_instruction(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     session_id: SessionId,
     task_id: orchestrator_domain::TaskId,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -260,7 +306,9 @@ impl MessageRedactor for IdentityRedactor {
     }
 }
 
-async fn wait_for_completion(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+async fn wait_for_completion(
+    database: &WorkspaceDatabase<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..400 {
         let tasks = database.list_tasks(&TaskListFilter {
             state: None,
@@ -277,17 +325,7 @@ async fn wait_for_completion(database: &Database) -> Result<(), Box<dyn std::err
                     let attempts = database
                         .list_task_attempts(task.task_id)
                         .unwrap_or_default();
-                    let verification = database
-                        .with_connection(|connection| {
-                            connection
-                                .query_row(
-                                    "SELECT result_json FROM verification_results WHERE task_id = ?1 ORDER BY completed_at DESC LIMIT 1",
-                                    [task.task_id.to_string()],
-                                    |row| row.get::<_, String>(0),
-                                )
-                                .map_err(orchestrator_state::StateError::from)
-                        })
-                        .ok();
+                    let verification = database.latest_verification(task.task_id).ok().flatten();
                     let checkpoint = database.latest_sealed_checkpoint(task.task_id).ok().flatten();
                     format!(
                         "{}={:?} attempts={attempts:?} verification={verification:?} checkpoint={checkpoint:?}",
@@ -312,8 +350,23 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     fs::create_dir_all(&paths.root)?;
     let database = Arc::new(Database::open(&paths.database)?);
     database.migrate_with_backup(&paths.backups)?;
-    let (session_id, task_ids) = seed_approved_graph(&database)?;
-    queue_instruction(&database, session_id, task_ids[0])?;
+    let workspace_id = database
+        .resolve_repository_workspace(&repository)?
+        .workspace_id;
+    let workspace = database.workspace(workspace_id);
+    let approved_base_commit = git_text(&repository, &["rev-parse", "HEAD"])?;
+    let (session_id, task_ids) = seed_approved_graph(&workspace, &approved_base_commit)?;
+    queue_instruction(&workspace, session_id, task_ids[0])?;
+    fs::write(repository.join("advanced-after-approval.txt"), "new head\n")?;
+    git(&repository, &["add", "advanced-after-approval.txt"])?;
+    git(
+        &repository,
+        &["commit", "-m", "advance head after approval"],
+    )?;
+    assert_ne!(
+        git_text(&repository, &["rev-parse", "HEAD"])?,
+        approved_base_commit
+    );
 
     let runtime: Arc<dyn AdapterRuntime> =
         Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
@@ -341,10 +394,12 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     };
     let cancellation = CancellationToken::new();
     let service_database = Arc::clone(&database);
+    let workspace_id = workspace.workspace_id();
     let service_cancellation = cancellation.clone();
     let service = tokio::spawn(async move {
         serve_with_full_orchestration(
             service_database,
+            workspace_id,
             DaemonInstanceId::new(),
             77,
             service_cancellation,
@@ -360,7 +415,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         .await
     });
     for _ in 0..100 {
-        if database
+        if workspace
             .load_task(task_ids[0])?
             .is_some_and(|task| task.state == TaskState::Running)
         {
@@ -369,26 +424,29 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    queue_instruction(&database, session_id, task_ids[0])?;
-    wait_for_completion(&database).await?;
+    queue_instruction(&workspace, session_id, task_ids[0])?;
+    wait_for_completion(&workspace).await?;
     cancellation.cancel();
     service.await??;
 
     for (index, task_id) in task_ids.iter().enumerate() {
-        assert!(database.latest_sealed_checkpoint(*task_id)?.is_some());
-        assert!(database.active_worktree(*task_id)?.is_some());
+        assert!(workspace.latest_sealed_checkpoint(*task_id)?.is_some());
+        let worktree = workspace
+            .active_worktree(*task_id)?
+            .ok_or("missing worktree")?;
+        assert_eq!(worktree.base_revision, approved_base_commit);
         assert_eq!(
-            database.list_task_attempts(*task_id)?.len(),
+            workspace.list_task_attempts(*task_id)?.len(),
             if index == 0 { 2 } else { 1 }
         );
     }
     assert!(
-        database
+        workspace
             .list_task_instructions(task_ids[0])?
             .iter()
             .all(|instruction| instruction.state == TaskInstructionState::Applied)
     );
-    database.with_connection(|connection| {
+    with_workspace(&paths.database, &workspace, |connection| {
         let claims: i64 =
             connection.query_row("SELECT count(*) FROM task_schedule_claims", [], |row| {
                 row.get(0)
@@ -415,9 +473,11 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     let restart_cancellation = CancellationToken::new();
     let restart_signal = restart_cancellation.clone();
     let restart_database = Arc::clone(&database);
+    let restart_workspace_id = workspace.workspace_id();
     let restart = tokio::spawn(async move {
         orchestrator_daemon::serve(
             &restart_database,
+            restart_workspace_id,
             DaemonInstanceId::new(),
             78,
             restart_signal,
@@ -434,7 +494,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
     restart.await??;
     for (index, task_id) in task_ids.into_iter().enumerate() {
         assert_eq!(
-            database.list_task_attempts(task_id)?.len(),
+            workspace.list_task_attempts(task_id)?.len(),
             if index == 0 { 2 } else { 1 }
         );
     }

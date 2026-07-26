@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
@@ -23,9 +23,13 @@ use orchestrator_engine::{
 };
 use orchestrator_state::{
     ConversationAttemptStatus, Database, GraphRevisionStatus, NewConversationAttempt,
+    WorkspaceDatabase, WorkspaceId,
 };
 use rusqlite::params;
 use tokio_util::sync::CancellationToken;
+
+mod support;
+use support::with_workspace;
 
 struct IdentityRedactor;
 
@@ -49,6 +53,10 @@ struct FakeConversation {
 
 struct FailingConversation;
 
+struct CapturingConversation {
+    transcript: Arc<Mutex<Option<String>>>,
+}
+
 fn verification_plan() -> Vec<VerificationCommand> {
     vec![VerificationCommand {
         executable: "cargo".to_owned(),
@@ -58,6 +66,22 @@ fn verification_plan() -> Vec<VerificationCommand> {
             "--all-features".to_owned(),
         ],
     }]
+}
+
+fn candidate_outcome() -> ConversationOutcome {
+    ConversationOutcome::WorktreeTaskCandidate {
+        response_redacted: "Ready for validation.".to_owned(),
+        requirements: RequirementSnapshot {
+            objective: "fix conversation flow".to_owned(),
+            in_scope: vec!["conversation flow".to_owned()],
+            out_of_scope: vec!["automatic merge".to_owned()],
+            constraints: vec!["no task before approval".to_owned()],
+            acceptance_criteria: vec!["tests pass".to_owned()],
+            verification_plan: verification_plan(),
+            risks: vec!["stale approval".to_owned()],
+            open_questions: Vec::new(),
+        },
+    }
 }
 
 #[async_trait]
@@ -89,6 +113,34 @@ impl ConversationOrchestrator for FakeConversation {
             exit: ConversationExit::Succeeded,
             output_redacted: serde_json::to_vec(&self.outcome).unwrap_or_default(),
             evidence_redacted: "fake conversation".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl ConversationOrchestrator for CapturingConversation {
+    async fn converse(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        *self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(request.transcript_redacted.clone());
+        Ok(ConversationResponse {
+            schema_version: orchestrator_domain::SchemaVersion::v1(),
+            attempt_id: request.attempt_id,
+            session_id: request.session_id,
+            source_message_id: request.source_message_id,
+            provider: ProviderId::Codex,
+            sandbox: SandboxMode::ReadOnly,
+            exit: ConversationExit::Succeeded,
+            output_redacted: serde_json::to_vec(&ConversationOutcome::AnswerComplete {
+                response_redacted: "captured".to_owned(),
+            })
+            .unwrap_or_default(),
+            evidence_redacted: "captured transcript".to_owned(),
         })
     }
 }
@@ -127,19 +179,31 @@ impl TaskPlanner for FakePlanner {
     }
 }
 
-fn database() -> Result<Database, Box<dyn std::error::Error>> {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    Ok(database)
+fn database() -> Result<(Database, WorkspaceId, std::path::PathBuf), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(temporary.path())?;
+    let _persisted = temporary.keep();
+    let database_path = root.join("state.db");
+    let database = Database::open(&database_path)?;
+    database.migrate_with_backup(&root.join("backups"))?;
+    let workspace_path = root.join("workspace");
+    std::fs::create_dir_all(&workspace_path)?;
+    let workspace_id = database
+        .resolve_repository_workspace(&workspace_path)?
+        .workspace_id;
+    Ok((database, workspace_id, database_path))
 }
 
-fn seed_session(database: &Database) -> Result<SessionId, Box<dyn std::error::Error>> {
+fn seed_session(
+    database_path: &std::path::Path,
+    database: &WorkspaceDatabase<'_>,
+) -> Result<SessionId, Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     let now = Utc::now().to_rfc3339();
-    database.with_connection(|connection| {
+    with_workspace(database_path, database, |connection| {
         connection.execute(
-            "INSERT INTO sessions(session_id, schema_version, revision, title, state, created_at, updated_at)
-             VALUES (?1, '1', 0, 'conversation', 'drafting', ?2, ?2)",
+            "INSERT INTO main.sessions(workspace_id, session_id, schema_version, revision, title, state, created_at, updated_at)
+             VALUES (current_workspace(), ?1, '1', 0, 'conversation', 'drafting', ?2, ?2)",
             params![session_id.to_string(), now],
         )?;
         Ok(())
@@ -192,8 +256,11 @@ fn services(repository_root: std::path::PathBuf, outcome: ConversationOutcome) -
     services_with_conversation(repository_root, Arc::new(FakeConversation { outcome }))
 }
 
-fn assert_zero_writable_rows(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
-    database.with_connection(|connection| {
+fn assert_zero_writable_rows(
+    database_path: &std::path::Path,
+    database: &WorkspaceDatabase<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_workspace(database_path, database, |connection| {
         for table in [
             "tasks",
             "task_attempts",
@@ -243,12 +310,13 @@ fn git_repository() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "Why is Git needed?"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?
         .ok_or("append command was not processed")?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
 
     let directory = tempfile::tempdir()?;
     let services = services(
@@ -264,15 +332,69 @@ async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
     assert_eq!(messages.len(), 2);
     assert!(messages[1].1.content_redacted.contains("approved writable"));
     assert!(database.current_requirement_revision(session_id)?.is_none());
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_transcript_includes_latest_message_after_two_hundred_turns()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
+    let now = Utc::now().to_rfc3339();
+    with_workspace(&database_path, &database, |connection| {
+        for ordinal in 1..=204 {
+            let content = if ordinal == 1 {
+                "first-dropped-marker".to_owned()
+            } else {
+                format!("old-message-{ordinal}")
+            };
+            connection.execute(
+                "INSERT INTO main.conversation_messages(
+                    workspace_id, message_id, session_id, task_id, ordinal, role, kind, state,
+                    content_redacted, created_at, finalized_at)
+                 VALUES (current_workspace(), ?1, ?2, NULL, ?3, 'user', 'user_message', 'final',
+                         ?4, ?5, ?5)",
+                params![
+                    MessageId::new().to_string(),
+                    session_id.to_string(),
+                    ordinal,
+                    content,
+                    now
+                ],
+            )?;
+        }
+        Ok(())
+    })?;
+    database.submit_client_command(&append_command(session_id, "latest-source-marker"))?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let transcript = Arc::new(Mutex::new(None));
+    let services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(CapturingConversation {
+            transcript: Arc::clone(&transcript),
+        }),
+    );
+
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+
+    let transcript = transcript
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or("provider did not receive a transcript")?;
+    assert!(transcript.contains("latest-source-marker"));
+    assert!(!transcript.contains("first-dropped-marker"));
     Ok(())
 }
 
 #[tokio::test]
 async fn interview_records_partial_requirements_without_starting_a_plan()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "please improve the flow"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let directory = tempfile::tempdir()?;
@@ -298,7 +420,7 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
         .current_requirement_revision(session_id)?
         .ok_or("missing partial requirement revision")?;
     assert!(!requirement.snapshot.is_complete());
-    database.with_connection(|connection| {
+    with_workspace(&database_path, &database, |connection| {
         let plan_commands: i64 = connection.query_row(
             "SELECT count(*) FROM client_commands WHERE action = 'request_plan'",
             [],
@@ -307,15 +429,16 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
         assert_eq!(plan_commands, 0);
         Ok(())
     })?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn provider_failure_is_redacted_and_preserves_the_session()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "hello"))?;
     process_next_client_command(&database, &SecretRedactor, Utc::now())?;
     let directory = tempfile::tempdir()?;
@@ -333,7 +456,7 @@ async fn provider_failure_is_redacted_and_preserves_the_session()
             .content_redacted
             .contains("session were preserved")
     );
-    database.with_connection(|connection| {
+    with_workspace(&database_path, &database, |connection| {
         let outcome: String = connection.query_row(
             "SELECT outcome_json FROM conversation_attempts LIMIT 1",
             [],
@@ -343,15 +466,16 @@ async fn provider_failure_is_redacted_and_preserves_the_session()
         assert!(outcome.contains("[REDACTED]"));
         Ok(())
     })?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
-async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_approval()
+async fn complete_candidate_in_non_git_directory_preserves_plan_until_writable_approval()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let directory = tempfile::tempdir()?;
@@ -374,24 +498,157 @@ async fn complete_candidate_in_non_git_directory_preserves_chat_and_blocks_appro
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
-    assert_eq!(graph.revision.status, GraphRevisionStatus::Invalid);
-    assert!(graph.revision.proposal_hash.is_none());
-    let messages = database.messages_after(session_id, 0, 10)?;
+    assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);
+    let proposal_hash = graph
+        .revision
+        .proposal_hash
+        .clone()
+        .ok_or("missing proposal hash")?;
+    let authority = serde_json::from_value::<orchestrator_domain::GraphValidationSummary>(
+        graph.revision.validation.clone(),
+    )?
+    .authority
+    .ok_or("missing deferred graph authority")?;
+    let approval_id = ClientCommandId::new();
+    database.submit_client_command(&ClientCommand {
+        command_id: approval_id,
+        session_id: Some(session_id),
+        task_id: None,
+        action: ClientCommandAction::ApproveGraph,
+        payload: serde_json::to_value(ApproveGraphCommandPayload {
+            revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash,
+            base_commit: authority.base_commit,
+            proposal_hash,
+            approved_by: "operator".to_owned(),
+        })?,
+        idempotency_key: "non-git-writable-approval".to_owned(),
+        state: ClientCommandState::Pending,
+        requested_by: "operator".to_owned(),
+        requested_at: Utc::now(),
+        claimed_at: None,
+        completed_at: None,
+        outcome: None,
+    })?;
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let approval = database
+        .load_client_command(approval_id)?
+        .ok_or("missing approval command")?;
+    assert_eq!(approval.state, ClientCommandState::Failed);
     assert!(
-        messages
-            .iter()
-            .any(|(_, message)| { message.content_redacted.contains("Initialize Git") })
+        approval
+            .outcome
+            .unwrap_or_default()
+            .contains("committed Git repository")
     );
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
-async fn validated_candidate_materializes_once_only_after_exact_approval()
+async fn planning_is_structural_when_writable_policy_is_ineligible()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let repository = git_repository()?;
+    let mut services = services(
+        std::fs::canonicalize(repository.path())?,
+        candidate_outcome(),
+    );
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    services.validation_policy.eligible_providers.clear();
+    services.validation_policy.eligible_profiles.clear();
+
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+
+    let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
+    assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);
+    assert_zero_writable_rows(&database_path, &database)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approval_revalidates_complete_current_policy_before_materializing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
+    database.submit_client_command(&append_command(session_id, "candidate"))?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let repository = git_repository()?;
+    let mut services = services(
+        std::fs::canonicalize(repository.path())?,
+        candidate_outcome(),
+    );
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
+    let summary: orchestrator_domain::GraphValidationSummary =
+        serde_json::from_value(graph.revision.validation.clone())?;
+    let authority = summary.authority.ok_or("missing graph authority")?;
+    let approval = ClientCommand {
+        command_id: ClientCommandId::new(),
+        session_id: Some(session_id),
+        task_id: None,
+        action: ClientCommandAction::ApproveGraph,
+        payload: serde_json::to_value(ApproveGraphCommandPayload {
+            revision_id: graph.revision.revision_id,
+            requirement_revision_id: authority.requirement_revision_id,
+            validation_hash: authority.validation_hash,
+            base_commit: authority.base_commit,
+            proposal_hash: graph
+                .revision
+                .proposal_hash
+                .ok_or("missing proposal hash")?,
+            approved_by: "operator".to_owned(),
+        })?,
+        idempotency_key: "reject-invalid-current-policy".to_owned(),
+        state: ClientCommandState::Pending,
+        requested_by: "operator".to_owned(),
+        requested_at: Utc::now(),
+        claimed_at: None,
+        completed_at: None,
+        outcome: None,
+    };
+    database.submit_client_command_with_invocation(&approval, false)?;
+    services.validation_policy.max_parallel_workers = 0;
+    services
+        .validation_policy
+        .per_provider_limits
+        .insert(ProviderId::Codex, 0);
+
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+
+    let stored = database
+        .load_client_command(approval.command_id)?
+        .ok_or("missing approval")?;
+    assert_eq!(stored.state, ClientCommandState::Failed);
+    assert!(
+        stored
+            .outcome
+            .unwrap_or_default()
+            .contains("current writable policy")
+    );
+    assert_zero_writable_rows(&database_path, &database)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn plan_only_invocation_rejects_spoofed_approval_then_later_explicit_approval_succeeds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
+    let mut append = append_command(session_id, "candidate");
+    append.requested_by = "spoofable-client-field".to_owned();
+    let message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    database.submit_client_command_with_invocation(&append, true)?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
     let services = services(
@@ -411,6 +668,9 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
         },
     );
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let plan = database
+        .load_client_command_by_idempotency_key(&format!("conversation-plan-{message_id}"))?
+        .ok_or("missing plan-only planning command")?;
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
     let graph = database.current_graph(session_id)?.ok_or("missing graph")?;
     assert_eq!(graph.revision.status, GraphRevisionStatus::AwaitingApproval);
@@ -430,9 +690,9 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
     let summary: orchestrator_domain::GraphValidationSummary =
         serde_json::from_value(graph.revision.validation.clone())?;
     let authority = summary.authority.ok_or("missing graph authority")?;
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
 
-    let approval = ClientCommand {
+    let same_invocation_approval = ClientCommand {
         command_id: ClientCommandId::new(),
         session_id: Some(session_id),
         task_id: None,
@@ -445,7 +705,7 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
             proposal_hash,
             approved_by: "operator".to_owned(),
         })?,
-        idempotency_key: "approve-validated-candidate".to_owned(),
+        idempotency_key: "reject-plan-only-derived-approval".to_owned(),
         state: ClientCommandState::Pending,
         requested_by: "operator".to_owned(),
         requested_at: Utc::now(),
@@ -453,11 +713,30 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
         completed_at: None,
         outcome: None,
     };
-    database.submit_client_command(&approval)?;
+    database.submit_derived_client_command(plan.command_id, &same_invocation_approval)?;
     process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
-    database.submit_client_command(&approval)?;
+    let rejected = database
+        .load_client_command(same_invocation_approval.command_id)?
+        .ok_or("missing rejected plan-only approval")?;
+    assert_eq!(rejected.state, ClientCommandState::Failed);
+    assert!(rejected.outcome.unwrap_or_default().contains("plan-only"));
+    assert_zero_writable_rows(&database_path, &database)?;
 
-    database.with_connection(|connection| {
+    let explicit_approval = ClientCommand {
+        command_id: ClientCommandId::new(),
+        idempotency_key: "later-explicit-graph-approval".to_owned(),
+        requested_by: "spoofable-client-field".to_owned(),
+        ..same_invocation_approval
+    };
+    database.submit_client_command_with_invocation(&explicit_approval, false)?;
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+    let approved = database
+        .load_client_command(explicit_approval.command_id)?
+        .ok_or("missing explicit approval")?;
+    assert_eq!(approved.state, ClientCommandState::Completed);
+    database.submit_client_command_with_invocation(&explicit_approval, false)?;
+
+    with_workspace(&database_path, &database, |connection| {
         let tasks: i64 =
             connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
         let worktrees: i64 =
@@ -485,8 +764,9 @@ async fn validated_candidate_materializes_once_only_after_exact_approval()
 #[tokio::test]
 async fn new_user_message_atomically_supersedes_approval_candidate()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
@@ -529,22 +809,24 @@ async fn new_user_message_atomically_supersedes_approval_candidate()
             .map(|session| session.state),
         Some(SessionState::Drafting)
     );
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = Arc::new(database()?);
-    let session_id = seed_session(&database)?;
-    database.submit_client_command(&append_command(session_id, "hello"))?;
-    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
-    let claimed = database
+    let (database, workspace_id, database_path) = database()?;
+    let database = Arc::new(database);
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    workspace.submit_client_command(&append_command(session_id, "hello"))?;
+    process_next_client_command(&workspace, &IdentityRedactor, Utc::now())?;
+    let claimed = workspace
         .claim_next_orchestration_client_command(Utc::now())?
         .ok_or("missing conversation command")?;
     let attempt_id = ConversationAttemptId::from_uuid(claimed.command_id.into_uuid());
-    database.begin_conversation_attempt(&NewConversationAttempt {
+    workspace.begin_conversation_attempt(&NewConversationAttempt {
         attempt_id,
         session_id,
         source_message_id: claimed
@@ -570,6 +852,7 @@ async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
 
     serve_with_orchestration(
         Arc::clone(&database),
+        workspace.workspace_id(),
         DaemonInstanceId::new(),
         42,
         cancellation,
@@ -580,26 +863,27 @@ async fn daemon_restart_finalizes_interrupted_conversation_before_polling()
     .await?;
 
     assert_eq!(
-        database
+        workspace
             .load_conversation_attempt(attempt_id)?
             .map(|attempt| attempt.status),
         Some(ConversationAttemptStatus::Failed)
     );
     assert_eq!(
-        database
+        workspace
             .load_client_command(claimed.command_id)?
             .map(|command| command.state),
         Some(ClientCommandState::Failed)
     );
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &workspace)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn repository_head_drift_rejects_approval_without_materializing_tasks()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = database()?;
-    let session_id = seed_session(&database)?;
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
     database.submit_client_command(&append_command(session_id, "candidate"))?;
     process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
     let repository = git_repository()?;
@@ -666,6 +950,6 @@ async fn repository_head_drift_rejects_approval_without_materializing_tasks()
         .ok_or("missing approval command")?;
     assert_eq!(stored.state, ClientCommandState::Failed);
     assert!(stored.outcome.unwrap_or_default().contains("HEAD changed"));
-    assert_zero_writable_rows(&database)?;
+    assert_zero_writable_rows(&database_path, &database)?;
     Ok(())
 }

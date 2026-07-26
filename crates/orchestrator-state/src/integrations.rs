@@ -8,10 +8,11 @@ use orchestrator_domain::{
     TaskState,
 };
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult, database::append_event_in_transaction};
+use crate::{StateError, StateResult, WorkspaceDatabase, database::append_event_in_transaction};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum IntegrationBatchStatus {
     Preview,
     Blocked,
@@ -36,7 +37,7 @@ impl IntegrationBatchStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct StoredIntegrationBatch {
     pub preview: IntegrationPreview,
     pub status: IntegrationBatchStatus,
@@ -44,7 +45,9 @@ pub struct StoredIntegrationBatch {
     pub application: Option<IntegrationApplication>,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn record_integration_preview(
         &self,
         preview: &IntegrationPreview,
@@ -69,8 +72,9 @@ impl Database {
             ));
         }
         transaction.execute(
-            "UPDATE integration_batches SET status = 'superseded', completed_at = ?1
-             WHERE session_id = ?2 AND status IN ('preview', 'blocked')",
+            "UPDATE main.integration_batches SET status = 'superseded', completed_at = ?1
+             WHERE workspace_id = current_workspace() \
+               AND session_id = ?2 AND status IN ('preview', 'blocked')",
             params![
                 preview.created_at.to_rfc3339(),
                 preview.session_id.to_string()
@@ -87,7 +91,7 @@ impl Database {
             IntegrationBatchStatus::Blocked
         };
         transaction.execute(
-            "INSERT INTO integration_batches(batch_id, session_id, revision_id, ordinal,
+            "INSERT INTO main.integration_batches(batch_id, session_id, revision_id, ordinal,
                 status, base_revision, preview_hash, preview_json, created_at, completed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
             params![
@@ -104,7 +108,7 @@ impl Database {
         )?;
         for (index, source) in preview.sources.iter().enumerate() {
             transaction.execute(
-                "INSERT INTO integration_sources(batch_id, source_order, task_id,
+                "INSERT INTO main.integration_sources(batch_id, source_order, task_id,
                     checkpoint_id, verification_id, diff_sha256, source_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -169,7 +173,7 @@ impl Database {
             .validate_for(&preview)
             .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
         transaction.execute(
-            "INSERT INTO integration_approvals(batch_id, preview_hash, approved_by, approved_at)
+            "INSERT INTO main.integration_approvals(batch_id, preview_hash, approved_by, approved_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 approval.batch_id.to_string(),
@@ -179,8 +183,8 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "UPDATE integration_batches SET status = 'approved'
-             WHERE batch_id = ?1 AND status = 'preview'",
+            "UPDATE main.integration_batches SET status = 'approved'
+             WHERE workspace_id = current_workspace() AND batch_id = ?1 AND status = 'preview'",
             [approval.batch_id.to_string()],
         )?;
         transaction.commit()?;
@@ -208,7 +212,7 @@ impl Database {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO integration_applications(application_id, batch_id, preview_hash,
+            "INSERT INTO main.integration_applications(application_id, batch_id, preview_hash,
                 state, worktree_path, branch_name, resulting_tree, detail_redacted,
                 started_at, completed_at)
              VALUES (?1, ?2, ?3, 'applying', ?4, ?5, NULL, '', ?6, NULL)",
@@ -222,7 +226,8 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "UPDATE integration_batches SET status = 'applying' WHERE batch_id = ?1",
+            "UPDATE main.integration_batches SET status = 'applying' \
+             WHERE workspace_id = current_workspace() AND batch_id = ?1",
             [batch_id.to_string()],
         )?;
         transaction.commit()?;
@@ -241,9 +246,10 @@ impl Database {
             "failed"
         };
         let changed = transaction.execute(
-            "UPDATE integration_applications SET state = ?1, resulting_tree = ?2,
+            "UPDATE main.integration_applications SET state = ?1, resulting_tree = ?2,
                 detail_redacted = ?3, completed_at = ?4
-             WHERE application_id = ?5 AND batch_id = ?6 AND state = 'applying'
+             WHERE workspace_id = current_workspace() \
+               AND application_id = ?5 AND batch_id = ?6 AND state = 'applying'
                AND preview_hash = ?7",
             params![
                 state,
@@ -261,7 +267,8 @@ impl Database {
             });
         }
         transaction.execute(
-            "UPDATE integration_batches SET status = ?1, completed_at = ?2 WHERE batch_id = ?3",
+            "UPDATE main.integration_batches SET status = ?1, completed_at = ?2 \
+             WHERE workspace_id = current_workspace() AND batch_id = ?3",
             params![
                 if application.succeeded {
                     "applied"
@@ -402,7 +409,7 @@ impl Database {
         };
         let timestamp = now.to_rfc3339();
         transaction.execute(
-            "INSERT INTO tasks(task_id, schema_version, revision, state, resume_state, paused,
+            "INSERT INTO main.tasks(task_id, schema_version, revision, state, resume_state, paused,
                 objective, original_request_redacted, task_envelope_json, created_at, updated_at,
                 archived_at)
              VALUES (?1, ?2, 0, 'queued', NULL, 0, ?3, ?4, ?5, ?6, ?6, NULL)",
@@ -416,7 +423,7 @@ impl Database {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+            "INSERT INTO main.session_tasks(session_id, revision_id, task_id, node_key,
                 display_order, provider_id, provider_id_v2, model_profile)
              VALUES (?1, ?2, ?3, ?4, ?5,
                      CASE WHEN ?6 = 'agy' THEN 'codex' ELSE ?6 END, ?6, ?7)",
@@ -432,7 +439,7 @@ impl Database {
         )?;
         for dependency_id in dependency_ids {
             transaction.execute(
-                "INSERT INTO task_dependencies(session_id, revision_id, task_id,
+                "INSERT INTO main.task_dependencies(session_id, revision_id, task_id,
                     depends_on_task_id) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     session_id.to_string(),
@@ -443,7 +450,7 @@ impl Database {
             )?;
         }
         transaction.execute(
-            "INSERT INTO integration_resolution_tasks(batch_id, task_id, created_by, created_at)
+            "INSERT INTO main.integration_resolution_tasks(batch_id, task_id, created_by, created_at)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 batch_id.to_string(),
@@ -536,17 +543,19 @@ impl Database {
                 "approved" | "applying" => {
                     if status == "applying" {
                         transaction.execute(
-                            "UPDATE integration_applications
+                            "UPDATE main.integration_applications
                              SET state = 'interrupted',
                                  detail_redacted = 'daemon stopped during integration application',
                                  completed_at = ?1
-                             WHERE batch_id = ?2 AND state = 'applying'",
+                             WHERE workspace_id = current_workspace() \
+                               AND batch_id = ?2 AND state = 'applying'",
                             params![now.to_rfc3339(), batch_id],
                         )?;
                     }
                     transaction.execute(
-                        "UPDATE integration_batches SET status = 'needs_attention', completed_at = ?1
-                         WHERE batch_id = ?2 AND status IN ('approved', 'applying')",
+                        "UPDATE main.integration_batches SET status = 'needs_attention', completed_at = ?1
+                         WHERE workspace_id = current_workspace() \
+                           AND batch_id = ?2 AND status IN ('approved', 'applying')",
                         params![now.to_rfc3339(), batch_id],
                     )?;
                     if session_state != SessionState::NeedsAttention {
@@ -593,6 +602,12 @@ impl Database {
         Ok(reconciled)
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 fn transition_session_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
@@ -618,9 +633,10 @@ fn transition_session_in_transaction(
         .ok_or_else(|| StateError::InvalidRecord("invalid session state".to_owned()))?
         .to_owned();
     let changed = transaction.execute(
-        "UPDATE sessions SET state = ?1, state_v2 = ?2,
+        "UPDATE main.sessions SET state = ?1, state_v2 = ?2,
          revision = revision + 1, updated_at = ?3
-         WHERE session_id = ?4 AND coalesce(state_v2, state) = ?5",
+         WHERE workspace_id = current_workspace() \
+           AND session_id = ?4 AND coalesce(state_v2, state) = ?5",
         params![
             legacy_to_text,
             to_text,
@@ -802,7 +818,7 @@ mod tests {
         second_source.task_id = second_source_task_id;
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO sessions(session_id, schema_version, revision, title, state,
+                "INSERT INTO main.sessions(session_id, schema_version, revision, title, state,
                     created_at, updated_at, archived_at)
                  VALUES (?1, ?2, 0, 'integration', 'running', ?3, ?3, NULL)",
                 params![
@@ -812,7 +828,7 @@ mod tests {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, task_id, ordinal,
+                "INSERT INTO main.conversation_messages(message_id, session_id, task_id, ordinal,
                     role, kind, state, content_redacted, created_at, finalized_at)
                  VALUES (?1, ?2, NULL, 1, 'user', 'user_message', 'final', 'integrate', ?3, ?3)",
                 params![
@@ -822,7 +838,7 @@ mod tests {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+                "INSERT INTO main.graph_revisions(revision_id, session_id, goal_message_id, ordinal,
                     status, proposal_hash, proposal_json, validation_json, planner_provider,
                     created_at, completed_at)
                  VALUES (?1, ?2, ?3, 1, 'approved', NULL, NULL, '{}', 'codex', ?4, ?4)",
@@ -834,7 +850,7 @@ mod tests {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+                "INSERT INTO main.session_graph_heads(session_id, revision_id, updated_at)
                  VALUES (?1, ?2, ?3)",
                 params![
                     session_id.to_string(),
@@ -844,7 +860,7 @@ mod tests {
             )?;
             for (index, envelope) in [source.clone(), second_source.clone()].iter().enumerate() {
                 connection.execute(
-                    "INSERT INTO tasks(task_id, schema_version, revision, state, resume_state,
+                    "INSERT INTO main.tasks(task_id, schema_version, revision, state, resume_state,
                         paused, objective, original_request_redacted, task_envelope_json,
                         created_at, updated_at, archived_at)
                      VALUES (?1, ?2, 0, 'completed', NULL, 0, ?3, ?4, ?5, ?6, ?6, NULL)",
@@ -858,7 +874,7 @@ mod tests {
                     ],
                 )?;
                 connection.execute(
-                    "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                    "INSERT INTO main.session_tasks(session_id, revision_id, task_id, node_key,
                         display_order, provider_id, model_profile)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
                     params![
@@ -906,7 +922,8 @@ mod tests {
             )?;
             assert_eq!(dependencies, 2);
             connection.execute(
-                "UPDATE tasks SET state = 'completed' WHERE task_id = ?1",
+                "UPDATE main.tasks SET state = 'completed' \
+                 WHERE workspace_id = current_workspace() AND task_id = ?1",
                 [resolution.to_string()],
             )?;
             Ok(())
@@ -918,15 +935,17 @@ mod tests {
         let application_id = IntegrationApplicationId::new();
         database.with_connection(|connection| {
             connection.execute(
-                "UPDATE sessions SET state = 'integrating' WHERE session_id = ?1",
+                "UPDATE main.sessions SET state = 'integrating' \
+                 WHERE workspace_id = current_workspace() AND session_id = ?1",
                 [session_id.to_string()],
             )?;
             connection.execute(
-                "UPDATE integration_batches SET status = 'applying' WHERE batch_id = ?1",
+                "UPDATE main.integration_batches SET status = 'applying' \
+                 WHERE workspace_id = current_workspace() AND batch_id = ?1",
                 [batch_id.to_string()],
             )?;
             connection.execute(
-                "INSERT INTO integration_applications(application_id, batch_id, preview_hash,
+                "INSERT INTO main.integration_applications(application_id, batch_id, preview_hash,
                     state, worktree_path, branch_name, resulting_tree, detail_redacted,
                     started_at, completed_at)
                  VALUES (?1, ?2, ?3, 'applying', '.colay/integration/test',

@@ -2,7 +2,7 @@
 
 ## Initialize and diagnose
 
-Run `colay init` once in the repository. It writes a minimal versioned override (rather than a materialized copy of every default), creates `.colay`, migrates a new SQLite database to the current schema, and creates/reconciles `events.jsonl`. Initialization does not invoke a provider. Other read-only commands do not create repository state. `run --plan-only` creates persisted static-assessment state if it is absent; a normal `colay run` creates state only after Git readiness succeeds.
+`colay init` writes a minimal versioned repository policy override when an editable local policy is wanted. Durable orchestration state is not repository-local: one user daemon owns one SQLite database per native OS user environment, and each encountered directory receives a non-null workspace UUID. Windows and WSL therefore use separate native state roots and never share a SQLite file. Initialization and state maintenance do not invoke provider inference. `doctor`, `status`, `compatibility`, and `run --plan-only` do not create `.colay` state unless an explicit local policy edit is requested.
 
 ## Configuration resolution
 
@@ -18,13 +18,15 @@ compiled defaults
 
 `COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Layers merge table values by key; arrays replace the lower-precedence value and never concatenate. Each loaded layer must carry the current supported `config_version`. Missing automatic layers are allowed, but normal runtime commands require a path selected through `$COLAY_CONFIG` or `--config` to exist. `init` instead treats a missing explicit selector as the destination for its new minimal override. A malformed or unsupported loaded layer fails startup rather than being skipped.
 
-The personal `$COLAY_HOME` layer and `$COLAY_CONFIG` provide configuration inputs only. The effective `state_dir` is constrained beneath the repository, so task state remains repository-local. When neither explicit selector is used, Colay discovers either `.colay/config.toml` or the legacy `.codex/orchestrator/config.toml` without moving live state. If both are present, automatic resolution fails closed; use `--config` to select one explicitly.
+The personal `$COLAY_HOME` layer and `$COLAY_CONFIG` provide configuration inputs. Missing local and global layers use the same validated compiled defaults and cannot block global state creation, doctor, or forward migration. The legacy `state_dir` setting is consulted only while inspecting the current workspace for a repository-local import source; new durable records always use the user-global database and workspace data root. When neither explicit selector is used, Colay may discover `.colay/config.toml` or the legacy `.codex/orchestrator/config.toml` as a project policy. If both are present, automatic resolution fails closed; use `--config` to select one explicitly.
 
-`colay doctor` performs only non-inference checks: config validation, current native executable/build/target identity, SQLite integrity/schema health when the database exists, event-log reconciliation when the log exists, active repository-daemon executable/build identity, and `<provider> --version` for configured CLIs. A CLI/daemon identity mismatch is a warning that requires stopping and restarting the daemon with the intended binary. Only a successful provider version check includes structured configured-executable, resolved-executable, and executable-kind evidence. Failed resolution, spawn, or nonzero version checks report their detail without that structured evidence. Doctor does not prove sandbox behavior or start a model turn.
+`colay doctor` performs only non-inference checks. Under exclusive maintenance ownership it captures an existing database and its effective WAL or rollback-journal state in an owner-private temporary directory, runs all SQLite integrity, workspace, and audit queries against that retained snapshot, and removes the snapshot when diagnosis ends. It never opens the source database through SQLite, changes source database or sidecar bytes, creates a backup or artifact directory, migrates the database, or registers or refreshes a workspace. A missing database, a pending migration, or an unregistered repository is reported as a warning with the explicit writable command needed to repair it. When the user daemon is live, doctor preserves an explicit `--config` selection while connecting and consumes one versioned, typed workspace-diagnostics response. A missing, malformed, mismatched, or unsupported response fails every dependent integrity category closed.
+
+Doctor reports global path/database integrity and schema, daemon runtime identity, the current workspace UUID/path, that workspace's event-chain head, every persisted artifact reference and its hash, Git readiness, the running CLI build/target, and every configured provider's safe public compatibility assessment. A CLI/daemon identity mismatch is a warning that requires restarting the user daemon with the intended binary. Successful executable resolution includes configured path, canonical resolved path, and executable kind. Doctor never starts a model turn, inspects credentials, or scrapes usage.
 
 Executable resolution is platform-specific but shared by diagnostics and execution. On Windows, a bare executable name is searched through the effective `PATH` using only `.exe`, `.com`, `.cmd`, and `.bat` entries from `PATHEXT`, in `PATHEXT` order; matching is case-insensitive and `.cmd`/`.bat` are reported as command scripts. A bare Unix name must be a regular file with an executable permission bit. An explicit path is resolved from the working directory when relative, and a missing explicit path does not fall back to `PATH`.
 
-`colay compatibility` performs the deeper Codex-only capability probe. The probe allowlist is limited to version/help output and stable App Server schema generation. The possible startup classifications are:
+`colay doctor providers` refreshes all configured providers through the existing safe assessment APIs. `colay compatibility` is a behavioral alias with the same provider report; only the JSON envelope command label differs. Because this supersedes the older Codex-only compatibility payload, both commands identify the multi-provider envelope and data contract as schema v2 rather than silently reusing v1. Probe allowlists remain limited to documented version/help/schema surfaces. The possible Codex startup classifications are:
 
 - `Compatible`: an exact tested Codex version exposes the mandatory public contract.
 - `CompatibleWithWarnings`: mandatory execution remains available but an optional capability is degraded.
@@ -60,7 +62,7 @@ On WSL, prefer a Linux-native clone under the distribution filesystem (for examp
 rules to the same files. Use Windows Colay with Windows Git for a Windows checkout; do not alternate
 Windows and WSL Git against one working tree. Review `git status --short` before writable approval.
 
-`status`, `usage`, `providers`, `explain-routing`, and `compatibility` support
+`status`, `usage`, `providers`, `doctor`, `explain-routing`, and `compatibility` support
 global `--json`. `colay tui [task-id]` opens the durable chat workspace and
 starts the daemon when needed. The header reports `online`, `stale`, or
 `offline`; stale/offline workspaces remain readable but messages and task
@@ -138,14 +140,23 @@ application, `/resolve` materializes one idempotent task bound to the batch;
 completing it grants no authority, and `/integrate` plus `/approve` must run
 again.
 
-## Repository daemon
+## User daemon and maintenance ownership
 
-Use `colay daemon start` to initialize missing repository state and launch the
-single local background service. A repeated start returns the existing healthy
-instance. `colay daemon status` is read-only and reports `stopped`, `online`, or
-`stale`; it does not create state when the database is absent. `stop` requests a
+Use `colay daemon start` to initialize missing user-global state, register the
+current workspace, and launch the single per-user background service. Repeating
+the command from any workspace attaches to that same daemon and database.
+`colay daemon status` reports `stopped`, `online`, or `stale`; `stop` requests a
 graceful release and is idempotent when no daemon exists. `restart` waits for the
-previous lease to be released or expire before starting a replacement.
+singleton owner and lease to be released before starting a replacement.
+
+Ordinary CLI and TUI mutations go through the daemon writer queue. Explicit
+`doctor`, `migrate`, migration rollback, and release rollback maintenance may open SQLite directly
+only after acquiring the same OS singleton lock. A live daemon therefore makes
+offline migration or rollback fail with an ownership diagnostic instead of admitting a
+second writer. Release rollback plans, approvals, audit, quiescence checks, and artifacts use the
+registered global workspace rather than repository-local state. Stop the daemon and repeat the maintenance command. Provider safe
+mode is never authority for database creation, backup, forward migration, import
+inspection, or state doctor; future-schema writes still fail closed.
 
 The hidden `daemon serve` action is an internal child-process entry point. The
 service heartbeats once per second with a five-second lease, processes durable
@@ -163,7 +174,7 @@ endpoint.
 
 `resume <task-id>` is the restart path for a paused, blocked, or interrupted non-terminal task. It validates the persisted worktree, sealed checkpoint/handover, task revision, and schema; converts an interrupted running/checkpoint/handover transition to an authoritative Git checkpoint when necessary; performs the persistence secret preflight; reroutes with current usage/health; and resumes through a vendor-neutral bundle. Inconsistent projections, missing worktrees, failed integrity, or unsafe persistence scans fail closed for administrator review.
 
-SQLite and the hash-chained JSONL log retain tasks, attempts, checkpoints, handovers, leases, and worktree metadata across process restarts. Stale claimed pause/resume/cancel controls can be requeued safely; ambiguous handover/usage-override controls require manual reconciliation.
+The global SQLite database retains tasks, attempts, checkpoints, handovers, leases, artifact references, and workspace-scoped hash chains across process restarts. Workspace files, including artifacts and managed worktrees, live below the matching UUID directory. Stale claimed pause/resume/cancel controls can be requeued safely; ambiguous handover/usage-override controls require manual reconciliation.
 
 Client commands use unique idempotency keys. Stale claimed session creation,
 message append, planning, graph approval, and preview commands are reconciled or

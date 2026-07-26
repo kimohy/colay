@@ -3,14 +3,14 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context as _, Result, bail};
-use orchestrator_domain::{
-    Checkpoint, EventType, HandoverAcknowledgement, HandoverBundle, ProviderId, TaskEvent, TaskId,
-};
-use orchestrator_state::{MigrationManager, ensure_private_file};
+use chrono::Utc;
+use orchestrator_domain::{EventType, TaskEvent, TaskId};
+use orchestrator_state::{Database, MigrationManager, ensure_private_file};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
@@ -56,8 +56,38 @@ fn run_cli(repository: &Path, config: &Path, args: &[OsString]) -> Result<Value>
         OsString::from("--json"),
     ];
     full_args.extend_from_slice(args);
-    let output = run_command(&colay_binary(), repository, &full_args)?;
-    serde_json::from_slice(&output.stdout).context("CLI stdout was not one JSON envelope")
+    let executable = colay_binary();
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let status = Command::new(&executable)
+        .current_dir(repository)
+        .args(&full_args)
+        .env(
+            "COLAY_HOME",
+            repository.parent().unwrap_or(repository).join("colay-home"),
+        )
+        .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?))
+        .status()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    stdout.seek(SeekFrom::Start(0))?;
+    stderr.seek(SeekFrom::Start(0))?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout.read_to_end(&mut stdout_bytes)?;
+    stderr.read_to_end(&mut stderr_bytes)?;
+    if !status.success() {
+        bail!(
+            "{} {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
+            executable.display(),
+            full_args,
+            status,
+            String::from_utf8_lossy(&stdout_bytes),
+            String::from_utf8_lossy(&stderr_bytes)
+        );
+    }
+    serde_json::from_slice(&stdout_bytes).context("CLI stdout was not one JSON envelope")
 }
 
 fn toml_path(path: &Path) -> String {
@@ -88,7 +118,7 @@ fn install_fake_provider_config(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn initialize_repository(repository: &Path) -> Result<PathBuf> {
+fn initialize_repository(repository: &Path, with_legacy_state: bool) -> Result<PathBuf> {
     fs::create_dir_all(repository.join("src"))?;
     fs::write(
         repository.join("Cargo.toml"),
@@ -121,6 +151,19 @@ fn initialize_repository(repository: &Path) -> Result<PathBuf> {
             OsString::from("."),
         ],
     )?;
+    if with_legacy_state {
+        let global_root = repository.parent().unwrap_or(repository).join("colay-home");
+        let database_path = global_root.join("state/state.db");
+        let database = Database::open(&database_path)?;
+        database.migrate_with_backup(&global_root.join("state/backups"))?;
+        drop(database);
+        let database = Connection::open(database_path)?;
+        database.execute(
+            "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+            [Utc::now().to_rfc3339()],
+        )?;
+    }
     install_fake_provider_config(&config)?;
     Ok(config)
 }
@@ -193,6 +236,17 @@ fn verification_stderr(repository: &Path, output: &Value) -> Result<String> {
     Ok(diagnostics)
 }
 
+fn load_workspace_events(connection: &Connection, workspace_id: &str) -> Result<Vec<TaskEvent>> {
+    let event_json = connection
+        .prepare("SELECT event_json FROM task_events WHERE workspace_id = ?1 ORDER BY sequence")?
+        .query_map([workspace_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    event_json
+        .iter()
+        .map(|event| serde_json::from_str::<TaskEvent>(event).map_err(Into::into))
+        .collect()
+}
+
 #[test]
 fn verification_stderr_reports_redacted_command_logs() -> Result<()> {
     let temporary = tempfile::tempdir()?;
@@ -218,12 +272,11 @@ fn verification_stderr_reports_redacted_command_logs() -> Result<()> {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> Result<()> {
+fn structured_run_enters_conversation_without_executing_handover() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let repository = fs::canonicalize(temporary.path())?.join("repository");
     fs::create_dir_all(&repository)?;
-    let config = initialize_repository(&repository)?;
+    let config = initialize_repository(&repository, false)?;
     let task_file = write_task_file(&repository)?;
 
     let output = run_cli(
@@ -235,148 +288,45 @@ fn real_cli_preserves_partial_diff_and_completes_codex_to_claude_handover() -> R
             task_file.as_os_str().to_owned(),
         ],
     )?;
-    let verification_stderr = verification_stderr(&repository, &output)?;
     assert_eq!(
         output.get("command").and_then(Value::as_str),
-        Some("run_completed"),
-        "unexpected CLI output: {}\nverification stderr:\n{}",
-        serde_json::to_string_pretty(&output)?,
-        verification_stderr
+        Some("run_conversation"),
+        "unexpected CLI output: {}",
+        serde_json::to_string_pretty(&output)?
     );
-    let data = output
-        .get("data")
-        .context("run output did not contain data")?;
-    let task_id = data
-        .get("task_id")
-        .and_then(Value::as_str)
-        .context("run output did not contain task_id")?;
-    let worktree = PathBuf::from(
-        data.pointer("/worktree/path")
-            .and_then(Value::as_str)
-            .context("run output did not contain the worktree path")?,
-    );
-    assert!(worktree.is_dir());
-    assert_eq!(
-        fs::read_to_string(worktree.join("src/partial.txt"))?,
-        "partial work preserved across handover\n"
-    );
-    assert!(
-        fs::read_to_string(worktree.join("src/lib.rs"))?.contains("answer() -> u32 {\n    42\n}")
-    );
+    assert_eq!(output.pointer("/data/plan_only"), Some(&Value::Bool(false)));
     assert!(fs::read_to_string(repository.join("src/lib.rs"))?.contains("answer() -> u32 { 1 }"));
     assert!(!repository.join("src/partial.txt").exists());
-
-    let database_path = repository.join(".colay/orchestrator.db");
-    let database = Connection::open(&database_path)?;
-    let state: String = database.query_row(
-        "SELECT state FROM tasks WHERE task_id = ?1",
-        [task_id],
-        |row| row.get(0),
+    let global = Connection::open(
+        repository
+            .parent()
+            .context("repository has no parent")?
+            .join("colay-home/state/state.db"),
     )?;
-    assert_eq!(state, "completed");
-
-    let attempts = {
-        let mut statement = database.prepare(
-            "SELECT provider_id, worker_mode, outcome FROM task_attempts \
-             WHERE task_id = ?1 ORDER BY ordinal",
-        )?;
-        statement
-            .query_map([task_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    assert_eq!(
-        attempts,
-        vec![
-            (
-                "codex".to_owned(),
-                "workspace_write".to_owned(),
-                "quota_exceeded".to_owned(),
-            ),
-            (
-                "claude".to_owned(),
-                "read_only".to_owned(),
-                "succeeded".to_owned(),
-            ),
-            (
-                "claude".to_owned(),
-                "workspace_write".to_owned(),
-                "succeeded".to_owned(),
-            ),
-        ]
-    );
-
-    let checkpoint_json: String = database.query_row(
-        "SELECT checkpoint_json FROM checkpoints WHERE task_id = ?1",
-        [task_id],
-        |row| row.get(0),
+    let (sessions, tasks, worktrees): (i64, i64, i64) = global.query_row(
+        "SELECT (SELECT count(*) FROM sessions),
+                (SELECT count(*) FROM tasks),
+                (SELECT count(*) FROM worktrees)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    let checkpoint: Checkpoint = serde_json::from_str(&checkpoint_json)?;
-    assert!(checkpoint.verify_integrity()?);
-    assert_eq!(checkpoint.current_worker, ProviderId::Codex);
-    assert!(
-        checkpoint
-            .files_changed
-            .iter()
-            .any(|path| path.to_string() == "src/partial.txt")
-    );
-
-    let (bundle_json, acknowledgement_json): (String, String) = database.query_row(
-        "SELECT bundle_json, acknowledgement_json FROM handovers WHERE task_id = ?1",
-        [task_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let bundle: HandoverBundle = serde_json::from_str(&bundle_json)?;
-    let acknowledgement: HandoverAcknowledgement = serde_json::from_str(&acknowledgement_json)?;
-    assert!(bundle.verify_integrity()?);
-    assert_eq!(bundle.current_worker, ProviderId::Codex);
-    assert_eq!(bundle.recommended_next_worker, ProviderId::Claude);
-    assert!(acknowledgement.matches(&bundle));
-
-    let events_path = repository.join(".colay/events.jsonl");
-    let events = fs::read_to_string(events_path)?
-        .lines()
-        .map(serde_json::from_str::<TaskEvent>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut previous_hash = None;
-    for event in &events {
-        assert_eq!(event.previous_hash, previous_hash);
-        assert!(event.verify_hash()?);
-        previous_hash = Some(event.event_hash.clone());
-    }
-    for expected in [
-        EventType::ProviderExhausted,
-        EventType::CheckpointCreated,
-        EventType::HandoverStarted,
-        EventType::HandoverCompleted,
-        EventType::VerificationCompleted,
-        EventType::TaskCompleted,
-    ] {
-        assert!(events.iter().any(|event| event.event_type == expected));
-    }
-
+    assert_eq!((sessions, tasks, worktrees), (1, 0, 0));
     let porcelain = git(&repository, &["status", "--porcelain"])?;
     assert!(porcelain.stdout.is_empty());
-    assert_eq!(
-        data.get("cleanup_requires_user_approval"),
-        Some(&Value::Bool(true))
-    );
-    assert_eq!(data.get("automatic_merge"), Some(&Value::Bool(false)));
-    assert_eq!(data.get("automatic_push"), Some(&Value::Bool(false)));
+    run_cli(
+        &repository,
+        &config,
+        &[OsString::from("daemon"), OsString::from("stop")],
+    )?;
     Ok(())
 }
 
 #[test]
-fn planned_task_resumes_without_duplicate_task_or_worktree() -> Result<()> {
+fn plan_only_structured_run_has_no_resumable_writable_task() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let repository = fs::canonicalize(temporary.path())?.join("repository");
     fs::create_dir_all(&repository)?;
-    let config = initialize_repository(&repository)?;
+    let config = initialize_repository(&repository, false)?;
     let task_file = write_task_file(&repository)?;
 
     let planned = run_cli(
@@ -389,30 +339,29 @@ fn planned_task_resumes_without_duplicate_task_or_worktree() -> Result<()> {
             task_file.as_os_str().to_owned(),
         ],
     )?;
-    let task_id = planned
-        .pointer("/data/task/task_id")
-        .or_else(|| planned.pointer("/data/task_id"))
-        .and_then(Value::as_str)
-        .context("plan-only output did not contain the persisted task ID")?;
-
-    let resumed = run_cli(
-        &repository,
-        &config,
-        &[OsString::from("resume"), OsString::from(task_id)],
-    )?;
     assert_eq!(
-        resumed.get("command").and_then(Value::as_str),
-        Some("run_completed")
+        planned.get("command").and_then(Value::as_str),
+        Some("run_conversation")
     );
-
-    let database = Connection::open(repository.join(".colay/orchestrator.db"))?;
-    let (tasks, worktrees): (i64, i64) = database.query_row(
-        "SELECT (SELECT count(*) FROM tasks WHERE task_id = ?1),
-                (SELECT count(*) FROM worktrees WHERE task_id = ?1)",
-        [task_id],
+    assert_eq!(planned.pointer("/data/plan_only"), Some(&Value::Bool(true)));
+    assert!(planned.pointer("/data/task_id").is_none());
+    let global = Connection::open(
+        repository
+            .parent()
+            .context("repository has no parent")?
+            .join("colay-home/state/state.db"),
+    )?;
+    let (tasks, worktrees): (i64, i64) = global.query_row(
+        "SELECT (SELECT count(*) FROM tasks), (SELECT count(*) FROM worktrees)",
+        [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!((tasks, worktrees), (1, 1));
+    assert_eq!((tasks, worktrees), (0, 0));
+    run_cli(
+        &repository,
+        &config,
+        &[OsString::from("daemon"), OsString::from("stop")],
+    )?;
     Ok(())
 }
 
@@ -421,10 +370,13 @@ fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<
     let temporary = tempfile::tempdir()?;
     let repository = fs::canonicalize(temporary.path())?.join("repository");
     fs::create_dir_all(&repository)?;
-    let config = initialize_repository(&repository)?;
-    let state_root = repository.join(".colay");
-    let database_path = state_root.join("orchestrator.db");
-    let backup_path = state_root.join("backups/orchestrator.db.backup.rollback-e2e");
+    let config = initialize_repository(&repository, true)?;
+    let state_root = repository
+        .parent()
+        .unwrap_or(&repository)
+        .join("colay-home");
+    let database_path = state_root.join("state/state.db");
+    let backup_path = state_root.join("state/backups/state.db.backup.rollback-e2e");
 
     let database = Connection::open(&database_path)?;
     MigrationManager::backup(&database, &backup_path)?;
@@ -488,6 +440,7 @@ fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<
         |row| row.get(0),
     )?;
     assert_eq!(marker_count, 0);
+    let events = load_workspace_events(&restored, "00000000-0000-0000-0000-000000000001")?;
     drop(restored);
     let recovery = apply_output
         .pointer("/data/execution/recovery_backup_path")
@@ -495,10 +448,6 @@ fn real_cli_applies_an_explicitly_approved_sealed_database_rollback() -> Result<
         .context("rollback result omitted its recovery backup")?;
     assert!(Path::new(recovery).is_file());
 
-    let events = fs::read_to_string(state_root.join("events.jsonl"))?
-        .lines()
-        .map(serde_json::from_str::<TaskEvent>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     assert!(
         events
             .iter()

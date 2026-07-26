@@ -8,7 +8,7 @@ use orchestrator_domain::{
 use rusqlite::{OptionalExtension as _, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult};
+use crate::{StateError, StateResult, WorkspaceDatabase};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewConversationAttempt {
@@ -41,7 +41,9 @@ pub struct StoredConversationAttempt {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn begin_conversation_attempt(
         &self,
         attempt: &NewConversationAttempt,
@@ -60,7 +62,7 @@ impl Database {
                 ));
             }
             transaction.execute(
-                "INSERT INTO conversation_attempts(
+                "INSERT INTO main.conversation_attempts(
                     attempt_id, session_id, source_message_id, provider_id, status, started_at)
                  VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
                 params![
@@ -112,9 +114,9 @@ impl Database {
                 ));
             }
             let changed = transaction.execute(
-                "UPDATE conversation_attempts
+                "UPDATE main.conversation_attempts
                  SET status = 'succeeded', outcome_json = ?1, completed_at = ?2
-                 WHERE attempt_id = ?3 AND status = 'running'",
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?3 AND status = 'running'",
                 params![
                     outcome_json,
                     completed_at.to_rfc3339(),
@@ -158,9 +160,9 @@ impl Database {
         };
         for attempt_id in &attempt_ids {
             let changed = transaction.execute(
-                "UPDATE conversation_attempts
+                "UPDATE main.conversation_attempts
                  SET status = 'failed', error_redacted = ?1, completed_at = ?2
-                 WHERE attempt_id = ?3 AND status = 'running'",
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?3 AND status = 'running'",
                 params![
                     error_redacted.trim(),
                     completed_at.to_rfc3339(),
@@ -173,9 +175,10 @@ impl Database {
                 });
             }
             transaction.execute(
-                "UPDATE client_commands
+                "UPDATE main.client_commands
                  SET state = 'failed', completed_at = ?1, outcome = ?2
-                 WHERE command_id = ?3 AND action = 'request_conversation_turn'
+                 WHERE workspace_id = current_workspace() \
+                 AND command_id = ?3 AND action = 'request_conversation_turn'
                  AND state IN ('pending', 'claimed')",
                 params![
                     completed_at.to_rfc3339(),
@@ -210,7 +213,7 @@ impl Database {
                 ));
             }
             transaction.execute(
-                "INSERT INTO requirement_revisions(
+                "INSERT INTO main.requirement_revisions(
                     requirement_revision_id, session_id, source_message_id, ordinal,
                     schema_version, snapshot_hash, snapshot_json, complete, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -229,9 +232,9 @@ impl Database {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_requirement_heads(session_id, requirement_revision_id, updated_at)
+                "INSERT INTO main.session_requirement_heads(session_id, requirement_revision_id, updated_at)
                  VALUES (?1, ?2, ?3)
-                 ON CONFLICT(session_id) DO UPDATE SET
+                 ON CONFLICT(workspace_id, session_id) DO UPDATE SET
                     requirement_revision_id = excluded.requirement_revision_id,
                     updated_at = excluded.updated_at",
                 params![
@@ -267,6 +270,12 @@ impl Database {
         })
     }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 fn load_attempt(
     connection: &rusqlite::Connection,

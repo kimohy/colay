@@ -78,7 +78,7 @@ impl Fixture {
     }
 
     fn database(&self) -> Result<Database> {
-        Database::open(self.repository.join(".colay/orchestrator.db")).map_err(Into::into)
+        Database::open(self.colay_home.join("state/state.db")).map_err(Into::into)
     }
 
     fn wait_online(&self) -> Result<()> {
@@ -163,8 +163,12 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
     fixture.wait_online()?;
 
     let database = fixture.database()?;
+    let workspace_id = database
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
+    let workspace = database.workspace(workspace_id);
     let session_id = SessionId::new();
-    database.submit_client_command(&command(
+    workspace.submit_client_command(&command(
         ClientCommandAction::CreateSession,
         None,
         serde_json::to_value(CreateSessionCommandPayload {
@@ -174,11 +178,11 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         "reconnect-session".to_owned(),
     ))?;
     wait_for_projection("create session", || {
-        Ok(database.load_session(session_id)?.is_some())
+        Ok(workspace.load_session(session_id)?.is_some())
     })?;
 
     let message_id = MessageId::new();
-    database.submit_client_command(&command(
+    workspace.submit_client_command(&command(
         ClientCommandAction::AppendMessage,
         Some(session_id),
         serde_json::to_value(AppendMessageCommandPayload {
@@ -188,17 +192,21 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         format!("reconnect-message-{message_id}"),
     ))?;
     wait_for_projection("persist message", || {
-        Ok(database.load_message(message_id)?.is_some())
+        Ok(workspace.load_message(message_id)?.is_some())
     })?;
     drop(database);
 
     let reopened = fixture.database()?;
-    let sessions = reopened.list_sessions(&orchestrator_state::SessionListFilter {
+    let reopened_id = reopened
+        .resolve_repository_workspace(&fixture.repository)?
+        .workspace_id;
+    let reopened_workspace = reopened.workspace(reopened_id);
+    let sessions = reopened_workspace.list_sessions(&orchestrator_state::SessionListFilter {
         include_archived: false,
         limit: 1,
     })?;
     assert_eq!(sessions[0].session_id, session_id);
-    let messages = reopened.messages_after(session_id, 0, 10)?;
+    let messages = reopened_workspace.messages_after(session_id, 0, 10)?;
     let stored_user_message = messages
         .iter()
         .find(|(_, message)| message.message_id == message_id)

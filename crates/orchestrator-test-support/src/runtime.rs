@@ -474,10 +474,12 @@ fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run_fake_cli<I>(args: I)
 where
     I: IntoIterator<Item = OsString>,
 {
+    enforce_schema_guard();
     let args = args
         .into_iter()
         .map(|value| value.to_string_lossy().into_owned())
@@ -579,6 +581,63 @@ where
     };
     for line in scenario_lines(provider, scenario) {
         println!("{}", String::from_utf8_lossy(&line));
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaGuard {
+    database: PathBuf,
+    required_schema_version: u32,
+    observation: PathBuf,
+}
+
+fn enforce_schema_guard() {
+    let Some(guard_path) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("schema-guard.json")))
+        .filter(|path| path.exists())
+    else {
+        return;
+    };
+    let guard = std::fs::read(&guard_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SchemaGuard>(&bytes).ok());
+    let Some(guard) = guard else {
+        eprintln!(
+            "fake provider schema guard is invalid: {}",
+            guard_path.display()
+        );
+        std::process::exit(86);
+    };
+    let observed = rusqlite::Connection::open_with_flags(
+        &guard.database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .and_then(|connection| {
+        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+    });
+    let observed_schema_version = observed.as_ref().ok().copied();
+    let guard_passed = observed_schema_version == Some(guard.required_schema_version);
+    let observation = serde_json::json!({
+        "observed_schema_version": observed_schema_version,
+        "required_schema_version": guard.required_schema_version,
+        "guard_passed": guard_passed,
+        "database": guard.database,
+    });
+    if let Some(parent) = guard.observation.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &guard.observation,
+        serde_json::to_vec_pretty(&observation).unwrap_or_default(),
+    );
+    if !guard_passed {
+        eprintln!(
+            "fake provider observed schema {:?}; required {}",
+            observed_schema_version, guard.required_schema_version
+        );
+        std::process::exit(86);
     }
 }
 

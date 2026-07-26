@@ -1,13 +1,11 @@
 use std::{
     collections::HashMap,
     fs,
-    future::Future,
     io::Write as _,
     path::{Path, PathBuf},
-    pin::Pin,
     str::FromStr as _,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -16,22 +14,24 @@ use codex_compat::{
     CapabilityProbe, CapabilitySource, CodexProbeReport, ProbeCommand, ProbeOutput,
 };
 use orchestrator_domain::{
-    AcceptanceEvidence, AttemptId, CapabilitySupport, CommandEvidence, CommandEvidenceId,
-    CorrelationId, DecisionRecord, EventActor, EventId, EventType, FailureRecord,
-    HandoverAcknowledgement, HealthStatus, ModelProfile, PlanStep, PlanStepStatus,
-    ProviderCapabilities, ProviderHealth, ProviderId, QuotaPeriod, QuotaScope, ReasoningEffort,
-    RepoPath, RiskTag, RoutingDecision, SandboxMode, SchemaVersion, TaskEnvelope, TaskEvent,
-    TaskId, TaskState, TestEvidence, TestStatus, UsageConfidence, UsageSnapshot, UsageSource,
-    UsageUnit, VerificationStatus, WorkerEvent, WorkerOutcome, WorkerRequest, WorkerResult,
+    AcceptanceEvidence, AppendMessageCommandPayload, AttemptId, CapabilitySupport, ClientCommand,
+    ClientCommandAction, ClientCommandId, ClientCommandState, CommandEvidence, CommandEvidenceId,
+    CorrelationId, CreateSessionCommandPayload, DecisionRecord, EventActor, EventId, EventType,
+    FailureRecord, HandoverAcknowledgement, HealthStatus, MessageId, ModelProfile, PlanStep,
+    PlanStepStatus, ProviderCapabilities, ProviderHealth, ProviderId, QuotaPeriod, QuotaScope,
+    ReasoningEffort, RepoPath, RoutingDecision, SandboxMode, SchemaVersion, SessionId,
+    TaskEnvelope, TaskEvent, TaskId, TaskState, TestEvidence, TestStatus, UsageConfidence,
+    UsageSnapshot, UsageSource, UsageUnit, VerificationStatus, WorkerEvent, WorkerOutcome,
+    WorkerRequest, WorkerResult,
 };
 use orchestrator_engine::{
     CheckpointInput, CheckpointManager, CodexExecutionPolicy, GitCheckpointEvidence, GitWorktree,
     GitWorktreeManager, HandoverInput, HandoverManager, StartupGuard, VerificationEngine,
-    VerificationInput, canonicalize_directory, inspect_git_repository,
+    VerificationInput, canonicalize_directory,
 };
 use orchestrator_policy::{
-    AnalysisHints, BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig,
-    RoutingContext, RoutingEngine, TaskAnalysisInput, TaskAnalyzer, TaskRole, period_window,
+    BudgetForecaster, ForecastConfig, ResetPolicy, RoutingCandidate, RoutingConfig, RoutingContext,
+    RoutingEngine, TaskRole, period_window,
 };
 use orchestrator_process::{
     CommandSpec, ProcessError, ProcessRunner, RedactionConfig, Redactor, ResolvedExecutable,
@@ -44,12 +44,12 @@ use orchestrator_providers::{
 };
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
-    ControlAction, CoordinatorLease, CoordinatorLeaseRequest, DaemonStatus, Database,
-    EffectiveConfig, EventLog, LeaseRenewal, MigratableConfigDocument, OrchestratorConfig,
-    ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig, StateError, WorkerLease,
-    WorkerLeaseMode, WorkerLeaseRequest, load_effective_config,
+    ControlAction, DaemonStatus, Database, EffectiveConfig, EventLog, GlobalStatePaths,
+    LeaseRenewal, MigratableConfigDocument, NewTaskAttemptRecord, NewWorktreeRecord,
+    OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig,
+    RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
 };
-use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
@@ -57,8 +57,11 @@ use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 use uuid::Uuid;
 
+#[cfg(test)]
+use orchestrator_state::{CoordinatorLease, CoordinatorLeaseRequest};
+
 use crate::args::{
-    Cli, Command, EffortName, HandoverArgs, MigrationAction, MigrationRollbackAction,
+    Cli, Command, DoctorAction, EffortName, HandoverArgs, MigrationAction, MigrationRollbackAction,
     ProfileAction, ProfileName, ProviderAction, ProviderName, RequiredTask, RollbackAction,
     RunArgs, TaskSelector, UsageAction, UsageOverrideArgs,
 };
@@ -70,9 +73,15 @@ use crate::profile_config::{
 const CONFIG_TEMPLATE: &str = include_str!("../../../config.example.toml");
 const DEFAULT_CONFIG_PATH: &str = ".colay/config.toml";
 const LEGACY_CONFIG_PATH: &str = ".codex/orchestrator/config.toml";
-const COORDINATOR_LEASE_TTL_SECONDS: i64 = 30;
 const WORKER_LEASE_TTL_SECONDS: i64 = 20;
+#[cfg(test)]
+const COORDINATOR_LEASE_TTL_SECONDS: i64 = 30;
 const LEASE_RENEWAL_INTERVAL_SECONDS: u64 = 5;
+const RUN_SESSION_KEY: &str = "cli-run-session-v1";
+const RUN_REQUESTED_BY: &str = "local-cli-run";
+const RUN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RUN_COMMAND_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -119,99 +128,163 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init(_) => initialize(&repository, &runtime, cli.json),
         Command::Daemon(arguments) => {
-            crate::daemon::run(
+            Box::pin(crate::daemon::run(
                 &repository,
                 runtime.effective.config(),
                 cli.config.as_deref(),
                 arguments.action,
                 cli.json,
-            )
+            ))
             .await
         }
         Command::Run(arguments) => {
-            run_task(&repository, &runtime.effective, arguments, cli.json).await
+            run_conversation(
+                &repository,
+                cli.config.as_deref(),
+                &runtime.effective,
+                arguments,
+                cli.json,
+            )
+            .await
         }
-        Command::Status(selector) => status(&repository, &runtime.effective, &selector, cli.json),
+        Command::Status(selector) => {
+            status(&repository, cli.config.as_deref(), &selector, cli.json).await
+        }
         Command::Providers(arguments) => match arguments.action {
-            Some(ProviderAction::Enable { provider }) => set_provider_enabled(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                provider.into(),
-                true,
-                cli.json,
-            ),
-            Some(ProviderAction::Disable { provider }) => set_provider_enabled(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                provider.into(),
-                false,
-                cli.json,
-            ),
+            Some(ProviderAction::Enable { provider }) => {
+                set_provider_enabled(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    provider.into(),
+                    true,
+                    cli.json,
+                )
+                .await
+            }
+            Some(ProviderAction::Disable { provider }) => {
+                set_provider_enabled(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    provider.into(),
+                    false,
+                    cli.json,
+                )
+                .await
+            }
             None => providers(&runtime.effective, cli.json).await,
         },
         Command::Profiles(arguments) => match arguments.action {
-            Some(ProfileAction::Set(arguments)) => set_model_profile(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                arguments.provider,
-                arguments.profile,
-                &arguments.model,
-                arguments.effort,
-                cli.json,
-            ),
-            Some(ProfileAction::Reset(arguments)) => reset_model_profile(
-                &repository,
-                cli.config.as_deref(),
-                environment,
-                &runtime,
-                arguments.provider,
-                arguments.profile,
-                cli.json,
-            ),
+            Some(ProfileAction::Set(arguments)) => {
+                set_model_profile(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    arguments.provider,
+                    arguments.profile,
+                    &arguments.model,
+                    arguments.effort,
+                    cli.json,
+                )
+                .await
+            }
+            Some(ProfileAction::Reset(arguments)) => {
+                reset_model_profile(
+                    &repository,
+                    cli.config.as_deref(),
+                    environment,
+                    &runtime,
+                    arguments.provider,
+                    arguments.profile,
+                    cli.json,
+                )
+                .await
+            }
             None => profiles(&runtime.effective, cli.json),
         },
         Command::Usage(arguments) => match arguments.action {
             Some(UsageAction::Override(arguments)) => {
-                usage_override(&repository, &runtime.effective, arguments, cli.json)
+                usage_override(
+                    &repository,
+                    cli.config.as_deref(),
+                    &runtime.effective,
+                    arguments,
+                    cli.json,
+                )
+                .await
             }
-            None => usage(&repository, &runtime.effective, cli.json),
+            None => {
+                usage(
+                    &repository,
+                    cli.config.as_deref(),
+                    &runtime.effective,
+                    cli.json,
+                )
+                .await
+            }
         },
         Command::Handover(arguments) => {
-            control_handover(&repository, &runtime.effective, arguments, cli.json)
+            control_handover(&repository, cli.config.as_deref(), arguments, cli.json).await
         }
-        Command::Pause(task) => control(
-            &repository,
-            &runtime.effective,
-            task,
-            "pause",
-            json!({}),
-            cli.json,
-        ),
+        Command::Pause(task) => {
+            control(
+                &repository,
+                cli.config.as_deref(),
+                task,
+                "pause",
+                json!({}),
+                cli.json,
+            )
+            .await
+        }
         Command::Resume(task) => {
-            resume_task(&repository, &runtime.effective, &task, cli.json).await
+            resume_task(
+                &repository,
+                cli.config.as_deref(),
+                &runtime.effective,
+                &task,
+                cli.json,
+            )
+            .await
         }
-        Command::Cancel(task) => control(
-            &repository,
-            &runtime.effective,
-            task,
-            "cancel",
-            json!({}),
-            cli.json,
-        ),
+        Command::Cancel(task) => {
+            control(
+                &repository,
+                cli.config.as_deref(),
+                task,
+                "cancel",
+                json!({}),
+                cli.json,
+            )
+            .await
+        }
         Command::ExplainRouting(task) => {
-            explain_routing(&repository, &runtime.effective, &task.task_id, cli.json)
+            explain_routing(&repository, cli.config.as_deref(), &task.task_id, cli.json).await
         }
         Command::Checkpoint(task) => {
-            checkpoint(&repository, &runtime.effective, &task.task_id, cli.json)
+            checkpoint(&repository, cli.config.as_deref(), &task.task_id, cli.json).await
         }
-        Command::Doctor => doctor(&repository, &runtime.effective, cli.json).await,
-        Command::Compatibility => compatibility(&runtime.effective, cli.json),
+        Command::Doctor(arguments) => match arguments.action {
+            Some(DoctorAction::Providers) => {
+                doctor_providers(&runtime.effective, "doctor_providers", cli.json).await
+            }
+            None => {
+                doctor(
+                    &repository,
+                    &runtime.effective,
+                    cli.config.as_deref(),
+                    cli.json,
+                )
+                .await
+            }
+        },
+        Command::Compatibility => {
+            doctor_providers(&runtime.effective, "compatibility", cli.json).await
+        }
         Command::Migrate(arguments) => migrate(
             &repository,
             &runtime.effective,
@@ -415,7 +488,7 @@ fn configure_tracing() {
         .try_init();
 }
 
-fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> Result<()> {
+fn initialize(_repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> Result<()> {
     let config_path = &runtime.explicit_edit_path;
     if config_path.exists() {
         bail!("configuration already exists: {}", config_path.display());
@@ -432,25 +505,26 @@ fn initialize(repository: &Path, runtime: &ConfigRuntime, json_output: bool) -> 
     }
     let document = CONFIG_TEMPLATE.parse::<DocumentMut>()?;
     save_override_atomic(&document, config_path)?;
-    let state = StatePaths::from_config(repository, runtime.effective.config())?;
-    let database = initialize_repository_state(&state)?;
-    let migration = database.migration_status()?;
-    let events = EventLog::open(&state.events)?;
-    let reconciliation = events.reconcile(&database)?;
+    let state = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
     emit(
         json_output,
         "initialized",
         &json!({
             "config": config_path,
             "state_dir": state.root,
-            "migration": migration,
-            "event_log": reconciliation,
+            "migration": Value::Null,
+            "event_log": Value::Null,
             "provider_inference_started": false,
         }),
     )
 }
 
-async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+async fn doctor(
+    repository: &Path,
+    effective: &EffectiveConfig,
+    _explicit_config: Option<&Path>,
+    json_output: bool,
+) -> Result<()> {
     let mut checks = vec![Check::pass("config", "schema and values are valid")];
     let executable = std::env::current_exe()?;
     checks.push(Check::with_data(
@@ -467,67 +541,49 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
     if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
         checks.push(Check::warn("wsl_mixed_git_checkout", warning));
     }
-    let config = effective.config();
-    {
-        let redaction = process_redaction(&config.orchestrator);
-        let state = StatePaths::from_config(repository, config)?;
-        if state.database.exists() {
-            match Database::open(&state.database)
-                .and_then(|database| database.health().map(|health| (database, health)))
-            {
-                Ok((database, health)) => {
-                    checks.push(Check::with_data(
-                        "database",
-                        health.integrity_ok,
-                        json!(health),
-                    ));
-                    checks.push(daemon_runtime_check(
-                        &database.daemon_status(Utc::now())?,
-                        &executable,
-                    ));
-                    if state.events.exists() {
-                        let reconciliation = EventLog::open(&state.events)?.reconcile(&database)?;
-                        checks.push(Check::with_data("event_log", true, json!(reconciliation)));
-                    } else {
-                        checks.push(Check::warn(
-                            "event_log",
-                            "events.jsonl has not been created",
-                        ));
-                    }
-                }
-                Err(error) => checks.push(Check::fail("database", error.to_string())),
+    doctor_state_checks(repository, &executable, &mut checks).await;
+    checks.push(git_health_check(repository));
+    for report in collect_provider_reports(effective).await {
+        let status = match report.health.status {
+            HealthStatus::Healthy => CheckStatus::Pass,
+            HealthStatus::Degraded | HealthStatus::Unhealthy | HealthStatus::Unknown => {
+                CheckStatus::Warn
             }
-        } else {
-            checks.push(Check::warn(
-                "database",
-                "state database does not exist; run `colay init` or the first `colay run` (including `--plan-only`) to initialize it; `colay migrate apply` is only for an existing database with pending schemas",
-            ));
-        }
-
-        for (provider, config) in provider_configs(&config.orchestrator) {
-            let result =
-                diagnostic_command(&config.executable, ["--version"], repository, &redaction).await;
-            match result {
-                Ok(output) if output.success() => checks.push(Check::with_data(
-                    format!("provider_{}", provider.as_str()),
-                    true,
-                    json!({
-                        "version": output.stdout.redacted_text.trim(),
-                        "configured_executable": output.resolved_executable.configured,
-                        "resolved_executable": output.resolved_executable.path,
-                        "executable_kind": output.resolved_executable.kind,
-                    }),
-                )),
-                Ok(output) => checks.push(Check::fail(
-                    format!("provider_{}", provider.as_str()),
-                    output.stderr.redacted_text,
-                )),
-                Err(error) => checks.push(Check::warn(
-                    format!("provider_{}", provider.as_str()),
-                    error.to_string(),
-                )),
-            }
-        }
+        };
+        let detail = report
+            .health
+            .detail
+            .clone()
+            .unwrap_or_else(|| "safe public provider probes completed".to_owned());
+        let resolution = provider_config(&effective.config().orchestrator, report.provider).map(
+            |config| async {
+                diagnostic_command(
+                    &config.executable,
+                    ["--version"],
+                    repository,
+                    &process_redaction(&effective.config().orchestrator),
+                )
+                .await
+            },
+        );
+        let resolution = match resolution {
+            Some(resolution) => resolution
+                .await
+                .ok()
+                .filter(orchestrator_process::ProcessResult::success),
+            None => None,
+        };
+        checks.push(Check::with_status_data(
+            format!("provider_{}", report.provider.as_str()),
+            status,
+            detail,
+            json!({
+                "provider": report,
+                "configured_executable": resolution.as_ref().map(|output| &output.resolved_executable.configured),
+                "resolved_executable": resolution.as_ref().map(|output| &output.resolved_executable.path),
+                "executable_kind": resolution.as_ref().map(|output| output.resolved_executable.kind),
+            }),
+        ));
     }
 
     let passed = checks.iter().all(|check| check.status != CheckStatus::Fail);
@@ -541,6 +597,357 @@ async fn doctor(repository: &Path, effective: &EffectiveConfig, json_output: boo
             inference_requests: 0,
         },
     )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut Vec<Check>) {
+    let paths = match GlobalStatePaths::resolve(&StateEnvironment::from_process()) {
+        Ok(paths) => paths,
+        Err(error) => {
+            checks.push(Check::fail("state", error.to_string()));
+            return;
+        }
+    };
+    match crate::daemon::acquire_maintenance() {
+        Ok(maintenance) => {
+            let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
+                Ok(Some(database)) => database,
+                Ok(None) => {
+                    checks.push(Check::with_status_data(
+                        "state",
+                        CheckStatus::Warn,
+                        "user-global database does not exist; run a writable command or `colay migrate apply` to create it",
+                        json!({
+                            "root": maintenance.paths.root,
+                            "database": maintenance.paths.database,
+                            "backups": maintenance.paths.backups,
+                            "current_schema_version": Value::Null,
+                            "target_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                        }),
+                    ));
+                    checks.push(daemon_runtime_check(&DaemonStatus::Stopped, executable));
+                    push_unavailable_workspace_checks(
+                        checks,
+                        "user-global database is not initialized",
+                    );
+                    return;
+                }
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let schema_version = match database.migration_status() {
+                Ok(status) => status.current_version,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            if schema_version != orchestrator_state::STATE_SCHEMA_VERSION {
+                checks.push(Check::with_status_data(
+                    "state",
+                    CheckStatus::Warn,
+                    format!(
+                        "database schema {schema_version} requires explicit `colay migrate apply` to reach {}",
+                        orchestrator_state::STATE_SCHEMA_VERSION
+                    ),
+                    json!({
+                        "root": maintenance.paths.root,
+                        "database": maintenance.paths.database,
+                        "backups": maintenance.paths.backups,
+                        "current_schema_version": schema_version,
+                        "target_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                    }),
+                ));
+                checks.push(daemon_runtime_check(&DaemonStatus::Stopped, executable));
+                push_unavailable_workspace_checks(
+                    checks,
+                    "workspace integrity requires explicit database migration",
+                );
+                return;
+            }
+            let health = match database.health() {
+                Ok(health) => health,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let state_healthy = health.integrity_ok
+                && health.foreign_key_violations == 0
+                && health.current_schema_version == orchestrator_state::STATE_SCHEMA_VERSION;
+            checks.push(Check::with_data(
+                "state",
+                state_healthy,
+                json!({
+                    "root": maintenance.paths.root,
+                    "database": maintenance.paths.database,
+                    "backups": maintenance.paths.backups,
+                    "health": health,
+                }),
+            ));
+            checks.push(daemon_runtime_check(
+                &database
+                    .daemon_status(Utc::now())
+                    .unwrap_or(DaemonStatus::Stopped),
+                executable,
+            ));
+            let registration = match database.find_repository_workspace(repository) {
+                Ok(Some(registration)) => registration,
+                Ok(None) => {
+                    checks.push(Check::warn(
+                        "workspace",
+                        "current repository is not registered; run a writable command to register it",
+                    ));
+                    checks.push(Check::warn(
+                        "audit",
+                        "workspace audit is unavailable until the repository is registered",
+                    ));
+                    checks.push(Check::warn(
+                        "artifacts",
+                        "workspace artifacts are unavailable until the repository is registered",
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    checks.push(Check::fail("workspace", error.to_string()));
+                    return;
+                }
+            };
+            checks.push(Check::with_data("workspace", true, json!(registration)));
+            let workspace = database.workspace(registration.workspace_id);
+            checks.push(match verify_workspace_audit(&workspace) {
+                Ok(data) => Check::with_data("audit", true, data),
+                Err(error) => Check::fail("audit", error.to_string()),
+            });
+            let workspace_paths = maintenance.paths.for_workspace(registration.workspace_id);
+            checks.push(
+                match verify_workspace_artifacts(&workspace, &workspace_paths) {
+                    Ok(data) => Check::with_data("artifacts", true, data),
+                    Err(error) => Check::fail("artifacts", error.to_string()),
+                },
+            );
+        }
+        Err(lock_error) => {
+            let response = match crate::ipc_client::DaemonClient::doctor_lookup(repository).await {
+                Ok(response) => response,
+                Err(ipc_error) => {
+                    checks.push(Check::fail(
+                        "state",
+                        format!(
+                            "cannot acquire maintenance ownership ({lock_error}) or query the user daemon ({ipc_error})"
+                        ),
+                    ));
+                    return;
+                }
+            };
+            let lookup = match response
+                .outcome
+                .get("data")
+                .cloned()
+                .ok_or_else(|| anyhow!("workspace doctor lookup response omitted data"))
+                .and_then(|data| {
+                    serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorLookup>(data)
+                        .context("workspace doctor lookup response is malformed")
+                }) {
+                Ok(lookup) => lookup,
+                Err(error) => {
+                    checks.push(Check::fail("state", error.to_string()));
+                    return;
+                }
+            };
+            let Some(diagnostics) = lookup.diagnostics else {
+                let healthy = lookup.database.integrity_ok
+                    && lookup.database.foreign_key_violations == 0
+                    && lookup.database.current_schema_version
+                        == orchestrator_state::STATE_SCHEMA_VERSION;
+                checks.push(Check::with_data(
+                    "state",
+                    healthy,
+                    json!({
+                        "root": paths.root,
+                        "database": paths.database,
+                        "backups": paths.backups,
+                        "health": lookup.database,
+                        "via": "daemon_ipc",
+                    }),
+                ));
+                checks.push(daemon_runtime_check(&lookup.daemon, executable));
+                push_unavailable_workspace_checks(
+                    checks,
+                    "current repository is not registered; run a writable command to register it",
+                );
+                return;
+            };
+            append_live_doctor_diagnostics(
+                checks,
+                &diagnostics,
+                &paths,
+                diagnostics.workspace.workspace_id,
+                repository,
+                executable,
+            );
+        }
+    }
+}
+
+fn append_live_doctor_diagnostics(
+    checks: &mut Vec<Check>,
+    diagnostics: &orchestrator_daemon::WorkspaceDoctorDiagnostics,
+    paths: &GlobalStatePaths,
+    expected_workspace_id: orchestrator_state::WorkspaceId,
+    expected_repository: &Path,
+    executable: &Path,
+) {
+    if let Err(error) = diagnostics.validate(
+        expected_workspace_id,
+        expected_repository,
+        &paths.for_workspace(expected_workspace_id).root,
+    ) {
+        let detail = format!("invalid workspace doctor IPC response: {error}");
+        for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+            checks.push(Check::fail(name, &detail));
+        }
+        return;
+    }
+    let health = &diagnostics.database;
+    let healthy = health.integrity_ok
+        && health.foreign_key_violations == 0
+        && health.current_schema_version == orchestrator_state::STATE_SCHEMA_VERSION;
+    checks.push(Check::with_data(
+        "state",
+        healthy,
+        json!({
+            "root": paths.root,
+            "database": paths.database,
+            "backups": paths.backups,
+            "health": &diagnostics.database,
+            "via": "daemon_ipc",
+        }),
+    ));
+    checks.push(daemon_runtime_check(&diagnostics.daemon, executable));
+    checks.push(Check::with_data(
+        "workspace",
+        true,
+        json!(diagnostics.workspace),
+    ));
+    checks.push(Check::with_data("audit", true, json!(diagnostics.audit)));
+    checks.push(Check::with_data(
+        "artifacts",
+        true,
+        json!(diagnostics.artifacts),
+    ));
+}
+
+#[cfg(test)]
+fn append_live_doctor_checks(
+    checks: &mut Vec<Check>,
+    response: &orchestrator_daemon::IpcResponse,
+    paths: &GlobalStatePaths,
+    expected_workspace_id: orchestrator_state::WorkspaceId,
+    expected_repository: &Path,
+    executable: &Path,
+) {
+    let diagnostics = response
+        .outcome
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow!("workspace doctor response omitted data"))
+        .and_then(|data| {
+            serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorDiagnostics>(data)
+                .context("workspace doctor response is malformed")
+        });
+    match diagnostics {
+        Ok(diagnostics) => append_live_doctor_diagnostics(
+            checks,
+            &diagnostics,
+            paths,
+            expected_workspace_id,
+            expected_repository,
+            executable,
+        ),
+        Err(error) => {
+            let detail = format!("invalid workspace doctor IPC response: {error}");
+            for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+                checks.push(Check::fail(name, &detail));
+            }
+        }
+    }
+}
+
+fn push_unavailable_workspace_checks(checks: &mut Vec<Check>, detail: &str) {
+    checks.push(Check::warn("workspace", detail));
+    checks.push(Check::warn("audit", detail));
+    checks.push(Check::warn("artifacts", detail));
+}
+
+fn verify_workspace_audit(database: &WorkspaceDatabase<'_>) -> Result<Value> {
+    let head = database.latest_outbox_sequence()?;
+    if head < 0 {
+        bail!("workspace event head is negative");
+    }
+    let mut previous_hash = None;
+    for sequence in 1..=head {
+        let event = database
+            .event_at(sequence)?
+            .ok_or_else(|| anyhow!("workspace event sequence {sequence} is missing"))?;
+        if event.sequence != u64::try_from(sequence)? || event.previous_hash != previous_hash {
+            bail!("workspace event chain diverges at sequence {sequence}");
+        }
+        if !event.verify_hash()? {
+            bail!("workspace event hash is invalid at sequence {sequence}");
+        }
+        previous_hash = Some(event.event_hash);
+    }
+    Ok(json!({
+        "workspace_id": database.workspace_id(),
+        "verified_events": head,
+        "last_sequence": head,
+        "last_hash": previous_hash,
+    }))
+}
+
+fn verify_workspace_artifacts(
+    database: &WorkspaceDatabase<'_>,
+    paths: &orchestrator_state::WorkspaceStatePaths,
+) -> Result<Value> {
+    let artifacts = database.list_artifacts()?;
+    if artifacts.is_empty() {
+        return Ok(json!({
+            "root": paths.root,
+            "verified_references": 0,
+            "scope": "persisted_references",
+        }));
+    }
+    let store = ArtifactStore::open_workspace_read_only(paths)?;
+    for artifact in &artifacts {
+        let _ = store.read_verified(artifact)?;
+    }
+    Ok(json!({
+        "root": store.root(),
+        "verified_references": artifacts.len(),
+        "scope": "persisted_references",
+    }))
+}
+
+fn git_health_check(repository: &Path) -> Check {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(repository)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Check::with_data(
+            "git",
+            true,
+            json!({"top_level": String::from_utf8_lossy(&output.stdout).trim()}),
+        ),
+        Ok(output) => Check::warn(
+            "git",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ),
+        Err(error) => Check::warn("git", format!("Git is unavailable: {error}")),
+    }
 }
 
 fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Check {
@@ -572,21 +979,22 @@ fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Chec
             } else {
                 (
                     CheckStatus::Warn,
-                    "daemon executable or build version differs from this CLI; restart the repository daemon with the intended Colay binary".to_owned(),
+                    "daemon executable or build version differs from this CLI; restart the user daemon with the intended Colay binary".to_owned(),
                 )
             }
         }
         DaemonStatus::Stopped => (
             CheckStatus::Warn,
-            "repository daemon is stopped; start it to compare runtime identity".to_owned(),
+            "user daemon is stopped; state was checked under exclusive maintenance ownership"
+                .to_owned(),
         ),
         DaemonStatus::Failed(_) | DaemonStatus::Stale(_) => (
             CheckStatus::Warn,
-            "repository daemon is failed or stale; restart it before writable execution".to_owned(),
+            "user daemon is failed or stale; restart it before writable execution".to_owned(),
         ),
     };
     Check::with_status_data(
-        "daemon_runtime",
+        "daemon",
         status,
         detail,
         json!({
@@ -597,22 +1005,32 @@ fn daemon_runtime_check(daemon_status: &DaemonStatus, executable: &Path) -> Chec
     )
 }
 
-fn compatibility(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
-    let executable = effective
-        .config()
-        .orchestrator
-        .providers
-        .codex
-        .as_ref()
-        .map_or("codex", |config| config.executable.as_str());
-    let report = probe_codex(
-        executable,
-        &process_redaction(&effective.config().orchestrator),
-    )?;
-    emit(json_output, "compatibility", &report)
+async fn doctor_providers(
+    effective: &EffectiveConfig,
+    command: &str,
+    json_output: bool,
+) -> Result<()> {
+    emit_versioned(
+        json_output,
+        "2",
+        command,
+        &DoctorProvidersReport {
+            schema_version: "2",
+            providers: collect_provider_reports(effective).await,
+            inference_requests: 0,
+        },
+    )
 }
 
 async fn providers(effective: &EffectiveConfig, json_output: bool) -> Result<()> {
+    emit(
+        json_output,
+        "providers",
+        &collect_provider_reports(effective).await,
+    )
+}
+
+async fn collect_provider_reports(effective: &EffectiveConfig) -> Vec<ProviderReport> {
     let redaction = process_redaction(&effective.config().orchestrator);
     let mut reports = Vec::new();
     for (provider, config) in provider_configs(&effective.config().orchestrator) {
@@ -639,10 +1057,10 @@ async fn providers(effective: &EffectiveConfig, json_output: bool) -> Result<()>
             },
         });
     }
-    emit(json_output, "providers", &reports)
+    reports
 }
 
-fn set_provider_enabled(
+async fn set_provider_enabled(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,
@@ -656,7 +1074,13 @@ fn set_provider_enabled(
     let providers = ensure_override_table(orchestrator, "providers")?;
     let provider_override = ensure_override_table(providers, provider.as_str())?;
     provider_override.insert("enabled", toml_edit::value(enabled));
-    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    write_override_via_daemon(
+        repository,
+        cli_config,
+        &document,
+        &runtime.explicit_edit_path,
+    )
+    .await?;
     let reloaded = load_config_runtime(repository, cli_config, environment)?;
     let persisted = provider_config(&reloaded.effective.config().orchestrator, provider)
         .is_some_and(|config| config.enabled == enabled);
@@ -689,7 +1113,7 @@ fn selected_profile_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn set_model_profile(
+async fn set_model_profile(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,
@@ -709,7 +1133,13 @@ fn set_model_profile(
         model,
         effort.map(EffortName::as_str),
     )?;
-    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    write_override_via_daemon(
+        repository,
+        cli_config,
+        &document,
+        &runtime.explicit_edit_path,
+    )
+    .await?;
     let reloaded = load_config_runtime(repository, cli_config, environment)?;
     let row = selected_profile_row(reloaded.effective.config(), provider, profile)?;
     if row.model != model.trim() {
@@ -721,7 +1151,7 @@ fn set_model_profile(
     emit(json_output, "profile_updated", &row)
 }
 
-fn reset_model_profile(
+async fn reset_model_profile(
     repository: &Path,
     cli_config: Option<&Path>,
     environment: ConfigEnvironment,
@@ -735,7 +1165,13 @@ fn reset_model_profile(
     if !reset_profile_override(&mut document, provider_id.as_str(), profile.as_str())? {
         bail!("selected writable layer has no override for this model profile");
     }
-    save_override_atomic(&document, &runtime.explicit_edit_path)?;
+    write_override_via_daemon(
+        repository,
+        cli_config,
+        &document,
+        &runtime.explicit_edit_path,
+    )
+    .await?;
     let reloaded = load_config_runtime(repository, cli_config, environment)?;
     let row = selected_profile_row(reloaded.effective.config(), provider, profile)?;
     emit(json_output, "profile_reset", &row)
@@ -764,6 +1200,32 @@ fn ensure_override_table<'a>(
         .get_mut(key)
         .and_then(Item::as_table_like_mut)
         .ok_or_else(|| anyhow!("configuration override `{key}` must be a table"))
+}
+
+async fn write_override_via_daemon(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    document: &DocumentMut,
+    path: &Path,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        let _ = (repository, explicit_config);
+        std::future::ready(()).await;
+        save_override_atomic(document, path)
+    }
+    #[cfg(not(test))]
+    {
+        let client =
+            crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+        client
+            .request(
+                "workspace.config.write",
+                json!({"path": path, "content": document.to_string()}),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 fn save_override_atomic(document: &DocumentMut, path: &Path) -> Result<()> {
@@ -796,9 +1258,9 @@ fn sync_override_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run_task(
+async fn run_conversation(
     repository: &Path,
+    explicit_config: Option<&Path>,
     effective: &EffectiveConfig,
     arguments: RunArgs,
     json_output: bool,
@@ -807,173 +1269,174 @@ async fn run_task(
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
-    if !arguments.plan_only {
-        inspect_git_repository(repository).await.with_context(|| {
-            "direct `colay run` executes a writable task and requires a committed Git repository; `run --plan-only` remains static assessment, not conversation mode"
-        })?;
-    }
-    let state = StatePaths::from_config(repository, document.config())?;
-    let database = if state.database.exists() {
-        open_ready_database(&state)?
-    } else {
-        initialize_repository_state(&state)?
-    };
-    reconcile_events(&state, &database)?;
+    let structured_input = arguments.task_file.is_some();
     let input = load_task_input(&arguments)?;
-    let redactor = Redactor::new(&process_redaction(&document.config().orchestrator))?;
-    let runtime_prompt = input.original_request.clone();
-    let role = infer_role(&input.objective);
-    let now = Utc::now();
-    let assessment = TaskAnalyzer::assess(&TaskAnalysisInput {
-        objective: input.objective.clone(),
-        constraints: input.constraints.clone(),
-        acceptance_criteria: input.acceptance_criteria.clone(),
-        hints: derive_analysis_hints(&input),
-    })?;
-    let mut envelope = TaskEnvelope::new(
-        redactor.redact(&input.objective),
-        redactor.redact(&input.original_request),
-        now,
+    let requested_provider = arguments.provider.map(ProviderId::from);
+    let content = conversation_requirement_input(&input, structured_input, requested_provider)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let session_id = ensure_run_session(&client).await?;
+    let message_id = MessageId::new();
+    let command = pending_client_command(
+        Some(session_id),
+        ClientCommandAction::AppendMessage,
+        serde_json::to_value(AppendMessageCommandPayload {
+            message_id,
+            content,
+        })?,
+        format!("cli-run-message-{message_id}"),
+        RUN_REQUESTED_BY,
     );
-    envelope.constraints = input
-        .constraints
-        .iter()
-        .map(|value| redactor.redact(value))
-        .collect();
-    envelope.acceptance_criteria = input
-        .acceptance_criteria
-        .iter()
-        .map(|value| redactor.redact(value))
-        .collect();
-    envelope.allowed_write_paths = input.allowed_write_paths.clone();
-    envelope.repository_wide_write_scope = input.repository_wide_write_scope;
-    envelope.assessment = Some(assessment.clone());
-    let correlation_id = CorrelationId::new();
-    persist_task(&database, &envelope, correlation_id)?;
-    transition_task(
-        &database,
-        envelope.task_id,
-        TaskState::Analyzing,
-        orchestrator_domain::TransitionGuards::default(),
-        correlation_id,
-        "task analysis started",
-    )?;
-    append_event(
-        &database,
-        Some(envelope.task_id),
-        EventType::AssessmentCompleted,
-        Some(TaskState::Queued),
-        Some(TaskState::Analyzing),
-        EventActor::Orchestrator,
-        correlation_id,
-        serde_json::to_value(&assessment)?,
-    )?;
-
-    let candidates = routing_candidates(
-        &document.config().orchestrator,
-        &database,
-        &assessment,
-        arguments.provider.map(ProviderId::from),
-        envelope.task_id,
-        correlation_id,
-    )
-    .await?;
-    let routing = RoutingEngine::route(
-        &RoutingContext {
-            task_id: envelope.task_id,
-            assessment,
-            role,
-            writable: true,
-            candidates,
-            current_provider: None,
-            implementation_provider: None,
-            manually_requested_provider: arguments.provider.map(ProviderId::from),
-            conserve_budget: false,
-        },
-        &RoutingConfig {
-            // Writable ownership is currently task-wide; parallelism is reduced before
-            // model-tier downgrade as required by the conservation policy.
-            max_parallel_workers: 1,
-            allow_amber: true,
-        },
-        now,
-    )?;
-    persist_routing(&database, &routing, &envelope)?;
-    append_event(
-        &database,
-        Some(envelope.task_id),
-        EventType::RouteSelected,
-        Some(TaskState::Analyzing),
-        Some(if routing.selected_provider.is_some() {
-            TaskState::Planned
-        } else {
-            TaskState::Blocked
+    client
+        .request(
+            "workspace.run.submit",
+            json!({"command": command, "plan_only": arguments.plan_only}),
+        )
+        .await?;
+    wait_for_client_command(&client, command.command_id).await?;
+    let conversation_command_id = ClientCommandId::from_uuid(message_id.into_uuid());
+    wait_for_client_command(&client, conversation_command_id).await?;
+    let response = client
+        .request("workspace.conversation", json!({"session_id": session_id}))
+        .await?;
+    emit(
+        json_output,
+        "run_conversation",
+        &json!({
+            "session_id": session_id,
+            "source_message_id": message_id,
+            "plan_only": arguments.plan_only,
+            "requested_provider": requested_provider,
+            "conversation": response.outcome["data"],
         }),
-        EventActor::Orchestrator,
-        correlation_id,
-        serde_json::to_value(&routing)?,
-    )?;
-
-    if routing.selected_provider.is_none() {
-        transition_task(
-            &database,
-            envelope.task_id,
-            TaskState::Blocked,
-            orchestrator_domain::TransitionGuards::default(),
-            correlation_id,
-            "no provider satisfies routing gates",
-        )?;
-    } else {
-        transition_task(
-            &database,
-            envelope.task_id,
-            TaskState::Planned,
-            orchestrator_domain::TransitionGuards::default(),
-            correlation_id,
-            "routing plan selected",
-        )?;
-    }
-    reconcile_events(&state, &database)?;
-
-    let plan = PlannedTask {
-        task: envelope,
-        routing,
-        plan_only: arguments.plan_only,
-    };
-    if arguments.plan_only || plan.routing.selected_provider.is_none() {
-        return emit(json_output, "run_plan", &plan);
-    }
-
-    // The execution coordinator is deliberately entered only after all persisted safety
-    // gates above have passed. It uses public CLI adapters and never provider SDK tokens.
-    let coordinator = acquire_task_coordinator(&database, plan.task.task_id)?;
-    let result = run_with_coordinator_renewal(
-        &database,
-        &coordinator,
-        Box::pin(execute_planned_task(
-            repository,
-            &state,
-            document.config(),
-            &database,
-            plan,
-            correlation_id,
-            runtime_prompt,
-            json_output,
-            None,
-            None,
-            false,
-            coordinator.lease_id,
-        )),
     )
-    .await;
-    let released =
-        database.release_coordinator_lease(coordinator.lease_id, coordinator.owner_id, Utc::now());
-    coordinated_result(result, released)
+}
+
+fn conversation_requirement_input(
+    input: &TaskInput,
+    structured_input: bool,
+    requested_provider: Option<ProviderId>,
+) -> Result<String> {
+    if !structured_input && requested_provider.is_none() {
+        return Ok(input.original_request.clone());
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "original_request": input.original_request,
+        "objective": input.objective,
+        "constraints": input.constraints,
+        "acceptance_criteria": input.acceptance_criteria,
+        "allowed_write_paths": input.allowed_write_paths,
+        "repository_wide_write_scope": input.repository_wide_write_scope,
+        "requested_provider": requested_provider,
+    }))?)
+}
+
+async fn ensure_run_session(client: &crate::ipc_client::DaemonClient) -> Result<SessionId> {
+    let command =
+        if let Some(command) = load_client_command(client, None, Some(RUN_SESSION_KEY)).await? {
+            command
+        } else {
+            let session_id = SessionId::new();
+            let command = pending_client_command(
+                None,
+                ClientCommandAction::CreateSession,
+                serde_json::to_value(CreateSessionCommandPayload {
+                    session_id,
+                    title: "Colay plan conversation".to_owned(),
+                })?,
+                RUN_SESSION_KEY.to_owned(),
+                RUN_REQUESTED_BY,
+            );
+            match client
+                .request("workspace.command.submit", serde_json::to_value(&command)?)
+                .await
+            {
+                Ok(_) => command,
+                Err(submit_error) => load_client_command(client, None, Some(RUN_SESSION_KEY))
+                    .await?
+                    .ok_or(submit_error)?,
+            }
+        };
+    let payload: CreateSessionCommandPayload = serde_json::from_value(command.payload.clone())
+        .context("stored run session command has an invalid payload")?;
+    wait_for_client_command(client, command.command_id).await?;
+    Ok(payload.session_id)
+}
+
+fn pending_client_command(
+    session_id: Option<SessionId>,
+    action: ClientCommandAction,
+    payload: Value,
+    idempotency_key: String,
+    requested_by: &str,
+) -> ClientCommand {
+    ClientCommand {
+        command_id: ClientCommandId::new(),
+        session_id,
+        task_id: None,
+        action,
+        payload,
+        idempotency_key,
+        state: ClientCommandState::Pending,
+        requested_by: requested_by.to_owned(),
+        requested_at: Utc::now(),
+        claimed_at: None,
+        completed_at: None,
+        outcome: None,
+    }
+}
+
+async fn wait_for_client_command(
+    client: &crate::ipc_client::DaemonClient,
+    command_id: ClientCommandId,
+) -> Result<ClientCommand> {
+    let started = Instant::now();
+    let mut poll_interval = RUN_COMMAND_POLL_INTERVAL;
+    loop {
+        if let Some(command) = load_client_command(client, Some(command_id), None).await? {
+            match command.state {
+                ClientCommandState::Completed => return Ok(command),
+                ClientCommandState::Failed => bail!(
+                    "user daemon rejected {:?}: {}",
+                    command.action,
+                    command.outcome.as_deref().unwrap_or("unknown failure")
+                ),
+                ClientCommandState::Pending | ClientCommandState::Claimed => {}
+            }
+        }
+        if started.elapsed() >= RUN_COMMAND_TIMEOUT {
+            bail!("user daemon did not complete command {command_id} within two minutes");
+        }
+        tokio::time::sleep(poll_interval).await;
+        poll_interval = next_run_command_poll_interval(poll_interval);
+    }
+}
+
+fn next_run_command_poll_interval(current: Duration) -> Duration {
+    current.saturating_mul(2).min(RUN_COMMAND_MAX_POLL_INTERVAL)
+}
+
+async fn load_client_command(
+    client: &crate::ipc_client::DaemonClient,
+    command_id: Option<ClientCommandId>,
+    idempotency_key: Option<&str>,
+) -> Result<Option<ClientCommand>> {
+    let response = client
+        .request(
+            "workspace.command.status",
+            json!({
+                "command_id": command_id,
+                "idempotency_key": idempotency_key,
+            }),
+        )
+        .await?;
+    serde_json::from_value(response.outcome["data"]["command"].clone()).map_err(Into::into)
 }
 
 #[allow(clippy::too_many_lines)]
 async fn resume_task(
     repository: &Path,
+    explicit_config: Option<&Path>,
     effective: &EffectiveConfig,
     task: &RequiredTask,
     json_output: bool,
@@ -982,38 +1445,50 @@ async fn resume_task(
     if !document.config().orchestrator.enabled || !document.config().features.orchestrator {
         bail!("orchestrator execution is disabled by configuration");
     }
-    let state = StatePaths::from_config(repository, document.config())?;
-    let database = open_ready_database(&state)?;
     let task_id = TaskId::from_str(&task.task_id)?;
-    let correlation_id = CorrelationId::new();
-    let stored = database
-        .load_task(task_id)?
-        .ok_or_else(|| anyhow!("task {task_id} does not exist"))?;
-    if stored.state.is_terminal() {
-        bail!("terminal task {task_id} cannot be resumed");
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.resume", json!({"task_id": task_id}))
+        .await?;
+    let mut data = response.outcome["data"].clone();
+    if data["disposition"].as_str() == Some("attached") {
+        let cursor = data["cursor"].as_u64().unwrap_or(0);
+        let mut stream = client
+            .stream(
+                "workspace.task.stream",
+                json!({"task_id": task_id, "cursor": cursor}),
+            )
+            .await?;
+        let mut updates = Vec::new();
+        loop {
+            let status = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .context("timed out attaching to the active task status stream")??;
+            let Some(status) = status else {
+                break;
+            };
+            if status.outcome["status"].as_str() != Some("ok") {
+                bail!(
+                    "{}",
+                    status.outcome["error"]
+                        .as_str()
+                        .unwrap_or("active task status stream failed")
+                );
+            }
+            updates.push(status.outcome["data"].clone());
+        }
+        let latest = updates
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("user daemon closed the active task status stream"))?;
+        data["active_status"] = latest;
+        data["active_status_updates"] = json!(updates);
     }
-    let coordinator = acquire_task_coordinator(&database, task_id)?;
-    let result = run_with_coordinator_renewal(
-        &database,
-        &coordinator,
-        Box::pin(resume_task_coordinated(
-            repository,
-            document,
-            &state,
-            &database,
-            task_id,
-            correlation_id,
-            stored,
-            coordinator.lease_id,
-            json_output,
-        )),
-    )
-    .await;
-    let released =
-        database.release_coordinator_lease(coordinator.lease_id, coordinator.owner_id, Utc::now());
-    coordinated_result(result, released)
+    emit(json_output, "resume", &data)
 }
 
+#[allow(dead_code)]
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1023,7 +1498,8 @@ async fn resume_task_coordinated(
     repository: &Path,
     document: &ConfigDocument,
     state: &StatePaths,
-    database: &Database,
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     correlation_id: CorrelationId,
     mut stored: orchestrator_state::StoredTask,
@@ -1221,6 +1697,7 @@ async fn resume_task_coordinated(
         .map(|bundle| bundle.recommended_next_worker);
     let candidates = routing_candidates(
         &document.config().orchestrator,
+        global_database,
         &database,
         &assessment,
         requested_provider,
@@ -1301,7 +1778,10 @@ async fn resume_task_coordinated(
             constraints: envelope.constraints.clone(),
             acceptance_criteria: envelope.acceptance_criteria.clone(),
             recommended_next_worker: selected_provider,
-            usage_snapshots: latest_usage_snapshots(&database, &document.config().orchestrator)?,
+            usage_snapshots: latest_usage_snapshots(
+                global_database,
+                &document.config().orchestrator,
+            )?,
             safe_boundary_confirmed: true,
             created_at: Utc::now(),
         })?;
@@ -1326,6 +1806,7 @@ async fn resume_task_coordinated(
         &repository,
         &state,
         document.config(),
+        global_database,
         database,
         PlannedTask {
             task: envelope.clone(),
@@ -1366,7 +1847,7 @@ fn validate_recovered_worktree(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn recover_checkpoint_if_needed(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     state: &StatePaths,
     repository: &Path,
     worktree: &GitWorktree,
@@ -1533,7 +2014,8 @@ async fn execute_planned_task(
     repository: &Path,
     state: &StatePaths,
     config: &RootConfig,
-    database: &Database,
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
     plan: PlannedTask,
     correlation_id: CorrelationId,
     runtime_prompt: String,
@@ -1586,7 +2068,6 @@ async fn execute_planned_task(
         .min(6);
 
     let mut successful_run = None;
-    let mut attempt_ordinal = next_attempt_ordinal(&database, plan.task.task_id)?;
     for _round in 1..=max_attempts {
         let (model, configured_effort) = profile_settings(&config.orchestrator, provider, profile)?;
         effort = configured_effort.or(effort);
@@ -1650,11 +2131,9 @@ async fn execute_planned_task(
                 &database,
                 coordinator_lease_id,
                 &acknowledgement_lease,
-                attempt_ordinal,
                 correlation_id,
             )
             .await;
-            attempt_ordinal = attempt_ordinal.saturating_add(1);
             let acknowledgement_run = match acknowledgement_run {
                 Ok(run) => {
                     release_worker_lease(&database, coordinator_lease_id, &acknowledgement_lease)?;
@@ -1773,7 +2252,7 @@ async fn execute_planned_task(
             .ok_or_else(|| anyhow!("task disappeared before worker execution"))?
             .state;
         let attempt_already_persisted = if task_state == TaskState::Planned {
-            persist_attempt_started(&database, &request, attempt_ordinal, Utc::now())?;
+            persist_attempt_started(&database, &request, Utc::now())?;
             transition_task(
                 &database,
                 plan.task.task_id,
@@ -1809,11 +2288,9 @@ async fn execute_planned_task(
             &database,
             coordinator_lease_id,
             &worker_lease,
-            attempt_ordinal,
             correlation_id,
         )
         .await;
-        attempt_ordinal = attempt_ordinal.saturating_add(1);
         let run = match run {
             Ok(run) => run,
             Err(error) => return Err(error),
@@ -1840,7 +2317,7 @@ async fn execute_planned_task(
                 provider_config(&config.orchestrator, provider)
                     .ok_or_else(|| anyhow!("provider config disappeared"))?,
             );
-            persist_usage(&database, &exhausted, Some(plan.task.task_id))?;
+            database.record_usage_snapshot(Some(plan.task.task_id), &exhausted)?;
             append_event(
                 &database,
                 Some(plan.task.task_id),
@@ -2053,6 +2530,7 @@ async fn execute_planned_task(
 
         let next_route = reroute_after_failure(
             &config.orchestrator,
+            global_database,
             &database,
             &assessment,
             provider,
@@ -2093,7 +2571,7 @@ async fn execute_planned_task(
             constraints: plan.task.constraints.clone(),
             acceptance_criteria: plan.task.acceptance_criteria.clone(),
             recommended_next_worker: next_provider,
-            usage_snapshots: latest_usage_snapshots(&database, &config.orchestrator)?,
+            usage_snapshots: latest_usage_snapshots(global_database, &config.orchestrator)?,
             safe_boundary_confirmed: true,
             created_at: Utc::now(),
         })?;
@@ -2157,6 +2635,7 @@ async fn execute_planned_task(
         repository,
         state,
         config,
+        global_database,
         &database,
         &worktrees,
         &worktree,
@@ -2180,15 +2659,14 @@ async fn run_worker(
     attempt_already_persisted: bool,
     redaction_config: &RedactionConfig,
     state: &StatePaths,
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     coordinator_lease_id: Uuid,
     worker_lease: &WorkerLease,
-    ordinal: usize,
     correlation_id: CorrelationId,
 ) -> Result<WorkerRunRecord> {
     let started_at = Utc::now();
     if !attempt_already_persisted {
-        persist_attempt_started(database, &request, ordinal, started_at)?;
+        persist_attempt_started(database, &request, started_at)?;
     }
     let handle = match adapter.start(request.clone()).await {
         Ok(handle) => handle,
@@ -2615,7 +3093,7 @@ fn looks_like_test_command(executable: &str, args: &[String]) -> bool {
 }
 
 fn claim_next_control(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
 ) -> Result<Option<orchestrator_state::ControlRequest>> {
     for control in database.pending_controls(task_id)? {
@@ -2809,28 +3287,16 @@ fn profile_settings(
 }
 
 fn persist_attempt_started(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     request: &WorkerRequest,
-    ordinal: usize,
     started_at: DateTime<Utc>,
 ) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO task_attempts(
-                attempt_id, task_id, ordinal, provider_id, worker_mode, started_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                request.attempt_id.to_string(),
-                request.task_id.to_string(),
-                i64::try_from(ordinal).unwrap_or(i64::MAX),
-                request.provider.as_str(),
-                enum_name(&request.sandbox).map_err(|error| {
-                    orchestrator_state::StateError::InvalidRecord(error.to_string())
-                })?,
-                started_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+    database.record_task_attempt_started(&NewTaskAttemptRecord {
+        attempt_id: request.attempt_id,
+        task_id: request.task_id,
+        provider: request.provider,
+        worker_mode: enum_name(&request.sandbox)?,
+        started_at,
     })?;
     Ok(())
 }
@@ -2848,49 +3314,31 @@ fn worker_started_payload(request: &WorkerRequest) -> Value {
 }
 
 fn persist_attempt_start_failure(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     attempt_id: AttemptId,
     detail: &str,
 ) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "UPDATE task_attempts SET ended_at = ?1, outcome = 'failed',
-             worker_result_json = ?2 WHERE attempt_id = ?3",
-            params![
-                Utc::now().to_rfc3339(),
-                serde_json::to_string(&json!({"start_error": bounded_text(detail, 2_048)}))?,
-                attempt_id.to_string(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.finish_task_attempt(
+        attempt_id,
+        "failed",
+        &json!({"start_error": bounded_text(detail, 2_048)}),
+        Utc::now(),
+    )?;
     Ok(())
 }
 
 fn persist_attempt_unconfirmed_termination(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     attempt_id: AttemptId,
     detail: &str,
 ) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "UPDATE task_attempts SET outcome = 'termination_unconfirmed',
-             worker_result_json = ?1 WHERE attempt_id = ?2",
-            params![
-                serde_json::to_string(&json!({
-                    "termination_unconfirmed": bounded_text(detail, 2_048)
-                }))?,
-                attempt_id.to_string(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.mark_task_attempt_termination_unconfirmed(attempt_id, &bounded_text(detail, 2_048))?;
     Ok(())
 }
 
 fn block_for_unconfirmed_termination(
     state: &StatePaths,
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     request: &WorkerRequest,
     correlation_id: CorrelationId,
     detail: &str,
@@ -2930,7 +3378,7 @@ fn block_for_unconfirmed_termination(
 }
 
 fn persist_attempt_result(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     result: &WorkerResult,
     process_execution: &ResolvedExecutable,
 ) -> Result<()> {
@@ -2943,47 +3391,32 @@ fn persist_attempt_result(
         "process_execution".to_owned(),
         serde_json::to_value(process_execution)?,
     );
-    database.with_connection(|connection| {
-        connection.execute(
-            "UPDATE task_attempts SET ended_at = ?1, outcome = ?2,
-             worker_result_json = ?3 WHERE attempt_id = ?4",
-            params![
-                result.finished_at.to_rfc3339(),
-                enum_name(&result.outcome).map_err(|error| {
-                    orchestrator_state::StateError::InvalidRecord(error.to_string())
-                })?,
-                persisted.to_string(),
-                result.attempt_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    database.finish_task_attempt(
+        result.attempt_id,
+        &enum_name(&result.outcome)?,
+        &persisted,
+        result.finished_at,
+    )?;
+    Ok(())
+}
+
+fn persist_worktree(database: &WorkspaceDatabase<'_>, worktree: &GitWorktree) -> Result<()> {
+    database.record_active_worktree(&NewWorktreeRecord {
+        task_id: worktree.task_id,
+        repo_root: worktree.repository_root.clone(),
+        worktree_path: worktree.path.clone(),
+        branch_name: worktree.branch.clone(),
+        base_revision: worktree.base_revision.clone(),
+        created_at: Utc::now(),
     })?;
     Ok(())
 }
 
-fn persist_worktree(database: &Database, worktree: &GitWorktree) -> Result<()> {
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO worktrees(
-                worktree_id, task_id, repo_root, worktree_path, branch_name,
-                base_revision, state, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-            params![
-                TaskId::new().to_string(),
-                worktree.task_id.to_string(),
-                worktree.repository_root.to_string_lossy(),
-                worktree.path.to_string_lossy(),
-                worktree.branch,
-                worktree.base_revision,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-fn acquire_task_coordinator(database: &Database, task_id: TaskId) -> Result<CoordinatorLease> {
+#[cfg(test)]
+fn acquire_task_coordinator(
+    database: &WorkspaceDatabase<'_>,
+    task_id: TaskId,
+) -> Result<CoordinatorLease> {
     let now = Utc::now();
     let worktree_id = database
         .active_worktree(task_id)?
@@ -3003,8 +3436,9 @@ fn acquire_task_coordinator(database: &Database, task_id: TaskId) -> Result<Coor
     }
 }
 
+#[cfg(test)]
 fn coordinator_conflict_diagnostic(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     error: StateError,
 ) -> anyhow::Error {
@@ -3042,10 +3476,11 @@ fn coordinator_conflict_diagnostic(
     )
 }
 
+#[cfg(test)]
 async fn run_with_coordinator_renewal(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     coordinator: &CoordinatorLease,
-    mut operation: Pin<Box<dyn Future<Output = Result<()>> + '_>>,
+    mut operation: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + '_>>,
 ) -> Result<()> {
     let mut renewal = tokio::time::interval(Duration::from_secs(LEASE_RENEWAL_INTERVAL_SECONDS));
     renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3067,22 +3502,8 @@ async fn run_with_coordinator_renewal(
     }
 }
 
-fn coordinated_result(
-    result: Result<()>,
-    released: orchestrator_state::StateResult<bool>,
-) -> Result<()> {
-    match (result, released) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(error), Ok(_)) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Err(error), Err(release_error)) => Err(error.context(format!(
-            "coordinator lease release also failed: {release_error}"
-        ))),
-    }
-}
-
 fn acquire_worker_lease(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     coordinator_lease_id: Uuid,
     task_id: TaskId,
     provider: ProviderId,
@@ -3111,7 +3532,7 @@ fn acquire_worker_lease(
 }
 
 fn release_worker_lease(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     coordinator_lease_id: Uuid,
     lease: &WorkerLease,
 ) -> Result<()> {
@@ -3120,44 +3541,26 @@ fn release_worker_lease(
 }
 
 fn record_changed_file_ownership(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     lease: &WorkerLease,
     changed_files: &[RepoPath],
 ) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
     let worktree_id = lease
         .worktree_id
-        .ok_or_else(|| anyhow!("changed-file ownership requires a worktree-bound lease"))?
-        .to_string();
-    let lease_id = lease.lease_id.to_string();
-    database.with_connection(|connection| {
-        for path in changed_files {
-            connection.execute(
-                "INSERT INTO changed_files(
-                    task_id, worktree_id, relative_path, owner_lease_id,
-                    sha256, first_seen_at, last_seen_at
-                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)
-                 ON CONFLICT(task_id, relative_path) DO UPDATE SET
-                    worktree_id = excluded.worktree_id,
-                    owner_lease_id = excluded.owner_lease_id,
-                    last_seen_at = excluded.last_seen_at",
-                params![
-                    task_id.to_string(),
-                    worktree_id,
-                    path.to_string(),
-                    &lease_id,
-                    now,
-                ],
-            )?;
-        }
-        Ok(())
-    })?;
+        .ok_or_else(|| anyhow!("changed-file ownership requires a worktree-bound lease"))?;
+    database.record_changed_file_ownership(
+        task_id,
+        worktree_id,
+        lease.lease_id,
+        changed_files,
+        Utc::now(),
+    )?;
     Ok(())
 }
 
 fn persist_usage_observation(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     observation: &orchestrator_domain::UsageObservation,
     provider_config: &ProviderConfig,
@@ -3215,7 +3618,7 @@ fn persist_usage_observation(
     snapshot.source = UsageSource::LocalLedger;
     snapshot.confidence = UsageConfidence::Estimated;
     snapshot.validate()?;
-    persist_usage(database, &snapshot, Some(task_id))?;
+    database.record_usage_snapshot(Some(task_id), &snapshot)?;
     Ok(snapshot)
 }
 
@@ -3247,7 +3650,8 @@ fn confirmed_exhaustion(provider: ProviderId, config: &ProviderConfig) -> UsageS
 #[allow(clippy::too_many_arguments)]
 async fn reroute_after_failure(
     config: &OrchestratorConfig,
-    database: &Database,
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
     assessment: &orchestrator_domain::TaskAssessment,
     failed_provider: ProviderId,
     implementation_provider: ProviderId,
@@ -3257,6 +3661,7 @@ async fn reroute_after_failure(
 ) -> Result<RoutingDecision> {
     let mut candidates = routing_candidates(
         config,
+        global_database,
         database,
         assessment,
         manually_requested_provider,
@@ -3321,7 +3726,7 @@ fn acknowledgement_from_messages(
 }
 
 fn complete_handover(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     bundle: &orchestrator_domain::HandoverBundle,
     acknowledgement: &HandoverAcknowledgement,
 ) -> Result<()> {
@@ -3386,7 +3791,8 @@ async fn verify_and_finish(
     repository: &Path,
     state: &StatePaths,
     config: &RootConfig,
-    database: &Database,
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
     worktrees: &GitWorktreeManager,
     worktree: &GitWorktree,
     task: &TaskEnvelope,
@@ -3436,6 +3842,7 @@ async fn verify_and_finish(
             repository,
             state,
             config,
+            global_database,
             database,
             worktrees,
             worktree,
@@ -3599,7 +4006,8 @@ async fn perform_independent_review(
     repository: &Path,
     state: &StatePaths,
     config: &RootConfig,
-    database: &Database,
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
     worktrees: &GitWorktreeManager,
     worktree: &GitWorktree,
     task: &TaskEnvelope,
@@ -3614,6 +4022,7 @@ async fn perform_independent_review(
         .ok_or_else(|| anyhow!("assessment is missing"))?;
     let candidates = routing_candidates(
         &config.orchestrator,
+        global_database,
         database,
         assessment,
         None,
@@ -3662,7 +4071,6 @@ async fn perform_independent_review(
          {{\"type\":\"independent_review\",\"approved\":true|false,\
          \"acceptance_criteria_met\":true|false,\"findings\":[\"...\"]}}.\n\nDIFF:\n{diff}"
     );
-    let ordinal = next_attempt_ordinal(database, task.task_id)?;
     let reviewer_config = provider_config(&config.orchestrator, reviewer)
         .ok_or_else(|| anyhow!("reviewer provider configuration disappeared"))?;
     let reviewer_timeout = config
@@ -3706,7 +4114,6 @@ async fn perform_independent_review(
         database,
         coordinator_lease_id,
         &reviewer_lease,
-        ordinal,
         correlation_id,
     )
     .await;
@@ -3932,21 +4339,8 @@ fn store_redacted_output(
     Ok(Some(artifacts.put(path, text.as_bytes())?))
 }
 
-fn next_attempt_ordinal(database: &Database, task_id: TaskId) -> Result<usize> {
-    let value: i64 = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT coalesce(max(ordinal), 0) + 1 FROM task_attempts WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    })?;
-    usize::try_from(value).context("attempt ordinal exceeded platform range")
-}
-
 fn latest_resume_session_id(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     provider: ProviderId,
 ) -> Result<Option<String>> {
@@ -4076,66 +4470,42 @@ fn acceptance_evidence(
     }
 }
 
-fn status(
+async fn status(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     selector: &TaskSelector,
     json_output: bool,
 ) -> Result<()> {
-    let state = StatePaths::from_config(repository, effective.config())?;
-    if !state.database.exists() {
-        return emit(
-            json_output,
-            "status",
-            &json!({"tasks": [], "database": Value::Null, "state_dir": state.root}),
-        );
-    }
-    let database = open_ready_database(&state)?;
-    let tasks = database.with_connection(|connection| {
-        let mut sql =
-            "SELECT task_id, state, objective, created_at, updated_at FROM tasks".to_owned();
-        if selector.task_id.is_some() {
-            sql.push_str(" WHERE task_id = ?1");
-        }
-        sql.push_str(" ORDER BY updated_at DESC LIMIT 100");
-        let mut statement = connection.prepare(&sql)?;
-        let mapper = |row: &rusqlite::Row<'_>| {
-            Ok(TaskStatusRow {
-                task_id: row.get(0)?,
-                state: row.get(1)?,
-                objective: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-            })
-        };
-        let rows = if let Some(task_id) = &selector.task_id {
-            statement
-                .query_map([task_id], mapper)?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            statement
-                .query_map([], mapper)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(rows)
-    })?;
-    let health = database.health()?;
-    emit(
-        json_output,
-        "status",
-        &json!({"tasks": tasks, "database": health, "state_dir": state.root}),
-    )
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request(
+            "workspace.status",
+            json!({"task_id": selector.task_id.as_deref()}),
+        )
+        .await?;
+    emit(json_output, "status", &response.outcome["data"])
 }
 
-fn usage(repository: &Path, effective: &EffectiveConfig, json_output: bool) -> Result<()> {
-    let (_, database) = load_existing_state(repository, effective)?;
-    let snapshots = latest_usage_snapshots(&database, &effective.config().orchestrator)?;
-    emit(json_output, "usage", &snapshots)
+async fn usage(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    effective: &EffectiveConfig,
+    json_output: bool,
+) -> Result<()> {
+    let defaults = usage_defaults(&effective.config().orchestrator)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.usage", json!({"defaults": defaults}))
+        .await?;
+    emit(json_output, "usage", &response.outcome["data"]["snapshots"])
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn usage_override(
+async fn usage_override(
     repository: &Path,
+    explicit_config: Option<&Path>,
     effective: &EffectiveConfig,
     arguments: UsageOverrideArgs,
     json_output: bool,
@@ -4143,7 +4513,6 @@ fn usage_override(
     if arguments.entered_by.trim().is_empty() {
         bail!("--entered-by must be a non-empty audit identity");
     }
-    let (_, database) = load_existing_state(repository, effective)?;
     let provider = ProviderId::from(arguments.provider);
     let provider_config = provider_config(&effective.config().orchestrator, provider)
         .ok_or_else(|| anyhow!("provider {} is not configured", provider.as_str()))?;
@@ -4197,31 +4566,30 @@ fn usage_override(
     snapshot.source = UsageSource::ManualOverride;
     snapshot.confidence = UsageConfidence::Confirmed;
     snapshot.validate()?;
-    persist_usage(&database, &snapshot, None)?;
-    append_event(
-        &database,
-        None,
-        EventType::UsageCollected,
-        None,
-        None,
-        EventActor::Administrator,
-        CorrelationId::new(),
-        json!({"snapshot": snapshot, "entered_by": arguments.entered_by}),
-    )?;
-    let state = StatePaths::from_config(repository, effective.config())?;
-    reconcile_events(&state, &database)?;
-    emit(json_output, "usage_override", &snapshot)
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request(
+            "workspace.usage.override",
+            json!({"snapshot": snapshot, "entered_by": arguments.entered_by}),
+        )
+        .await?;
+    emit(
+        json_output,
+        "usage_override",
+        &response.outcome["data"]["snapshot"],
+    )
 }
 
-fn control_handover(
+async fn control_handover(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     arguments: HandoverArgs,
     json_output: bool,
 ) -> Result<()> {
     control(
         repository,
-        effective,
+        explicit_config,
         RequiredTask {
             task_id: arguments.task_id,
         },
@@ -4229,34 +4597,19 @@ fn control_handover(
         json!({"to": ProviderId::from(arguments.to)}),
         json_output,
     )
+    .await
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn control(
+async fn control(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     task: RequiredTask,
     action: &str,
     payload: Value,
     json_output: bool,
 ) -> Result<()> {
-    let (state, database) = load_existing_state(repository, effective)?;
     let task_id = TaskId::from_str(&task.task_id)?;
-    let current_state: Option<String> = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT state FROM tasks WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    })?;
-    let current_state = current_state.ok_or_else(|| anyhow!("task {task_id} does not exist"))?;
-    if matches!(current_state.as_str(), "completed" | "failed" | "cancelled") {
-        bail!("task {task_id} is terminal ({current_state})");
-    }
-    let requested_at = Utc::now();
     let control_action = match action {
         "pause" => orchestrator_state::ControlAction::Pause,
         "resume" => orchestrator_state::ControlAction::Resume,
@@ -4264,64 +4617,57 @@ fn control(
         "handover" => orchestrator_state::ControlAction::Handover,
         _ => bail!("unsupported control action {action}"),
     };
-    let request = database.request_control(
-        task_id,
-        control_action,
-        payload.clone(),
-        "user",
-        requested_at,
-    )?;
-    append_event(
-        &database,
-        Some(task_id),
-        EventType::ControlRequested,
-        None,
-        None,
-        EventActor::User,
-        CorrelationId::new(),
-        json!({"control_id": request.control_id, "action": action, "payload": payload}),
-    )?;
-    reconcile_events(&state, &database)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request(
+            "workspace.control",
+            json!({
+                "task_id": task_id,
+                "action": control_action,
+                "payload": payload,
+            }),
+        )
+        .await?;
+    emit(json_output, "control_requested", &response.outcome["data"])
+}
+
+async fn explain_routing(
+    repository: &Path,
+    explicit_config: Option<&Path>,
+    task_id: &str,
+    json_output: bool,
+) -> Result<()> {
+    let task_id = TaskId::from_str(task_id)?;
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.routing", json!({"task_id": task_id}))
+        .await?;
     emit(
         json_output,
-        "control_requested",
-        &json!({
-            "task_id": task_id,
-            "control_id": request.control_id,
-            "action": action,
-            "safe_checkpoint_required": matches!(action, "pause" | "cancel" | "handover"),
-        }),
+        "explain_routing",
+        &response.outcome["data"]["decision"],
     )
 }
 
-fn explain_routing(
+async fn checkpoint(
     repository: &Path,
-    effective: &EffectiveConfig,
+    explicit_config: Option<&Path>,
     task_id: &str,
     json_output: bool,
 ) -> Result<()> {
-    let (_, database) = load_existing_state(repository, effective)?;
     let task_id = TaskId::from_str(task_id)?;
-    let decision = database
-        .list_routing_audits(task_id, 1)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("no routing decision for task {task_id}"))?;
-    emit(json_output, "explain_routing", &decision)
-}
-
-fn checkpoint(
-    repository: &Path,
-    effective: &EffectiveConfig,
-    task_id: &str,
-    json_output: bool,
-) -> Result<()> {
-    let (_, database) = load_existing_state(repository, effective)?;
-    let task_id = TaskId::from_str(task_id)?;
-    let checkpoint = database
-        .latest_sealed_checkpoint(task_id)?
-        .ok_or_else(|| anyhow!("task {task_id} has no checkpoint"))?;
-    emit(json_output, "checkpoint", &checkpoint)
+    let client =
+        crate::ipc_client::DaemonClient::connect_or_start(repository, explicit_config).await?;
+    let response = client
+        .request("workspace.checkpoint", json!({"task_id": task_id}))
+        .await?;
+    emit(
+        json_output,
+        "checkpoint",
+        &response.outcome["data"]["checkpoint"],
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -4378,7 +4724,7 @@ fn migration_config_preview(
 
 #[allow(clippy::needless_pass_by_value)]
 fn migrate_inner(
-    repository: &Path,
+    _repository: &Path,
     effective: Option<&EffectiveConfig>,
     explicit_edit_path: &Path,
     action: MigrationAction,
@@ -4386,11 +4732,8 @@ fn migrate_inner(
 ) -> Result<()> {
     let (migratable, source_is_current, config_preview) =
         migration_config_preview(effective, explicit_edit_path)?;
-    let config = effective.map_or_else(
-        || config_preview.migrated().config(),
-        EffectiveConfig::config,
-    );
-    let state = StatePaths::from_config(repository, config)?;
+    let maintenance = crate::daemon::acquire_maintenance()?;
+    let state = &maintenance.paths;
     let database = Database::open(&state.database)?;
     match action {
         MigrationAction::Status => emit(
@@ -4402,9 +4745,7 @@ fn migrate_inner(
             }),
         ),
         MigrationAction::Plan => {
-            let database_plan = database.with_connection(|connection| {
-                orchestrator_state::MigrationManager::plan(connection)
-            })?;
+            let database_plan = database.migration_plan()?;
             emit(
                 json_output,
                 "migrate_plan",
@@ -4426,7 +4767,9 @@ fn migrate_inner(
             }),
         ),
         MigrationAction::Apply { dry_run: false } => {
-            ensure_migration_write_allowed(config)?;
+            // Validate the complete catalog, including future-schema refusal, before the first
+            // append-only audit write. Provider compatibility never authorizes state repair.
+            let _ = database.dry_run_migrations()?;
             append_event_if_schema_available(
                 &database,
                 EventType::MigrationStarted,
@@ -4438,7 +4781,6 @@ fn migrate_inner(
             // Both plans are validated before the first write. Config apply is
             // backup-first and DB migrations run transactionally with their own
             // backup; neither path skips an intermediate schema.
-            let _ = database.dry_run_migrations()?;
             let config_status = if source_is_current {
                 orchestrator_state::ConfigMigrationApplyResult {
                     result: config_preview.result().clone(),
@@ -4458,21 +4800,22 @@ fn migrate_inner(
                 },
                 "database": database_status,
             });
-            append_event(
-                &database,
-                None,
-                EventType::MigrationCompleted,
-                None,
-                None,
-                EventActor::Administrator,
-                CorrelationId::new(),
-                migration_payload.clone(),
-            )?;
-            reconcile_events(&state, &database)?;
+            if let Some(workspace) = legacy_migration_workspace_if_present(&database)? {
+                append_event(
+                    &workspace,
+                    None,
+                    EventType::MigrationCompleted,
+                    None,
+                    None,
+                    EventActor::Administrator,
+                    CorrelationId::new(),
+                    migration_payload.clone(),
+                )?;
+            }
             emit(json_output, "migrate_apply", &migration_payload)
         }
         MigrationAction::Rollback(arguments) => migrate_rollback(
-            &state,
+            state,
             &database,
             config_preview.migrated().config(),
             arguments.action,
@@ -4483,7 +4826,7 @@ fn migrate_inner(
 
 #[allow(clippy::too_many_lines)]
 fn migrate_rollback(
-    state: &StatePaths,
+    state: &GlobalStatePaths,
     database: &Database,
     config: &RootConfig,
     action: MigrationRollbackAction,
@@ -4491,16 +4834,8 @@ fn migrate_rollback(
 ) -> Result<()> {
     match action {
         MigrationRollbackAction::Plan { backup } => {
-            if database.migration_status()?.current_version >= 3 {
-                reconcile_events(state, database)?;
-            }
             let backup = trusted_migration_backup(&state.backups, backup.as_deref())?;
-            let plan = database.with_connection(|connection| {
-                let plan =
-                    orchestrator_state::MigrationManager::create_rollback_plan(connection, backup)?;
-                orchestrator_state::MigrationManager::validate_rollback(connection, &plan)?;
-                Ok(plan)
-            })?;
+            let plan = database.create_validated_migration_rollback_plan(backup)?;
             let relative = migration_rollback_plan_relative_path(&plan.integrity_hash)?;
             let stored = ArtifactStore::open(&state.root)?
                 .put(relative.clone(), &serde_json::to_vec_pretty(&plan)?)?;
@@ -4523,9 +4858,6 @@ fn migrate_rollback(
             ensure_migration_write_allowed(config)?;
             validate_sha256(&plan_hash)?;
             validate_approval_identity(&approved_by)?;
-            if database.migration_status()?.current_version >= 3 {
-                reconcile_events(state, database)?;
-            }
 
             let plan_relative = migration_rollback_plan_relative_path(&plan_hash)?;
             let plan_path = plan_relative.join_to(&state.root);
@@ -4537,9 +4869,7 @@ fn migrate_rollback(
                 bail!("stored migration rollback plan does not match --plan-hash");
             }
             plan.verify_integrity_hash()?;
-            database.with_connection(|connection| {
-                orchestrator_state::MigrationManager::validate_rollback(connection, &plan)
-            })?;
+            database.validate_migration_rollback(&plan)?;
 
             let approved_at = Utc::now();
             let approval_relative =
@@ -4576,10 +4906,11 @@ fn migrate_rollback(
                 }))?,
             )?;
 
-            let audit_event_recorded = database.migration_status()?.current_version >= 3;
-            if audit_event_recorded {
+            let audit_workspace = legacy_migration_workspace_if_present(database)?;
+            let audit_event_recorded = audit_workspace.is_some();
+            if let Some(workspace) = audit_workspace {
                 append_event(
-                    database,
+                    &workspace,
                     None,
                     EventType::RollbackPlanned,
                     None,
@@ -4594,7 +4925,7 @@ fn migrate_rollback(
                     }),
                 )?;
                 append_event(
-                    database,
+                    &workspace,
                     None,
                     EventType::MigrationCompleted,
                     None,
@@ -4609,7 +4940,6 @@ fn migrate_rollback(
                         "result_artifact": result_artifact,
                     }),
                 )?;
-                reconcile_events(state, database)?;
             }
             emit(
                 json_output,
@@ -4660,7 +4990,13 @@ fn rollback(
     action: RollbackAction,
     json_output: bool,
 ) -> Result<()> {
-    let state = StatePaths::from_config(repository, effective.config())?;
+    let maintenance = crate::daemon::acquire_maintenance()?;
+    let database = Database::open(&maintenance.paths.database)?;
+    database.migrate_with_backup(&maintenance.paths.backups)?;
+    let registration = database.resolve_repository_workspace(repository)?;
+    let workspace_paths = maintenance.paths.for_workspace(registration.workspace_id);
+    let state = global_release_state_paths(&maintenance.paths, &workspace_paths);
+    let workspace = database.workspace(registration.workspace_id);
     match action {
         RollbackAction::Plan { to } => {
             validate_release_component(&to)?;
@@ -4704,20 +5040,16 @@ fn rollback(
             let plan_relative = rollback_plan_relative_path(&to, &plan.integrity_hash)?;
             let stored = ArtifactStore::open(&state.root)?
                 .put(plan_relative.clone(), &serde_json::to_vec_pretty(&plan)?)?;
-            if state.database.exists() {
-                let database = open_ready_database(&state)?;
-                append_event(
-                    &database,
-                    None,
-                    EventType::RollbackPlanned,
-                    None,
-                    None,
-                    EventActor::User,
-                    CorrelationId::new(),
-                    json!({"target": to, "plan_hash": plan.integrity_hash, "artifact": stored}),
-                )?;
-                reconcile_events(&state, &database)?;
-            }
+            append_event(
+                &workspace,
+                None,
+                EventType::RollbackPlanned,
+                None,
+                None,
+                EventActor::User,
+                CorrelationId::new(),
+                json!({"target": to, "plan_hash": plan.integrity_hash, "artifact": stored}),
+            )?;
             emit(
                 json_output,
                 "rollback_plan",
@@ -4779,28 +5111,12 @@ fn rollback(
             let manager = rollback_manager(&state, &plan.steps)?;
             let approval =
                 orchestrator_engine::RollbackApproval::for_plan(&plan, approved_by, Utc::now());
-            if state.database.exists() {
-                let database = open_ready_database(&state)?;
-                ensure_rollback_quiescent(&database)?;
-                database.with_connection(|connection| {
-                    connection.execute(
-                        "INSERT INTO approval_records(
-                            approval_id, task_id, action, scope_json, approved_by,
-                            approved_at, expires_at, revoked_at
-                         ) VALUES (?1, NULL, 'release_rollback', ?2, ?3, ?4, NULL, NULL)",
-                        params![
-                            TaskId::new().to_string(),
-                            serde_json::to_string(&json!({
-                                "target_version": to,
-                                "plan_hash": plan_hash,
-                            }))?,
-                            approval.approved_by,
-                            approval.approved_at.to_rfc3339(),
-                        ],
-                    )?;
-                    Ok(())
-                })?;
-            }
+            ensure_rollback_quiescent(&workspace)?;
+            workspace.record_release_rollback_approval(
+                &json!({"target_version": to, "plan_hash": plan_hash}),
+                &approval.approved_by,
+                approval.approved_at,
+            )?;
             let report = manager.apply(&plan, &approval)?;
             emit(
                 json_output,
@@ -4808,6 +5124,22 @@ fn rollback(
                 &json!({"plan": plan, "execution": report, "restart_required": true}),
             )
         }
+    }
+}
+
+fn global_release_state_paths(
+    global: &GlobalStatePaths,
+    workspace: &orchestrator_state::WorkspaceStatePaths,
+) -> StatePaths {
+    StatePaths {
+        root: workspace.root.clone(),
+        database: global.database.clone(),
+        events: workspace.root.join("events.jsonl"),
+        backups: workspace.backups.clone(),
+        tasks: workspace.root.join("tasks"),
+        checkpoints: workspace.checkpoints.clone(),
+        handovers: workspace.handovers.clone(),
+        worktrees: workspace.worktrees.clone(),
     }
 }
 
@@ -4895,24 +5227,8 @@ fn read_regular_file_below(root: &Path, path: &Path) -> Result<Vec<u8>> {
     Ok(fs::read(canonical)?)
 }
 
-fn ensure_rollback_quiescent(database: &Database) -> Result<()> {
-    let (active_tasks, active_workers, active_coordinators): (i64, i64, i64) = database
-        .with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT
-                    (SELECT count(*) FROM tasks WHERE state IN (
-                        'running','checkpoint_requested','checkpointing',
-                        'handover_requested','handing_over','resuming','verifying'
-                    )),
-                    (SELECT count(*) FROM worker_leases WHERE released_at IS NULL),
-                    (SELECT count(*) FROM coordinator_leases WHERE released_at IS NULL)",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(Into::into)
-        })?;
-    if active_tasks > 0 || active_workers > 0 || active_coordinators > 0 {
+fn ensure_rollback_quiescent(database: &WorkspaceDatabase<'_>) -> Result<()> {
+    if !database.is_release_rollback_quiescent()? {
         bail!(
             "rollback requires all running tasks to reach a safe checkpoint and every worker/coordinator lease to be released"
         );
@@ -4965,33 +5281,15 @@ fn rollback_resolution_context(
         );
     }
     let database = open_ready_database(state)?;
-    let selected = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT attempt_id, task_id, worker_result_json FROM task_attempts
-                 WHERE provider_id = 'codex' AND worker_mode = 'workspace_write'
-                   AND ended_at IS NOT NULL
-                 ORDER BY started_at DESC, ordinal DESC, attempt_id DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    })?;
-    let (attempt_id, task_id, persisted) = selected
+    let database = workspace_for_repository(&database, repository)?;
+    let selected = database
+        .latest_completed_writable_attempt(ProviderId::Codex)?
         .ok_or_else(|| anyhow!("Codex rollback has no completed writable provider attempt"))?;
-    let attempt_id = AttemptId::from_str(&attempt_id)?;
-    let task_id = TaskId::from_str(&task_id)?;
-    let persisted = persisted
+    let attempt_id = selected.attempt_id;
+    let task_id = selected.task_id;
+    let persisted = selected
+        .worker_result
         .ok_or_else(|| anyhow!("selected Codex attempt has no process execution evidence"))?;
-    let persisted: Value = serde_json::from_str(&persisted)
-        .context("selected Codex attempt has malformed persisted result JSON")?;
     let worker_result: WorkerResult = serde_json::from_value(persisted.clone())
         .context("selected Codex attempt does not contain a complete WorkerResult v1")?;
     if worker_result.attempt_id != attempt_id
@@ -5226,37 +5524,32 @@ async fn legacy_tui(
     if !config.features.orchestrator_tui {
         bail!("orchestrator TUI is disabled by configuration");
     }
-    let (_, database) = load_existing_state(repository, &runtime.effective)?;
-    let rows = task_status_rows(&database, selector.task_id.as_deref())?;
-    let task = rows.first();
-    let usage = latest_usage_snapshots(&database, &config.orchestrator)?;
-    let selected_task_id = task
-        .map(|task| TaskId::from_str(&task.task_id))
-        .transpose()?;
-    let stored_task = selected_task_id
-        .map(|task_id| database.load_task(task_id))
-        .transpose()?
-        .flatten();
-    let task_envelope = stored_task
-        .as_ref()
+    let defaults = usage_defaults(&config.orchestrator)?;
+    let client = crate::ipc_client::DaemonClient::connect_or_start(repository, cli_config).await?;
+    let dashboard = client
+        .request(
+            "workspace.dashboard",
+            json!({"task_id": selector.task_id.as_deref(), "defaults": defaults}),
+        )
+        .await?
+        .outcome["data"]
+        .clone();
+    let tasks = serde_json::from_value::<Vec<StoredTask>>(dashboard["tasks"].clone())?;
+    let task = tasks.first();
+    let usage = serde_json::from_value::<Vec<UsageSnapshot>>(dashboard["usage"].clone())?;
+    let task_envelope = task
         .map(|stored| serde_json::from_value::<TaskEnvelope>(stored.envelope.clone()))
         .transpose()?;
-    let latest_routing = selected_task_id
-        .map(|task_id| database.list_routing_audits(task_id, 1))
-        .transpose()?
-        .and_then(|mut decisions| decisions.pop());
-    let latest_handover = selected_task_id
-        .map(|task_id| database.latest_handover(task_id))
-        .transpose()?
-        .flatten();
-    let handover_count = selected_task_id
-        .map(|task_id| count_handovers(&database, task_id))
-        .transpose()?
-        .unwrap_or(0);
-    let latest_verification = selected_task_id
-        .map(|task_id| latest_verification_result(&database, task_id))
-        .transpose()?
-        .flatten();
+    let latest_routing =
+        serde_json::from_value::<Option<RoutingAuditRecord>>(dashboard["routing"].clone())?;
+    let latest_handover =
+        serde_json::from_value::<Option<StoredHandover>>(dashboard["handover"].clone())?;
+    let handover_count = serde_json::from_value::<u32>(dashboard["handover_count"].clone())?;
+    let latest_verification = serde_json::from_value::<
+        Option<orchestrator_domain::VerificationResult>,
+    >(dashboard["verification"].clone())?;
+    let provider_health =
+        serde_json::from_value::<Vec<ProviderHealth>>(dashboard["provider_health"].clone())?;
     let entered_by = std::env::var("USERNAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -5285,9 +5578,9 @@ async fn legacy_tui(
                 .as_ref()
                 .and_then(|envelope| envelope.assessment.as_ref());
             orchestrator_tui::TaskPanel {
-                id: task.task_id.clone(),
+                id: task.task_id.to_string(),
                 objective: task.objective.clone(),
-                state: task.state.clone(),
+                state: format!("{:?}", task.state),
                 difficulty: assessment.map_or_else(
                     || "Unknown".to_owned(),
                     |value| format!("{:?} ({})", value.difficulty, value.total_score),
@@ -5301,7 +5594,7 @@ async fn legacy_tui(
                             .collect()
                     })
                     .unwrap_or_default(),
-                phase: task.state.clone(),
+                phase: format!("{:?}", task.state),
             }
         }),
         providers: usage
@@ -5316,9 +5609,9 @@ async fn legacy_tui(
                     .map_or_else(|| "Unknown".to_owned(), |value| value.to_rfc3339()),
                 source: format!("{:?}", usage.source),
                 confidence: format!("{:?}", usage.confidence),
-                health: latest_provider_health(&database, usage.provider)
-                    .ok()
-                    .flatten()
+                health: provider_health
+                    .iter()
+                    .find(|health| health.provider == usage.provider)
                     .map_or_else(
                         || "Unknown".to_owned(),
                         |health| format!("{:?}", health.status),
@@ -5393,7 +5686,13 @@ async fn legacy_tui(
             let mut document = load_edit_document(&runtime.explicit_edit_path)?;
             ensure_override_table(document.as_table_mut(), "orchestrator")?
                 .insert("automatic_routing", toml_edit::value(enabled));
-            save_override_atomic(&document, &runtime.explicit_edit_path)?;
+            write_override_via_daemon(
+                repository,
+                cli_config,
+                &document,
+                &runtime.explicit_edit_path,
+            )
+            .await?;
             let _ = load_config_runtime(repository, cli_config, environment)?;
             emit(
                 json_output,
@@ -5411,78 +5710,96 @@ async fn legacy_tui(
                 enabled,
                 json_output,
             )
+            .await
         }
         orchestrator_tui::ControlAction::SelectProvider { task_id, provider }
         | orchestrator_tui::ControlAction::Handover {
             task_id,
             to_provider: provider,
-        } => control(
-            repository,
-            &runtime.effective,
-            RequiredTask { task_id },
-            "handover",
-            json!({"to": parse_provider_id(&provider)?}),
-            json_output,
-        ),
-        orchestrator_tui::ControlAction::Pause { task_id } => control(
-            repository,
-            &runtime.effective,
-            RequiredTask { task_id },
-            "pause",
-            json!({}),
-            json_output,
-        ),
+        } => {
+            control(
+                repository,
+                cli_config,
+                RequiredTask { task_id },
+                "handover",
+                json!({"to": parse_provider_id(&provider)?}),
+                json_output,
+            )
+            .await
+        }
+        orchestrator_tui::ControlAction::Pause { task_id } => {
+            control(
+                repository,
+                cli_config,
+                RequiredTask { task_id },
+                "pause",
+                json!({}),
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::Resume { task_id } => {
             resume_task(
                 repository,
+                cli_config,
                 &runtime.effective,
                 &RequiredTask { task_id },
                 json_output,
             )
             .await
         }
-        orchestrator_tui::ControlAction::Cancel { task_id } => control(
-            repository,
-            &runtime.effective,
-            RequiredTask { task_id },
-            "cancel",
-            json!({}),
-            json_output,
-        ),
+        orchestrator_tui::ControlAction::Cancel { task_id } => {
+            control(
+                repository,
+                cli_config,
+                RequiredTask { task_id },
+                "cancel",
+                json!({}),
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::UsageOverride {
             provider,
             used,
             limit,
             remaining,
             entered_by,
-        } => usage_override(
-            repository,
-            &runtime.effective,
-            UsageOverrideArgs {
-                provider: parse_provider_name(&provider)?,
-                used,
-                limit,
-                remaining,
-                entered_by,
-            },
-            json_output,
-        ),
+        } => {
+            usage_override(
+                repository,
+                cli_config,
+                &runtime.effective,
+                UsageOverrideArgs {
+                    provider: parse_provider_name(&provider)?,
+                    used,
+                    limit,
+                    remaining,
+                    entered_by,
+                },
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::SetModelProfile {
             provider,
             profile,
             model,
             effort,
-        } => set_model_profile(
-            repository,
-            cli_config,
-            environment,
-            runtime,
-            parse_provider_name(&provider)?,
-            parse_profile_name(&profile)?,
-            &model,
-            Some(parse_effort_name(&effort)?),
-            json_output,
-        ),
+        } => {
+            set_model_profile(
+                repository,
+                cli_config,
+                environment,
+                runtime,
+                parse_provider_name(&provider)?,
+                parse_profile_name(&profile)?,
+                &model,
+                Some(parse_effort_name(&effort)?),
+                json_output,
+            )
+            .await
+        }
         orchestrator_tui::ControlAction::ResetModelProfile { provider, profile } => {
             reset_model_profile(
                 repository,
@@ -5493,6 +5810,7 @@ async fn legacy_tui(
                 parse_profile_name(&profile)?,
                 json_output,
             )
+            .await
         }
         orchestrator_tui::ControlAction::Quit => Ok(()),
     }
@@ -5530,75 +5848,6 @@ fn parse_effort_name(value: &str) -> Result<EffortName> {
     }
 }
 
-fn latest_provider_health(
-    database: &Database,
-    provider: ProviderId,
-) -> Result<Option<ProviderHealth>> {
-    database
-        .with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT details_json FROM provider_health
-                 WHERE provider_id = ?1 ORDER BY checked_at DESC LIMIT 1",
-                    [provider.as_str()],
-                    |row| {
-                        let value: String = row.get(0)?;
-                        serde_json::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    },
-                )
-                .optional()
-                .map_err(Into::into)
-        })
-        .map_err(Into::into)
-}
-
-fn latest_verification_result(
-    database: &Database,
-    task_id: TaskId,
-) -> Result<Option<orchestrator_domain::VerificationResult>> {
-    database
-        .with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT result_json FROM verification_results
-                 WHERE task_id = ?1 ORDER BY completed_at DESC LIMIT 1",
-                    [task_id.to_string()],
-                    |row| {
-                        let value: String = row.get(0)?;
-                        serde_json::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    },
-                )
-                .optional()
-                .map_err(Into::into)
-        })
-        .map_err(Into::into)
-}
-
-fn count_handovers(database: &Database, task_id: TaskId) -> Result<u32> {
-    let count: i64 = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT count(*) FROM handovers WHERE task_id = ?1",
-                [task_id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    })?;
-    Ok(u32::try_from(count).unwrap_or(u32::MAX))
-}
-
 fn routing_alternatives(value: &Value, selected: Option<ProviderId>) -> Vec<String> {
     value
         .as_array()
@@ -5613,7 +5862,8 @@ fn routing_alternatives(value: &Value, selected: Option<ProviderId>) -> Vec<Stri
 
 async fn routing_candidates(
     config: &OrchestratorConfig,
-    database: &Database,
+    global_database: &Database,
+    database: &WorkspaceDatabase<'_>,
     assessment: &orchestrator_domain::TaskAssessment,
     manually_requested: Option<ProviderId>,
     task_id: TaskId,
@@ -5638,7 +5888,7 @@ async fn routing_candidates(
                     ProviderCapabilities::unsupported(provider),
                 ),
             };
-        persist_health(database, &health)?;
+        persist_health(global_database, &health)?;
         if provider == ProviderId::Codex && health.status != HealthStatus::Healthy {
             append_event(
                 database,
@@ -5656,8 +5906,10 @@ async fn routing_candidates(
                 }),
             )?;
         }
-        let snapshot = collect_usage(provider, provider_config, database, now, &redaction).await?;
-        let budgets = budget_for_snapshot(config, provider_config, &snapshot, database, now)?;
+        let snapshot =
+            collect_usage(provider, provider_config, global_database, now, &redaction).await?;
+        let budgets =
+            budget_for_snapshot(config, provider_config, &snapshot, global_database, now)?;
         let calibrated_remaining_work_units =
             provider_config
                 .quota_units_per_work_unit
@@ -5745,7 +5997,7 @@ async fn collect_usage(
         .await;
         match probe_result {
             Ok(snapshot) => {
-                persist_usage(database, &snapshot, None)?;
+                persist_global_usage(database, &snapshot)?;
                 return Ok(snapshot);
             }
             Err(error) => {
@@ -5794,7 +6046,7 @@ fn budget_for_snapshot(
     config: &OrchestratorConfig,
     provider_config: &ProviderConfig,
     snapshot: &UsageSnapshot,
-    database: &Database,
+    global_database: &Database,
     now: DateTime<Utc>,
 ) -> Result<Vec<orchestrator_policy::BudgetForecast>> {
     let policy = reset_policy(provider_config)?;
@@ -5805,7 +6057,7 @@ fn budget_for_snapshot(
     } else {
         period_window(&policy, now)?
     };
-    let history = usage_history(database, snapshot.provider)?
+    let history = usage_history(global_database, snapshot.provider)?
         .into_iter()
         .filter(|observation| observation.quota_scope == snapshot.quota_scope)
         .filter(|observation| {
@@ -6077,45 +6329,8 @@ where
         .map_err(Into::into)
 }
 
-fn persist_task(
-    database: &Database,
-    task: &TaskEnvelope,
-    correlation_id: CorrelationId,
-) -> Result<()> {
-    database.create_task_with_event(
-        &orchestrator_state::NewTaskRecord {
-            task_id: task.task_id,
-            schema_version: task.schema_version.to_string(),
-            state: TaskState::Queued,
-            objective: task.objective.clone(),
-            original_request_redacted: task.original_request_redacted.clone(),
-            envelope: task,
-            created_at: task.created_at,
-        },
-        TaskEvent {
-            schema_version: SchemaVersion::state_current(),
-            sequence: 0,
-            event_id: EventId::new(),
-            session_id: None,
-            task_id: Some(task.task_id),
-            occurred_at: task.created_at,
-            event_type: EventType::TaskCreated,
-            from_state: None,
-            to_state: Some(TaskState::Queued),
-            reason: None,
-            actor: EventActor::User,
-            correlation_id,
-            causation_id: None,
-            payload: json!({"objective": task.objective}),
-            previous_hash: None,
-            event_hash: String::new(),
-        },
-    )?;
-    Ok(())
-}
-
 fn transition_task(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     next: TaskState,
     guards: orchestrator_domain::TransitionGuards,
@@ -6163,7 +6378,7 @@ fn state_transition_event(
 
 #[allow(clippy::too_many_arguments)]
 fn transition_task_projection(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: TaskId,
     next: TaskState,
     paused: bool,
@@ -6202,7 +6417,7 @@ fn transition_task_projection(
 }
 
 fn persist_routing(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     decision: &RoutingDecision,
     task: &TaskEnvelope,
 ) -> Result<()> {
@@ -6214,39 +6429,19 @@ fn persist_routing(
     Ok(())
 }
 
-fn persist_usage(
-    database: &Database,
-    snapshot: &UsageSnapshot,
-    task_id: Option<TaskId>,
-) -> Result<()> {
-    database.record_usage_snapshot(task_id, snapshot)?;
+fn persist_global_usage(database: &Database, snapshot: &UsageSnapshot) -> Result<()> {
+    database.record_global_usage_snapshot(snapshot)?;
     Ok(())
 }
 
 fn persist_health(database: &Database, health: &ProviderHealth) -> Result<()> {
-    let status = enum_name(&health.status)?;
-    database.with_connection(|connection| {
-        connection.execute(
-            "INSERT INTO provider_health(
-                health_id, provider_id, status, consecutive_failures, details_json, checked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                TaskId::new().to_string(),
-                health.provider.as_str(),
-                status,
-                health.consecutive_failures,
-                serde_json::to_string(health)?,
-                health.checked_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    })?;
+    database.record_provider_health(health)?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn append_event(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     task_id: Option<TaskId>,
     event_type: EventType,
     from_state: Option<TaskState>,
@@ -6280,9 +6475,9 @@ fn append_event_if_schema_available(
     event_type: EventType,
     payload: Value,
 ) -> Result<()> {
-    if database.migration_status()?.current_version >= 3 {
+    if let Some(workspace) = legacy_migration_workspace_if_present(database)? {
         append_event(
-            database,
+            &workspace,
             None,
             event_type,
             None,
@@ -6367,47 +6562,28 @@ fn latest_usage_snapshots(
     Ok(snapshots)
 }
 
+fn usage_defaults(config: &OrchestratorConfig) -> Result<Vec<UsageSnapshot>> {
+    let now = Utc::now();
+    provider_configs(config)
+        .map(|(provider, provider_config)| {
+            let mut snapshot =
+                UsageSnapshot::unknown(provider, quota_scope(provider, provider_config)?, now);
+            let window = period_window(&reset_policy(provider_config)?, now)?;
+            snapshot.period_started_at = Some(window.started_at);
+            snapshot.resets_at = Some(window.resets_at);
+            Ok(snapshot)
+        })
+        .collect()
+}
+
 fn usage_history(database: &Database, provider: ProviderId) -> Result<Vec<UsageSnapshot>> {
-    let snapshots = database.with_connection(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT snapshot_json FROM (
-                SELECT snapshot_json, collected_at FROM provider_usage_snapshots
-                WHERE provider_id = ?1 ORDER BY collected_at DESC LIMIT 256
-             ) ORDER BY collected_at ASC",
-        )?;
-        let values = statement
-            .query_map([provider.as_str()], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        values
-            .into_iter()
-            .map(|value| serde_json::from_str(&value).map_err(Into::into))
-            .collect()
-    })?;
+    let mut snapshots = database.list_global_usage_snapshots(Some(provider), 256)?;
+    snapshots.reverse();
     Ok(snapshots)
 }
 
-fn recent_failure_rate(database: &Database, provider: ProviderId) -> Result<f64> {
-    let (failures, total): (i64, i64) = database.with_connection(|connection| {
-        connection
-            .query_row(
-                "SELECT
-                    coalesce(sum(CASE WHEN outcome IN ('failed','timed_out','quota_exceeded')
-                                      THEN 1 ELSE 0 END), 0),
-                    count(*)
-                 FROM (SELECT outcome FROM task_attempts WHERE provider_id = ?1
-                       AND outcome IS NOT NULL ORDER BY ended_at DESC LIMIT 20)",
-                [provider.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(Into::into)
-    })?;
-    Ok(if total == 0 {
-        0.0
-    } else {
-        let failures = u32::try_from(failures).unwrap_or(u32::MAX);
-        let total = u32::try_from(total).unwrap_or(u32::MAX);
-        f64::from(failures) / f64::from(total)
-    })
+fn recent_failure_rate(database: &WorkspaceDatabase<'_>, provider: ProviderId) -> Result<f64> {
+    Ok(database.recent_attempt_failure_rate(provider)?)
 }
 
 fn load_task_input(arguments: &RunArgs) -> Result<TaskInput> {
@@ -6525,80 +6701,6 @@ fn explicitly_repository_wide(task: &str) -> bool {
             "전체 저장소",
         ],
     )
-}
-
-fn derive_analysis_hints(input: &TaskInput) -> AnalysisHints {
-    let text = format!(
-        "{} {} {}",
-        input.objective,
-        input.constraints.join(" "),
-        input.acceptance_criteria.join(" ")
-    )
-    .to_lowercase();
-    let repository_wide = contains_any(
-        &text,
-        &["repository", "workspace", "codebase", "저장소", "전체"],
-    );
-    let cross_component = repository_wide
-        || contains_any(
-            &text,
-            &[
-                "multi-provider",
-                "database",
-                "tui",
-                "cli",
-                "migration",
-                "통합",
-            ],
-        );
-    let advanced_technical_concerns = [
-        "architecture",
-        "security",
-        "concurrency",
-        "protocol",
-        "migration",
-        "아키텍처",
-        "보안",
-    ]
-    .iter()
-    .filter(|needle| text.contains(**needle))
-    .count()
-    .min(3);
-    let advanced_technical_concerns = u32::try_from(advanced_technical_concerns).unwrap_or(3);
-    let production_impact = contains_any(&text, &["production", "enterprise", "프로덕션", "운영"]);
-    let needs_e2e = contains_any(&text, &["e2e", "end-to-end", "통합 테스트"]);
-    AnalysisHints {
-        estimated_files: repository_wide.then_some(12),
-        estimated_components: cross_component.then_some(4),
-        repository_wide,
-        cross_component,
-        unclear_requirements: u32::from(input.acceptance_criteria.is_empty()),
-        advanced_technical_concerns,
-        production_impact,
-        rollback_difficult: contains_any(&text, &["destructive", "data loss", "파괴", "손실"]),
-        verification_layers: if needs_e2e { 3 } else { 1 },
-        needs_e2e,
-        lacks_clear_oracle: input.acceptance_criteria.is_empty(),
-        risk_tags: explicit_risk_tags(&text),
-    }
-}
-
-fn explicit_risk_tags(text: &str) -> Vec<RiskTag> {
-    let mappings = [
-        (RiskTag::Security, &["security", "보안"][..]),
-        (RiskTag::Authentication, &["authentication", "인증"]),
-        (RiskTag::Production, &["production", "프로덕션"]),
-        (RiskTag::Infrastructure, &["infrastructure", "인프라"]),
-        (RiskTag::DataLoss, &["data loss", "데이터 손실"]),
-        (RiskTag::Billing, &["billing", "결제"]),
-        (RiskTag::Privacy, &["privacy", "개인정보"]),
-        (RiskTag::Compliance, &["compliance", "규정 준수"]),
-    ];
-    mappings
-        .into_iter()
-        .filter(|(_, needles)| needles.iter().any(|needle| text.contains(needle)))
-        .map(|(risk, _)| risk)
-        .collect()
 }
 
 fn infer_role(text: &str) -> TaskRole {
@@ -6749,24 +6851,26 @@ fn open_ready_database(state: &StatePaths) -> Result<Database> {
     Ok(database)
 }
 
-fn initialize_repository_state(state: &StatePaths) -> Result<Database> {
-    let database = Database::open(&state.database)?;
-    database.migrate_with_backup(&state.backups)?;
-    EventLog::open(&state.events)?.reconcile(&database)?;
-    Ok(database)
-}
-
-fn load_existing_state(
+fn workspace_for_repository<'a>(
+    database: &'a Database,
     repository: &Path,
-    effective: &EffectiveConfig,
-) -> Result<(StatePaths, Database)> {
-    let state = StatePaths::from_config(repository, effective.config())?;
-    let database = open_ready_database(&state)?;
-    Ok((state, database))
+) -> Result<WorkspaceDatabase<'a>> {
+    let registration = database.resolve_repository_workspace(repository)?;
+    Ok(database.workspace(registration.workspace_id))
 }
 
-fn reconcile_events(state: &StatePaths, database: &Database) -> Result<()> {
-    EventLog::open(&state.events)?.reconcile(database)?;
+fn legacy_migration_workspace_if_present(
+    database: &Database,
+) -> Result<Option<WorkspaceDatabase<'_>>> {
+    match database.legacy_workspace() {
+        Ok(workspace) => Ok(Some(workspace)),
+        Err(StateError::WorkspaceNotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn reconcile_events(state: &StatePaths, database: &WorkspaceDatabase<'_>) -> Result<()> {
+    EventLog::open(&state.events)?.reconcile_workspace(database)?;
     Ok(())
 }
 
@@ -6788,45 +6892,18 @@ fn latest_database_backup(directory: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no database backup is available"))
 }
 
-fn task_status_rows(database: &Database, task_id: Option<&str>) -> Result<Vec<TaskStatusRow>> {
-    database
-        .with_connection(|connection| {
-            let mut statement = if task_id.is_some() {
-                connection.prepare(
-                    "SELECT task_id, state, objective, created_at, updated_at
-                     FROM tasks WHERE task_id = ?1 ORDER BY updated_at DESC LIMIT 1",
-                )?
-            } else {
-                connection.prepare(
-                    "SELECT task_id, state, objective, created_at, updated_at
-                     FROM tasks ORDER BY updated_at DESC LIMIT 100",
-                )?
-            };
-            let map = |row: &rusqlite::Row<'_>| {
-                Ok(TaskStatusRow {
-                    task_id: row.get(0)?,
-                    state: row.get(1)?,
-                    objective: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                })
-            };
-            if let Some(task_id) = task_id {
-                Ok(statement
-                    .query_map([task_id], map)?
-                    .collect::<Result<Vec<_>, _>>()?)
-            } else {
-                Ok(statement
-                    .query_map([], map)?
-                    .collect::<Result<Vec<_>, _>>()?)
-            }
-        })
-        .map_err(Into::into)
+fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> {
+    emit_versioned(json_output, "1", command, data)
 }
 
-fn emit<T: Serialize>(json_output: bool, command: &str, data: &T) -> Result<()> {
+fn emit_versioned<T: Serialize>(
+    json_output: bool,
+    schema_version: &str,
+    command: &str,
+    data: &T,
+) -> Result<()> {
     let envelope = json!({
-        "schema_version": "1",
+        "schema_version": schema_version,
         "command": command,
         "data": data,
     });
@@ -6869,15 +6946,6 @@ struct PlannedTask {
     task: TaskEnvelope,
     routing: RoutingDecision,
     plan_only: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct TaskStatusRow {
-    task_id: String,
-    state: String,
-    objective: String,
-    created_at: String,
-    updated_at: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -6979,6 +7047,13 @@ struct DoctorReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct DoctorProvidersReport {
+    schema_version: &'static str,
+    providers: Vec<ProviderReport>,
+    inference_requests: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct ProviderReport {
     provider: ProviderId,
     enabled: bool,
@@ -7008,10 +7083,11 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         sync::Arc,
+        time::Duration,
     };
 
-    use crate::args::{EffortName, MigrationAction, ProfileName, ProviderName};
-    use anyhow::Result;
+    use crate::args::{EffortName, ProfileName, ProviderName};
+    use anyhow::{Context as _, Result};
     use chrono::Utc;
     use orchestrator_domain::{
         AttemptId, ModelProfile, ProviderId, ReasoningEffort, SandboxMode, SchemaVersion,
@@ -7019,17 +7095,70 @@ mod tests {
         WorkerOutcome, WorkerRequest, WorkerResult,
     };
     use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
-    use orchestrator_state::{ConfigEnvironment, Database, NewTaskRecord, RootConfig};
+    use orchestrator_state::{
+        ConfigEnvironment, DaemonStatus, Database, DatabaseHealth, GlobalStatePaths, NewTaskRecord,
+        RootConfig, WorkspaceDatabase, WorkspaceId, WorkspaceKind, WorkspaceRegistration,
+        WorkspaceStatus,
+    };
     use rusqlite::params;
     use toml_edit::DocumentMut;
 
     use super::{
-        ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
-        acquire_task_coordinator, acquire_worker_lease, block_for_unconfirmed_termination,
-        initialize, load_config_runtime, mixed_git_checkout_warning, provider_adapter,
+        CheckStatus, ReviewOutcome, RollbackManifestStep, StatePaths, acceptance_evidence,
+        acquire_task_coordinator, acquire_worker_lease, append_live_doctor_checks,
+        block_for_unconfirmed_termination, initialize, load_config_runtime,
+        mixed_git_checkout_warning, next_run_command_poll_interval, provider_adapter,
         reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
         set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
+
+    #[test]
+    fn run_command_polling_backs_off_and_caps_at_one_second() {
+        let mut interval = Duration::from_millis(25);
+        let expected = [50_u64, 100, 200, 400, 800, 1_000, 1_000];
+
+        for expected_millis in expected {
+            interval = next_run_command_poll_interval(interval);
+            assert_eq!(interval, Duration::from_millis(expected_millis));
+        }
+    }
+
+    fn test_with_database<T>(
+        database: &Database,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        let connection = open_test_connection(database.path())?;
+        operation(&connection)
+    }
+
+    fn test_with_workspace<T>(
+        database_path: &Path,
+        database: &WorkspaceDatabase<'_>,
+        operation: impl FnOnce(&rusqlite::Connection) -> orchestrator_state::StateResult<T>,
+    ) -> orchestrator_state::StateResult<T> {
+        use rusqlite::functions::FunctionFlags;
+        let connection = open_test_connection(database_path)?;
+        let workspace_id = database.workspace_id().to_string();
+        connection.create_scalar_function(
+            "current_workspace",
+            0,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            move |_| Ok(workspace_id.clone()),
+        )?;
+        operation(&connection)
+    }
+
+    fn open_test_connection(path: &Path) -> orchestrator_state::StateResult<rusqlite::Connection> {
+        let connection = rusqlite::Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;\
+             PRAGMA journal_mode = WAL;\
+             PRAGMA synchronous = FULL;\
+             PRAGMA temp_store = MEMORY;\
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(connection)
+    }
 
     fn test_state(root: PathBuf) -> StatePaths {
         StatePaths {
@@ -7054,6 +7183,130 @@ mod tests {
         assert!(mixed_git_checkout_warning(Path::new("C:/work/project"), "windows").is_none());
     }
 
+    #[test]
+    fn malformed_live_doctor_response_fails_every_integrity_category() -> Result<()> {
+        let root = PathBuf::from("doctor-test-root");
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let response = orchestrator_daemon::IpcResponse {
+            schema_version: orchestrator_daemon::IPC_SCHEMA_VERSION,
+            request_id: "doctor-test".to_owned(),
+            outcome: serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "workspace": null
+                }
+            }),
+        };
+        let mut checks = Vec::new();
+        let workspace_id = "00000000-0000-0000-0000-000000000002".parse::<WorkspaceId>()?;
+
+        append_live_doctor_checks(
+            &mut checks,
+            &response,
+            &paths,
+            workspace_id,
+            Path::new("doctor-test-repository"),
+            Path::new("colay"),
+        );
+
+        assert_eq!(checks.len(), 5);
+        for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+            let check = checks
+                .iter()
+                .find(|check| check.name == name)
+                .with_context(|| format!("missing {name} failure"))?;
+            assert_eq!(check.status, CheckStatus::Fail, "{name} must fail closed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_live_doctor_workspace_path_fails_every_integrity_category() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let expected_repository = root.join("expected-repository");
+        let wrong_repository = root.join("wrong-repository");
+        fs::create_dir_all(&expected_repository)?;
+        fs::create_dir_all(&wrong_repository)?;
+        let expected_repository = fs::canonicalize(expected_repository)?;
+        let wrong_repository = fs::canonicalize(wrong_repository)?;
+        let workspace_id = "00000000-0000-0000-0000-000000000003".parse::<WorkspaceId>()?;
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let now = Utc::now();
+        let diagnostics = orchestrator_daemon::WorkspaceDoctorDiagnostics {
+            schema_version: orchestrator_daemon::WORKSPACE_DOCTOR_SCHEMA_VERSION,
+            database: DatabaseHealth {
+                integrity_ok: true,
+                foreign_key_violations: 0,
+                current_schema_version: orchestrator_state::STATE_SCHEMA_VERSION,
+                last_event_sequence: 0,
+            },
+            daemon: DaemonStatus::Stopped,
+            workspace: WorkspaceRegistration {
+                workspace_id,
+                kind: WorkspaceKind::Directory,
+                status: WorkspaceStatus::Active,
+                canonical_path: wrong_repository,
+                git_common_dir: None,
+                created_at: now,
+                last_seen_at: now,
+            },
+            audit: orchestrator_daemon::WorkspaceAuditDiagnostics {
+                workspace_id,
+                verified_events: 0,
+                last_sequence: 0,
+                last_hash: None,
+            },
+            artifacts: orchestrator_daemon::WorkspaceArtifactDiagnostics {
+                root: paths.for_workspace(workspace_id).root,
+                verified_references: 0,
+                scope: orchestrator_daemon::WorkspaceArtifactScope::PersistedReferences,
+            },
+        };
+        let response = orchestrator_daemon::IpcResponse {
+            schema_version: orchestrator_daemon::IPC_SCHEMA_VERSION,
+            request_id: "doctor-test".to_owned(),
+            outcome: serde_json::json!({
+                "status": "ok",
+                "data": serde_json::to_value(diagnostics)?,
+            }),
+        };
+        let mut checks = Vec::new();
+
+        append_live_doctor_checks(
+            &mut checks,
+            &response,
+            &paths,
+            workspace_id,
+            &expected_repository,
+            Path::new("colay"),
+        );
+
+        assert_eq!(checks.len(), 5);
+        for name in ["state", "daemon", "workspace", "audit", "artifacts"] {
+            let check = checks
+                .iter()
+                .find(|check| check.name == name)
+                .with_context(|| format!("missing {name} failure"))?;
+            assert_eq!(check.status, CheckStatus::Fail, "{name} must fail closed");
+        }
+        Ok(())
+    }
+
     fn write_fake_executable(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::write(path, bytes)?;
         #[cfg(unix)]
@@ -7071,17 +7324,34 @@ mod tests {
         Ok((temporary, root))
     }
 
+    fn install_legacy_workspace(database: &Database) -> Result<()> {
+        test_with_database(database, |connection| {
+            connection.execute(
+                "INSERT INTO main.workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'directory', 'detached', ?1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     fn attempt_completion(
-        database: &Database,
+        database_path: &Path,
+        database: &WorkspaceDatabase<'_>,
         attempt_id: AttemptId,
     ) -> Result<(Option<String>, Option<String>)> {
-        Ok(database.with_connection(|connection| {
-            Ok(connection.query_row(
-                "SELECT ended_at, outcome FROM task_attempts WHERE attempt_id = ?1",
-                [attempt_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?)
-        })?)
+        Ok(test_with_workspace(
+            database_path,
+            database,
+            |connection| {
+                Ok(connection.query_row(
+                    "SELECT ended_at, outcome FROM task_attempts WHERE attempt_id = ?1",
+                    [attempt_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            },
+        )?)
     }
 
     #[test]
@@ -7138,8 +7408,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn profile_set_persists_one_override_and_reloads_effective_config() -> Result<()> {
+    #[tokio::test]
+    async fn profile_set_persists_one_override_and_reloads_effective_config() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -7154,7 +7424,8 @@ mod tests {
             "company-fable",
             Some(EffortName::High),
             true,
-        )?;
+        )
+        .await?;
 
         let reloaded = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
         let profiles = &reloaded.effective.config().orchestrator.model_profiles;
@@ -7163,8 +7434,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn profile_reset_reveals_the_compiled_preset() -> Result<()> {
+    #[tokio::test]
+    async fn profile_reset_reveals_the_compiled_preset() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -7178,7 +7449,8 @@ mod tests {
             "company-gemini",
             None,
             true,
-        )?;
+        )
+        .await?;
         let runtime = load_config_runtime(&root, None, environment.clone())?;
         reset_model_profile(
             &root,
@@ -7188,7 +7460,8 @@ mod tests {
             ProviderName::Gemini,
             ProfileName::Standard,
             true,
-        )?;
+        )
+        .await?;
 
         let reloaded = load_config_runtime(&root, None, ConfigEnvironment::isolated())?;
         assert_eq!(
@@ -7228,6 +7501,7 @@ mod tests {
 
     #[cfg(feature = "test-fixtures")]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn terminal_provider_error_requests_cancel_and_finalizes_attempt() -> Result<()> {
         use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
 
@@ -7235,6 +7509,8 @@ mod tests {
         let state = test_state(root.join(".colay"));
         let database = Database::open(&state.database)?;
         database.migrate_with_backup(&state.backups)?;
+        install_legacy_workspace(&database)?;
+        let database = database.legacy_workspace()?;
         let now = Utc::now();
         let envelope = TaskEnvelope::new("terminal provider error", "terminal provider error", now);
         database.create_task(&NewTaskRecord {
@@ -7310,7 +7586,6 @@ mod tests {
             &database,
             coordinator.lease_id,
             &worker,
-            1,
             orchestrator_domain::CorrelationId::new(),
         )
         .await?;
@@ -7323,7 +7598,8 @@ mod tests {
             .find(|lease| lease.lease_id == worker.lease_id)
             .ok_or_else(|| anyhow::anyhow!("worker lease disappeared before release"))?;
         assert!(renewed_worker.expires_at > worker.expires_at);
-        let (ended_at, outcome) = attempt_completion(&database, request.attempt_id)?;
+        let (ended_at, outcome) =
+            attempt_completion(&state.database, &database, request.attempt_id)?;
         assert!(ended_at.is_some());
         assert_eq!(outcome.as_deref(), Some("cancelled"));
         database.release_worker_lease(coordinator.lease_id, worker.lease_id, Utc::now())?;
@@ -7341,6 +7617,8 @@ mod tests {
         let state = test_state(root.join(".colay"));
         let database = Database::open(&state.database)?;
         database.migrate_with_backup(&state.backups)?;
+        install_legacy_workspace(&database)?;
+        let database = database.legacy_workspace()?;
         let now = Utc::now();
         let envelope = TaskEnvelope::new("bounded leases", "bounded leases", now);
         database.create_task(&NewTaskRecord {
@@ -7417,8 +7695,8 @@ mod tests {
         assert!(example.contains("orchestrator.model_profiles.agy.premium"));
     }
 
-    #[test]
-    fn provider_enable_adds_only_the_requested_agy_boolean() -> Result<()> {
+    #[tokio::test]
+    async fn provider_enable_adds_only_the_requested_agy_boolean() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment = ConfigEnvironment::isolated();
         let runtime = load_config_runtime(&root, None, environment.clone())?;
@@ -7431,7 +7709,8 @@ mod tests {
             ProviderId::Agy,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         let persisted = fs::read_to_string(&runtime.explicit_edit_path)?.parse::<DocumentMut>()?;
         let providers = persisted["orchestrator"]["providers"]
@@ -7446,8 +7725,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn repository_provider_edit_preserves_global_comments() -> Result<()> {
+    #[tokio::test]
+    async fn repository_provider_edit_preserves_global_comments() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let global = root.join("home/config.toml");
         fs::create_dir_all(
@@ -7472,15 +7751,16 @@ mod tests {
             ProviderId::Claude,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         assert_eq!(fs::read_to_string(global)?, original);
         assert!(runtime.explicit_edit_path.exists());
         Ok(())
     }
 
-    #[test]
-    fn provider_edit_targets_the_environment_override() -> Result<()> {
+    #[tokio::test]
+    async fn provider_edit_targets_the_environment_override() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let environment_path = root.join("environment.toml");
         fs::write(
@@ -7502,7 +7782,8 @@ mod tests {
             ProviderId::Gemini,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         let persisted = fs::read_to_string(environment_path)?;
         assert!(persisted.starts_with("# environment comment\n"));
@@ -7522,12 +7803,17 @@ mod tests {
         )?;
         assert!(load_config_runtime(&root, Some(&path), ConfigEnvironment::isolated()).is_err());
 
-        super::migrate_without_runtime(&root, &path, MigrationAction::Status, true)?;
+        let (migratable, source_is_current, preview) =
+            super::migration_config_preview(None, &path)?;
+        assert!(migratable.is_some());
+        assert!(!source_is_current);
+        assert_eq!(preview.result().initial_version, 3);
+        assert_eq!(preview.result().final_version, 4);
         Ok(())
     }
 
-    #[test]
-    fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
+    #[tokio::test]
+    async fn automatic_legacy_provider_edit_updates_only_legacy_source() -> Result<()> {
         let (_temporary, root) = canonical_tempdir()?;
         let legacy = root.join(".codex/orchestrator/config.toml");
         write_layer(&legacy, 3)?;
@@ -7542,7 +7828,8 @@ mod tests {
             ProviderId::Codex,
             false,
             true,
-        )?;
+        )
+        .await?;
 
         assert!(fs::read_to_string(&legacy)?.contains("enabled = false"));
         assert!(!root.join(".colay/config.toml").exists());
@@ -7720,6 +8007,8 @@ mod tests {
 
         let database = Database::open(&state.database)?;
         database.migrate_with_backup(&state.backups)?;
+        install_legacy_workspace(&database)?;
+        let database = database.legacy_workspace()?;
         let now = Utc::now();
         let envelope = TaskEnvelope::new("writable fake provider", "writable fake provider", now);
         database.create_task(&NewTaskRecord {
@@ -7757,12 +8046,12 @@ mod tests {
                 "search_directory": null
             }
         });
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "INSERT INTO worktrees(
-                    worktree_id, task_id, repo_root, worktree_path, branch_name,
+                "INSERT INTO main.worktrees(
+                    workspace_id, worktree_id, task_id, repo_root, worktree_path, branch_name,
                     base_revision, state, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, 'codex/test', 'base', 'active', ?5)",
+                 ) VALUES (current_workspace(), ?1, ?2, ?3, ?4, 'codex/test', 'base', 'active', ?5)",
                 params![
                     uuid::Uuid::now_v7().to_string(),
                     envelope.task_id.to_string(),
@@ -7772,10 +8061,10 @@ mod tests {
                 ],
             )?;
             connection.execute(
-                "INSERT INTO task_attempts(
-                    attempt_id, task_id, ordinal, provider_id, worker_mode, started_at,
+                "INSERT INTO main.task_attempts(
+                    workspace_id, attempt_id, task_id, ordinal, provider_id, worker_mode, started_at,
                     ended_at, outcome, worker_result_json
-                 ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3, ?3, 'succeeded', ?4)",
+                 ) VALUES (current_workspace(), ?1, ?2, 1, 'codex', 'workspace_write', ?3, ?3, 'succeeded', ?4)",
                 params![
                     attempt_id.to_string(),
                     envelope.task_id.to_string(),
@@ -7856,9 +8145,10 @@ mod tests {
 
         let mut path_persisted = serde_json::to_value(&worker_result)?;
         path_persisted["process_execution"] = serde_json::to_value(&attempt_execution)?;
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                "UPDATE main.task_attempts SET worker_result_json = ?1
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?2",
                 params![path_persisted.to_string(), attempt_id.to_string()],
             )?;
             Ok(())
@@ -7891,9 +8181,10 @@ mod tests {
         let mut mismatched = path_persisted;
         mismatched["process_execution"]["path"] =
             serde_json::to_value(fs::canonicalize(&executable_b)?)?;
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                "UPDATE main.task_attempts SET worker_result_json = ?1
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?2",
                 params![mismatched.to_string(), attempt_id.to_string()],
             )?;
             Ok(())
@@ -7917,9 +8208,10 @@ mod tests {
                 .contains("invalid process execution evidence")
         );
 
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                "UPDATE main.task_attempts SET worker_result_json = ?1
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?2",
                 params![
                     serde_json::to_string(&worker_result)?,
                     attempt_id.to_string()
@@ -7954,13 +8246,15 @@ mod tests {
         });
         let other_worktree = state.worktrees.join("other-writable-worker");
         fs::create_dir_all(&other_worktree)?;
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                "UPDATE main.task_attempts SET worker_result_json = ?1
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?2",
                 params![relative_persisted.to_string(), attempt_id.to_string()],
             )?;
             connection.execute(
-                "UPDATE worktrees SET worktree_path = ?1 WHERE task_id = ?2 AND state = 'active'",
+                "UPDATE main.worktrees SET worktree_path = ?1
+                 WHERE workspace_id = current_workspace() AND task_id = ?2 AND state = 'active'",
                 params![
                     other_worktree.to_string_lossy(),
                     envelope.task_id.to_string()
@@ -7982,9 +8276,10 @@ mod tests {
             anyhow::bail!("relative identity bypassed its trusted active worktree");
         };
         assert!(error.to_string().contains("trusted worktree"));
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "UPDATE worktrees SET worktree_path = ?1 WHERE task_id = ?2 AND state = 'active'",
+                "UPDATE main.worktrees SET worktree_path = ?1
+                 WHERE workspace_id = current_workspace() AND task_id = ?2 AND state = 'active'",
                 params![worktree.to_string_lossy(), envelope.task_id.to_string()],
             )?;
             Ok(())
@@ -8000,9 +8295,10 @@ mod tests {
                 "search_directory": null
             }
         });
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "UPDATE task_attempts SET worker_result_json = ?1 WHERE attempt_id = ?2",
+                "UPDATE main.task_attempts SET worker_result_json = ?1
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?2",
                 params![absolute_persisted.to_string(), attempt_id.to_string()],
             )?;
             Ok(())
@@ -8038,6 +8334,8 @@ mod tests {
         let state = test_state(temporary_root.join("state"));
         let database = Database::open(&state.database)?;
         database.migrate_with_backup(&state.backups)?;
+        install_legacy_workspace(&database)?;
+        let database = database.legacy_workspace()?;
         let now = Utc::now();
         let envelope = TaskEnvelope::new("verify termination", "verify termination", now);
         database.create_task(&NewTaskRecord {
@@ -8050,11 +8348,11 @@ mod tests {
             created_at: now,
         })?;
         let attempt_id = AttemptId::new();
-        database.with_connection(|connection| {
+        test_with_workspace(&state.database, &database, |connection| {
             connection.execute(
-                "INSERT INTO task_attempts(
-                    attempt_id, task_id, ordinal, provider_id, worker_mode, started_at
-                 ) VALUES (?1, ?2, 1, 'codex', 'workspace_write', ?3)",
+                "INSERT INTO main.task_attempts(
+                    workspace_id, attempt_id, task_id, ordinal, provider_id, worker_mode, started_at
+                 ) VALUES (current_workspace(), ?1, ?2, 1, 'codex', 'workspace_write', ?3)",
                 params![
                     attempt_id.to_string(),
                     envelope.task_id.to_string(),

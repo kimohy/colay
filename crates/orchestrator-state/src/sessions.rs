@@ -9,7 +9,7 @@ use orchestrator_domain::{
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{Database, StateError, StateResult, database::append_event_in_transaction};
+use crate::{StateError, StateResult, WorkspaceDatabase, database::append_event_in_transaction};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewSessionRecord {
@@ -47,7 +47,9 @@ impl Default for SessionListFilter {
     }
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn create_session_with_event(
         &self,
         session: &NewSessionRecord,
@@ -57,7 +59,7 @@ impl Database {
         validate_session_event(session.session_id, EventType::SessionCreated, &event)?;
         self.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO sessions(
+                "INSERT INTO main.sessions(
                     session_id, schema_version, revision, title, state, state_v2, created_at, updated_at,
                     archived_at
                  ) VALUES (?1, ?2, 0, ?3, ?4, ?4, ?5, ?5, NULL)",
@@ -148,9 +150,9 @@ impl Database {
                 .validate_transition(next)
                 .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
             let changed = transaction.execute(
-                "UPDATE sessions SET state = ?1, state_v2 = ?2,
+                "UPDATE main.sessions SET state = ?1, state_v2 = ?2,
                  revision = revision + 1, updated_at = ?3
-                 WHERE session_id = ?4 AND revision = ?5",
+                 WHERE workspace_id = current_workspace() AND session_id = ?4 AND revision = ?5",
                 params![
                     legacy_session_state(next)?,
                     enum_text(&next)?,
@@ -246,6 +248,7 @@ impl Database {
         &self,
         message: &ConversationMessage,
         mut event: TaskEvent,
+        source_command_id: orchestrator_domain::ClientCommandId,
         command: &ClientCommand,
     ) -> StateResult<u64> {
         message
@@ -270,7 +273,7 @@ impl Database {
         self.with_transaction(|transaction| {
             let ordinal = append_message_in_transaction(transaction, message)?;
             transaction.execute(
-                "INSERT INTO client_commands(
+                "INSERT INTO main.client_commands(
                     command_id, session_id, task_id, action, payload_json, idempotency_key, state,
                     requested_by, requested_at, claimed_at, completed_at, outcome)
                  VALUES (?1, ?2, NULL, 'request_conversation_turn', ?3, ?4, 'pending',
@@ -284,6 +287,22 @@ impl Database {
                     command.requested_at.to_rfc3339(),
                 ],
             )?;
+            let copied_invocations = transaction.execute(
+                "INSERT INTO main.client_command_invocations(
+                    command_id, root_command_id, plan_only, recorded_at)
+                 SELECT ?1, root_command_id, plan_only, ?2
+                 FROM client_command_invocations WHERE command_id = ?3",
+                params![
+                    command.command_id.to_string(),
+                    command.requested_at.to_rfc3339(),
+                    source_command_id.to_string(),
+                ],
+            )?;
+            if copied_invocations != 1 {
+                return Err(StateError::InvalidRecord(
+                    "conversation follow-up source has no invocation provenance".to_owned(),
+                ));
+            }
             append_event_in_transaction(transaction, &mut event)?;
             invalidate_pre_task_candidate_in_transaction(
                 transaction,
@@ -328,8 +347,9 @@ impl Database {
                 .validate()
                 .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
             let changed = transaction.execute(
-                "UPDATE conversation_messages SET state = ?1, content_redacted = ?2,
-                 finalized_at = ?3 WHERE session_id = ?4 AND message_id = ?5
+                "UPDATE main.conversation_messages SET state = ?1, content_redacted = ?2,
+                 finalized_at = ?3 WHERE workspace_id = current_workspace() \
+                 AND session_id = ?4 AND message_id = ?5
                  AND state = 'streaming'",
                 params![
                     enum_text(&state)?,
@@ -367,7 +387,33 @@ impl Database {
                 .map_err(StateError::from)
         })
     }
+
+    pub fn latest_messages(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> StateResult<Vec<(u64, ConversationMessage)>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT ordinal, message_id, session_id, task_id, role, kind, state,
+                 content_redacted, created_at, finalized_at FROM conversation_messages
+                 WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT ?2",
+            )?;
+            let mut messages = statement
+                .query_map(params![session_id.to_string(), limit], map_message)?
+                .collect::<Result<Vec<_>, _>>()?;
+            messages.reverse();
+            Ok(messages)
+        })
+    }
 }
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
 
 fn invalidate_pre_task_candidate_in_transaction(
     transaction: &Transaction<'_>,
@@ -390,15 +436,16 @@ fn invalidate_pre_task_candidate_in_transaction(
     }
 
     transaction.execute(
-        "UPDATE graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
-         WHERE revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
+        "UPDATE main.graph_revisions SET status = 'superseded', completed_at = coalesce(completed_at, ?1)
+         WHERE workspace_id = current_workspace() \
+         AND revision_id = (SELECT revision_id FROM session_graph_heads WHERE session_id = ?2)
          AND status IN ('planning', 'awaiting_approval')",
         params![changed_at.to_rfc3339(), session_id.to_string()],
     )?;
     let changed = transaction.execute(
-        "UPDATE sessions SET state = 'drafting', state_v2 = 'drafting',
+        "UPDATE main.sessions SET state = 'drafting', state_v2 = 'drafting',
          revision = revision + 1, updated_at = ?1
-         WHERE session_id = ?2 AND revision = ?3",
+         WHERE workspace_id = current_workspace() AND session_id = ?2 AND revision = ?3",
         params![
             changed_at.to_rfc3339(),
             session_id.to_string(),
@@ -445,7 +492,7 @@ fn append_message_in_transaction(
         |row| row.get(0),
     )?;
     transaction.execute(
-        "INSERT INTO conversation_messages(
+        "INSERT INTO main.conversation_messages(
             message_id, session_id, task_id, ordinal, role, kind, state,
             content_redacted, created_at, finalized_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -679,7 +726,7 @@ mod tests {
         let now = timestamp().to_rfc3339();
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO tasks(
+                "INSERT INTO main.tasks(
                     task_id, schema_version, revision, state, resume_state, paused, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at,
                     archived_at
@@ -841,6 +888,41 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0], (1, first));
         assert_eq!(messages[1], (2, second));
+        Ok(())
+    }
+
+    #[test]
+    fn latest_messages_returns_the_tail_in_conversation_order() -> StateResult<()> {
+        let database = migrated_database();
+        let session = new_session("long conversation");
+        database.create_session_with_event(
+            &session,
+            session_event(session.session_id, EventType::SessionCreated),
+        )?;
+        for ordinal in 1..=205 {
+            database.append_message(&ConversationMessage {
+                message_id: MessageId::new(),
+                session_id: session.session_id,
+                task_id: None,
+                role: MessageRole::User,
+                kind: MessageKind::UserMessage,
+                state: MessageState::Final,
+                content_redacted: format!("message-{ordinal}"),
+                created_at: timestamp(),
+                finalized_at: Some(timestamp()),
+            })?;
+        }
+
+        let messages = database.latest_messages(session.session_id, 200)?;
+        assert_eq!(messages.len(), 200);
+        assert_eq!(messages.first().map(|(ordinal, _)| *ordinal), Some(6));
+        assert_eq!(messages.last().map(|(ordinal, _)| *ordinal), Some(205));
+        assert_eq!(
+            messages
+                .last()
+                .map(|(_, message)| message.content_redacted.as_str()),
+            Some("message-205")
+        );
         Ok(())
     }
 

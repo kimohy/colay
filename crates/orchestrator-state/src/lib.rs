@@ -14,17 +14,23 @@ mod daemon_instances;
 mod database;
 mod error;
 mod event_log;
+mod global_paths;
 mod graphs;
+mod import_scratch;
 mod instructions;
 mod integrations;
 mod leases;
+mod legacy_import;
 mod migrations;
 mod paths;
 mod permissions;
 mod records;
 mod scheduling;
 mod sessions;
+mod source_guard;
+mod sqlite_snapshot;
 mod workspace;
+mod workspace_registry;
 
 pub use artifacts::{ArtifactStore, StoredArtifact};
 pub use client_commands::ClientCommandRecoveryDisposition;
@@ -42,9 +48,14 @@ pub use conversations::{
     ConversationAttemptStatus, NewConversationAttempt, StoredConversationAttempt,
 };
 pub use daemon_instances::{DaemonInstance, DaemonLeaseRequest, DaemonPhase, DaemonStatus};
-pub use database::{Database, DatabaseHealth, OutboxRecord};
+pub use database::{
+    Database, DatabaseHealth, OutboxRecord, WorkspaceDatabase, WorkspaceOutboxRecord,
+};
 pub use error::{StateError, StateResult};
 pub use event_log::{EventLog, ReconciliationReport};
+pub use global_paths::{
+    GlobalStatePaths, StateEnvironment, StateEnvironmentTestInput, WorkspaceStatePaths,
+};
 pub use graphs::{
     ApprovedGraph, GraphApprovalRequest, GraphProjection, GraphRevisionStatus, GraphTaskDependency,
     GraphTaskProjection, NewGraphAttempt, NewPlanningAttempt, StoredGraphRevision,
@@ -52,14 +63,17 @@ pub use graphs::{
 pub use instructions::StoredTaskInstruction;
 pub use integrations::{IntegrationBatchStatus, StoredIntegrationBatch};
 pub use leases::{
-    CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, WorkerLease, WorkerLeaseMode,
-    WorkerLeaseRequest,
+    CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, ResumeDisposition, WorkerLease,
+    WorkerLeaseMode, WorkerLeaseRequest,
 };
+pub use legacy_import::{LegacyImportPlan, LegacyImportResult, LegacyImporter};
 pub use migrations::{
     AppliedMigration, MigrationManager, MigrationPlan, MigrationStatus,
     ROLLBACK_PLAN_SCHEMA_VERSION, RollbackApplyResult, RollbackPlan, STATE_SCHEMA_VERSION,
 };
 pub use paths::RepositoryStatePaths;
+#[cfg(windows)]
+pub use permissions::current_windows_user_sid;
 pub use permissions::{
     ensure_private_directory, ensure_private_file, reject_symlink_components, verify_private_file,
 };
@@ -74,6 +88,7 @@ pub use workspace::{
     WorkspaceAttention, WorkspaceAttentionKind, WorkspaceInspector, WorkspaceProjection,
     WorkspaceReadRequest, WorkspaceTask, WorkspaceVerification,
 };
+pub use workspace_registry::{WorkspaceId, WorkspaceKind, WorkspaceRegistration, WorkspaceStatus};
 
 pub(crate) struct CanonicalTempDir {
     _directory: tempfile::TempDir,

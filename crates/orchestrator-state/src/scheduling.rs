@@ -9,7 +9,7 @@ use orchestrator_domain::{
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult};
+use crate::{StateError, StateResult, WorkspaceDatabase, WorkspaceId};
 
 #[derive(Clone, Debug)]
 pub struct ClaimReadyTaskRequest {
@@ -22,6 +22,7 @@ pub struct ClaimReadyTaskRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClaimedTask {
+    pub workspace_id: WorkspaceId,
     pub schedule_claim_id: ScheduleClaimId,
     pub daemon_instance_id: DaemonInstanceId,
     pub session_id: SessionId,
@@ -33,19 +34,24 @@ pub struct ClaimedTask {
     pub profile: ModelProfile,
     pub envelope: TaskEnvelope,
     pub scope: ResourceScope,
+    pub approved_base_commit: String,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
 struct CandidateRecord {
+    workspace_id: WorkspaceId,
     candidate: ScheduleCandidate,
     node_key: String,
     profile: ModelProfile,
     envelope: TaskEnvelope,
+    approved_base_commit: String,
 }
 
-impl Database {
+macro_rules! impl_workspace_database {
+    ($database:ty) => {
+impl $database {
     pub fn claim_next_ready_task(
         &self,
         request: &ClaimReadyTaskRequest,
@@ -113,7 +119,7 @@ impl Database {
             })?;
         let schedule_claim_id = ScheduleClaimId::new();
         transaction.execute(
-            "INSERT INTO task_schedule_claims(
+            "INSERT INTO main.task_schedule_claims(
                 schedule_claim_id, daemon_instance_id, session_id, revision_id, task_id,
                 provider_id, acquired_at, expires_at, released_at, release_reason
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
@@ -136,21 +142,12 @@ impl Database {
             expires_at,
         )?;
         transaction.commit()?;
-        Ok(Some(ClaimedTask {
+        Ok(Some(claimed_task(
+            record,
+            request,
             schedule_claim_id,
-            daemon_instance_id: request.daemon_instance_id,
-            session_id: record.candidate.session_id,
-            revision_id: record.candidate.revision_id,
-            task_id,
-            node_key: record.node_key,
-            display_order: record.candidate.graph_order,
-            provider: record.candidate.provider,
-            profile: record.profile,
-            envelope: record.envelope,
-            scope: record.candidate.scope,
-            acquired_at: request.now,
             expires_at,
-        }))
+        )))
     }
 
     pub fn renew_schedule_claim(
@@ -172,8 +169,9 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_daemon_owner(&transaction, daemon_instance_id, now)?;
         let changed = transaction.execute(
-            "UPDATE task_schedule_claims SET expires_at = ?1
-             WHERE schedule_claim_id = ?2 AND daemon_instance_id = ?3
+            "UPDATE main.task_schedule_claims SET expires_at = ?1
+             WHERE workspace_id = current_workspace() \
+               AND schedule_claim_id = ?2 AND daemon_instance_id = ?3
                AND released_at IS NULL AND expires_at > ?4",
             params![
                 expires_at.to_rfc3339(),
@@ -188,8 +186,9 @@ impl Database {
             });
         }
         transaction.execute(
-            "UPDATE resource_claims SET expires_at = ?1
-             WHERE schedule_claim_id = ?2 AND released_at IS NULL",
+            "UPDATE main.resource_claims SET expires_at = ?1
+             WHERE workspace_id = current_workspace() \
+               AND schedule_claim_id = ?2 AND released_at IS NULL",
             params![expires_at.to_rfc3339(), schedule_claim_id.to_string()],
         )?;
         transaction.commit()?;
@@ -212,8 +211,9 @@ impl Database {
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
-            "UPDATE task_schedule_claims SET released_at = ?1, release_reason = ?2
-             WHERE schedule_claim_id = ?3 AND daemon_instance_id = ?4 AND released_at IS NULL",
+            "UPDATE main.task_schedule_claims SET released_at = ?1, release_reason = ?2
+             WHERE workspace_id = current_workspace() \
+               AND schedule_claim_id = ?3 AND daemon_instance_id = ?4 AND released_at IS NULL",
             params![
                 released_at.to_rfc3339(),
                 reason,
@@ -223,8 +223,9 @@ impl Database {
         )?;
         if changed == 1 {
             transaction.execute(
-                "UPDATE resource_claims SET released_at = ?1, release_reason = ?2
-                 WHERE schedule_claim_id = ?3 AND released_at IS NULL",
+                "UPDATE main.resource_claims SET released_at = ?1, release_reason = ?2
+                 WHERE workspace_id = current_workspace() \
+                   AND schedule_claim_id = ?3 AND released_at IS NULL",
                 params![
                     released_at.to_rfc3339(),
                     reason,
@@ -234,6 +235,37 @@ impl Database {
         }
         transaction.commit()?;
         Ok(changed == 1)
+    }
+}
+    };
+}
+
+impl_workspace_database!(WorkspaceDatabase<'_>);
+#[cfg(test)]
+impl_workspace_database!(crate::Database);
+
+fn claimed_task(
+    record: CandidateRecord,
+    request: &ClaimReadyTaskRequest,
+    schedule_claim_id: ScheduleClaimId,
+    expires_at: DateTime<Utc>,
+) -> ClaimedTask {
+    ClaimedTask {
+        workspace_id: record.workspace_id,
+        schedule_claim_id,
+        daemon_instance_id: request.daemon_instance_id,
+        session_id: record.candidate.session_id,
+        revision_id: record.candidate.revision_id,
+        task_id: record.candidate.task_id,
+        node_key: record.node_key,
+        display_order: record.candidate.graph_order,
+        provider: record.candidate.provider,
+        profile: record.profile,
+        envelope: record.envelope,
+        scope: record.candidate.scope,
+        approved_base_commit: record.approved_base_commit,
+        acquired_at: request.now,
+        expires_at,
     }
 }
 
@@ -283,13 +315,13 @@ fn schedule_claim_expiry(now: DateTime<Utc>, ttl: TimeDelta) -> StateResult<Date
 fn expire_claims(transaction: &Transaction<'_>, now: DateTime<Utc>) -> StateResult<()> {
     let now = now.to_rfc3339();
     transaction.execute(
-        "UPDATE resource_claims SET released_at = ?1, release_reason = 'schedule claim expired'
-         WHERE released_at IS NULL AND expires_at <= ?1",
+        "UPDATE main.resource_claims SET released_at = ?1, release_reason = 'schedule claim expired'
+         WHERE workspace_id = current_workspace() AND released_at IS NULL AND expires_at <= ?1",
         [&now],
     )?;
     transaction.execute(
-        "UPDATE task_schedule_claims SET released_at = ?1, release_reason = 'schedule claim expired'
-         WHERE released_at IS NULL AND expires_at <= ?1",
+        "UPDATE main.task_schedule_claims SET released_at = ?1, release_reason = 'schedule claim expired'
+         WHERE workspace_id = current_workspace() AND released_at IS NULL AND expires_at <= ?1",
         [&now],
     )?;
     Ok(())
@@ -320,15 +352,16 @@ fn ensure_daemon_owner(
 
 fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRecord>> {
     let mut statement = transaction.prepare(
-        "SELECT st.session_id, st.revision_id, st.task_id, st.node_key, st.display_order,
+        "SELECT current_workspace(), st.session_id, st.revision_id, st.task_id, st.node_key, st.display_order,
                 coalesce(st.provider_id_v2, st.provider_id), st.model_profile,
                 t.state, t.paused, t.task_envelope_json,
-                t.created_at
+                t.created_at, approval.base_commit
          FROM session_tasks st
          JOIN tasks t ON t.task_id = st.task_id
          JOIN graph_revisions gr ON gr.revision_id = st.revision_id
          JOIN session_graph_heads gh ON gh.session_id = st.session_id
                                     AND gh.revision_id = st.revision_id
+         LEFT JOIN graph_approvals approval ON approval.revision_id = st.revision_id
          WHERE gr.status = 'approved' AND t.archived_at IS NULL
          ORDER BY t.created_at, st.display_order, st.task_id",
     )?;
@@ -338,18 +371,21 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, String>(5)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
-            row.get::<_, i64>(8)?,
-            row.get::<_, String>(9)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
             row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, Option<String>>(12)?,
         ))
     })?;
     let mut candidates = Vec::new();
     for row in rows {
         let (
+            workspace_id,
             session_id,
             revision_id,
             task_id,
@@ -361,7 +397,22 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
             paused,
             envelope_json,
             created_at,
+            approved_base_commit,
         ) = row?;
+        let approved_base_commit = approved_base_commit.ok_or_else(|| {
+            StateError::InvalidRecord(format!(
+                "approved graph revision {revision_id} has no sealed approval base"
+            ))
+        })?;
+        if !matches!(approved_base_commit.len(), 40 | 64)
+            || !approved_base_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(StateError::InvalidRecord(format!(
+                "approved graph revision {revision_id} has an invalid sealed approval base"
+            )));
+        }
         let task_id = parse_id("task id", &task_id)?;
         let envelope: TaskEnvelope = serde_json::from_str(&envelope_json)?;
         let scope = ResourceScope {
@@ -370,6 +421,7 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
         };
         let dependencies = load_dependencies(transaction, task_id)?;
         candidates.push(CandidateRecord {
+            workspace_id: parse_id("workspace id", &workspace_id)?,
             candidate: ScheduleCandidate {
                 task_id,
                 session_id: parse_id("session id", &session_id)?,
@@ -388,6 +440,7 @@ fn load_candidates(transaction: &Transaction<'_>) -> StateResult<Vec<CandidateRe
             node_key,
             profile: parse_enum("model profile", &profile)?,
             envelope,
+            approved_base_commit,
         });
     }
     Ok(candidates)
@@ -489,7 +542,7 @@ fn insert_resource_claims(
     };
     for path in paths {
         transaction.execute(
-            "INSERT INTO resource_claims(
+            "INSERT INTO main.resource_claims(
                 resource_claim_id, schedule_claim_id, session_id, revision_id, task_id,
                 path, repository_wide, acquired_at, expires_at, released_at, release_reason
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
@@ -544,8 +597,9 @@ mod tests {
     };
     use rusqlite::params;
 
-    use super::{ClaimReadyTaskRequest, Database};
-    use crate::DaemonLeaseRequest;
+    use super::ClaimReadyTaskRequest;
+    use crate::Database;
+    use crate::{DaemonLeaseRequest, ResumeDisposition};
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0)
@@ -614,7 +668,7 @@ mod tests {
         };
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO tasks(task_id, schema_version, state, objective,
+                "INSERT INTO main.tasks(task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
                  VALUES (?1, 'v1', 'queued', ?2, 'goal', ?3, ?4, ?4)",
                 params![
@@ -625,7 +679,7 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                "INSERT INTO main.session_tasks(session_id, revision_id, task_id, node_key,
                     display_order, provider_id, model_profile)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -642,7 +696,7 @@ mod tests {
             )?;
             for dependency in dependencies {
                 transaction.execute(
-                    "INSERT INTO task_dependencies(session_id, revision_id, task_id,
+                    "INSERT INTO main.task_dependencies(session_id, revision_id, task_id,
                         depends_on_task_id) VALUES (?1, ?2, ?3, ?4)",
                     params![
                         session.to_string(),
@@ -665,18 +719,18 @@ mod tests {
         let revision = orchestrator_domain::GraphRevisionId::new();
         database.with_transaction(|transaction| {
             transaction.execute(
-                "INSERT INTO sessions(session_id, schema_version, title, state, created_at, updated_at)
+                "INSERT INTO main.sessions(session_id, schema_version, title, state, created_at, updated_at)
                  VALUES (?1, 'v1', 'test', 'running', ?2, ?2)",
                 params![session.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind,
+                "INSERT INTO main.conversation_messages(message_id, session_id, ordinal, role, kind,
                     state, content_redacted, created_at, finalized_at)
                  VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
                 params![message.to_string(), session.to_string(), now().to_rfc3339()],
             )?;
             transaction.execute(
-                "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+                "INSERT INTO main.graph_revisions(revision_id, session_id, goal_message_id, ordinal,
                     status, proposal_hash, validation_json, planner_provider, created_at, completed_at)
                  VALUES (?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
                 params![
@@ -688,9 +742,22 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
+                "INSERT INTO main.session_graph_heads(session_id, revision_id, updated_at)
                  VALUES (?1, ?2, ?3)",
                 params![session.to_string(), revision.to_string(), now().to_rfc3339()],
+            )?;
+            transaction.execute(
+                "INSERT INTO main.graph_approvals(
+                    revision_id, proposal_hash, approved_by, approved_at, session_id,
+                    requirement_revision_id, validation_hash, base_commit)
+                 VALUES (?1, ?2, 'scheduler-test', ?3, ?4, NULL, NULL, ?5)",
+                params![
+                    revision.to_string(),
+                    "0".repeat(64),
+                    now().to_rfc3339(),
+                    session.to_string(),
+                    "a".repeat(40),
+                ],
             )?;
             Ok(())
         })?;
@@ -727,6 +794,7 @@ mod tests {
             .claim_next_ready_task(&request(daemon))?
             .ok_or("claim missing")?;
         assert_eq!(claimed.task_id, task);
+        assert_eq!(claimed.approved_base_commit, "a".repeat(40));
         assert!(other.claim_next_ready_task(&request(daemon))?.is_none());
         assert!(database.release_schedule_claim(
             claimed.schedule_claim_id,
@@ -740,6 +808,40 @@ mod tests {
             now(),
             "done"
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn active_schedule_claim_attaches_only_to_its_daemon_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, daemon) = setup()?;
+        let (session, revision) = seed_graph(&database)?;
+        let task = seed_task(
+            &database,
+            session,
+            revision,
+            1,
+            ProviderId::Codex,
+            "src/a",
+            &[],
+        )?;
+        let claimed = database
+            .claim_next_ready_task(&request(daemon))?
+            .ok_or("claim missing")?;
+        assert_eq!(claimed.task_id, task);
+
+        assert_eq!(
+            database.resume_disposition(task, daemon, now() + TimeDelta::seconds(1))?,
+            ResumeDisposition::Attached
+        );
+        assert_eq!(
+            database.resume_disposition(
+                task,
+                DaemonInstanceId::new(),
+                now() + TimeDelta::seconds(1),
+            )?,
+            ResumeDisposition::Rejected
+        );
         Ok(())
     }
 
@@ -828,7 +930,8 @@ mod tests {
         )?;
         database.with_connection(|connection| {
             connection.execute(
-                "UPDATE tasks SET state = 'completed' WHERE task_id = ?1",
+                "UPDATE main.tasks SET state = 'completed' \
+                 WHERE workspace_id = current_workspace() AND task_id = ?1",
                 [dependency.to_string()],
             )?;
             Ok(())
@@ -839,7 +942,7 @@ mod tests {
 
         database.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO verification_results(verification_id, task_id, outcome,
+                "INSERT INTO main.verification_results(verification_id, task_id, outcome,
                     schema_version, result_json, started_at, completed_at)
                  VALUES (?1, ?2, 'pass', 'v1', '{}', ?3, ?3)",
                 params![

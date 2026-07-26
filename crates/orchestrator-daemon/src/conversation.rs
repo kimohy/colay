@@ -9,7 +9,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     ConversationOrchestrator, ConversationRequest, collect_conversation_response,
 };
-use orchestrator_state::{Database, NewConversationAttempt, StateError};
+use orchestrator_state::{NewConversationAttempt, StateError, WorkspaceDatabase};
 
 use crate::MessageRedactor;
 
@@ -22,7 +22,7 @@ pub(crate) enum ConversationCommandError {
 }
 
 pub(crate) async fn request_conversation_turn(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     orchestrator: &dyn ConversationOrchestrator,
     provider: orchestrator_domain::ProviderId,
     redactor: &dyn MessageRedactor,
@@ -73,7 +73,7 @@ pub(crate) async fn request_conversation_turn(
             started_at: command.requested_at,
         })?;
         let transcript = database
-            .messages_after(session_id, 0, 200)?
+            .latest_messages(session_id, 200)?
             .into_iter()
             .filter(|(_, message)| message.task_id.is_none())
             .map(|(_, message)| {
@@ -113,7 +113,7 @@ pub(crate) async fn request_conversation_turn(
 }
 
 fn reconcile_outcome(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     source_message_id: MessageId,
@@ -162,14 +162,17 @@ fn reconcile_outcome(
         .map_err(|error| ConversationCommandError::Rejected(error.to_string()))?;
         database.record_requirement_revision(&revision)?;
         if matches!(outcome, ConversationOutcome::WorktreeTaskCandidate { .. }) {
-            database.submit_client_command(&plan_command(command, source_message_id)?)?;
+            database.submit_derived_client_command(
+                command.command_id,
+                &plan_command(command, source_message_id)?,
+            )?;
         }
     }
     Ok(())
 }
 
 fn append_response(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     command: &ClientCommand,
     session_id: SessionId,
     content: &str,
@@ -237,7 +240,7 @@ fn plan_command(
             .map_err(StateError::from)?,
         idempotency_key: format!("conversation-plan-{}", source.command_id),
         state: ClientCommandState::Pending,
-        requested_by: "conversation-orchestrator".to_owned(),
+        requested_by: source.requested_by.clone(),
         requested_at: source.requested_at,
         claimed_at: None,
         completed_at: None,

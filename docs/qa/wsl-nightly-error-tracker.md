@@ -8,9 +8,10 @@
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-23
+- 마지막 갱신: 2026-07-26
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
-- 확인한 nightly: `0.1.1-nightly.20260722.f693062`
+- 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
+  `0.1.1-nightly.20260726.7a45d97`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
@@ -28,10 +29,214 @@
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
+| `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
+| `WSL-011` | high | open | migration 대기 DB에서 `doctor`가 미래 schema 컬럼을 먼저 조회해 raw SQL 오류 반환 |
 | `WIN-001` | medium | fixed | Windows PATH가 npm nightly 대신 오래된 Cargo `0.1.0`을 선택 |
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
+
+## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
+
+### 관찰
+
+nightly `0.1.1-nightly.20260723.7a977cf`를 WSL 홈에서 실행했을 때 다음 순환이 발생했다.
+
+```text
+$ colay run --plan-only hello
+error: state schema migration is required ([9, 10, 11]); run `colay migrate apply`
+
+$ colay migrate apply
+error: migration apply is disabled in safe mode; run `colay compatibility` and resolve:
+Codex version is untested; writable work is disabled
+```
+
+또한 `colay run hello`는 홈 디렉터리에 별도 repository-local 상태를 전제로 하면서 plan
+대화에 진입하기 전에 committed Git repository를 요구했다. 경로마다 `.colay` DB가 생성되므로
+사용자가 작업 디렉터리를 바꿀 때마다 schema, daemon, lease, backup이 분리되고 migration이
+로컬 config 존재 여부에 영향을 받는다.
+
+### 영향
+
+- provider가 새 버전이라는 이유로 상태 유지보수까지 safe mode에 묶여 사용자가 순환에서
+  빠져나올 수 없다.
+- non-Git 위치에서 plan 대화를 시작할 수 없고 raw Git 준비 상태가 제품 진입 조건이 된다.
+- daemon과 CLI가 repository-local DB에 직접 접근해 `WSL-003`의 writer 경합이 구조적으로
+  남는다.
+- 동일 사용자의 task와 conversation을 다른 경로에서 일관되게 조회하거나 재개하기 어렵다.
+
+### 승인된 개선 방향
+
+- OS 사용자당 SQLite DB 하나를 두고 모든 workspace 상태를 `workspace_id`로 분리한다.
+- Windows와 WSL은 SQLite 파일을 공유하지 않고 각 환경의 사용자 전역 위치를 사용한다.
+- 정상 동작의 SQLite writer는 사용자당 daemon 하나로 제한하고 CLI/TUI는 IPC를 사용한다.
+- Git이 없는 디렉터리에서도 interview·validation·plan 대화를 허용하고, 정확한 최종 승인
+  뒤 writable task로 승격할 때만 committed Git repository를 요구한다.
+- schema 생성·backup·forward migration은 provider compatibility 검사 전에 실행하고 safe
+  mode가 이를 차단하지 못하게 한다.
+- 현재 workspace의 기존 `.colay` 상태만 자동으로 멱등 import하며 원본은 삭제하지 않는다.
+- 상세 결정은
+  `docs/superpowers/specs/2026-07-24-user-global-workspace-state-design.md`에서 추적한다.
+
+### 완료 조건
+
+- WSL과 Windows의 non-Git 홈에서 `colay run hello`와 `run --plan-only hello`가 task/worktree
+  없이 plan 대화를 시작한다.
+- schema 8 전역 DB와 untested provider 조합에서 daemon이 backup 후 schema 11 이상으로
+  migration하고 provider 진단 단계로 진행한다.
+- 여러 workspace와 동시 CLI stress test에서 `SQLITE_BUSY`가 발생하지 않는다.
+- 기존 repository-local 상태가 정확히 한 번 import되고 원본과 audit evidence가 보존된다.
+- active lease의 `resume`은 충돌 오류 대신 기존 실행에 연결된다.
+- fake provider만 사용한 Windows/WSL QA와 전체 Rust 품질 게이트가 통과한다.
+
+### Task 8 Windows/WSL rollout 검증 (2026-07-26)
+
+검증 환경은 Windows 11 Home `10.0.26100` x86-64와 WSL 2 Ubuntu 24.04
+`6.18.33.2-microsoft-standard-WSL2` x86-64, Rust 1.95.0이다. WSL은 source만
+`/mnt/c`에서 읽고 아래 Linux-native cache를 사용했다. 모든 CLI fixture는 OS-native
+임시 `COLAY_HOME`, `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`, compiled fake provider만
+사용했다. 실제 Codex, Claude, Gemini, Agy inference는 호출하지 않았다.
+
+```text
+export RUSTUP_HOME=/home/kimohy/.cache/colay-task8-20260726/rustup
+export CARGO_HOME=/home/kimohy/.cache/colay-task8-20260726/cargo
+export CARGO_TARGET_DIR=/home/kimohy/.cache/colay-task8-20260726/target
+```
+
+#### 재현된 실패와 원인
+
+- 초기 WSL cold fan-in의 readiness timeout, 후속 raw `ENOENT`/connection reset은 같은
+  daemon endpoint 소실의 서로 다른 관찰이었다. test-only daemon stderr와 persisted
+  `daemon_instances`를 함께 수집한 재현에서 online owner가 stop 요청 없이 released되고
+  `optimistic update conflict for daemon instance ...`로 종료됨을 확인했다. 5초 lease보다
+  WSL virtual ext4 I/O가 늦어지면 기존 SQL의 `lease_expires_at > heartbeat_at` 조건이
+  아직 대체 owner가 없는 동일 owner의 늦은 heartbeat까지 거절한 것이 원인이었다.
+  동일 owner는 unreleased row를 갱신할 수 있게 하되, takeover가 먼저 old row를 release하면
+  old-owner heartbeat가 계속 거절되도록 수정했다.
+- heartbeat 수정 후 16개 plan-only client 가운데 하나가 10초 IPC response deadline을
+  넘기는 RED가 재현됐다. 각 client가 command status를 고정 25ms로 polling해 single IPC
+  writer에 최대 640 request/s를 넣은 것이 원인이었다. 전체 command deadline 2분은 유지하고
+  poll 간격만 25, 50, 100, 200, 400, 800, 1000ms로 지수 backoff/cap했다.
+- 과거 WSL full legacy-import를 5분에 중단했을 때 main thread의 `futex_do_wait`만 보고
+  deadlock으로 분류한 것은 잘못이었다. 다시 관찰한 worker들은 `jbd2_log_wait_commit`,
+  `submit_bio_wait`, `folio_wait_bit_common`에서 진행 중이었고, serial 22/22가 660.12초
+  (command 741.9초), default-parallel 22/22가 283.27초(command 331.8초)에 모두 끝났다.
+  원인은 WSL virtual ext4 journal I/O 지연이며 import deadlock이나 제품 실패가 아니다.
+
+#### 결정적 RED/GREEN 회귀
+
+```text
+cargo test -p colay --bin colay ipc_client::tests --all-features -- --nocapture
+cargo test -p orchestrator-state --lib daemon_instances::tests::same_owner_renews_an_expired_lease_before_any_takeover -- --nocapture --exact
+cargo test -p colay --bin colay app::tests::run_command_polling_backs_off_and_caps_at_one_second --all-features -- --nocapture --exact
+```
+
+첫 명령은 helper 추출 전 unresolved import RED 뒤 4/4 GREEN으로 startup spawn 1회,
+Windows `ERROR_PIPE_BUSY` busy→busy→success, non-busy 즉시 실패, deadline 종료를 고정했다.
+두 번째는 수정 전 `OptimisticConflict` RED, 수정 후 1/1 GREEN이었다. takeover test에도
+old-owner heartbeat 거절 assertion을 추가했다. 세 번째는 helper 부재 compile RED 뒤
+backoff sequence 1/1 GREEN이었다. 모두 exit code 0으로 재실행했다.
+
+#### Windows-native 최종 명령
+
+```text
+cargo test -p colay --bin colay ipc_client::tests --all-features
+cargo test -p orchestrator-state --lib daemon_instances::tests
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_daemon --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_resume --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_doctor --features test-fixtures doctor_reports_global_workspace_and_operational_checks -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+cargo test -p colay --test global_concurrency --features test-fixtures -- --nocapture --test-threads=1
+```
+
+위 순차 행렬은 각 명령 exit code 0이었다. 전역 path 14/14, daemon/IPC 7/7,
+non-Git plan 2/2, resume 3/3, doctor exact 1/1, full import 22/22, 32-client stress와
+Unicode/case 2/2가 통과했다. Named pipe DACL은 현재 SID ACE 하나만 포함하고 broad
+principal ACE를 포함하지 않았다.
+
+#### WSL-native 최종 명령
+
+```text
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_concurrency --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+for run in 1 2 3; do cargo test -p colay --test global_concurrency --features test-fixtures concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows -- --nocapture --exact || exit 1; done
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+```
+
+각 명령은 exit code 0이었다. path/XDG 18/18, clean combined concurrency 2/2
+(105.42초)와 plan-first 2/2(23.76초), exact 32-client stress 3회(67.89, 54.58,
+53.33초), final full import 22/22(293.87초)가 통과했다. Unix socket은 mode `0600`이며
+`COLAY_HOME` 소유자 UID와 일치했다. Windows와 WSL DB root는 서로 다른 OS-native
+임시 경로였고 WSL `/mnt/<drive>` state root 거부도 통과했다.
+
+모든 성공 경로 concurrency test는 `daemon stop` 성공 뒤 최대 10초 동안 unreleased
+lease 0건, IPC endpoint 부재, OS PID 종료를 확인한다. `Drop`은 실패 경로 fallback일
+뿐 성공 증거가 아니다. 이 원인 분석과 clean full matrix로 `WSL-010`을 fixed로 유지한다.
+
+최종 candidate에서 `cargo fmt --all -- --check`는 exit code 0(6.6초),
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`는 exit code
+0(28.2초), `cargo test --workspace --all-features`는 exit code 0(676.4초)이었다.
+마지막 전체 suite에서도 concurrency 2/2(45.49초), daemon 7/7(27.85초), doctor
+13/13(15.26초), plan-first 2/2(24.23초), resume 3/3(14.48초)와 full import
+22/22가 통과했다.
+
+### 배포 nightly 재검증 (2026-07-26)
+
+`main` merge commit `7a45d976d89274fd575babeabbedf9438c183452`에서 배포된
+`0.1.1-nightly.20260726.7a45d97`을 WSL Ubuntu 24.04의 NVM Node 22.23.1에
+정확한 버전으로 설치했다. npm root와 중첩 Linux native package 버전은 일치했고,
+native binary는 x86-64 static PIE였으며 `colay --version`도 일치했다. 실제 provider
+inference는 호출하지 않았다.
+
+배포본에는 이 브랜치의 전역 상태 변경이 아직 포함되지 않았다. 격리 HOME 아래 두 Git
+workspace에서 `colay init`을 실행하자 각각 `.colay/config.toml`,
+`.colay/events.jsonl`, `.colay/orchestrator.db`가 생성됐고 사용자당 공용 DB는 생성되지
+않았다. non-Git `run --plan-only hello`도 provider를 호출하지 않고 성공했지만 같은
+경로에 별도 `.colay/orchestrator.db`를 만들었으며 출력 계약은 계속
+`static assessment, not conversation mode`였다.
+
+실사용 schema 8 DB에서 `migrate plan`은 9, 10, 11의 비파괴 순차 계획을 만들었지만
+`migrate apply`는 Codex 0.145.0을 `untested`로 분류한 safe mode에 의해 다시 거부됐다.
+호출 전후 DB SHA-256은 같아 사용자 상태는 변경되지 않았다. `compatibility`는 exec,
+App Server, read-only/workspace-write sandbox와 reasoning effort를 공개 probe로 확인했지만
+최종 상태는 `generic_untested`, writable unsupported였다.
+
+반면 신규 schema 11 격리 workspace에서는 `init`, `doctor`, `migrate status`, `status`,
+daemon start/status/restart/stop이 모두 성공했다. restart는 PID를 교체했고 CLI/daemon의
+native 경로, nightly 버전, `linux/x86_64` identity가 일치했다. non-Git과 unborn HEAD의
+writable `run`은 상태 파일을 만들기 전에 구체적인 Git 준비 오류로 차단됐다.
+
+따라서 source candidate의 Windows/WSL 검증은 유지하되, 사용자에게 배포된 nightly에서
+완료 조건이 확인될 때까지 `WSL-010` 상태를 `fix-in-progress`로 되돌린다. 다음 완료
+조건은 이 브랜치를 `main`에 통합하고 새 nightly에서 사용자당 DB 1개, schema 8 자동
+유지보수, capability-qualified Codex 0.145.0, conversation-first non-Git 진입을 재검증하는
+것이다.
+
+## WSL-011: migration 대기 DB의 `doctor` 선행 schema 조회
+
+### 관찰
+
+nightly `0.1.1-nightly.20260726.7a45d97`에서 schema 8 사용자 DB를 대상으로
+`colay --json doctor`를 실행하면 migration-required 진단 대신 다음 SQL 오류로 종료한다.
+
+```text
+error: SQLite operation failed: no such column: phase in SELECT ...
+FROM daemon_instances WHERE released_at IS NULL ...
+```
+
+같은 DB에서 `migrate plan`은 pending 9, 10, 11을 정상 보고하고 `daemon status`와
+`status`는 `state schema migration is required`로 올바르게 차단된다. `phase`는 schema 9에서
+추가되는 컬럼이므로 `doctor`만 migration guard보다 daemon runtime 조회를 먼저 수행한다.
+
+### 영향 및 완료 조건
+
+- 사용자가 migration 필요성을 진단하려는 명령에서 내부 SQL과 schema 세부가 노출된다.
+- `doctor`가 migration을 적용하지 않더라도 현재/목표 schema와 pending step을 안전하게
+  보고하고, 현재 schema에 없는 컬럼을 조회하지 않아야 한다.
+- schema 8 fixture에서 `doctor`가 raw SQLite 오류 없이 구조화된 migration-required 또는
+  제한된 진단을 반환하는 회귀 테스트가 필요하다.
 
 ## WSL-001: NVM/Node 및 PATH 불일치
 

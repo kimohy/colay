@@ -262,6 +262,12 @@ fn daemon_help_hides_internal_serve_action() -> Result<()> {
 fn slow_fake_provider_probe_does_not_make_start_fail() -> Result<()> {
     let fixture = CliFixture::new()?;
     fixture.configure_slow_fake_codex(6_000)?;
+    let initialized = fixture.colay(["init"])?;
+    assert!(
+        initialized.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
 
     let started = fixture.invoke_without_capture(&["daemon", "start"])?;
 

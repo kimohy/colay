@@ -11,6 +11,7 @@ members = [
     "crates/orchestrator-cli",
     "crates/orchestrator-tui",
     "crates/orchestrator-test-support",
+    "crates/orchestrator-windows-ipc",
 ]
 resolver = "3"
 
@@ -33,14 +34,15 @@ hex = "0.4"
 libc = "0.2"
 ratatui = "0.29"
 regex = "1"
-rusqlite = { version = "0.37", features = ["backup", "bundled", "chrono", "uuid"] }
+rusqlite = { version = "0.37", features = ["backup", "bundled", "chrono", "functions", "uuid"] }
+same-file = "1"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
 toml_edit = { version = "0.23", features = ["serde"] }

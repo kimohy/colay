@@ -3,14 +3,16 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use chrono::{TimeDelta, Utc};
 use orchestrator_domain::{
     CorrelationId, DaemonInstanceId, EventActor, EventId, EventType, ProviderId, SchemaVersion,
-    TaskEvent, TaskInstructionState, TaskState, TransitionGuards, WorkerOutcome,
+    TaskEvent, TaskId, TaskInstructionState, TaskState, TransitionGuards, WorkerOutcome,
 };
 use orchestrator_engine::{
     GitWorktree, TaskExecutionReport, TaskExecutionRequest, TaskExecutor, canonicalize_directory,
 };
 use orchestrator_state::{
     ClaimReadyTaskRequest, ClaimedTask, Database, NewTaskAttemptRecord, NewWorktreeRecord,
+    WorkspaceDatabase, WorkspaceId,
 };
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{DaemonError, MessageRedactor};
@@ -23,6 +25,35 @@ pub struct ExecutionServices {
     pub global_limit: usize,
     pub provider_limits: BTreeMap<ProviderId, usize>,
     pub claim_ttl: TimeDelta,
+}
+
+/// A revision-cursor snapshot emitted when a CLI attaches to a task already owned by this
+/// daemon. Re-reading after `revision` changes is replay-safe and never creates a worker attempt.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ActiveTaskStatus {
+    pub task_id: TaskId,
+    pub state: TaskState,
+    pub revision: u64,
+    pub attempt_count: usize,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+pub(crate) fn active_task_status(
+    database: &Database,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+) -> orchestrator_state::StateResult<Option<ActiveTaskStatus>> {
+    let workspace = database.workspace(workspace_id);
+    let Some(task) = workspace.load_task(task_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(ActiveTaskStatus {
+        task_id,
+        state: task.state,
+        revision: task.revision,
+        attempt_count: workspace.list_task_attempts(task_id)?.len(),
+        updated_at: task.updated_at,
+    }))
 }
 
 pub(crate) fn validate_execution_services(services: &ExecutionServices) -> Result<(), DaemonError> {
@@ -46,12 +77,14 @@ pub(crate) fn validate_execution_services(services: &ExecutionServices) -> Resul
 
 pub(crate) fn spawn_ready_tasks(
     database: &Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     services: &ExecutionServices,
     redactor: &Arc<dyn MessageRedactor>,
     cancellation: &CancellationToken,
     jobs: &mut Vec<tokio::task::JoinHandle<Result<(), DaemonError>>>,
 ) -> Result<(), DaemonError> {
+    let workspace = database.workspace(workspace_id);
     while jobs.len() < services.global_limit {
         let request = ClaimReadyTaskRequest {
             daemon_instance_id: instance_id,
@@ -60,7 +93,7 @@ pub(crate) fn spawn_ready_tasks(
             now: Utc::now(),
             ttl: services.claim_ttl,
         };
-        let Some(claim) = database.claim_next_ready_task(&request)? else {
+        let Some(claim) = workspace.claim_next_ready_task(&request)? else {
             break;
         };
         let job_database = Arc::clone(database);
@@ -70,6 +103,7 @@ pub(crate) fn spawn_ready_tasks(
         jobs.push(tokio::spawn(async move {
             run_claimed_task(
                 job_database,
+                workspace_id,
                 instance_id,
                 claim,
                 job_services,
@@ -114,33 +148,57 @@ pub(crate) async fn stop_execution_jobs(
 
 async fn run_claimed_task(
     database: Arc<Database>,
+    workspace_id: WorkspaceId,
     instance_id: DaemonInstanceId,
     claim: ClaimedTask,
     services: ExecutionServices,
     redactor: Arc<dyn MessageRedactor>,
     cancellation: CancellationToken,
 ) -> Result<(), DaemonError> {
-    let result = run_claimed_task_inner(
-        &database,
-        instance_id,
-        &claim,
-        &services,
-        redactor.as_ref(),
-        cancellation,
-    )
+    let workspace = database.workspace(workspace_id);
+    let result = async {
+        if claim.workspace_id != workspace_id {
+            return Err(DaemonError::InvalidSettings(
+                "claimed task workspace identity does not match its execution runtime".to_owned(),
+            ));
+        }
+        let registration = database.load_workspace(workspace_id)?.ok_or_else(|| {
+            DaemonError::InvalidSettings(
+                "claimed task workspace registration disappeared".to_owned(),
+            )
+        })?;
+        let runtime_repository = canonicalize_directory(&services.repository_root)
+            .map_err(|error| DaemonError::InvalidSettings(error.to_string()))?;
+        let registered_repository = canonicalize_directory(&registration.canonical_path)
+            .map_err(|error| DaemonError::InvalidSettings(error.to_string()))?;
+        if runtime_repository != registered_repository {
+            return Err(DaemonError::InvalidSettings(
+                "claimed task repository identity does not match its execution runtime".to_owned(),
+            ));
+        }
+        run_claimed_task_inner(
+            &workspace,
+            instance_id,
+            &claim,
+            &services,
+            redactor.as_ref(),
+            cancellation,
+        )
+        .await
+    }
     .await;
     let reason = if result.is_ok() {
         "task execution finished"
     } else {
         "task execution failed"
     };
-    database.release_schedule_claim(claim.schedule_claim_id, instance_id, Utc::now(), reason)?;
+    workspace.release_schedule_claim(claim.schedule_claim_id, instance_id, Utc::now(), reason)?;
     result
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_claimed_task_inner(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     instance_id: DaemonInstanceId,
     claim: &ClaimedTask,
     services: &ExecutionServices,
@@ -275,7 +333,7 @@ async fn run_claimed_task_inner(
 }
 
 fn persist_report(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     claim: &ClaimedTask,
     report: &TaskExecutionReport,
     repository_root: &std::path::Path,
@@ -339,7 +397,7 @@ fn persist_report(
 }
 
 fn finish_instructions(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     instructions: &[orchestrator_state::StoredTaskInstruction],
     applied: bool,
 ) -> Result<(), DaemonError> {
@@ -363,7 +421,7 @@ fn finish_instructions(
 }
 
 fn transition(
-    database: &Database,
+    database: &WorkspaceDatabase<'_>,
     claim: &ClaimedTask,
     expected: TaskState,
     next: TaskState,
@@ -461,12 +519,13 @@ mod tests {
     use orchestrator_engine::{
         EngineResult, TaskExecutionReport, TaskExecutionRequest, TaskExecutor,
     };
-    use orchestrator_state::{DaemonLeaseRequest, Database};
+    use orchestrator_state::{DaemonLeaseRequest, Database, WorkspaceDatabase};
     use rusqlite::params;
     use tokio_util::sync::CancellationToken;
 
     use super::{ExecutionServices, reap_finished_tasks, spawn_ready_tasks, stop_execution_jobs};
     use crate::MessageRedactor;
+    use crate::test_support::{with_workspace, with_workspace_transaction};
 
     struct IdentityRedactor;
 
@@ -519,28 +578,29 @@ mod tests {
     }
 
     fn seed_graph(
-        database: &Database,
+        database_path: &std::path::Path,
+        database: &WorkspaceDatabase<'_>,
     ) -> Result<(SessionId, GraphRevisionId), Box<dyn std::error::Error>> {
         let session = SessionId::new();
         let message = MessageId::new();
         let revision = GraphRevisionId::new();
         let now = Utc::now().to_rfc3339();
-        database.with_transaction(|transaction| {
+        with_workspace_transaction(database_path, database, |transaction| {
             transaction.execute(
-                "INSERT INTO sessions(session_id, schema_version, title, state, created_at, updated_at)
-                 VALUES (?1, 'v1', 'parallel', 'running', ?2, ?2)",
+                "INSERT INTO main.sessions(workspace_id, session_id, schema_version, title, state, created_at, updated_at)
+                 VALUES (current_workspace(), ?1, 'v1', 'parallel', 'running', ?2, ?2)",
                 params![session.to_string(), now],
             )?;
             transaction.execute(
-                "INSERT INTO conversation_messages(message_id, session_id, ordinal, role, kind,
+                "INSERT INTO main.conversation_messages(workspace_id, message_id, session_id, ordinal, role, kind,
                     state, content_redacted, created_at, finalized_at)
-                 VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
+                 VALUES (current_workspace(), ?1, ?2, 1, 'user', 'user_message', 'final', 'goal', ?3, ?3)",
                 params![message.to_string(), session.to_string(), now],
             )?;
             transaction.execute(
-                "INSERT INTO graph_revisions(revision_id, session_id, goal_message_id, ordinal,
+                "INSERT INTO main.graph_revisions(workspace_id, revision_id, session_id, goal_message_id, ordinal,
                     status, proposal_hash, validation_json, planner_provider, created_at, completed_at)
-                 VALUES (?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
+                 VALUES (current_workspace(), ?1, ?2, ?3, 1, 'approved', ?4, '{}', 'codex', ?5, ?5)",
                 params![
                     revision.to_string(),
                     session.to_string(),
@@ -550,9 +610,22 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_graph_heads(session_id, revision_id, updated_at)
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO main.session_graph_heads(workspace_id, session_id, revision_id, updated_at)
+                 VALUES (current_workspace(), ?1, ?2, ?3)",
                 params![session.to_string(), revision.to_string(), now],
+            )?;
+            transaction.execute(
+                "INSERT INTO main.graph_approvals(
+                    workspace_id, revision_id, proposal_hash, approved_by, approved_at,
+                    session_id, base_commit)
+                 VALUES (current_workspace(), ?1, ?2, 'daemon-execution-test', ?3, ?4, ?5)",
+                params![
+                    revision.to_string(),
+                    "0".repeat(64),
+                    now,
+                    session.to_string(),
+                    "0".repeat(40),
+                ],
             )?;
             Ok(())
         })?;
@@ -560,7 +633,8 @@ mod tests {
     }
 
     fn seed_task(
-        database: &Database,
+        database_path: &std::path::Path,
+        database: &WorkspaceDatabase<'_>,
         session: SessionId,
         revision: GraphRevisionId,
         order: i64,
@@ -579,11 +653,11 @@ mod tests {
             assessment: None,
             created_at: now,
         };
-        database.with_transaction(|transaction| {
+        with_workspace_transaction(database_path, database, |transaction| {
             transaction.execute(
-                "INSERT INTO tasks(task_id, schema_version, state, objective,
+                "INSERT INTO main.tasks(workspace_id, task_id, schema_version, state, objective,
                     original_request_redacted, task_envelope_json, created_at, updated_at)
-                 VALUES (?1, ?2, 'queued', ?3, 'goal', ?4, ?5, ?5)",
+                 VALUES (current_workspace(), ?1, ?2, 'queued', ?3, 'goal', ?4, ?5, ?5)",
                 params![
                     task_id.to_string(),
                     SchemaVersion::V1,
@@ -593,9 +667,9 @@ mod tests {
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO session_tasks(session_id, revision_id, task_id, node_key,
+                "INSERT INTO main.session_tasks(workspace_id, session_id, revision_id, task_id, node_key,
                     display_order, provider_id, model_profile)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
+                 VALUES (current_workspace(), ?1, ?2, ?3, ?4, ?5, 'codex', 'standard')",
                 params![
                     session.to_string(),
                     revision.to_string(),
@@ -614,8 +688,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = std::fs::canonicalize(directory.path())?;
-        let database = Arc::new(Database::open(root.join("state.db"))?);
+        let database_path = root.join("state.db");
+        let database = Arc::new(Database::open(&database_path)?);
         database.migrate_with_backup(&root.join("backups"))?;
+        let workspace_id = database.resolve_repository_workspace(&root)?.workspace_id;
+        let workspace = database.workspace(workspace_id);
         let daemon = DaemonInstanceId::new();
         database.acquire_daemon_lease(&DaemonLeaseRequest {
             instance_id: daemon,
@@ -623,9 +700,9 @@ mod tests {
             started_at: Utc::now(),
             ttl: TimeDelta::minutes(2),
         })?;
-        let (session, revision) = seed_graph(&database)?;
-        let first = seed_task(&database, session, revision, 1)?;
-        let second = seed_task(&database, session, revision, 2)?;
+        let (session, revision) = seed_graph(&database_path, &workspace)?;
+        let first = seed_task(&database_path, &workspace, session, revision, 1)?;
+        let second = seed_task(&database_path, &workspace, session, revision, 2)?;
         let executor = Arc::new(FakeExecutor {
             active: AtomicUsize::new(0),
             maximum: AtomicUsize::new(0),
@@ -643,6 +720,7 @@ mod tests {
         let mut jobs = Vec::new();
         spawn_ready_tasks(
             &database,
+            workspace.workspace_id(),
             daemon,
             &services,
             &redactor,
@@ -660,14 +738,14 @@ mod tests {
         assert!(jobs.is_empty());
         assert_eq!(executor.maximum.load(Ordering::SeqCst), 2);
         assert_eq!(
-            database.load_task(first)?.map(|task| task.state),
+            workspace.load_task(first)?.map(|task| task.state),
             Some(TaskState::Failed)
         );
         assert_eq!(
-            database.load_task(second)?.map(|task| task.state),
+            workspace.load_task(second)?.map(|task| task.state),
             Some(TaskState::Failed)
         );
-        database.with_connection(|connection| {
+        with_workspace(&database_path, &workspace, |connection| {
             let active: i64 = connection.query_row(
                 "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
                 [],

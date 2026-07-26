@@ -33,9 +33,9 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum Command {
-    /// Create local state and an editable configuration without invoking providers.
+    /// Create an editable repository policy without invoking providers.
     Init(InitArgs),
-    /// Manage the repository-local background orchestration service.
+    /// Manage the per-user background orchestration service.
     Daemon(DaemonArgs),
     /// Analyze, route, and run one development task.
     Run(RunArgs),
@@ -60,10 +60,10 @@ pub enum Command {
     /// Show the newest integrity-verified vendor-neutral checkpoint.
     Checkpoint(RequiredTask),
     /// Run non-inference configuration, binary, database, and compatibility checks.
-    Doctor,
-    /// Probe public Codex interfaces without starting a model turn.
+    Doctor(DoctorArgs),
+    /// Alias for `doctor providers`; never starts a model turn.
     Compatibility,
-    /// Inspect and apply sequential SQLite/config migrations.
+    /// Inspect and apply sequential user-global SQLite/config migrations under maintenance ownership.
     Migrate(MigrationArgs),
     /// Plan or explicitly approve recovery from versioned backups.
     Rollback(RollbackArgs),
@@ -75,6 +75,18 @@ pub enum Command {
 pub struct DaemonArgs {
     #[command(subcommand)]
     pub action: DaemonAction,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct DoctorArgs {
+    #[command(subcommand)]
+    pub action: Option<DoctorAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+pub enum DoctorAction {
+    /// Refresh and report every configured provider's safe public interfaces.
+    Providers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
@@ -89,23 +101,23 @@ pub enum DaemonAction {
 
 #[derive(Clone, Debug, Args)]
 pub struct InitArgs {
-    /// Repository whose local .colay state directory will be initialized.
+    /// Repository whose editable policy override will be initialized.
     #[arg(long, default_value = ".")]
     pub repository: PathBuf,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
-    /// Task text. Mutually exclusive with --task-file.
+    /// Conversation goal. Mutually exclusive with --task-file.
     #[arg(value_name = "TASK", required_unless_present = "task_file")]
     pub task: Option<String>,
     /// Versioned JSON task envelope input.
     #[arg(long, conflicts_with = "task")]
     pub task_file: Option<PathBuf>,
-    /// Force one approved provider while retaining all quality and safety gates.
+    /// Record one preferred provider for later exact graph validation and approval.
     #[arg(long, value_enum)]
     pub provider: Option<ProviderName>,
-    /// Analyze and route without creating a worktree or invoking a provider.
+    /// Persist a promotion fence so this invocation cannot create writable tasks.
     #[arg(long)]
     pub plan_only: bool,
 }

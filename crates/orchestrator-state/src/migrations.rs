@@ -14,7 +14,7 @@ use crate::{
     reject_symlink_components, verify_private_file,
 };
 
-pub const STATE_SCHEMA_VERSION: u32 = 11;
+pub const STATE_SCHEMA_VERSION: u32 = 15;
 pub const ROLLBACK_PLAN_SCHEMA_VERSION: u32 = 1;
 
 const MIGRATIONS: &[(u32, &str, &str)] = &[
@@ -68,6 +68,26 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         11,
         "session_validation_and_provider_compat",
         include_str!("../../../migrations/0011_session_validation_and_provider_compat.sql"),
+    ),
+    (
+        12,
+        "global_workspaces",
+        include_str!("../../../migrations/0012_global_workspaces.sql"),
+    ),
+    (
+        13,
+        "workspace_partitions",
+        include_str!("../../../migrations/0013_workspace_partitions.sql"),
+    ),
+    (
+        14,
+        "legacy_imports",
+        include_str!("../../../migrations/0014_legacy_imports.sql"),
+    ),
+    (
+        15,
+        "command_invocation_fences",
+        include_str!("../../../migrations/0015_command_invocation_fences.sql"),
     ),
 ];
 
@@ -601,7 +621,7 @@ fn validate_live_rollback_guards(
     let active_tasks = count_where_nonzero(
         connection,
         "tasks",
-        "SELECT count(*) FROM tasks WHERE state NOT IN ('completed', 'failed', 'cancelled')",
+        "SELECT count(*) FROM main.tasks WHERE state NOT IN ('completed', 'failed', 'cancelled')",
     )?;
     if active_tasks != 0 {
         return Err(StateError::RollbackGuard(format!(
@@ -611,12 +631,12 @@ fn validate_live_rollback_guards(
     let active_coordinator_leases = count_where_nonzero(
         connection,
         "coordinator_leases",
-        "SELECT count(*) FROM coordinator_leases WHERE released_at IS NULL",
+        "SELECT count(*) FROM main.coordinator_leases WHERE released_at IS NULL",
     )?;
     let active_worker_leases = count_where_nonzero(
         connection,
         "worker_leases",
-        "SELECT count(*) FROM worker_leases WHERE released_at IS NULL",
+        "SELECT count(*) FROM main.worker_leases WHERE released_at IS NULL",
     )?;
     if active_coordinator_leases != 0 || active_worker_leases != 0 {
         return Err(StateError::RollbackGuard(format!(
@@ -734,6 +754,7 @@ fn rollback_plan_hash(plan: &RollbackPlan) -> StateResult<String> {
 }
 
 pub(crate) fn configure_connection(connection: &Connection) -> StateResult<()> {
+    crate::database::register_workspace_function(connection)?;
     connection.execute_batch(
         "PRAGMA foreign_keys = ON;\
          PRAGMA journal_mode = WAL;\
@@ -824,12 +845,16 @@ fn last_event_sequence(connection: &Connection) -> StateResult<i64> {
     if !table_exists(connection, "task_events")? {
         return Ok(0);
     }
+    let state_version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let sql = if state_version >= 13 {
+        // Per-workspace sequences overlap. Counting the append-only rows gives the rollback
+        // guard one monotonic aggregate that changes when any workspace appends an event.
+        "SELECT count(*) FROM main.task_events"
+    } else {
+        "SELECT coalesce(max(sequence), 0) FROM main.task_events"
+    };
     connection
-        .query_row(
-            "SELECT coalesce(max(sequence), 0) FROM task_events",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(sql, [], |row| row.get(0))
         .map_err(StateError::from)
 }
 
@@ -870,6 +895,218 @@ mod tests {
         let live =
             MigrationManager::status(&connection).unwrap_or_else(|error| panic!("status: {error}"));
         assert_eq!(live.current_version, 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v12_rows_move_to_reserved_workspace_and_global_tables() -> StateResult<()> {
+        let mut connection = v12_connection()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO tasks(task_id, schema_version, state, objective, \
+                original_request_redacted, task_envelope_json, created_at, updated_at) \
+             VALUES ('legacy-task', '1', 'queued', 'legacy', 'legacy', '{}', ?1, ?1)",
+            [&now],
+        )?;
+        connection.execute(
+            "INSERT INTO tasks(task_id, schema_version, state, objective, \
+                original_request_redacted, task_envelope_json, created_at, updated_at) \
+             VALUES ('legacy-task-2', '1', 'queued', 'legacy', 'legacy', '{}', ?1, ?1)",
+            [&now],
+        )?;
+        connection.execute(
+            "INSERT INTO provider_usage_snapshots( \
+                snapshot_id, task_id, provider_id, quota_scope, quota_period, usage_unit, \
+                source, confidence, snapshot_json, collected_at \
+             ) VALUES ('global-usage', NULL, 'codex', 'account', 'rolling', 'percent', \
+                'confirmed', 'confirmed', '{}', ?1)",
+            [&now],
+        )?;
+        connection.execute(
+            "INSERT INTO provider_usage_snapshots( \
+                snapshot_id, task_id, provider_id, quota_scope, quota_period, usage_unit, \
+                source, confidence, snapshot_json, collected_at \
+             ) VALUES ('linked-usage', NULL, 'codex', 'account', 'rolling', 'percent', \
+                'confirmed', 'confirmed', '{}', ?1)",
+            [&now],
+        )?;
+        for (decision_id, task_id) in [
+            ("legacy-decision-1", "legacy-task"),
+            ("legacy-decision-2", "legacy-task-2"),
+        ] {
+            connection.execute(
+                "INSERT INTO routing_decisions( \
+                    decision_id, task_id, difficulty, risk_json, candidates_json, policy_json, \
+                    downgraded, rationale_json, schema_version, decided_at \
+                 ) VALUES (?1, ?2, 'simple', '[]', '[]', '{}', 0, '[]', '1', ?3)",
+                params![decision_id, task_id, now],
+            )?;
+            connection.execute(
+                "INSERT INTO routing_decision_usage(decision_id, snapshot_id) \
+                 VALUES (?1, 'linked-usage')",
+                [decision_id],
+            )?;
+        }
+        connection.execute(
+            "INSERT INTO artifacts(artifact_id, task_id, kind, relative_path, sha256, \
+                byte_length, created_at) \
+             VALUES ('global-report', NULL, 'compatibility_report', 'reports/global.json', \
+                ?1, 0, ?2)",
+            params!["0".repeat(64), now],
+        )?;
+        connection.execute(
+            "INSERT INTO artifacts(artifact_id, task_id, kind, relative_path, sha256, \
+                byte_length, created_at) \
+             VALUES ('task-output', NULL, 'command_stdout', 'tasks/output.txt', ?1, 0, ?2)",
+            params!["1".repeat(64), now],
+        )?;
+        connection.execute(
+            "INSERT INTO command_evidence( \
+                command_id, task_id, executable, args_json, termination, stdout_artifact_id, \
+                stdout_truncated, stderr_truncated, invalid_utf8, started_at, ended_at \
+             ) VALUES ('legacy-command', 'legacy-task', 'cargo', '[]', 'exit', 'task-output', \
+                0, 0, 0, ?1, ?1)",
+            [&now],
+        )?;
+        connection.execute(
+            "INSERT INTO compatibility_runs(run_id, provider_id, classification, \
+                capabilities_json, report_artifact_id, checked_at) \
+             VALUES ('compat-run', 'codex', 'supported', '{}', 'global-report', ?1)",
+            [&now],
+        )?;
+
+        MigrationManager::apply(&mut connection)?;
+
+        let reserved = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM tasks WHERE workspace_id = ?1 AND task_id = 'legacy-task'",
+                [reserved],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM global_provider_usage_snapshots \
+                 WHERE snapshot_id = 'global-usage'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM provider_usage_snapshots \
+                 WHERE workspace_id = ?1 AND snapshot_id = 'linked-usage' AND task_id IS NULL",
+                [reserved],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM routing_decision_usage \
+                 WHERE workspace_id = ?1 AND snapshot_id = 'linked-usage'",
+                [reserved],
+                |row| row.get::<_, i64>(0),
+            )?,
+            2
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM global_provider_usage_snapshots \
+                 WHERE snapshot_id = 'linked-usage'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM artifacts \
+                 WHERE workspace_id = ?1 AND artifact_id = 'task-output'",
+                [reserved],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM global_artifacts WHERE artifact_id = 'task-output'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM compatibility_runs \
+                 WHERE report_artifact_id = 'global-report'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_legacy_approval_creates_the_reserved_workspace() -> StateResult<()> {
+        let mut connection = v12_connection()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO approval_records( \
+                approval_id, task_id, action, scope_json, approved_by, approved_at \
+             ) VALUES ('standalone-approval', NULL, 'migration', '{}', 'administrator', ?1)",
+            [&now],
+        )?;
+
+        MigrationManager::apply(&mut connection)?;
+
+        let reserved = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM workspaces WHERE workspace_id = ?1",
+                [reserved],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM approval_records \
+                 WHERE workspace_id = ?1 AND approval_id = 'standalone-approval'",
+                [reserved],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    fn v12_connection() -> StateResult<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        configure_connection(&connection)?;
+        for &(version, name, sql) in super::MIGRATIONS
+            .iter()
+            .filter(|(version, _, _)| *version <= 12)
+        {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(sql)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    version,
+                    name,
+                    super::checksum(sql),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+            transaction.commit()?;
+        }
+        Ok(connection)
     }
 
     #[test]
@@ -1092,6 +1329,12 @@ mod tests {
         let mut connection = Connection::open(path)?;
         configure_connection(&connection)?;
         MigrationManager::apply(&mut connection)?;
+        let workspace_id = uuid::Uuid::from_u128(u128::MAX).to_string();
+        connection.execute(
+            "INSERT OR IGNORE INTO workspaces(workspace_id, kind, status, created_at, last_seen_at) \
+             VALUES (?1, 'directory', 'detached', ?2, ?2)",
+            params![workspace_id, chrono::Utc::now().to_rfc3339()],
+        )?;
         Ok(connection)
     }
 
@@ -1112,9 +1355,10 @@ mod tests {
     fn insert_audit_event(connection: &Connection, event_id: &str) -> StateResult<()> {
         connection.execute(
             "INSERT INTO task_events( \
-                event_id, task_id, event_type, schema_version, occurred_at, event_json, \
+                sequence, event_id, task_id, event_type, schema_version, occurred_at, event_json, \
                 previous_hash, event_hash, exported_at \
-             ) VALUES (?1, NULL, 'compatibility_warning', 'state-v3', ?2, '{}', \
+             ) VALUES ((SELECT coalesce(max(sequence), 0) + 1 FROM task_events), \
+                ?1, NULL, 'compatibility_warning', 'state-v3', ?2, '{}', \
                 NULL, ?3, NULL)",
             params![event_id, chrono::Utc::now().to_rfc3339(), "0".repeat(64)],
         )?;

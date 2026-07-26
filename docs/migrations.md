@@ -4,7 +4,7 @@ State, config, handover, worker result, checkpoint, routing decision, and usage 
 
 ## SQLite
 
-SQLite migrations are embedded, ordered through v11, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied.
+SQLite migrations are embedded, ordered through v15, and checksum-verified. The runner refuses gaps and never skips an intermediate version. Each pending migration executes in its own transaction and advances `PRAGMA user_version`; a failed step rolls back that step and leaves later versions unapplied. Every workspace-owned v15 row has a non-null `workspace_id`; daemon ownership and other user-global metadata remain outside workspace partitions.
 
 State schema v4 adds `sessions`, ordered `conversation_messages`, idempotent
 `client_commands`, and repository `daemon_instances`. It also adds nullable
@@ -57,9 +57,33 @@ It also persists exact graph-approval authority (session, requirement revision,
 validation hash, and base commit) and active daemon executable/build/target identity.
 Triggers keep legacy readers safe while current readers use the v11 projections.
 
-For an existing nonzero schema, `migrate apply` creates an online SQLite backup under `.colay/backups/orchestrator.db.backup.<timestamp>` before applying pending versions. A legacy config keeps using its explicitly selected state root. A brand-new empty database has no prior state to back up. After migration, `doctor` reports SQLite integrity and foreign-key health.
+State schema v12 adds the user-global workspace registry and canonical path history. State schema
+v13 rebuilds workspace-owned tables with composite workspace keys, independent event sequences,
+and a reserved compatibility partition only when pre-workspace rows exist. State schema v14 adds
+idempotent legacy-import evidence and mappings. State schema v15 adds durable command invocation
+fences used by the single daemon writer.
 
-`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. The integration contract test starts from a real v1 database, verifies the complete plan through v11, proves dry-run non-mutation, checks the v1 backup, preserves historical event hashes, and rejects checksum tampering/future schemas. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
+The live database is the native user-global state file (`$COLAY_HOME/state/state.db` when
+`COLAY_HOME` is set), never a repository-local SQLite file. Before opening it, `migrate status`,
+`plan`, `apply`, and migration rollback acquire the same OS singleton lock as the user daemon. If
+the daemon is live, stop it and repeat the maintenance command; a second writer is never admitted.
+
+For an existing nonzero schema, `migrate apply` creates a verified SQLite backup under the global
+state backup directory before applying pending versions. A brand-new empty database has no prior
+state to back up. Missing local or global configuration uses validated defaults and does not create
+a repository config. Forward apply is idempotent: no pending versions succeeds without another
+backup. Provider compatibility and safe mode are never migration authority. Every normal database
+open first reads the existing database header directly. When recovery sidecars are present, it copies
+the database and WAL or rollback journal into private temporary scratch and asks SQLite for the
+effective schema only from that copy. Future-schema refusal therefore completes before SQLite opens
+the source or changes its journal/shared-memory state, and before any migration audit append, so an
+unknown future database and its sidecars are not modified. Offline `doctor` retains the same kind of
+owner-private snapshot for its complete schema, integrity, workspace, and audit diagnosis, so even a
+current-schema WAL database is never opened by SQLite at the source. After an explicit migration,
+`doctor` reports global integrity, foreign keys, current workspace audit head, and artifact-reference
+integrity. Doctor itself never applies a migration or creates a backup.
+
+`migrate apply --dry-run` copies the live database to a temporary directory, applies the same catalog to the copy, and runs integrity/foreign-key checks without modifying the source. Integration contracts verify the complete plan through v15, prove dry-run non-mutation, preserve historical event hashes, reject checksum tampering/future schemas, and exercise the workspace-partition and command-fence migrations. Separate fixtures prove later migrations preserve completed command rows and create a verified pre-apply backup.
 
 ## Configuration
 
@@ -84,7 +108,7 @@ The state API exposes a non-mutating plan and dry-run result. A live config appl
 
 ## Rollback
 
-`migrate rollback plan [--backup <path>]` selects only a regular, non-symlink file below the local backup root, verifies SQLite integrity, foreign keys, the sequential migration catalog, backup SHA-256, and exact append-only event sequence, then writes an immutable integrity-sealed plan artifact. If `--backup` is omitted, the newest `orchestrator.db.backup.*` is selected. Planning never swaps the live database.
+`migrate rollback plan [--backup <path>]` selects only a regular, non-symlink file below the global backup root, verifies SQLite integrity, foreign keys, the sequential migration catalog, backup SHA-256, and exact append-only event sequence, then writes an immutable integrity-sealed plan artifact. If `--backup` is omitted, the newest migration backup is selected. Planning never swaps the live database and owns the singleton maintenance lock for the entire direct database operation.
 
 `migrate rollback apply --plan-hash <sha256> --approved-by <identity>` loads that exact artifact and requires a non-empty plan-bound administrator identity. It revalidates schema, hash, event sequence, task/lease quiescence, and safe mode; creates and verifies a full online recovery backup; restores through the locked SQLite connection; then checks integrity, foreign keys, schema, and event sequence again. A failed restore or post-restore check automatically restores the recovery image and retains it for repair. A successful current-schema restore appends the deferred `rollback_planned` and `migration_completed` events without rewriting `events.jsonl`; all outcomes retain immutable approval/result artifacts.
 

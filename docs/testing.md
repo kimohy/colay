@@ -52,6 +52,65 @@ remains read-only, exact approval applies two verified sources only to the
 dedicated integration worktree, session state completes, and the user plus task
 worktrees remain unchanged.
 
+## User-global state platform matrix
+
+Run this matrix before rolling out a user-global state change. Every CLI fixture
+creates an absolute temporary `COLAY_HOME`, clears its child environment, sets
+`COLAY_TEST_FAKE_PROVIDERS_ONLY=1`, and configures only the compiled
+`colay-e2e-fake-provider`. The 32-client test uses separated executable/argument
+arrays and rejects every failed client, `database is locked`, `database is busy`,
+`SQLITE_BUSY`, or `SQLITE_LOCKED`. It also requires exactly one database, one
+workspace/path, zero plan-only tasks, and one live daemon. Before a successful
+test returns, it explicitly stops that daemon and waits at most ten seconds for
+the live lease row, IPC endpoint, and OS process to disappear. `Drop` cleanup is
+only a failure-path fallback and is not accepted as successful cleanup evidence.
+
+Resume coverage is deliberately split at deterministic boundaries. The CLI
+integration test `resume_reports_the_latest_published_revision` proves that an
+attachment projects the latest revision already committed before the request.
+The daemon tests `task_status_stream_emits_new_revisions_and_closes_after_terminal_state`,
+`task_status_stream_never_pairs_terminal_event_with_stale_status`, and
+`task_status_stream_replays_intervening_events_after_reconnect_cursor` exercise
+same-connection live updates and reconnect replay without wall-clock sleeps.
+
+Windows-native PowerShell:
+
+```text
+cargo test -p colay --bin colay ipc_client::tests --all-features
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_daemon --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_resume --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p colay --test global_doctor --features test-fixtures doctor_reports_global_workspace_and_operational_checks -- --nocapture --exact
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+cargo test -p colay --test global_concurrency --features test-fixtures -- --nocapture
+```
+
+This covers Windows native path validation, Unicode/case-equivalent workspace
+registration, the current-SID-only named-pipe DACL, singleton ownership,
+non-Git plan-first behavior, all four fake provider doctor fixtures, idempotent
+legacy import, junction redirect rejection, and the 32-client cold-start fan-in.
+
+Run the Linux commands inside WSL with Cargo build output on the Linux-native
+filesystem, not under `/mnt/<drive>`. A native checkout is preferred; when the
+source checkout is mounted read-only or used only as source, set
+`CARGO_TARGET_DIR` to a WSL-native temporary directory:
+
+```text
+export COLAY_TEST_FAKE_PROVIDERS_ONLY=1
+mkdir -p /home/<user>/.cache/colay-task8-target
+export CARGO_TARGET_DIR=/home/<user>/.cache/colay-task8-target
+cargo test -p orchestrator-state --test global_workspace_state -- --nocapture
+cargo test -p colay --test global_concurrency --test global_plan_first --features test-fixtures -- --nocapture --test-threads=1
+cargo test -p orchestrator-state --test legacy_import -- --nocapture
+```
+
+This covers XDG defaults and Windows-mount refusal, a mode-`0600` Unix socket
+owned by the same user as `COLAY_HOME`, a non-Git home plan, idempotent import,
+Unix symlink redirect rejection, and the same 32-client stress contract. Windows
+and WSL evidence is valid only when their resolved databases are under separate
+native temporary roots; a WSL database under `/mnt/<drive>` is a test failure.
+
 ## Required local verification
 
 ```text
@@ -91,7 +150,7 @@ No provider credentials are needed. If an integration test asks for a provider l
 - `orchestrator-test-support/tests/provider_e2e.rs` runs each adapter through fake structured streams or Agy's bounded plain-text bridge, malformed/error/quota paths, cancellation, redaction, bounded process execution, and executable/argv usage probes.
 - `orchestrator-test-support/tests/multi_provider_handover_e2e.rs` drives the vendor-neutral lifecycle from a fake Gemini daily quota event through a sealed checkpoint, Codex implementation, a monthly-headroom warning carried into the Claude handover, Claude read-only review, and the independent completion gate.
 - `orchestrator-cli/tests/fake_cli_handover_e2e.rs` launches the compiled `colay` and gated `colay-e2e-fake-provider` binaries. It proves a Codex quota failure preserves a partial Git diff, Claude exactly acknowledges the sealed bundle before writing, local fmt/clippy/check/test evidence reaches `Completed`, the original branch remains untouched, and no merge/push/cleanup occurs. A second scenario exercises sealed, explicitly approved SQLite restore, recovery backup retention, and the post-restore JSONL hash chain.
-- `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential plan through v11 and historical event hashes, rebuilds constrained command tables without losing rows, proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.
+- `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential plan through v15 and historical event hashes, rebuilds constrained command tables without losing rows, proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.
 - `orchestrator-cli/tests/daemon_lifecycle.rs` proves public help, hidden internal serve, absent-state status, single-instance start, idempotent start, restart ownership transfer, graceful stop, and child cleanup.
 - `orchestrator-cli/tests/chat_tui_reconnect.rs` proves chat help/docs, durable daemon command processing, redacted persistence, a second SQLite connection restoring the session, and daemon survival/cleanup.
 - `orchestrator-cli/tests/chat_plan_approval.rs` proves the full goal -> read-only fake planner -> validated revision -> exact typed approval path through a real daemon process, with no pre-approval writable artifact and no real provider.

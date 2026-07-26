@@ -1,25 +1,31 @@
+use std::path::Path;
+
 use chrono::Utc;
 use orchestrator_domain::{
     ConversationAttemptId, ConversationOutcome, MessageId, ProviderId, RequirementRevision,
     RequirementRevisionId, RequirementSnapshot, SessionId, VerificationCommand,
 };
-use orchestrator_state::{Database, NewConversationAttempt};
+use orchestrator_state::{Database, NewConversationAttempt, WorkspaceDatabase, WorkspaceId};
 use rusqlite::params;
 
+mod support;
+use support::{fresh_database, with_workspace_connection};
+
 fn seed_session_message(
-    database: &Database,
+    database_path: &Path,
+    database: &WorkspaceDatabase<'_>,
 ) -> Result<(SessionId, MessageId), Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     let message_id = MessageId::new();
     let now = Utc::now().to_rfc3339();
-    database.with_connection(|connection| {
+    with_workspace_connection(database_path, database, |connection| {
         connection.execute(
-            "INSERT INTO sessions(session_id, schema_version, revision, title, state, created_at, updated_at)
+            "INSERT INTO main.sessions(session_id, schema_version, revision, title, state, created_at, updated_at)
              VALUES (?1, '1.0', 0, 'conversation test', 'drafting', ?2, ?2)",
             params![session_id.to_string(), now],
         )?;
         connection.execute(
-            "INSERT INTO conversation_messages(
+            "INSERT INTO main.conversation_messages(
                 message_id, session_id, ordinal, role, kind, state, content_redacted,
                 created_at, finalized_at)
              VALUES (?1, ?2, 1, 'user', 'user_message', 'final', 'fix the issue', ?3, ?3)",
@@ -28,6 +34,10 @@ fn seed_session_message(
         Ok(())
     })?;
     Ok((session_id, message_id))
+}
+
+fn database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
+    fresh_database()
 }
 
 fn ready_snapshot() -> RequirementSnapshot {
@@ -53,9 +63,10 @@ fn ready_snapshot() -> RequirementSnapshot {
 #[test]
 fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    let (session_id, message_id) = seed_session_message(&database)?;
+    let (database, workspace_id) = database()?;
+    let database_path = database.path().to_path_buf();
+    let database = database.workspace(workspace_id);
+    let (session_id, message_id) = seed_session_message(&database_path, &database)?;
     let attempt_id = ConversationAttemptId::new();
     database.begin_conversation_attempt(&NewConversationAttempt {
         attempt_id,
@@ -86,11 +97,11 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
     );
     database.record_requirement_revision(&revision)?;
 
-    database.with_connection(|connection| {
+    with_workspace_connection(&database_path, &database, |connection| {
         assert!(
             connection
                 .execute(
-                    "UPDATE requirement_revisions SET snapshot_hash = ?1 WHERE requirement_revision_id = ?2",
+                    "UPDATE main.requirement_revisions SET snapshot_hash = ?1 WHERE requirement_revision_id = ?2",
                     params!["0".repeat(64), revision.requirement_revision_id.to_string()],
                 )
                 .is_err()
@@ -102,11 +113,10 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
             "coordinator_leases",
             "worker_leases",
         ] {
-            let count: i64 = connection.query_row(
-                &format!("SELECT count(*) FROM {table}"),
-                [],
-                |row| row.get(0),
-            )?;
+            let count: i64 =
+                connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
             assert_eq!(count, 0, "pre-approval row in {table}");
         }
         Ok(())
@@ -117,9 +127,10 @@ fn attempts_and_requirement_revisions_are_immutable_and_session_scoped()
 #[test]
 fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
 -> Result<(), Box<dyn std::error::Error>> {
-    let database = Database::open_in_memory()?;
-    database.migrate_with_backup(std::path::Path::new("unused"))?;
-    let (session_id, message_id) = seed_session_message(&database)?;
+    let (database, workspace_id) = database()?;
+    let database_path = database.path().to_path_buf();
+    let database = database.workspace(workspace_id);
+    let (session_id, message_id) = seed_session_message(&database_path, &database)?;
     let attempt_id = ConversationAttemptId::new();
     let started_at = Utc::now();
     database.begin_conversation_attempt(&NewConversationAttempt {
@@ -129,9 +140,9 @@ fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
         provider: ProviderId::Codex,
         started_at,
     })?;
-    database.with_connection(|connection| {
+    with_workspace_connection(&database_path, &database, |connection| {
         connection.execute(
-            "INSERT INTO client_commands(
+            "INSERT INTO main.client_commands(
                 command_id, session_id, action, payload_json, idempotency_key, state,
                 requested_by, requested_at, claimed_at)
              VALUES (?1, ?2, 'request_conversation_turn', ?3, ?4, 'claimed',
@@ -162,7 +173,7 @@ fn interrupted_conversation_attempt_and_claimed_command_are_finalized_together()
         attempt.error_redacted.as_deref(),
         Some("interrupted by daemon restart")
     );
-    database.with_connection(|connection| {
+    with_workspace_connection(&database_path, &database, |connection| {
         let (state, outcome): (String, String) = connection.query_row(
             "SELECT state, outcome FROM client_commands WHERE command_id = ?1",
             [attempt_id.to_string()],
