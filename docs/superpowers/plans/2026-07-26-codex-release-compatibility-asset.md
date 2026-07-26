@@ -101,24 +101,28 @@ git commit -m "ci: verify Codex release package"
 - Consumes: Task 1 CLI and provenance JSON.
 - Produces workflow outputs: `asset_name`, `asset_sha256`, and verified binary at `${RUNNER_TEMP}/codex-release/bin/codex`.
 
-- [ ] **Step 1: Write failing static workflow contract tests**
+- [ ] **Step 1: Write a failing helper CLI contract test**
 
-Read both workflow files as text and assert:
+Invoke the real helper as a subprocess against the fixture archive and assert the process exit,
+extracted binary, and parsed provenance:
 
 ```python
-self.assertNotIn("cargo build --locked -p codex-cli", stable_workflow)
-self.assertIn("codex-package_SHA256SUMS", stable_workflow)
-self.assertIn(EXPECTED_ASSET, stable_workflow)
-self.assertIn("prepare_codex_release_asset.py", stable_workflow)
-self.assertIn('codex_bin="$RUNNER_TEMP/codex-release/bin/codex"', stable_workflow)
-self.assertIn("python -m unittest discover -s scripts -p 'test_*.py'", ci_workflow)
+completed = subprocess.run(
+    [sys.executable, str(SCRIPT), "--archive", str(archive), "--checksums", str(checksums),
+     "--output", str(output), "--provenance", str(provenance)],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+self.assertEqual(completed.returncode, 0, completed.stderr)
+self.assertEqual(json.loads(provenance.read_text())["binary_relative_path"], "bin/codex")
 ```
 
-- [ ] **Step 2: Run the contract test and confirm RED**
+- [ ] **Step 2: Run the CLI contract test and confirm RED**
 
-Run: `python -m unittest scripts.test_prepare_codex_release_asset.WorkflowContractTests -v`
+Run: `python -m unittest scripts.test_prepare_codex_release_asset.ReleaseAssetCliTests -v`
 
-Expected: failure because stable workflow still contains `cargo build --locked` and no asset path.
+Expected: failure because the helper CLI is not implemented yet.
 
 - [ ] **Step 3: Replace source build with exact release download and preparation**
 
@@ -145,7 +149,9 @@ than shell-constructed JSON.
 
 Run: `python -m unittest discover -s scripts -p "test_*.py" -v`
 
-Expected: helper and static workflow contracts pass.
+Expected: all helper API and CLI behavior tests pass. The workflow YAML is configuration wiring;
+its behavioral RED is the recorded scheduled failure on run `30189827289`, and its GREEN is Task
+3's exact-tag `workflow_dispatch` run rather than a source-text assertion.
 
 - [ ] **Step 5: Document operations and run repository gates**
 
