@@ -5,6 +5,8 @@ use std::{
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -109,9 +111,20 @@ impl ResumeFixture {
             .resolve_repository_workspace(&self.repository)?
             .workspace_id;
         self.workspace_id = Some(workspace_id);
-        let daemon_instance = match database.daemon_status(Utc::now())? {
-            DaemonStatus::Online(instance) => instance.instance_id,
-            status => bail!("fixture daemon is not online: {status:?}"),
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let daemon_instance = loop {
+            let status = database.daemon_status(Utc::now())?;
+            match &status {
+                DaemonStatus::Online(instance) => break instance.instance_id,
+                DaemonStatus::Stopped | DaemonStatus::Failed(_) | DaemonStatus::Stale(_) => {
+                    bail!("fixture daemon stopped before becoming online: {status:?}");
+                }
+                DaemonStatus::Booting(_) | DaemonStatus::Probing(_) => {}
+            }
+            if Instant::now() >= deadline {
+                bail!("fixture daemon did not become online within ten seconds: {status:?}");
+            }
+            thread::sleep(Duration::from_millis(25));
         };
         let now = Utc::now();
         let envelope = TaskEnvelope {
