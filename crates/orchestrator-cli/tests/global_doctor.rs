@@ -96,6 +96,20 @@ impl DoctorFixture {
     fn old_global_schema_untrusted_provider() -> Result<Self> {
         let fixture = Self::new()?;
         let database = fixture.global_database();
+        Self::seed_schema_through_v8(&database)?;
+        Ok(fixture)
+    }
+
+    fn seed_repository_legacy_schema_v8(&self) -> Result<PathBuf> {
+        let state = self.repository.join(".colay");
+        fs::create_dir_all(&state)?;
+        fs::write(state.join("config.toml"), "config_version = 4\n")?;
+        let database = state.join("orchestrator.db");
+        Self::seed_schema_through_v8(&database)?;
+        Ok(database)
+    }
+
+    fn seed_schema_through_v8(database: &Path) -> Result<()> {
         fs::create_dir_all(database.parent().context("global database has no parent")?)?;
         let connection = Connection::open(database)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -113,7 +127,7 @@ impl DoctorFixture {
             )?;
         }
         drop(connection);
-        Ok(fixture)
+        Ok(())
     }
 
     fn configure_fake_providers(&self) -> Result<()> {
@@ -633,6 +647,32 @@ fn doctor_reports_pending_migrations_without_changing_the_database() -> Result<(
     assert_eq!(
         check_named(&document, "state")?["data"]["current_schema_version"],
         8
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_does_not_query_future_columns_from_schema_eight_legacy_workspace() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    let legacy_database = fixture.seed_repository_legacy_schema_v8()?;
+    let before = fs::read(&legacy_database)?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("no such column: phase"), "{stderr}");
+    assert_eq!(fs::read(&legacy_database)?, before);
+    assert!(!fixture.global_database().exists());
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(check_named(&document, "state")?["status"], "warn");
+    assert_eq!(
+        check_named(&document, "state")?["data"]["current_schema_version"],
+        Value::Null
     );
     Ok(())
 }
