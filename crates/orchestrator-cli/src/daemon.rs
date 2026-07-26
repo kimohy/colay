@@ -269,18 +269,27 @@ async fn serve_foreground(
     let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
     database.transition_daemon_phase(instance_id, DaemonPhase::Probing, None)?;
     database.transition_daemon_phase(instance_id, DaemonPhase::Online, None)?;
+    let Some(planner) = finish_unless_daemon_cancelled(
+        &cancellation,
+        Box::pin(OfficialCliTaskPlanner::probe_from_config(
+            config,
+            repository,
+            Arc::clone(&runtime),
+            ModelProfile::Standard,
+        )),
+    )
+    .await
+    else {
+        database.release_daemon(instance_id, Utc::now())?;
+        startup_heartbeat.abort();
+        signal_task.abort();
+        return Ok(());
+    };
     let (planner, planner_provider, conversation): (
         Arc<dyn TaskPlanner>,
         ProviderId,
         Arc<dyn ConversationOrchestrator>,
-    ) = match OfficialCliTaskPlanner::probe_from_config(
-        config,
-        repository,
-        Arc::clone(&runtime),
-        ModelProfile::Standard,
-    )
-    .await
-    {
+    ) = match planner {
         Ok(planner) => {
             let provider = planner.primary_provider();
             let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
