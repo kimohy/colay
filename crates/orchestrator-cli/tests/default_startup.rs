@@ -114,12 +114,20 @@ impl CliFixture {
     }
 
     fn configure_fake_codex(&self) -> Result<()> {
+        self.configure_codex(&fake_provider_binary())
+    }
+
+    fn configure_future_codex(&self) -> Result<()> {
+        self.configure_codex(&future_codex_binary())
+    }
+
+    fn configure_codex(&self, executable: &Path) -> Result<()> {
         fs::create_dir_all(&self.colay_home)?;
         fs::write(
             self.colay_home.join("config.toml"),
             format!(
                 "config_version = 4\n[orchestrator.providers.codex]\nexecutable = {}\n",
-                toml_path(&fake_provider_binary())
+                toml_path(executable)
             ),
         )?;
         Ok(())
@@ -150,6 +158,10 @@ impl CliFixture {
 
 fn fake_provider_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_colay-e2e-fake-provider"))
+}
+
+fn future_codex_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_colay-e2e-future-codex"))
 }
 
 fn fake_provider_path() -> Result<PathBuf> {
@@ -309,6 +321,43 @@ fn compatibility_and_status_do_not_create_repository_state() -> Result<()> {
         String::from_utf8_lossy(&status.stderr)
     );
     assert!(!fixture.repository.join(".colay").exists());
+    Ok(())
+}
+
+#[test]
+fn future_codex_version_is_writable_by_minimum_version_policy() -> Result<()> {
+    let fixture = CliFixture::new()?;
+    fixture.configure_future_codex()?;
+
+    let output = fixture.colay(["--json", "compatibility"])?;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout)?;
+    let codex = json["data"]["providers"]
+        .as_array()
+        .context("provider list missing")?
+        .iter()
+        .find(|provider| provider["provider"] == "codex")
+        .context("Codex report missing")?;
+    assert_eq!(codex["capabilities"]["version"], "0.145.0");
+    assert_eq!(codex["capabilities"]["writable"], "advertised");
+    assert_eq!(codex["health"]["status"], "degraded");
+    assert!(
+        codex["health"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("minimum supported Codex version 0.144.5"))
+    );
+    assert_eq!(json["data"]["inference_requests"], 0);
+
+    let migrate = fixture.colay(["migrate", "apply"])?;
+    assert!(
+        migrate.status.success(),
+        "minimum-version eligibility should permit migration: {}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
     Ok(())
 }
 

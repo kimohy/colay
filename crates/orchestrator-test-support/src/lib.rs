@@ -12,5 +12,13 @@ pub fn fake_cli_main<I>(args: I)
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    runtime::run_fake_cli(args);
+    runtime::run_fake_cli(args, None);
+}
+
+/// Entry point for compatibility tests that need a future Codex version.
+pub fn future_codex_fake_cli_main<I>(args: I)
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    runtime::run_fake_cli(args, Some("0.145.0"));
 }

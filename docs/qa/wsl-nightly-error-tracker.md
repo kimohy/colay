@@ -1,5 +1,42 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
+
+- 심각도: high
+- 상태: fix-in-progress
+- 발견 nightly: `0.1.1-nightly.20260726.5b1a207`
+
+### 관찰 및 원인
+
+WSL에 nightly를 설치한 뒤 공개 probe만 수행한 `colay compatibility`에서 Codex
+`0.145.0`의 exec, App Server, read-only/workspace-write sandbox 기능이 확인됐지만 최종
+상태가 `untested`로 남았다. 그 결과 provider inference와 무관한 `colay migrate apply`도
+safe mode에 의해 차단됐다. 사용자 전역 DB 변경의 별도 구현은 배포됐지만, 승인된
+"최소 버전 충족 또는 필수 공개 기능 확인" 정책은 설계 문서에만 있고 `codex-compat`의
+generic adapter 판정에는 연결되지 않은 것이 원인이었다.
+
+### 수정 및 검증
+
+- Codex `0.144.5`를 최소 지원 버전으로 두고, exact fixture가 없는 버전도 최소 버전 이상이면
+  실제 probe에서 관찰된 기능 한계와 함께 `CompatibleWithWarnings`로 허용한다.
+- 최소 버전 미만은 안전한 transport, read-only sandbox, workspace-write sandbox가 관찰된
+  경우에만 writable generic adapter를 허용한다.
+- 버전 판정이 누락 기능을 만들어내지 않도록 workspace-write sandbox가 명시적으로 없으면
+  최소 버전 이상에서도 read-only로 제한한다.
+- fake Codex `0.145.0` CLI 통합 테스트에서 `compatibility`가 degraded/eligible로 보고되고,
+  inference request가 0이며, `migrate apply`가 safe mode에 막히지 않음을 확인했다.
+- Windows에서 fmt와 전체 Clippy, npm 66개가 통과했다. 전체 Rust suite의 유일한 실패는
+  기존 `WIN-003`의 간헐적 `icacls.exe` 접근 거부였고 같은 테스트를 단독 3회 재실행해
+  모두 통과했다. WSL Ubuntu 24.04/Rust 1.95에서도 대상 통합 테스트와 전체 Clippy가
+  통과했다.
+
+### 남은 완료 조건
+
+수정 PR을 병합하고 새 nightly를 WSL에 설치한 뒤 실제 Codex `0.145.0` 공개 probe에서
+`untested` 문구가 사라지고, 격리된 `COLAY_HOME`에서 migration 및 daemon lifecycle이
+정상이며 사용자 기존 DB가 변경되지 않는지 확인한다. 실제 provider inference는 호출하지
+않는다.
+
 이 문서는 WSL Linux와 Windows에서 nightly Colay를 실제 사용하면서 발견한 오류와 개선
 후보를 지속적으로 누적하는 메모다. 오류를 재현했다고 해서 수정 완료로 간주하지 않으며,
 각 항목은 증거, 영향, 임시 우회, 제품 개선안, 검증 조건을 분리해서 기록한다. 기존

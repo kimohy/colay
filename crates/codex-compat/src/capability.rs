@@ -7,6 +7,8 @@ use thiserror::Error;
 
 use crate::{AdapterSelection, CompatibilityRegistry};
 
+const CODEX_MINIMUM_SUPPORTED_VERSION: (u64, u64, u64) = (0, 144, 5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilitySupport {
@@ -392,13 +394,42 @@ impl CapabilityProbe {
             && capabilities.read_only_sandbox.is_available();
         let app_server_transport = capabilities.app_server == CapabilitySupport::Verified
             && capabilities.read_only_sandbox == CapabilitySupport::Verified;
+        let safe_transport = exec_transport || app_server_transport;
+        let minimum_version = Version::new(
+            CODEX_MINIMUM_SUPPORTED_VERSION.0,
+            CODEX_MINIMUM_SUPPORTED_VERSION.1,
+            CODEX_MINIMUM_SUPPORTED_VERSION.2,
+        );
+        let minimum_version_met = capabilities
+            .version
+            .as_ref()
+            .is_some_and(|version| version >= &minimum_version);
+        let writable_capabilities_observed =
+            safe_transport && capabilities.workspace_write_sandbox.is_available();
         let status = if (!exec_transport && !app_server_transport) || capabilities.version.is_none()
         {
             diagnostics.push("no verified safe Codex transport is available".to_owned());
             CompatibilityStatus::Incompatible
+        } else if matches!(adapter, AdapterSelection::GenericUntested) && minimum_version_met {
+            diagnostics.push(format!(
+                "Codex version meets the minimum supported Codex version {minimum_version}; \
+                     eligibility is granted by version with observed capability limits"
+            ));
+            CompatibilityStatus::CompatibleWithWarnings
+        } else if matches!(adapter, AdapterSelection::GenericUntested)
+            && writable_capabilities_observed
+        {
+            diagnostics.push(
+                "Codex eligibility is granted by observed public capabilities below the \
+                 minimum supported version"
+                    .to_owned(),
+            );
+            CompatibilityStatus::CompatibleWithWarnings
         } else if matches!(adapter, AdapterSelection::GenericUntested) {
             diagnostics.push(
-                "Codex version is untested; writable execution must remain disabled".to_owned(),
+                "Codex version is below the supported minimum and required public capabilities \
+                 are incomplete; writable execution remains disabled"
+                    .to_owned(),
             );
             CompatibilityStatus::Untested
         } else if capabilities.app_server != CapabilitySupport::Verified
@@ -412,6 +443,18 @@ impl CapabilityProbe {
         } else {
             CompatibilityStatus::Compatible
         };
+
+        add_evidence(
+            &mut evidence,
+            "minimum_version",
+            if minimum_version_met {
+                CapabilitySupport::Verified
+            } else {
+                CapabilitySupport::Unsupported
+            },
+            "compiled Codex compatibility manifest",
+            format!("{minimum_version}; met={minimum_version_met}"),
+        );
 
         CodexProbeReport {
             capabilities,
@@ -591,9 +634,47 @@ mod tests {
     }
 
     #[test]
-    fn unknown_version_is_untested_even_with_help_support() {
-        let report = CapabilityProbe::default().evaluate(&known_input("9.0.0"));
-        assert_eq!(report.status, CompatibilityStatus::Untested);
+    fn future_version_meeting_the_floor_is_compatible_with_warnings() {
+        let report = CapabilityProbe::default().evaluate(&known_input("0.145.0"));
+        assert_eq!(report.status, CompatibilityStatus::CompatibleWithWarnings);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains("minimum supported Codex version 0.144.5")
+            })
+        );
+    }
+
+    #[test]
+    fn version_below_the_floor_can_qualify_by_observed_capabilities() {
+        let report = CapabilityProbe::default().evaluate(&known_input("0.144.4"));
+        assert_eq!(report.status, CompatibilityStatus::CompatibleWithWarnings);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("observed public capabilities"))
+        );
+    }
+
+    #[test]
+    fn minimum_version_does_not_invent_a_missing_writable_sandbox() {
+        let mut input = known_input("0.145.0");
+        input.outputs.insert(
+            ProbeCommandKind::ExecHelp,
+            ProbeOutput::success("--json --output-schema --sandbox read-only"),
+        );
+        input.generated_schema = Some(
+            "initialize initialized thread/start thread/resume turn/start turn/completed \
+             item/started item/completed tokenUsage sandbox read-only"
+                .to_owned(),
+        );
+
+        let report = CapabilityProbe::default().evaluate(&input);
+        assert_eq!(report.status, CompatibilityStatus::CompatibleWithWarnings);
+        assert_eq!(
+            report.capabilities.workspace_write_sandbox,
+            CapabilitySupport::Unsupported
+        );
     }
 
     #[test]

@@ -29,9 +29,11 @@ Executable resolution is platform-specific but shared by diagnostics and executi
 `colay doctor providers` refreshes all configured providers through the existing safe assessment APIs. `colay compatibility` is a behavioral alias with the same provider report; only the JSON envelope command label differs. Because this supersedes the older Codex-only compatibility payload, both commands identify the multi-provider envelope and data contract as schema v2 rather than silently reusing v1. Probe allowlists remain limited to documented version/help/schema surfaces. The possible Codex startup classifications are:
 
 - `Compatible`: an exact tested Codex version exposes the mandatory public contract.
-- `CompatibleWithWarnings`: mandatory execution remains available but an optional capability is degraded.
+- `CompatibleWithWarnings`: mandatory execution remains available but an optional capability is degraded, or a generic adapter is eligible because Codex meets the minimum version (`0.144.5`) or exposes the required public capabilities.
 - `Untested`: writable Codex work is blocked; read-only Codex is allowed only when its sandbox capability is present.
 - `Incompatible`: Codex is disabled.
+
+Minimum-version eligibility does not invent capabilities: an explicitly missing read-only or workspace-write sandbox still disables that execution mode. `doctor providers` reports the version/capability provenance and degraded status so newer provider versions can be diagnosed without requiring an exact release fixture first.
 
 Codex incompatibility does not disable a usable Claude, Agy, or Gemini adapter. Agy and Gemini are configured and routed independently. An incompatible state, config, or handover schema blocks task execution rather than attempting an implicit downgrade.
 
