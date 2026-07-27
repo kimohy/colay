@@ -128,7 +128,7 @@ impl IpcResponseStream {
     }
 }
 
-async fn ping(paths: &GlobalStatePaths) -> Result<u32> {
+async fn ping(paths: &GlobalStatePaths) -> Result<PingReadiness> {
     let request = IpcRequest {
         schema_version: IPC_SCHEMA_VERSION,
         request_id: Uuid::now_v7().to_string(),
@@ -141,10 +141,16 @@ async fn ping(paths: &GlobalStatePaths) -> Result<u32> {
         .await
         .context("timed out waiting for the user daemon readiness response")??
         .ok_or_else(|| endpoint_refused("user daemon closed readiness IPC without replying"))?;
-    ready_owner_pid(&response)
+    ping_readiness(&response)
 }
 
-fn ready_owner_pid(response: &IpcResponse) -> Result<u32> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PingReadiness {
+    Legacy,
+    Owner(u32),
+}
+
+fn ping_readiness(response: &IpcResponse) -> Result<PingReadiness> {
     ensure_success(response)?;
     if response
         .outcome
@@ -154,17 +160,61 @@ fn ready_owner_pid(response: &IpcResponse) -> Result<u32> {
     {
         bail!("user daemon readiness response was not ready");
     }
-    let owner_pid = response
-        .outcome
-        .pointer("/data/owner_pid")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("user daemon omitted its authoritative owner PID"))?;
+    let Some(owner_pid) = response.outcome.pointer("/data/owner_pid") else {
+        return Ok(PingReadiness::Legacy);
+    };
+    let owner_pid = owner_pid
+        .as_u64()
+        .ok_or_else(|| anyhow!("user daemon returned a non-numeric owner PID"))?;
     let owner_pid = u32::try_from(owner_pid)
         .context("user daemon returned an owner PID outside the u32 range")?;
     if owner_pid == 0 {
         bail!("user daemon returned an invalid zero owner PID");
     }
+    Ok(PingReadiness::Owner(owner_pid))
+}
+
+fn legacy_status_owner_pid(response: &IpcResponse) -> Result<u32> {
+    ensure_success(response)?;
+    if response
+        .outcome
+        .pointer("/data/status/state")
+        .and_then(Value::as_str)
+        != Some("online")
+    {
+        bail!("user daemon legacy status was not online");
+    }
+    let owner_pid = response
+        .outcome
+        .pointer("/data/status/instance/pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("user daemon legacy status omitted its authoritative owner PID"))?;
+    let owner_pid = u32::try_from(owner_pid)
+        .context("user daemon legacy status returned an owner PID outside the u32 range")?;
+    if owner_pid == 0 {
+        bail!("user daemon legacy status returned an invalid zero owner PID");
+    }
     Ok(owner_pid)
+}
+
+async fn request_legacy_status_owner_pid(paths: &GlobalStatePaths) -> Result<u32> {
+    let request = legacy_status_request();
+    let mut stream = open_response_stream(paths, &request).await?;
+    let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+        .await
+        .context("timed out waiting for the legacy user daemon status response")??
+        .ok_or_else(|| endpoint_refused("user daemon closed status IPC without replying"))?;
+    legacy_status_owner_pid(&response)
+}
+
+fn legacy_status_request() -> IpcRequest {
+    IpcRequest {
+        schema_version: IPC_SCHEMA_VERSION,
+        request_id: Uuid::now_v7().to_string(),
+        workspace_id: None,
+        action: "daemon.status".to_owned(),
+        payload: json!({}),
+    }
 }
 
 fn endpoint_refused(message: &'static str) -> std::io::Error {
@@ -227,10 +277,18 @@ async fn wait_until_ready(
     let mut spawn_attempted = false;
     let mut last_child_exit = None;
     loop {
-        if let Ok(owner_pid) = ping(paths).await {
-            match classify_ready_child(child.as_ref().map(Child::id), owner_pid) {
+        if let Ok(readiness) = ping(paths).await {
+            match resolve_ready_child(child.as_mut(), readiness, || {
+                request_legacy_status_owner_pid(paths)
+            })
+            .await?
+            {
                 ReadyChildDisposition::NoSpawn => return Ok(()),
                 ReadyChildDisposition::LiveOwner => {
+                    let owner_pid = child
+                        .as_ref()
+                        .map(Child::id)
+                        .ok_or_else(|| anyhow!("daemon owner child was lost before recording"))?;
                     record_startup_child_resolution("owner", owner_pid)?;
                     return Ok(());
                 }
@@ -325,6 +383,40 @@ fn classify_ready_child(child_pid: Option<u32>, owner_pid: u32) -> ReadyChildDis
         Some(child_pid) if child_pid == owner_pid => ReadyChildDisposition::LiveOwner,
         Some(_) => ReadyChildDisposition::ReapContender,
     }
+}
+
+async fn resolve_ready_child<C, Status, StatusFuture>(
+    child: Option<&mut C>,
+    readiness: PingReadiness,
+    legacy_owner_pid: Status,
+) -> Result<ReadyChildDisposition>
+where
+    C: StartupChild,
+    Status: FnOnce() -> StatusFuture,
+    StatusFuture: std::future::Future<Output = Result<u32>>,
+{
+    let Some(child) = child else {
+        return Ok(ReadyChildDisposition::NoSpawn);
+    };
+    let owner_pid = match readiness {
+        PingReadiness::Owner(owner_pid) => owner_pid,
+        PingReadiness::Legacy => match legacy_owner_pid().await {
+            Ok(owner_pid) => owner_pid,
+            Err(status_error) => {
+                let child_pid = child.id();
+                if let Err(cleanup_error) = child.terminate_and_reap() {
+                    bail!(
+                        "cannot obtain authoritative owner PID from legacy daemon status: {status_error}; cleanup of daemon child {child_pid} also failed: {cleanup_error}"
+                    );
+                }
+                record_startup_child_resolution("reaped", child_pid)?;
+                bail!(
+                    "cannot obtain authoritative owner PID from legacy daemon status: {status_error}; cleaned up daemon child {child_pid}"
+                );
+            }
+        },
+    };
+    Ok(classify_ready_child(Some(child.id()), owner_pid))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -542,17 +634,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, collections::VecDeque, io};
     #[cfg(windows)]
-    use std::{future, time::Instant};
+    use std::time::Instant;
+    use std::{cell::Cell, collections::VecDeque, future, io};
 
+    use super::{
+        PingReadiness, ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
+        inspect_child_at_startup_deadline, legacy_status_owner_pid, legacy_status_request,
+        ping_readiness, poll_non_owner_contender, resolve_ready_child, spawn_contender_once,
+    };
     #[cfg(windows)]
     use super::{RESPONSE_TIMEOUT, open_windows_pipe_with_retry};
-    use super::{
-        ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
-        inspect_child_at_startup_deadline, poll_non_owner_contender, ready_owner_pid,
-        spawn_contender_once,
-    };
     use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcResponse};
     use serde_json::json;
 
@@ -594,16 +686,22 @@ mod tests {
     }
 
     #[test]
-    fn readiness_response_requires_authoritative_owner_pid() -> anyhow::Result<()> {
+    fn readiness_response_preserves_version_one_legacy_shape() -> anyhow::Result<()> {
         let response = IpcResponse {
             schema_version: IPC_SCHEMA_VERSION,
             request_id: "ping".to_owned(),
             outcome: json!({"status": "ok", "data": {"ready": true, "owner_pid": 42}}),
         };
-        assert_eq!(ready_owner_pid(&response)?, 42);
+        assert_eq!(ping_readiness(&response)?, PingReadiness::Owner(42));
+
+        let legacy = IpcResponse {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "ping".to_owned(),
+            outcome: json!({"status": "ok", "data": {"ready": true}}),
+        };
+        assert_eq!(ping_readiness(&legacy)?, PingReadiness::Legacy);
 
         for invalid in [
-            json!({"status": "ok", "data": {"ready": true}}),
             json!({"status": "ok", "data": {"ready": false, "owner_pid": 42}}),
             json!({"status": "ok", "data": {"ready": true, "owner_pid": 0}}),
             json!({"status": "ok", "data": {"ready": true, "owner_pid": "42"}}),
@@ -613,9 +711,51 @@ mod tests {
                 request_id: "ping".to_owned(),
                 outcome: invalid,
             };
-            assert!(ready_owner_pid(&response).is_err());
+            assert!(ping_readiness(&response).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn legacy_status_requires_an_online_authoritative_owner_pid() -> anyhow::Result<()> {
+        let online = IpcResponse {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "status".to_owned(),
+            outcome: json!({
+                "status": "ok",
+                "data": {"status": {"state": "online", "instance": {"pid": 42}}}
+            }),
+        };
+        assert_eq!(legacy_status_owner_pid(&online)?, 42);
+
+        for invalid in [
+            json!({"status": "error", "error": "status unavailable"}),
+            json!({"status": "ok", "data": {}}),
+            json!({"status": "ok", "data": {"status": {"state": "stopped"}}}),
+            json!({"status": "ok", "data": {"status": {"state": "booting", "instance": {"pid": 42}}}}),
+            json!({"status": "ok", "data": {"status": {"state": "online"}}}),
+            json!({"status": "ok", "data": {"status": {"state": "online", "instance": {"pid": 0}}}}),
+            json!({"status": "ok", "data": {"status": {"state": "online", "instance": {"pid": "42"}}}}),
+            json!({"status": "ok", "data": {"status": {"state": "online", "instance": {"pid": u64::from(u32::MAX) + 1}}}}),
+        ] {
+            let response = IpcResponse {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "status".to_owned(),
+                outcome: invalid,
+            };
+            assert!(legacy_status_owner_pid(&response).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_owner_lookup_uses_the_version_one_status_operation() {
+        let request = legacy_status_request();
+
+        assert_eq!(request.schema_version, 1);
+        assert_eq!(request.workspace_id, None);
+        assert_eq!(request.action, "daemon.status");
+        assert_eq!(request.payload, json!({}));
     }
 
     #[test]
@@ -632,6 +772,96 @@ mod tests {
             classify_ready_child(None, 42),
             ReadyChildDisposition::NoSpawn
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_ready_without_spawn_skips_owner_lookup() -> anyhow::Result<()> {
+        let status_calls = Cell::new(0_u32);
+
+        let disposition =
+            resolve_ready_child(None::<&mut FakeStartupChild>, PingReadiness::Legacy, || {
+                status_calls.set(status_calls.get() + 1);
+                future::ready(Ok(42))
+            })
+            .await?;
+
+        assert_eq!(disposition, ReadyChildDisposition::NoSpawn);
+        assert_eq!(status_calls.get(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_ready_reaps_child_when_status_names_old_owner() -> anyhow::Result<()> {
+        let mut child = FakeStartupChild::new(41, vec![Ok(Some("exit code: 1".to_owned()))]);
+
+        let disposition = resolve_ready_child(Some(&mut child), PingReadiness::Legacy, || {
+            future::ready(Ok(42))
+        })
+        .await?;
+        assert_eq!(disposition, ReadyChildDisposition::ReapContender);
+        assert_eq!(
+            poll_non_owner_contender(&mut child, false)?,
+            ReapProgress::Reaped("exit code: 1".to_owned())
+        );
+        assert_eq!(child.cleanup_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_ready_preserves_child_when_status_names_it_owner() -> anyhow::Result<()> {
+        let mut child = FakeStartupChild::new(42, vec![]);
+
+        let disposition = resolve_ready_child(Some(&mut child), PingReadiness::Legacy, || {
+            future::ready(Ok(42))
+        })
+        .await?;
+
+        assert_eq!(disposition, ReadyChildDisposition::LiveOwner);
+        assert_eq!(child.cleanup_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_status_cleans_up_tracked_child() -> anyhow::Result<()> {
+        for invalid in [
+            json!({"status": "error", "error": "status unavailable"}),
+            json!({"status": "ok", "data": {}}),
+            json!({"status": "ok", "data": {"status": {"state": "stopped"}}}),
+            json!({"status": "ok", "data": {"status": {"state": "online", "instance": {"pid": "42"}}}}),
+        ] {
+            let mut child = FakeStartupChild::new(41, vec![]);
+            let response = IpcResponse {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "status".to_owned(),
+                outcome: invalid,
+            };
+
+            let result = resolve_ready_child(Some(&mut child), PingReadiness::Legacy, || {
+                future::ready(legacy_status_owner_pid(&response))
+            })
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(child.cleanup_count, 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modern_ready_with_child_skips_legacy_status_lookup() -> anyhow::Result<()> {
+        let status_calls = Cell::new(0_u32);
+        let mut child = FakeStartupChild::new(42, vec![]);
+
+        let disposition = resolve_ready_child(Some(&mut child), PingReadiness::Owner(42), || {
+            status_calls.set(status_calls.get() + 1);
+            future::ready(Ok(41))
+        })
+        .await?;
+
+        assert_eq!(disposition, ReadyChildDisposition::LiveOwner);
+        assert_eq!(status_calls.get(), 0);
+        assert_eq!(child.cleanup_count, 0);
+        Ok(())
     }
 
     #[test]
