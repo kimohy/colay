@@ -64,6 +64,24 @@ enum FailureFixture {
     },
 }
 
+struct ProviderFailureCase {
+    name: &'static str,
+    fixture: FailureFixture,
+    expected_status: ConversationAttemptStatus,
+    expected_action: &'static str,
+}
+
+struct ProviderFailureRun {
+    database: Database,
+    workspace_id: WorkspaceId,
+    database_path: std::path::PathBuf,
+    session_id: SessionId,
+    attempt_id: ConversationAttemptId,
+    command_id: ClientCommandId,
+    services: PlanningServices,
+    starts: Arc<AtomicUsize>,
+}
+
 struct FailingConversation {
     fixture: FailureFixture,
     starts: Arc<AtomicUsize>,
@@ -74,6 +92,81 @@ struct CapturingConversation {
 }
 
 struct ProviderAwareConversation;
+
+fn provider_failure_cases() -> Vec<ProviderFailureCase> {
+    vec![
+        ProviderFailureCase {
+            name: "authentication",
+            fixture: FailureFixture::Error(ConversationFailure::Invocation {
+                reason: "token_expired secret-token".to_owned(),
+                evidence_redacted: "credential secret-token expired".to_owned(),
+            }),
+            expected_status: ConversationAttemptStatus::Failed,
+            expected_action: "authenticate",
+        },
+        ProviderFailureCase {
+            name: "quota",
+            fixture: FailureFixture::Response {
+                exit: ConversationExit::QuotaExhausted,
+                output_redacted: Vec::new(),
+                evidence_redacted: "Credit balance is too low".to_owned(),
+            },
+            expected_status: ConversationAttemptStatus::Failed,
+            expected_action: "quota or billing",
+        },
+        ProviderFailureCase {
+            name: "unsupported client",
+            fixture: FailureFixture::Error(ConversationFailure::Invocation {
+                reason: "UNSUPPORTED_CLIENT".to_owned(),
+                evidence_redacted: "account rejected this client".to_owned(),
+            }),
+            expected_status: ConversationAttemptStatus::Failed,
+            expected_action: "not supported",
+        },
+        ProviderFailureCase {
+            name: "timeout",
+            fixture: FailureFixture::Response {
+                exit: ConversationExit::TimedOut,
+                output_redacted: Vec::new(),
+                evidence_redacted: "provider exceeded its deadline".to_owned(),
+            },
+            expected_status: ConversationAttemptStatus::Failed,
+            expected_action: "timed out",
+        },
+        ProviderFailureCase {
+            name: "cancellation",
+            fixture: FailureFixture::Response {
+                exit: ConversationExit::Cancelled,
+                output_redacted: Vec::new(),
+                evidence_redacted: "request was cancelled".to_owned(),
+            },
+            expected_status: ConversationAttemptStatus::Cancelled,
+            expected_action: "cancelled",
+        },
+        ProviderFailureCase {
+            name: "malformed output",
+            fixture: FailureFixture::Response {
+                exit: ConversationExit::Succeeded,
+                output_redacted: b"not-json".to_vec(),
+                evidence_redacted: "provider returned malformed output".to_owned(),
+            },
+            expected_status: ConversationAttemptStatus::Failed,
+            expected_action: "incompatible",
+        },
+        ProviderFailureCase {
+            name: "nonzero exit",
+            fixture: FailureFixture::Response {
+                exit: ConversationExit::Crashed {
+                    exit_code: Some(17),
+                },
+                output_redacted: Vec::new(),
+                evidence_redacted: "provider exited 17".to_owned(),
+            },
+            expected_status: ConversationAttemptStatus::Failed,
+            expected_action: "process failed",
+        },
+    ]
+}
 
 fn verification_plan() -> Vec<VerificationCommand> {
     vec![VerificationCommand {
@@ -602,180 +695,161 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
     Ok(())
 }
 
+async fn start_provider_failure_case(
+    case: &ProviderFailureCase,
+) -> Result<ProviderFailureRun, Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    let append = append_command(session_id, case.name);
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    workspace.submit_client_command(&append)?;
+    process_next_client_command(&workspace, &SecretRedactor, Utc::now())?;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let directory = tempfile::tempdir()?;
+    let services = services_with_conversation(
+        std::fs::canonicalize(directory.path())?,
+        Arc::new(FailingConversation {
+            fixture: case.fixture.clone(),
+            starts: Arc::clone(&starts),
+        }),
+    );
+    process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now()).await?;
+    let source_uuid = source_message_id.into_uuid();
+    Ok(ProviderFailureRun {
+        database,
+        workspace_id,
+        database_path,
+        session_id,
+        attempt_id: ConversationAttemptId::from_uuid(source_uuid),
+        command_id: ClientCommandId::from_uuid(source_uuid),
+        services,
+        starts,
+    })
+}
+
+fn assert_terminal_provider_failure(
+    run: &ProviderFailureRun,
+    case: &ProviderFailureCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = run.database.workspace(run.workspace_id);
+    let attempt = workspace
+        .load_conversation_attempt(run.attempt_id)?
+        .ok_or("conversation attempt is missing")?;
+    assert_eq!(
+        attempt.status, case.expected_status,
+        "fixture: {}",
+        case.name
+    );
+    let error = attempt.error_redacted.ok_or("missing redacted error")?;
+    assert!(!error.contains("secret-token"), "fixture: {}", case.name);
+    assert!(error.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert!(
+        error.contains(case.expected_action),
+        "fixture: {}: {error}",
+        case.name
+    );
+    let outcome = attempt.outcome.ok_or("missing recovery outcome")?;
+    let ConversationOutcome::NeedsAttention {
+        response_redacted,
+        evidence_redacted,
+    } = outcome
+    else {
+        return Err(format!("fixture {} did not store needs_attention", case.name).into());
+    };
+    assert!(
+        response_redacted.contains(case.expected_action),
+        "fixture: {}",
+        case.name
+    );
+    assert!(
+        !evidence_redacted.contains("secret-token"),
+        "fixture: {}",
+        case.name
+    );
+    assert!(evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+
+    let command = workspace
+        .load_client_command(run.command_id)?
+        .ok_or("conversation command is missing")?;
+    assert_eq!(
+        command.state,
+        ClientCommandState::Failed,
+        "fixture: {}",
+        case.name
+    );
+    assert!(
+        command
+            .outcome
+            .unwrap_or_default()
+            .contains(case.expected_action),
+        "fixture: {}",
+        case.name
+    );
+    let messages = workspace.messages_after(run.session_id, 0, 10)?;
+    assert_eq!(messages.len(), 2, "fixture: {}", case.name);
+    assert_eq!(messages[1].1.content_redacted, response_redacted);
+    Ok(())
+}
+
+async fn assert_terminal_provider_failure_replay(
+    run: &mut ProviderFailureRun,
+    case: &ProviderFailureCase,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = run.database.workspace(run.workspace_id);
+    with_workspace(&run.database_path, &workspace, |connection| {
+        connection.execute(
+            "UPDATE client_commands
+             SET state = 'pending', claimed_at = NULL, completed_at = NULL, outcome = NULL
+             WHERE command_id = ?1",
+            [run.command_id.to_string()],
+        )?;
+        Ok(())
+    })?;
+    run.services.conversation_providers.clear();
+    process_next_orchestration_command(&workspace, &run.services, &SecretRedactor, Utc::now())
+        .await?;
+    let replayed_command = workspace
+        .load_client_command(run.command_id)?
+        .ok_or("replayed conversation command is missing")?;
+    assert_eq!(
+        replayed_command.state,
+        ClientCommandState::Failed,
+        "fixture: {}",
+        case.name
+    );
+    assert!(
+        replayed_command
+            .outcome
+            .unwrap_or_default()
+            .contains(case.expected_action),
+        "fixture: {}",
+        case.name
+    );
+    assert_eq!(
+        workspace.messages_after(run.session_id, 0, 10)?.len(),
+        2,
+        "fixture: {}",
+        case.name
+    );
+    assert_zero_writable_rows(&run.database_path, &workspace)?;
+    assert_eq!(
+        run.starts.load(Ordering::SeqCst),
+        1,
+        "fixture: {}",
+        case.name
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn provider_failures_are_terminal_actionable_and_preserve_the_session()
 -> Result<(), Box<dyn std::error::Error>> {
-    let cases = vec![
-        (
-            "authentication",
-            FailureFixture::Error(ConversationFailure::Invocation {
-                reason: "token_expired secret-token".to_owned(),
-                evidence_redacted: "credential secret-token expired".to_owned(),
-            }),
-            ConversationAttemptStatus::Failed,
-            "authenticate",
-        ),
-        (
-            "quota",
-            FailureFixture::Response {
-                exit: ConversationExit::QuotaExhausted,
-                output_redacted: Vec::new(),
-                evidence_redacted: "Credit balance is too low".to_owned(),
-            },
-            ConversationAttemptStatus::Failed,
-            "quota or billing",
-        ),
-        (
-            "unsupported client",
-            FailureFixture::Error(ConversationFailure::Invocation {
-                reason: "UNSUPPORTED_CLIENT".to_owned(),
-                evidence_redacted: "account rejected this client".to_owned(),
-            }),
-            ConversationAttemptStatus::Failed,
-            "not supported",
-        ),
-        (
-            "timeout",
-            FailureFixture::Response {
-                exit: ConversationExit::TimedOut,
-                output_redacted: Vec::new(),
-                evidence_redacted: "provider exceeded its deadline".to_owned(),
-            },
-            ConversationAttemptStatus::Failed,
-            "timed out",
-        ),
-        (
-            "cancellation",
-            FailureFixture::Response {
-                exit: ConversationExit::Cancelled,
-                output_redacted: Vec::new(),
-                evidence_redacted: "request was cancelled".to_owned(),
-            },
-            ConversationAttemptStatus::Cancelled,
-            "cancelled",
-        ),
-        (
-            "malformed output",
-            FailureFixture::Response {
-                exit: ConversationExit::Succeeded,
-                output_redacted: b"not-json".to_vec(),
-                evidence_redacted: "provider returned malformed output".to_owned(),
-            },
-            ConversationAttemptStatus::Failed,
-            "incompatible",
-        ),
-        (
-            "nonzero exit",
-            FailureFixture::Response {
-                exit: ConversationExit::Crashed {
-                    exit_code: Some(17),
-                },
-                output_redacted: Vec::new(),
-                evidence_redacted: "provider exited 17".to_owned(),
-            },
-            ConversationAttemptStatus::Failed,
-            "process failed",
-        ),
-    ];
-
-    for (name, fixture, expected_status, expected_action) in cases {
-        let (database, workspace_id, database_path) = database()?;
-        let database = database.workspace(workspace_id);
-        let session_id = seed_session(&database_path, &database)?;
-        let append = append_command(session_id, name);
-        let source_message_id =
-            serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?
-                .message_id;
-        database.submit_client_command(&append)?;
-        process_next_client_command(&database, &SecretRedactor, Utc::now())?;
-        let starts = Arc::new(AtomicUsize::new(0));
-        let directory = tempfile::tempdir()?;
-        let mut services = services_with_conversation(
-            std::fs::canonicalize(directory.path())?,
-            Arc::new(FailingConversation {
-                fixture,
-                starts: Arc::clone(&starts),
-            }),
-        );
-        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
-            .await?;
-
-        let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
-        let attempt = database
-            .load_conversation_attempt(attempt_id)?
-            .ok_or("conversation attempt is missing")?;
-        assert_eq!(attempt.status, expected_status, "fixture: {name}");
-        let error = attempt.error_redacted.ok_or("missing redacted error")?;
-        assert!(!error.contains("secret-token"), "fixture: {name}");
-        assert!(error.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
-        assert!(error.contains(expected_action), "fixture: {name}: {error}");
-        let outcome = attempt.outcome.ok_or("missing recovery outcome")?;
-        let ConversationOutcome::NeedsAttention {
-            response_redacted,
-            evidence_redacted,
-        } = outcome
-        else {
-            return Err(format!("fixture {name} did not store needs_attention").into());
-        };
-        assert!(
-            response_redacted.contains(expected_action),
-            "fixture: {name}"
-        );
-        assert!(
-            !evidence_redacted.contains("secret-token"),
-            "fixture: {name}"
-        );
-        assert!(evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
-
-        let command_id = ClientCommandId::from_uuid(source_message_id.into_uuid());
-        let command = database
-            .load_client_command(command_id)?
-            .ok_or("conversation command is missing")?;
-        assert_eq!(command.state, ClientCommandState::Failed, "fixture: {name}");
-        assert!(
-            command
-                .outcome
-                .unwrap_or_default()
-                .contains(expected_action),
-            "fixture: {name}"
-        );
-        let messages = database.messages_after(session_id, 0, 10)?;
-        assert_eq!(messages.len(), 2, "fixture: {name}");
-        assert_eq!(messages[1].1.content_redacted, response_redacted);
-        with_workspace(&database_path, &database, |connection| {
-            connection.execute(
-                "UPDATE client_commands
-                 SET state = 'pending', claimed_at = NULL, completed_at = NULL, outcome = NULL
-                 WHERE command_id = ?1",
-                [command_id.to_string()],
-            )?;
-            Ok(())
-        })?;
-        services.conversation_providers.clear();
-        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
-            .await?;
-        let replayed_command = database
-            .load_client_command(command_id)?
-            .ok_or("replayed conversation command is missing")?;
-        assert_eq!(
-            replayed_command.state,
-            ClientCommandState::Failed,
-            "fixture: {name}"
-        );
-        assert!(
-            replayed_command
-                .outcome
-                .unwrap_or_default()
-                .contains(expected_action),
-            "fixture: {name}"
-        );
-        assert_eq!(
-            database.messages_after(session_id, 0, 10)?.len(),
-            2,
-            "fixture: {name}"
-        );
-        assert_zero_writable_rows(&database_path, &database)?;
-        assert_eq!(starts.load(Ordering::SeqCst), 1, "fixture: {name}");
+    for case in provider_failure_cases() {
+        let mut run = start_provider_failure_case(&case).await?;
+        assert_terminal_provider_failure(&run, &case)?;
+        assert_terminal_provider_failure_replay(&mut run, &case).await?;
     }
     Ok(())
 }

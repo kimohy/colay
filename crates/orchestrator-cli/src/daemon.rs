@@ -568,6 +568,53 @@ where
     }
 }
 
+struct WorkspacePlanningAdapters {
+    planner: Arc<dyn TaskPlanner>,
+    planner_provider: ProviderId,
+    conversation: Arc<dyn ConversationOrchestrator>,
+    conversation_providers: Vec<ProviderId>,
+}
+
+async fn build_workspace_planning_adapters(
+    config: &RootConfig,
+    repository: &Path,
+    runtime: &Arc<dyn AdapterRuntime>,
+) -> WorkspacePlanningAdapters {
+    match OfficialCliTaskPlanner::probe_from_config(
+        config,
+        repository,
+        Arc::clone(runtime),
+        ModelProfile::Standard,
+    )
+    .await
+    {
+        Ok(planner) => {
+            let planner_provider = planner.primary_provider();
+            let conversation_providers = planner.conversation_providers();
+            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
+                &planner,
+            ));
+            WorkspacePlanningAdapters {
+                planner: Arc::new(planner),
+                planner_provider,
+                conversation,
+                conversation_providers,
+            }
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            WorkspacePlanningAdapters {
+                planner: Arc::new(UnavailablePlanner {
+                    reason: reason.clone(),
+                }),
+                planner_provider: ProviderId::Codex,
+                conversation: Arc::new(UnavailableConversation { reason }),
+                conversation_providers: unavailable_conversation_providers(),
+            }
+        }
+    }
+}
+
 async fn build_workspace_runtime(
     repository: &Path,
     explicit_config: Option<&Path>,
@@ -586,44 +633,12 @@ async fn build_workspace_runtime(
     let redactor: Arc<dyn MessageRedactor> =
         Arc::new(ProcessMessageRedactor(Redactor::new(&redaction)?));
     let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
-    let (planner, planner_provider, conversation, conversation_providers): (
-        Arc<dyn TaskPlanner>,
-        ProviderId,
-        Arc<dyn ConversationOrchestrator>,
-        Vec<ProviderId>,
-    ) = match OfficialCliTaskPlanner::probe_from_config(
-        &config,
-        repository,
-        Arc::clone(&runtime),
-        ModelProfile::Standard,
-    )
-    .await
-    {
-        Ok(planner) => {
-            let provider = planner.primary_provider();
-            let conversation_providers = planner.conversation_providers();
-            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
-                &planner,
-            ));
-            (
-                Arc::new(planner),
-                provider,
-                conversation,
-                conversation_providers,
-            )
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            (
-                Arc::new(UnavailablePlanner {
-                    reason: reason.clone(),
-                }),
-                ProviderId::Codex,
-                Arc::new(UnavailableConversation { reason }),
-                unavailable_conversation_providers(),
-            )
-        }
-    };
+    let WorkspacePlanningAdapters {
+        planner,
+        planner_provider,
+        conversation,
+        conversation_providers,
+    } = build_workspace_planning_adapters(&config, repository, &runtime).await;
     let executor = Arc::new(OfficialCliTaskExecutor::new(&config, repository, runtime)?);
     let integration = IntegrationServices {
         manager: Arc::new(GitIntegrationManager::new(
