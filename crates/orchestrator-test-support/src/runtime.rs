@@ -682,10 +682,47 @@ fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
     let Some(prompt) = conversation_prompt(stdin) else {
         return false;
     };
+    mark_fake_conversation_started();
+    if prompt.contains("scenario:timeout") {
+        std::thread::sleep(Duration::from_mins(5));
+        return true;
+    }
+    if prompt.contains("scenario:crash") {
+        eprintln!("fake conversation provider crash");
+        std::process::exit(17);
+    }
     for line in conversation_lines(provider, &prompt) {
         println!("{}", String::from_utf8_lossy(&line));
     }
     true
+}
+
+fn mark_fake_conversation_started() {
+    let marker_path = std::env::var_os("COLAY_TEST_FAKE_CONVERSATION_MARKER")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("TEMP")
+                .or_else(|| std::env::var_os("TMP"))
+                .map(PathBuf::from)
+                .map(|directory| directory.join("colay-fake-conversation-starts.json"))
+        });
+    let Some(marker_path) = marker_path else {
+        return;
+    };
+    let invocation_count = std::fs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("invocation_count")?.as_u64())
+        .unwrap_or_default()
+        .saturating_add(1);
+    let marker = serde_json::json!({ "invocation_count": invocation_count });
+    if let Some(parent) = marker_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        marker_path,
+        serde_json::to_vec_pretty(&marker).unwrap_or_default(),
+    );
 }
 
 fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_json::Value) {

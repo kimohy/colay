@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -17,9 +20,9 @@ use orchestrator_domain::{
     RequirementSnapshot, SandboxMode, SessionId, SessionState, VerificationCommand,
 };
 use orchestrator_engine::{
-    ConversationExit, ConversationFailure, ConversationOrchestrator, ConversationRequest,
-    ConversationResponse, PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse,
-    TaskPlanner,
+    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationExit, ConversationFailure,
+    ConversationOrchestrator, ConversationRequest, ConversationResponse, PlannerExit,
+    PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
 };
 use orchestrator_state::{
     ConversationAttemptStatus, Database, GraphRevisionStatus, NewConversationAttempt,
@@ -51,7 +54,20 @@ struct FakeConversation {
     outcome: ConversationOutcome,
 }
 
-struct FailingConversation;
+#[derive(Clone)]
+enum FailureFixture {
+    Error(ConversationFailure),
+    Response {
+        exit: ConversationExit,
+        output_redacted: Vec<u8>,
+        evidence_redacted: String,
+    },
+}
+
+struct FailingConversation {
+    fixture: FailureFixture,
+    starts: Arc<AtomicUsize>,
+}
 
 struct CapturingConversation {
     transcript: Arc<Mutex<Option<String>>>,
@@ -90,12 +106,27 @@ fn candidate_outcome() -> ConversationOutcome {
 impl ConversationOrchestrator for FailingConversation {
     async fn converse(
         &self,
-        _request: ConversationRequest,
+        request: ConversationRequest,
     ) -> Result<ConversationResponse, ConversationFailure> {
-        Err(ConversationFailure::Invocation {
-            reason: "provider rejected secret-token".to_owned(),
-            evidence_redacted: "secret-token".to_owned(),
-        })
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        match self.fixture.clone() {
+            FailureFixture::Error(error) => Err(error),
+            FailureFixture::Response {
+                exit,
+                output_redacted,
+                evidence_redacted,
+            } => Ok(ConversationResponse {
+                schema_version: orchestrator_domain::SchemaVersion::v1(),
+                attempt_id: request.attempt_id,
+                session_id: request.session_id,
+                source_message_id: request.source_message_id,
+                provider: request.provider,
+                sandbox: SandboxMode::ReadOnly,
+                exit,
+                output_redacted,
+                evidence_redacted,
+            }),
+        }
     }
 }
 
@@ -572,39 +603,180 @@ async fn interview_records_partial_requirements_without_starting_a_plan()
 }
 
 #[tokio::test]
-async fn provider_failure_is_redacted_and_preserves_the_session()
+async fn provider_failures_are_terminal_actionable_and_preserve_the_session()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id, database_path) = database()?;
-    let database = database.workspace(workspace_id);
-    let session_id = seed_session(&database_path, &database)?;
-    database.submit_client_command(&append_command(session_id, "hello"))?;
-    process_next_client_command(&database, &SecretRedactor, Utc::now())?;
-    let directory = tempfile::tempdir()?;
-    let services = services_with_conversation(
-        std::fs::canonicalize(directory.path())?,
-        Arc::new(FailingConversation),
-    );
-    process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now()).await?;
+    let cases = vec![
+        (
+            "authentication",
+            FailureFixture::Error(ConversationFailure::Invocation {
+                reason: "token_expired secret-token".to_owned(),
+                evidence_redacted: "credential secret-token expired".to_owned(),
+            }),
+            ConversationAttemptStatus::Failed,
+            "authenticate",
+        ),
+        (
+            "quota",
+            FailureFixture::Response {
+                exit: ConversationExit::QuotaExhausted,
+                output_redacted: Vec::new(),
+                evidence_redacted: "Credit balance is too low".to_owned(),
+            },
+            ConversationAttemptStatus::Failed,
+            "quota or billing",
+        ),
+        (
+            "unsupported client",
+            FailureFixture::Error(ConversationFailure::Invocation {
+                reason: "UNSUPPORTED_CLIENT".to_owned(),
+                evidence_redacted: "account rejected this client".to_owned(),
+            }),
+            ConversationAttemptStatus::Failed,
+            "not supported",
+        ),
+        (
+            "timeout",
+            FailureFixture::Response {
+                exit: ConversationExit::TimedOut,
+                output_redacted: Vec::new(),
+                evidence_redacted: "provider exceeded its deadline".to_owned(),
+            },
+            ConversationAttemptStatus::Failed,
+            "timed out",
+        ),
+        (
+            "cancellation",
+            FailureFixture::Response {
+                exit: ConversationExit::Cancelled,
+                output_redacted: Vec::new(),
+                evidence_redacted: "request was cancelled".to_owned(),
+            },
+            ConversationAttemptStatus::Cancelled,
+            "cancelled",
+        ),
+        (
+            "malformed output",
+            FailureFixture::Response {
+                exit: ConversationExit::Succeeded,
+                output_redacted: b"not-json".to_vec(),
+                evidence_redacted: "provider returned malformed output".to_owned(),
+            },
+            ConversationAttemptStatus::Failed,
+            "incompatible",
+        ),
+        (
+            "nonzero exit",
+            FailureFixture::Response {
+                exit: ConversationExit::Crashed {
+                    exit_code: Some(17),
+                },
+                output_redacted: Vec::new(),
+                evidence_redacted: "provider exited 17".to_owned(),
+            },
+            ConversationAttemptStatus::Failed,
+            "process failed",
+        ),
+    ];
 
-    let messages = database.messages_after(session_id, 0, 10)?;
-    assert_eq!(messages.len(), 2);
-    assert!(
-        messages[1]
-            .1
-            .content_redacted
-            .contains("session were preserved")
-    );
-    with_workspace(&database_path, &database, |connection| {
-        let outcome: String = connection.query_row(
-            "SELECT outcome_json FROM conversation_attempts LIMIT 1",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(!outcome.contains("secret-token"));
-        assert!(outcome.contains("[REDACTED]"));
-        Ok(())
-    })?;
-    assert_zero_writable_rows(&database_path, &database)?;
+    for (name, fixture, expected_status, expected_action) in cases {
+        let (database, workspace_id, database_path) = database()?;
+        let database = database.workspace(workspace_id);
+        let session_id = seed_session(&database_path, &database)?;
+        let append = append_command(session_id, name);
+        let source_message_id =
+            serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?
+                .message_id;
+        database.submit_client_command(&append)?;
+        process_next_client_command(&database, &SecretRedactor, Utc::now())?;
+        let starts = Arc::new(AtomicUsize::new(0));
+        let directory = tempfile::tempdir()?;
+        let mut services = services_with_conversation(
+            std::fs::canonicalize(directory.path())?,
+            Arc::new(FailingConversation {
+                fixture,
+                starts: Arc::clone(&starts),
+            }),
+        );
+        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+            .await?;
+
+        let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+        let attempt = database
+            .load_conversation_attempt(attempt_id)?
+            .ok_or("conversation attempt is missing")?;
+        assert_eq!(attempt.status, expected_status, "fixture: {name}");
+        let error = attempt.error_redacted.ok_or("missing redacted error")?;
+        assert!(!error.contains("secret-token"), "fixture: {name}");
+        assert!(error.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+        assert!(error.contains(expected_action), "fixture: {name}: {error}");
+        let outcome = attempt.outcome.ok_or("missing recovery outcome")?;
+        let ConversationOutcome::NeedsAttention {
+            response_redacted,
+            evidence_redacted,
+        } = outcome
+        else {
+            return Err(format!("fixture {name} did not store needs_attention").into());
+        };
+        assert!(
+            response_redacted.contains(expected_action),
+            "fixture: {name}"
+        );
+        assert!(
+            !evidence_redacted.contains("secret-token"),
+            "fixture: {name}"
+        );
+        assert!(evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+
+        let command_id = ClientCommandId::from_uuid(source_message_id.into_uuid());
+        let command = database
+            .load_client_command(command_id)?
+            .ok_or("conversation command is missing")?;
+        assert_eq!(command.state, ClientCommandState::Failed, "fixture: {name}");
+        assert!(
+            command
+                .outcome
+                .unwrap_or_default()
+                .contains(expected_action),
+            "fixture: {name}"
+        );
+        let messages = database.messages_after(session_id, 0, 10)?;
+        assert_eq!(messages.len(), 2, "fixture: {name}");
+        assert_eq!(messages[1].1.content_redacted, response_redacted);
+        with_workspace(&database_path, &database, |connection| {
+            connection.execute(
+                "UPDATE client_commands
+                 SET state = 'pending', claimed_at = NULL, completed_at = NULL, outcome = NULL
+                 WHERE command_id = ?1",
+                [command_id.to_string()],
+            )?;
+            Ok(())
+        })?;
+        services.conversation_providers.clear();
+        process_next_orchestration_command(&database, &services, &SecretRedactor, Utc::now())
+            .await?;
+        let replayed_command = database
+            .load_client_command(command_id)?
+            .ok_or("replayed conversation command is missing")?;
+        assert_eq!(
+            replayed_command.state,
+            ClientCommandState::Failed,
+            "fixture: {name}"
+        );
+        assert!(
+            replayed_command
+                .outcome
+                .unwrap_or_default()
+                .contains(expected_action),
+            "fixture: {name}"
+        );
+        assert_eq!(
+            database.messages_after(session_id, 0, 10)?.len(),
+            2,
+            "fixture: {name}"
+        );
+        assert_zero_writable_rows(&database_path, &database)?;
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "fixture: {name}");
+    }
     Ok(())
 }
 

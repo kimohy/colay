@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{StateError, StateResult, WorkspaceDatabase};
 
+const CONVERSATION_MAX_ERROR_BYTES: usize = 16 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewConversationAttempt {
     pub attempt_id: ConversationAttemptId,
@@ -134,16 +136,112 @@ impl $database {
         })
     }
 
+    pub fn finalize_conversation_failure(
+        &self,
+        attempt_id: ConversationAttemptId,
+        status: ConversationAttemptStatus,
+        outcome: &ConversationOutcome,
+        error_redacted: &str,
+        completed_at: DateTime<Utc>,
+    ) -> StateResult<StoredConversationAttempt> {
+        let status_text = match status {
+            ConversationAttemptStatus::Failed => "failed",
+            ConversationAttemptStatus::Cancelled => "cancelled",
+            ConversationAttemptStatus::Running | ConversationAttemptStatus::Succeeded => {
+                return Err(StateError::InvalidRecord(
+                    "conversation failure status must be failed or cancelled".to_owned(),
+                ));
+            }
+        };
+        if !matches!(outcome, ConversationOutcome::NeedsAttention { .. }) {
+            return Err(StateError::InvalidRecord(
+                "conversation failure outcome must need attention".to_owned(),
+            ));
+        }
+        outcome
+            .validate()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        let error_redacted = error_redacted.trim();
+        if error_redacted.is_empty() {
+            return Err(StateError::InvalidRecord(
+                "conversation failure error must not be blank".to_owned(),
+            ));
+        }
+        if error_redacted.len() > CONVERSATION_MAX_ERROR_BYTES {
+            return Err(StateError::InvalidRecord(format!(
+                "conversation failure error exceeds {CONVERSATION_MAX_ERROR_BYTES} bytes"
+            )));
+        }
+        let outcome_json = serde_json::to_string(outcome)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = load_attempt(&transaction, attempt_id)?.ok_or_else(|| {
+            StateError::InvalidRecord("conversation attempt does not exist".to_owned())
+        })?;
+        if existing.status == status {
+            if existing.outcome.as_ref() == Some(outcome)
+                && existing.error_redacted.as_deref() == Some(error_redacted)
+                && existing.completed_at == Some(completed_at)
+            {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StateError::InvalidRecord(
+                "completed conversation failure conflicts with existing row".to_owned(),
+            ));
+        }
+        if existing.status != ConversationAttemptStatus::Running {
+            return Err(StateError::InvalidRecord(
+                "conversation attempt is not running".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE main.conversation_attempts
+             SET status = ?1, outcome_json = ?2, error_redacted = ?3, completed_at = ?4
+             WHERE workspace_id = current_workspace() AND attempt_id = ?5 AND status = 'running'",
+            params![
+                status_text,
+                outcome_json,
+                error_redacted,
+                completed_at.to_rfc3339(),
+                attempt_id.to_string(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StateError::OptimisticConflict {
+                entity: format!("conversation attempt {attempt_id}"),
+            });
+        }
+        let completed = load_attempt(&transaction, attempt_id)?.ok_or_else(|| {
+            StateError::InvalidRecord("completed conversation attempt is missing".to_owned())
+        })?;
+        transaction.commit()?;
+        Ok(completed)
+    }
+
     pub fn reconcile_interrupted_conversation_attempts(
         &self,
         completed_at: DateTime<Utc>,
         error_redacted: &str,
     ) -> StateResult<Vec<ConversationAttemptId>> {
-        if error_redacted.trim().is_empty() {
+        let error_redacted = error_redacted.trim();
+        if error_redacted.is_empty() {
             return Err(StateError::InvalidRecord(
                 "interrupted conversation evidence must not be blank".to_owned(),
             ));
         }
+        if error_redacted.len() > CONVERSATION_MAX_ERROR_BYTES {
+            return Err(StateError::InvalidRecord(format!(
+                "interrupted conversation evidence exceeds {CONVERSATION_MAX_ERROR_BYTES} bytes"
+            )));
+        }
+        let outcome = ConversationOutcome::NeedsAttention {
+            response_redacted:
+                "The conversation was interrupted by a daemon restart. Retry this conversation."
+                    .to_owned(),
+            evidence_redacted: error_redacted.to_owned(),
+        };
+        let outcome_json = serde_json::to_string(&outcome)?;
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let attempt_ids = {
@@ -161,10 +259,11 @@ impl $database {
         for attempt_id in &attempt_ids {
             let changed = transaction.execute(
                 "UPDATE main.conversation_attempts
-                 SET status = 'failed', error_redacted = ?1, completed_at = ?2
-                 WHERE workspace_id = current_workspace() AND attempt_id = ?3 AND status = 'running'",
+                 SET status = 'failed', outcome_json = ?1, error_redacted = ?2, completed_at = ?3
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?4 AND status = 'running'",
                 params![
-                    error_redacted.trim(),
+                    outcome_json,
+                    error_redacted,
                     completed_at.to_rfc3339(),
                     attempt_id.to_string(),
                 ],
@@ -182,7 +281,7 @@ impl $database {
                  AND state IN ('pending', 'claimed')",
                 params![
                     completed_at.to_rfc3339(),
-                    error_redacted.trim(),
+                    error_redacted,
                     attempt_id.to_string(),
                 ],
             )?;

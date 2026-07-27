@@ -7,9 +7,12 @@ use orchestrator_domain::{
     SchemaVersion, SessionId, TaskEvent,
 };
 use orchestrator_engine::{
-    ConversationOrchestrator, ConversationRequest, collect_conversation_response,
+    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationFailureKind, ConversationOrchestrator,
+    ConversationRequest, collect_conversation_response, diagnose_conversation_failure,
 };
-use orchestrator_state::{NewConversationAttempt, StateError, WorkspaceDatabase};
+use orchestrator_state::{
+    ConversationAttemptStatus, NewConversationAttempt, StateError, WorkspaceDatabase,
+};
 
 use crate::MessageRedactor;
 
@@ -85,61 +88,155 @@ pub(crate) async fn request_conversation_turn(
             "conversation source must be a final session-level user message".to_owned(),
         ));
     }
+    let attempt_id = ConversationAttemptId::from_uuid(command.command_id.into_uuid());
+    let stored = database.load_conversation_attempt(attempt_id)?;
+    if let Some(existing) = stored.as_ref()
+        && let Some(outcome) = existing.outcome.as_ref()
+    {
+        reconcile_outcome(
+            database,
+            command,
+            session_id,
+            payload.source_message_id,
+            outcome,
+        )?;
+        return match existing.status {
+            ConversationAttemptStatus::Succeeded => Ok(format!("conversation:{attempt_id}")),
+            ConversationAttemptStatus::Failed | ConversationAttemptStatus::Cancelled => Err(
+                ConversationCommandError::Rejected(existing.error_redacted.clone().unwrap_or_else(
+                    || "conversation provider failed without redacted evidence".to_owned(),
+                )),
+            ),
+            ConversationAttemptStatus::Running => Err(ConversationCommandError::Rejected(
+                "running conversation attempt unexpectedly has an outcome".to_owned(),
+            )),
+        };
+    }
+
     let provider_selection =
         select_conversation_provider(payload.requested_provider, conversation_providers)?;
 
-    let attempt_id = ConversationAttemptId::from_uuid(command.command_id.into_uuid());
-    let stored = database.load_conversation_attempt(attempt_id)?;
-    let outcome = if let Some(existing) = stored.as_ref().and_then(|value| value.outcome.clone()) {
-        existing
-    } else {
-        database.begin_conversation_attempt(&NewConversationAttempt {
-            attempt_id,
-            session_id,
-            source_message_id: payload.source_message_id,
-            provider: provider_selection.selected,
-            started_at: command.requested_at,
-        })?;
-        let transcript = database
-            .latest_messages(session_id, 200)?
-            .into_iter()
-            .filter(|(_, message)| message.task_id.is_none())
-            .map(|(_, message)| {
-                format!("{}: {}", role_name(message.role), message.content_redacted)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let request = ConversationRequest {
-            attempt_id,
-            session_id,
-            source_message_id: payload.source_message_id,
-            provider: provider_selection.selected,
-            transcript_redacted: transcript,
-            repository_summary_redacted:
-                "Repository metadata is optional for conversation and required before approval"
-                    .to_owned(),
-            sandbox: SandboxMode::ReadOnly,
-        };
-        let collected = match orchestrator.converse(request.clone()).await {
-            Ok(response) => collect_conversation_response(&request, response),
-            Err(error) => Err(error),
-        };
-        let outcome = collected.unwrap_or_else(|error| ConversationOutcome::NeedsAttention {
-            response_redacted: "The read-only conversation provider needs attention; your message and session were preserved.".to_owned(),
-            evidence_redacted: redactor.redact(&error.to_string()),
-        });
-        let outcome = apply_provider_fallback_notice(outcome, provider_selection);
-        database.finish_conversation_attempt(attempt_id, &outcome, now)?;
-        outcome
-    };
-    reconcile_outcome(
-        database,
-        command,
+    database.begin_conversation_attempt(&NewConversationAttempt {
+        attempt_id,
         session_id,
-        payload.source_message_id,
-        &outcome,
-    )?;
-    Ok(format!("conversation:{attempt_id}"))
+        source_message_id: payload.source_message_id,
+        provider: provider_selection.selected,
+        started_at: command.requested_at,
+    })?;
+    let transcript = database
+        .latest_messages(session_id, 200)?
+        .into_iter()
+        .filter(|(_, message)| message.task_id.is_none())
+        .map(|(_, message)| format!("{}: {}", role_name(message.role), message.content_redacted))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let request = ConversationRequest {
+        attempt_id,
+        session_id,
+        source_message_id: payload.source_message_id,
+        provider: provider_selection.selected,
+        transcript_redacted: transcript,
+        repository_summary_redacted:
+            "Repository metadata is optional for conversation and required before approval"
+                .to_owned(),
+        sandbox: SandboxMode::ReadOnly,
+    };
+    let collected = match orchestrator.converse(request.clone()).await {
+        Ok(response) => collect_conversation_response(&request, response),
+        Err(error) => Err(error),
+    };
+    match collected {
+        Ok(outcome) => {
+            let outcome = apply_provider_fallback_notice(outcome, provider_selection);
+            database.finish_conversation_attempt(attempt_id, &outcome, now)?;
+            reconcile_outcome(
+                database,
+                command,
+                session_id,
+                payload.source_message_id,
+                &outcome,
+            )?;
+            Ok(format!("conversation:{attempt_id}"))
+        }
+        Err(failure) => {
+            let diagnostic = diagnose_conversation_failure(provider_selection.selected, &failure);
+            let status = if diagnostic.kind == ConversationFailureKind::Cancelled {
+                ConversationAttemptStatus::Cancelled
+            } else {
+                ConversationAttemptStatus::Failed
+            };
+            let response_redacted = bounded_redacted(redactor, &diagnostic.response_redacted);
+            let evidence_redacted = nonblank_failure_evidence(bounded_redacted(
+                redactor,
+                &diagnostic.evidence_redacted,
+            ));
+            let outcome = apply_provider_fallback_notice(
+                ConversationOutcome::NeedsAttention {
+                    response_redacted,
+                    evidence_redacted: evidence_redacted.clone(),
+                },
+                provider_selection,
+            );
+            let error_redacted = bounded_redacted(
+                redactor,
+                &format!(
+                    "{} Evidence: {evidence_redacted}",
+                    outcome_response(&outcome)
+                ),
+            );
+            database.finalize_conversation_failure(
+                attempt_id,
+                status,
+                &outcome,
+                &error_redacted,
+                now,
+            )?;
+            reconcile_outcome(
+                database,
+                command,
+                session_id,
+                payload.source_message_id,
+                &outcome,
+            )?;
+            Err(ConversationCommandError::Rejected(error_redacted))
+        }
+    }
+}
+
+fn outcome_response(outcome: &ConversationOutcome) -> &str {
+    match outcome {
+        ConversationOutcome::AnswerComplete { response_redacted }
+        | ConversationOutcome::MoreInformationNeeded {
+            response_redacted, ..
+        }
+        | ConversationOutcome::WorktreeTaskCandidate {
+            response_redacted, ..
+        }
+        | ConversationOutcome::NeedsAttention {
+            response_redacted, ..
+        } => response_redacted,
+    }
+}
+
+fn nonblank_failure_evidence(evidence_redacted: String) -> String {
+    if evidence_redacted.trim().is_empty() {
+        "provider failure evidence was fully redacted".to_owned()
+    } else {
+        evidence_redacted
+    }
+}
+
+fn bounded_redacted(redactor: &dyn MessageRedactor, value: &str) -> String {
+    const TRUNCATED: &str = "[truncated]";
+    let redacted = redactor.redact(value);
+    if redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES {
+        return redacted;
+    }
+    let mut end = CONVERSATION_MAX_EVIDENCE_BYTES.saturating_sub(TRUNCATED.len());
+    while !redacted.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}{TRUNCATED}", &redacted[..end])
 }
 
 fn apply_provider_fallback_notice(

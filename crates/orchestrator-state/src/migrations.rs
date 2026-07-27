@@ -14,7 +14,7 @@ use crate::{
     reject_symlink_components, verify_private_file,
 };
 
-pub const STATE_SCHEMA_VERSION: u32 = 15;
+pub const STATE_SCHEMA_VERSION: u32 = 16;
 pub const ROLLBACK_PLAN_SCHEMA_VERSION: u32 = 1;
 
 const MIGRATIONS: &[(u32, &str, &str)] = &[
@@ -88,6 +88,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         15,
         "command_invocation_fences",
         include_str!("../../../migrations/0015_command_invocation_fences.sql"),
+    ),
+    (
+        16,
+        "conversation_failure_outcomes",
+        include_str!("../../../migrations/0016_conversation_failure_outcomes.sql"),
     ),
 ];
 

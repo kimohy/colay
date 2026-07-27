@@ -119,6 +119,15 @@ unbounded provider output.
 A valid parsed `ConversationOutcome`, including a provider-authored valid
 `needs_attention`, finishes the attempt as `succeeded`.
 
+Implementation correction approved on 2026-07-27: schema v15 required
+`outcome_json IS NULL` for failed and cancelled attempts, which contradicts the
+durable recovery-outcome contract below. Forward migration v16 rebuilds only
+`conversation_attempts` so every terminal status carries an outcome, preserves
+the workspace-partitioned composite identity and append-only triggers, and
+backfills a deterministic `needs_attention` outcome for existing failed or
+cancelled rows. Applied migrations 0010 and 0013 remain unchanged so their
+checksums and existing user databases stay valid.
+
 A provider invocation or collection failure follows this order:
 
 1. construct a bounded redacted diagnostic and deterministic user recovery

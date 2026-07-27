@@ -259,16 +259,20 @@ git commit -m "fix: honor conversation provider preference"
 - Modify: `crates/orchestrator-engine/src/lib.rs`
 - Modify: `crates/orchestrator-engine/tests/conversation_collector.rs`
 - Modify: `crates/orchestrator-state/src/conversations.rs`
+- Modify: `crates/orchestrator-state/src/migrations.rs`
 - Modify: `crates/orchestrator-state/tests/conversations.rs`
+- Modify: `crates/orchestrator-state/tests/migration_contract.rs`
 - Modify: `crates/orchestrator-daemon/src/conversation.rs`
 - Modify: `crates/orchestrator-daemon/tests/conversation_flow.rs`
 - Modify: `crates/orchestrator-cli/tests/global_plan_first.rs`
+- Modify: `crates/orchestrator-test-support/src/runtime.rs`
+- Add: `migrations/0016_conversation_failure_outcomes.sql`
 
 **Interfaces:**
 - Produces: `ConversationFailureKind` with `Authentication`, `QuotaOrBilling`, `UnsupportedClientOrAccount`, `Timeout`, `Cancelled`, `Compatibility`, and `ProcessFailure`.
 - Produces: `ConversationFailureDiagnostic { kind, response_redacted, evidence_redacted }` and `diagnose_conversation_failure(provider, failure)`.
 - Produces: `WorkspaceDatabase::finalize_conversation_failure(attempt_id, status, outcome, error_redacted, completed_at)` accepting only `Failed` or `Cancelled`.
-- Consumes: existing `ConversationFailure`, bounded evidence, redactor, and existing `conversation_attempts` columns.
+- Consumes: existing `ConversationFailure`, bounded evidence, redactor, and the v16 `conversation_attempts` terminal-outcome constraint.
 
 - [ ] **Step 1: Write failing diagnostic classification tests**
 
@@ -314,9 +318,21 @@ cargo test -p orchestrator-state --test conversations
 
 Expected: compilation fails because `finalize_conversation_failure` does not exist.
 
+- [ ] **Step 6a: Add the approved forward migration for terminal outcomes**
+
+Implementation correction approved on 2026-07-27: the v15 CHECK constraint
+requires failed and cancelled attempts to have a null `outcome_json`, so the
+specified recovery outcome cannot be persisted without a forward schema
+change. Add migration 0016; do not edit migrations 0010 or 0013. Rebuild
+`conversation_attempts` with its workspace-partitioned keys, foreign keys,
+index, and append-only triggers intact. Backfill deterministic
+`needs_attention` outcomes for existing failed and cancelled rows, and test a
+v15-to-v16 upgrade for row preservation, valid and invalid terminal
+combinations, integrity, and foreign-key enforcement.
+
 - [ ] **Step 7: Implement atomic failed/cancelled finalization**
 
-Validate the outcome and nonblank bounded error, accept only `Failed` or `Cancelled`, and update `status`, `outcome_json`, `error_redacted`, and `completed_at` in one immediate transaction guarded by `status = 'running'`. Preserve exact idempotency for an already identical terminal row. Do not change the schema or `finish_conversation_attempt` success behavior.
+Validate the outcome and nonblank bounded error, accept only `Failed` or `Cancelled`, and update `status`, `outcome_json`, `error_redacted`, and `completed_at` in one immediate transaction guarded by `status = 'running'`. Preserve exact idempotency for an already identical terminal row. Use the approved v16 constraint above and do not change `finish_conversation_attempt` success behavior.
 
 - [ ] **Step 8: Run state tests and confirm GREEN**
 
