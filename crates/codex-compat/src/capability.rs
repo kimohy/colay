@@ -36,6 +36,7 @@ pub struct CodexCapabilities {
     pub output_schema: CapabilitySupport,
     pub workspace_write_sandbox: CapabilitySupport,
     pub read_only_sandbox: CapabilitySupport,
+    pub skip_git_repo_check: CapabilitySupport,
     pub reasoning_effort: CapabilitySupport,
     pub exec_reasoning_effort: CapabilitySupport,
     pub app_server_reasoning_effort: CapabilitySupport,
@@ -53,6 +54,7 @@ impl Default for CodexCapabilities {
             output_schema: CapabilitySupport::Unsupported,
             workspace_write_sandbox: CapabilitySupport::Unsupported,
             read_only_sandbox: CapabilitySupport::Unsupported,
+            skip_git_repo_check: CapabilitySupport::Unsupported,
             reasoning_effort: CapabilitySupport::Unsupported,
             exec_reasoning_effort: CapabilitySupport::Unsupported,
             app_server_reasoning_effort: CapabilitySupport::Unsupported,
@@ -293,6 +295,11 @@ impl CapabilityProbe {
                 .as_deref()
                 .is_some_and(|text| text.contains("read-only")),
         );
+        capabilities.skip_git_repo_check = support_if(
+            exec_help
+                .as_deref()
+                .is_some_and(|text| text.contains("--skip-git-repo-check")),
+        );
         capabilities.app_server = support_if(app_help.is_some());
         // Unlike a version-number contract, the installed binary's explicit
         // help is runtime evidence for this exact option and value set.
@@ -372,6 +379,11 @@ impl CapabilityProbe {
             (
                 "read_only_sandbox",
                 capabilities.read_only_sandbox,
+                "codex exec --help",
+            ),
+            (
+                "skip_git_repo_check",
+                capabilities.skip_git_repo_check,
                 "codex exec --help",
             ),
             (

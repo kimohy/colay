@@ -2,9 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use codex_compat::{
-    AdapterSelection, CapabilityProbe, CapabilityProbeInput, CodexEventParser, CodexItem,
-    CompatEvent, CompatibilityError, CompatibilityRegistry, CompatibilityStatus, ProbeCommandKind,
-    ProbeOutput, QuotaErrorKind,
+    AdapterSelection, CapabilityProbe, CapabilityProbeInput, CapabilitySupport, CodexEventParser,
+    CodexItem, CompatEvent, CompatibilityError, CompatibilityRegistry, CompatibilityStatus,
+    ProbeCommandKind, ProbeOutput, QuotaErrorKind,
 };
 use serde::Deserialize;
 
@@ -208,6 +208,22 @@ fn current_and_previous_codex_versions_are_exact() {
         registry.select(Some(&semver::Version::new(0, 144, 4))),
         AdapterSelection::GenericUntested
     ));
+}
+
+#[test]
+fn successful_exec_help_advertises_skip_git_repo_check() {
+    let mut input = CapabilityProbeInput::default();
+    input.outputs.insert(
+        ProbeCommandKind::ExecHelp,
+        ProbeOutput::success("--skip-git-repo-check"),
+    );
+
+    let report = CapabilityProbe::default().evaluate(&input);
+
+    assert_eq!(
+        report.capabilities.skip_git_repo_check,
+        CapabilitySupport::Advertised
+    );
 }
 
 #[test]
