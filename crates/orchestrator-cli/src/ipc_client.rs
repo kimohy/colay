@@ -754,12 +754,17 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
     let status_request = legacy_status_request();
-    let mut encoded = serde_json::to_vec(&status_request)?;
-    encoded.push(b'\n');
-    encoded.extend(serde_json::to_vec(request)?);
-    encoded.push(b'\n');
-    let mut stream = response_stream(stream, &encoded).await?;
-    let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+    let mut encoded_status = serde_json::to_vec(&status_request)?;
+    encoded_status.push(b'\n');
+    let mut encoded_request = serde_json::to_vec(request)?;
+    encoded_request.push(b'\n');
+    let (reader, mut writer) = tokio::io::split(stream);
+    writer.write_all(&encoded_status).await?;
+    let reader: ResponseReader = Box::pin(BufReader::new(reader));
+    let mut responses = IpcResponseStream {
+        lines: reader.lines(),
+    };
+    let response = tokio::time::timeout(RESPONSE_TIMEOUT, responses.next())
         .await
         .context("timed out validating the selected legacy daemon endpoint")??
         .ok_or_else(|| endpoint_refused("legacy user daemon closed status IPC without replying"))?;
@@ -768,7 +773,8 @@ where
     }
     let observed = legacy_status_identity(&response)?;
     validate_legacy_daemon_identity(observed, expected, pinned)?;
-    Ok(stream)
+    writer.write_all(&encoded_request).await?;
+    Ok(responses)
 }
 
 #[cfg(windows)]
@@ -980,10 +986,13 @@ mod tests {
             let mut lines = BufReader::new(reader).lines();
             let status_request: IpcRequest =
                 serde_json::from_str(&lines.next_line().await?.context("status request")?)?;
-            let actual_request: IpcRequest =
-                serde_json::from_str(&lines.next_line().await?.context("actual request")?)?;
             assert_eq!(status_request.action, "daemon.status");
-            assert_eq!(actual_request.action, "daemon.stop");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), lines.next_line())
+                    .await
+                    .is_err(),
+                "legacy client sent its actual request before status validation"
+            );
             let status = IpcResponse {
                 schema_version: IPC_SCHEMA_VERSION,
                 request_id: status_request.request_id,
@@ -992,13 +1001,16 @@ mod tests {
                     "instance": {"instance_id": identity.instance_id, "pid": identity.owner_pid}
                 }}}),
             };
+            writer.write_all(&serde_json::to_vec(&status)?).await?;
+            writer.write_all(b"\n").await?;
+            let actual_request: IpcRequest =
+                serde_json::from_str(&lines.next_line().await?.context("actual request")?)?;
+            assert_eq!(actual_request.action, "daemon.stop");
             let actual = IpcResponse {
                 schema_version: IPC_SCHEMA_VERSION,
                 request_id: actual_request.request_id,
                 outcome: json!({"status": "ok", "data": {"requested": true}}),
             };
-            writer.write_all(&serde_json::to_vec(&status)?).await?;
-            writer.write_all(b"\n").await?;
             writer.write_all(&serde_json::to_vec(&actual)?).await?;
             writer.write_all(b"\n").await?;
             Ok::<_, anyhow::Error>(())
@@ -1008,6 +1020,58 @@ mod tests {
             response_stream_with_legacy_identity(client, &request, identity, identity).await?;
         let response = stream.next().await?.context("actual response")?;
         assert_eq!(response.request_id, "actual-request");
+        peer.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_mismatch_never_receives_the_actual_request() -> anyhow::Result<()> {
+        let expected = LegacyDaemonIdentity {
+            instance_id: "018f68d2-00f0-7000-8000-000000000042".parse()?,
+            owner_pid: 42,
+        };
+        let observed = LegacyDaemonIdentity {
+            instance_id: expected.instance_id,
+            owner_pid: 43,
+        };
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "actual-request".to_owned(),
+            workspace_id: None,
+            action: "daemon.stop".to_owned(),
+            payload: json!({}),
+        };
+        let (client, server) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut lines = BufReader::new(reader).lines();
+            let status_request: IpcRequest =
+                serde_json::from_str(&lines.next_line().await?.context("status request")?)?;
+            let status = IpcResponse {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: status_request.request_id,
+                outcome: json!({"status": "ok", "data": {"status": {
+                    "state": "online",
+                    "instance": {"instance_id": observed.instance_id, "pid": observed.owner_pid}
+                }}}),
+            };
+            writer.write_all(&serde_json::to_vec(&status)?).await?;
+            writer.write_all(b"\n").await?;
+            if let Ok(Ok(Some(actual))) =
+                tokio::time::timeout(std::time::Duration::from_millis(20), lines.next_line()).await
+            {
+                anyhow::bail!("legacy identity mismatch received actual request: {actual}");
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+
+        assert!(
+            response_stream_with_legacy_identity(client, &request, expected, expected)
+                .await
+                .is_err()
+        );
         peer.await??;
         Ok(())
     }
@@ -1347,17 +1411,7 @@ mod tests {
             let mut lines = BufReader::new(reader).lines();
             let status_request: IpcRequest =
                 serde_json::from_str(&lines.next_line().await?.context("status request")?)?;
-            let actual_request: IpcRequest =
-                serde_json::from_str(&lines.next_line().await?.context("actual request")?)?;
             assert_eq!(status_request.action, "daemon.status");
-            assert_eq!(
-                actual_request.action,
-                if connection_index == 0 {
-                    "daemon.ping"
-                } else {
-                    "daemon.stop"
-                }
-            );
             let status = IpcResponse {
                 schema_version: IPC_SCHEMA_VERSION,
                 request_id: status_request.request_id,
@@ -1366,6 +1420,18 @@ mod tests {
                     "instance": {"instance_id": instance_id, "pid": 42}
                 }}}),
             };
+            writer.write_all(&serde_json::to_vec(&status)?).await?;
+            writer.write_all(b"\n").await?;
+            let actual_request: IpcRequest =
+                serde_json::from_str(&lines.next_line().await?.context("actual request")?)?;
+            assert_eq!(
+                actual_request.action,
+                if connection_index == 0 {
+                    "daemon.ping"
+                } else {
+                    "daemon.stop"
+                }
+            );
             let actual = IpcResponse {
                 schema_version: IPC_SCHEMA_VERSION,
                 request_id: actual_request.request_id,
@@ -1375,8 +1441,6 @@ mod tests {
                     json!({"status": "ok", "data": {"requested": true}})
                 },
             };
-            writer.write_all(&serde_json::to_vec(&status)?).await?;
-            writer.write_all(b"\n").await?;
             writer.write_all(&serde_json::to_vec(&actual)?).await?;
             writer.write_all(b"\n").await?;
         }
