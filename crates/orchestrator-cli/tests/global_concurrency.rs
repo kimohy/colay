@@ -36,6 +36,21 @@ struct CommandContext {
     temp: PathBuf,
 }
 
+#[derive(Debug)]
+struct DaemonDiagnostic {
+    pid: i64,
+    phase: String,
+    startup_error: String,
+    stop_requested_at: String,
+    released_at: String,
+}
+
+#[derive(Debug)]
+struct DaemonDiagnostics {
+    instances: Vec<DaemonDiagnostic>,
+    stderr: String,
+}
+
 impl ConcurrencyFixture {
     fn new() -> Result<Self> {
         let serial = concurrency_fixture_guard();
@@ -128,7 +143,7 @@ impl ConcurrencyFixture {
             .map_err(Into::into)
     }
 
-    fn daemon_diagnostics(&self) -> Result<String> {
+    fn daemon_diagnostics(&self) -> Result<DaemonDiagnostics> {
         let connection = Connection::open(self.database())?;
         let mut statement = connection.prepare(
             "SELECT pid, phase, COALESCE(startup_error, ''), \
@@ -136,18 +151,22 @@ impl ConcurrencyFixture {
              FROM daemon_instances ORDER BY started_at",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok(format!(
-                "pid={} phase={} startup_error={:?} stop_requested_at={:?} released_at={:?}",
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?
-            ))
+            Ok(DaemonDiagnostic {
+                pid: row.get(0)?,
+                phase: row.get(1)?,
+                startup_error: row.get(2)?,
+                stop_requested_at: row.get(3)?,
+                released_at: row.get(4)?,
+            })
         })?;
-        let rows = rows.collect::<Result<Vec<_>, _>>()?.join("; ");
-        let daemon_log = fs::read_to_string(&self.command.daemon_log).unwrap_or_default();
-        Ok(format!("{rows}; daemon_stderr={daemon_log:?}"))
+        let instances = rows.collect::<Result<Vec<_>, _>>()?;
+        let stderr = fs::read_to_string(&self.command.daemon_log).with_context(|| {
+            format!(
+                "failed to read daemon stderr log {}",
+                self.command.daemon_log.display()
+            )
+        })?;
+        Ok(DaemonDiagnostics { instances, stderr })
     }
 
     fn database_files(&self) -> Result<Vec<PathBuf>> {
@@ -330,13 +349,13 @@ fn toml_path(path: &Path) -> String {
     )
 }
 
-fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &str) {
+fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &DaemonDiagnostics) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let normalized = stderr.to_ascii_lowercase();
     assert!(
         output.status.success(),
-        "client {index} failed with {}: {stderr}; stdout: {stdout}; daemon: {daemon_diagnostics}",
+        "client {index} failed with {}: {stderr}; stdout: {stdout}; daemon: {daemon_diagnostics:?}",
         output.status,
     );
     for forbidden in [
@@ -352,18 +371,86 @@ fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &str) 
     }
 }
 
-fn assert_clean_daemon_startup(daemon_diagnostics: &str) {
-    let normalized = daemon_diagnostics.to_ascii_lowercase();
-    for forbidden in [
-        "i/o operation failed",
-        "permission hardening failed",
-        "unable to open database file",
-    ] {
-        assert!(
-            !normalized.contains(forbidden),
-            "daemon contender observed {forbidden}: {daemon_diagnostics}"
-        );
+fn validate_daemon_diagnostics(daemon_diagnostics: &DaemonDiagnostics) -> Result<()> {
+    const ERROR_PREFIX: &str = "error: ";
+    const EXPECTED_CONTENDER: &str = "daemon singleton is already owned by another process";
+
+    for instance in &daemon_diagnostics.instances {
+        if !instance.startup_error.is_empty() {
+            bail!(
+                "daemon {} entered phase {} with startup_error {:?}; stop_requested_at={:?} released_at={:?}",
+                instance.pid,
+                instance.phase,
+                instance.startup_error,
+                instance.stop_requested_at,
+                instance.released_at
+            );
+        }
     }
+
+    let mut remaining = daemon_diagnostics.stderr.as_str();
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if let Some(rest) = remaining.strip_prefix(ERROR_PREFIX) {
+            remaining = rest;
+            continue;
+        }
+        if let Some(rest) = remaining.strip_prefix(EXPECTED_CONTENDER) {
+            remaining = rest;
+            continue;
+        }
+        bail!("unexpected daemon contender stderr: {remaining:?}");
+    }
+}
+
+#[test]
+fn daemon_diagnostics_allow_only_expected_owner_contention() -> Result<()> {
+    let diagnostics = DaemonDiagnostics {
+        instances: vec![DaemonDiagnostic {
+            pid: 42,
+            phase: "online".to_owned(),
+            startup_error: String::new(),
+            stop_requested_at: String::new(),
+            released_at: String::new(),
+        }],
+        stderr: concat!(
+            "error: daemon singleton is already owned by another process\n",
+            "error: error: daemon singleton is already owned by another process",
+            "daemon singleton is already owned by another process\n",
+        )
+        .to_owned(),
+    };
+
+    validate_daemon_diagnostics(&diagnostics)
+}
+
+#[test]
+fn daemon_diagnostics_reject_persisted_startup_error() {
+    let diagnostics = DaemonDiagnostics {
+        instances: vec![DaemonDiagnostic {
+            pid: 42,
+            phase: "failed".to_owned(),
+            startup_error: "unable to open database file".to_owned(),
+            stop_requested_at: String::new(),
+            released_at: String::new(),
+        }],
+        stderr: String::new(),
+    };
+
+    assert!(validate_daemon_diagnostics(&diagnostics).is_err());
+}
+
+#[test]
+fn daemon_diagnostics_reject_unexpected_contender_output() {
+    let diagnostics = DaemonDiagnostics {
+        instances: Vec::new(),
+        stderr: "error: IPC I/O failed at daemon.lock: access denied\n".to_owned(),
+    };
+
+    assert!(validate_daemon_diagnostics(&diagnostics).is_err());
 }
 
 #[test]
@@ -371,10 +458,8 @@ fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()
     let fixture = ConcurrencyFixture::new()?;
 
     let outputs = fixture.run_parallel_status_and_plan_clients(CLIENT_COUNT)?;
-    let daemon_diagnostics = fixture
-        .daemon_diagnostics()
-        .unwrap_or_else(|error| format!("unavailable: {error:#}"));
-    assert_clean_daemon_startup(&daemon_diagnostics);
+    let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
 
     assert_eq!(outputs.len(), CLIENT_COUNT);
     for (index, output) in outputs.iter().enumerate() {
@@ -406,6 +491,7 @@ fn windows_unicode_and_case_variants_share_one_global_workspace() -> Result<()> 
     let second = fixture.run(&differently_cased, &["--json", "status"])?;
 
     let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
     assert_clean_client(0, &first, &daemon_diagnostics);
     assert_clean_client(1, &second, &daemon_diagnostics);
     assert_eq!(fixture.count("SELECT count(*) FROM workspaces")?, 1);
@@ -422,7 +508,9 @@ fn unix_socket_is_private_and_owned_with_the_colay_home() -> Result<()> {
 
     let fixture = ConcurrencyFixture::new()?;
     let output = fixture.run(&fixture.repository, &["--json", "status"])?;
-    assert_clean_client(0, &output, &fixture.daemon_diagnostics()?);
+    let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
+    assert_clean_client(0, &output, &daemon_diagnostics);
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         fixture.colay_home.clone(),
     )?)?;

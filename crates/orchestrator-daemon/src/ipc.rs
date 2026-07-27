@@ -290,19 +290,73 @@ impl DaemonOwnerLock {
 }
 
 #[cfg(windows)]
+struct WindowsOwnerBootstrapGuard {
+    _mutex: orchestrator_windows_ipc::CurrentUserMutex,
+    _directory_tree: orchestrator_windows_ipc::CurrentUserDirectoryTree,
+}
+
+#[cfg(windows)]
 fn windows_owner_bootstrap_guard(
     paths: &GlobalStatePaths,
-) -> Result<orchestrator_windows_ipc::CurrentUserMutex, IpcError> {
-    let digest = Sha256::digest(paths.root.to_string_lossy().as_bytes());
-    let suffix = hex::encode(&digest[..16]);
-    let name = format!(r"Local\ColayDaemonOwner-{suffix}");
+) -> Result<WindowsOwnerBootstrapGuard, IpcError> {
     let current_user_sid = orchestrator_state::current_windows_user_sid()?;
-    orchestrator_windows_ipc::acquire_current_user_mutex(&name, &current_user_sid).map_err(
-        |source| IpcError::Io {
+    let directory_tree = orchestrator_windows_ipc::ensure_current_user_only_directory_tree(
+        &paths.root,
+        &current_user_sid,
+    )
+    .map_err(|source| IpcError::Io {
+        path: paths.root.clone(),
+        source,
+    })?;
+    let canonical_root = windows_canonical_state_root(paths)?;
+    let name = windows_owner_mutex_name(&canonical_root, &current_user_sid);
+    let mutex = orchestrator_windows_ipc::acquire_current_user_mutex(&name, &current_user_sid)
+        .map_err(|source| IpcError::Io {
             path: PathBuf::from(name),
             source,
-        },
-    )
+        })?;
+    Ok(WindowsOwnerBootstrapGuard {
+        _mutex: mutex,
+        _directory_tree: directory_tree,
+    })
+}
+
+#[cfg(windows)]
+fn windows_canonical_state_root(paths: &GlobalStatePaths) -> Result<PathBuf, IpcError> {
+    reject_symlink_components(&paths.root)?;
+    let canonical = std::fs::canonicalize(&paths.root).map_err(|source| IpcError::Io {
+        path: paths.root.clone(),
+        source,
+    })?;
+    reject_symlink_components(&canonical)?;
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn windows_owner_mutex_name(canonical_root: &Path, current_user_sid: &str) -> String {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let root_units = canonical_root.as_os_str().encode_wide().collect::<Vec<_>>();
+    let sid_bytes = current_user_sid.as_bytes();
+    let mut digest = Sha256::new();
+    digest.update(b"colay-daemon-owner-bootstrap-v2\0");
+    digest.update(
+        u64::try_from(root_units.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for unit in root_units {
+        digest.update(unit.to_le_bytes());
+    }
+    digest.update(
+        u64::try_from(sid_bytes.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    digest.update(sid_bytes);
+    let digest = digest.finalize();
+    let suffix = hex::encode(&digest[..16]);
+    format!(r"Local\ColayDaemonOwner-{suffix}")
 }
 
 fn lock_is_contended(error: &std::io::Error) -> bool {
@@ -1771,6 +1825,9 @@ fn request_daemon_stop(database: &Database) -> Result<Value, IpcError> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    #[cfg(windows)]
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, path::PathBuf};
+
     use chrono::Utc;
     use orchestrator_domain::{
         ConversationMessage, CorrelationId, DaemonInstanceId, EventActor, EventId, EventType,
@@ -1784,10 +1841,76 @@ mod tests {
         TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook, handle_connection,
         resume_workspace_task, workspace_conversation, workspace_projection,
     };
+    #[cfg(windows)]
+    use super::{windows_owner_bootstrap_guard, windows_owner_mutex_name};
     use orchestrator_state::{
         DaemonLeaseRequest, Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord,
         WorkspaceReadRequest,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_mutex_name_uses_canonical_case_insensitive_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("Daemon-Identity");
+        std::fs::create_dir_all(&root)?;
+        let canonical = std::fs::canonicalize(&root)?;
+        let case_alias = temporary.path().join("dAEMON-iDENTITY");
+        let alias_canonical = std::fs::canonicalize(case_alias)?;
+        let sid = "S-1-5-21-100-200-300-400";
+
+        assert_eq!(canonical, alias_canonical);
+        assert_eq!(
+            windows_owner_mutex_name(&canonical, sid),
+            windows_owner_mutex_name(&alias_canonical, sid)
+        );
+        assert_ne!(
+            windows_owner_mutex_name(&canonical, sid),
+            windows_owner_mutex_name(&canonical, "S-1-5-21-100-200-300-401")
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_mutex_name_hashes_non_unicode_units_losslessly() {
+        let prefix = [u16::from(b'C'), u16::from(b':'), u16::from(b'\\')];
+        let mut unpaired_units = prefix.to_vec();
+        unpaired_units.push(0xD800);
+        let mut replacement_units = prefix.to_vec();
+        replacement_units.push(0xFFFD);
+        let unpaired = PathBuf::from(OsString::from_wide(&unpaired_units));
+        let replacement = PathBuf::from(OsString::from_wide(&replacement_units));
+        let sid = "S-1-5-21-100-200-300-400";
+
+        assert_ne!(
+            windows_owner_mutex_name(&unpaired, sid),
+            windows_owner_mutex_name(&replacement, sid)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bootstrap_securely_creates_a_missing_state_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("missing-state-root");
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root: root.clone(),
+        };
+
+        let _guard = windows_owner_bootstrap_guard(&paths)?;
+
+        assert!(root.is_dir());
+        assert!(std::fs::canonicalize(&root)?.is_dir());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn oversized_request_is_rejected_and_connection_is_closed()

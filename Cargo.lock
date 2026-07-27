@@ -975,6 +975,7 @@ dependencies = [
 name = "orchestrator-windows-ipc"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "tokio",
  "windows-sys 0.61.2",
 ]
