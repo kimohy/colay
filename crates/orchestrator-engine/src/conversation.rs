@@ -14,6 +14,7 @@ pub struct ConversationRequest {
     pub attempt_id: ConversationAttemptId,
     pub session_id: SessionId,
     pub source_message_id: MessageId,
+    pub provider: ProviderId,
     pub transcript_redacted: String,
     pub repository_summary_redacted: String,
     pub sandbox: SandboxMode,
@@ -121,6 +122,7 @@ pub fn collect_conversation_response(
             "source_message_id",
             response.source_message_id != request.source_message_id,
         ),
+        ("provider", response.provider != request.provider),
     ] {
         if mismatch {
             return Err(ConversationFailure::IdentityMismatch {

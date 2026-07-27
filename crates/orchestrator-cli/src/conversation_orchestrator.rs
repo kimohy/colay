@@ -142,7 +142,12 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse, ConversationFailure> {
-        let provider = self.planner.primary_provider();
+        let provider = request.provider;
+        if !self.planner.capabilities.contains_key(&provider) {
+            return Err(invocation_failure(format!(
+                "selected conversation provider {provider} is not eligible"
+            )));
+        }
         let worker_request = self.worker_request(&request, provider)?;
         let adapter: Arc<dyn WorkerAdapter> = Arc::from(
             build_provider_adapter(

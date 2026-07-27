@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone as _, Utc};
 use orchestrator_domain::{
-    ClientCommandAction, ConversationOutcome, GraphRevisionId, MessageId, ModelProfile, ProviderId,
-    RepoValidationEvidence, RequestConversationTurnCommandPayload, RequirementRevision,
-    RequirementRevisionId, RequirementSnapshot, SchemaVersion, SessionId, SessionState,
-    VerificationCommand,
+    AppendMessageCommandPayload, ClientCommandAction, ConversationOutcome, GraphRevisionId,
+    MessageId, ModelProfile, ProviderId, RepoValidationEvidence,
+    RequestConversationTurnCommandPayload, RequirementRevision, RequirementRevisionId,
+    RequirementSnapshot, SchemaVersion, SessionId, SessionState, VerificationCommand,
 };
 
 fn snapshot(open_questions: Vec<String>) -> RequirementSnapshot {
@@ -115,6 +115,7 @@ fn conversation_command_and_validation_state_are_explicit() -> Result<(), Box<dy
 {
     let payload = RequestConversationTurnCommandPayload {
         source_message_id: MessageId::new(),
+        requested_provider: None,
     };
     assert!(serde_json::to_value(payload).is_ok());
     assert_eq!(
@@ -128,6 +129,44 @@ fn conversation_command_and_validation_state_are_explicit() -> Result<(), Box<dy
     assert_eq!(
         serde_json::to_value(ClientCommandAction::RequestConversationTurn)?,
         "request_conversation_turn"
+    );
+    Ok(())
+}
+
+#[test]
+fn conversation_payload_provider_preference_is_backward_compatible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let legacy_append: AppendMessageCommandPayload = serde_json::from_value(serde_json::json!({
+        "message_id": MessageId::new(),
+        "content": "inspect"
+    }))?;
+    assert_eq!(legacy_append.requested_provider, None);
+
+    let append = AppendMessageCommandPayload {
+        message_id: MessageId::new(),
+        content: "inspect".to_owned(),
+        requested_provider: Some(ProviderId::Claude),
+    };
+    assert_eq!(
+        serde_json::from_value::<AppendMessageCommandPayload>(serde_json::to_value(&append)?)?,
+        append
+    );
+
+    let legacy_turn: RequestConversationTurnCommandPayload =
+        serde_json::from_value(serde_json::json!({
+            "source_message_id": MessageId::new()
+        }))?;
+    assert_eq!(legacy_turn.requested_provider, None);
+
+    let turn = RequestConversationTurnCommandPayload {
+        source_message_id: MessageId::new(),
+        requested_provider: Some(ProviderId::Claude),
+    };
+    assert_eq!(
+        serde_json::from_value::<RequestConversationTurnCommandPayload>(serde_json::to_value(
+            &turn
+        )?)?,
+        turn
     );
     Ok(())
 }

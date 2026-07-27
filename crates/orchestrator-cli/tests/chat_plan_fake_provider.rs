@@ -156,6 +156,15 @@ fn planner_priority_keeps_agy_ahead_of_gemini() -> Result<(), Box<dyn std::error
         ModelProfile::Standard,
     )?;
     assert_eq!(planner.primary_provider(), ProviderId::Codex);
+    assert_eq!(
+        planner.conversation_providers(),
+        vec![
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Agy,
+            ProviderId::Gemini,
+        ]
+    );
 
     let mut fallback = config;
     fallback
@@ -180,6 +189,10 @@ fn planner_priority_keeps_agy_ahead_of_gemini() -> Result<(), Box<dyn std::error
         ModelProfile::Standard,
     )?;
     assert_eq!(planner.primary_provider(), ProviderId::Agy);
+    assert_eq!(
+        planner.conversation_providers(),
+        vec![ProviderId::Agy, ProviderId::Gemini]
+    );
     Ok(())
 }
 

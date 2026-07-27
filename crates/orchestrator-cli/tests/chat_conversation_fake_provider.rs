@@ -27,12 +27,57 @@ fn allowed_fake_binary(repository: &std::path::Path) -> Result<PathBuf, std::io:
 }
 
 fn capability() -> ProviderCapabilities {
-    let mut capability = ProviderCapabilities::unsupported(ProviderId::Codex);
+    capability_for(ProviderId::Codex)
+}
+
+fn capability_for(provider: ProviderId) -> ProviderCapabilities {
+    let mut capability = ProviderCapabilities::unsupported(provider);
     capability.non_interactive = CapabilitySupport::Verified;
     capability.structured_output = CapabilitySupport::Verified;
     capability.read_only = CapabilitySupport::Verified;
-    capability.evidence = vec!["fake CLI supports read-only JSONL".to_owned()];
+    capability.evidence = vec![format!("fake {provider} marker")];
     capability
+}
+
+#[tokio::test]
+async fn requested_provider_reaches_the_claude_fake_adapter_despite_codex_priority()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::Success,
+    )?);
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.agy = None;
+    for provider in [
+        config.orchestrator.providers.codex.as_mut(),
+        config.orchestrator.providers.claude.as_mut(),
+    ] {
+        provider.ok_or("provider config")?.executable = executable.to_string_lossy().into_owned();
+    }
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[
+            capability_for(ProviderId::Codex),
+            capability_for(ProviderId::Claude),
+        ],
+        ModelProfile::Standard,
+    )?;
+    let mut request = request("Why does colay need Git?");
+    request.provider = ProviderId::Claude;
+    let response = orchestrator.converse(request.clone()).await?;
+    assert_eq!(response.provider, ProviderId::Claude);
+    assert!(response.evidence_redacted.contains("fake claude marker"));
+    assert!(matches!(
+        collect_conversation_response(&request, response)?,
+        ConversationOutcome::AnswerComplete { .. }
+    ));
+    Ok(())
 }
 
 fn request(transcript: &str) -> ConversationRequest {
@@ -40,6 +85,7 @@ fn request(transcript: &str) -> ConversationRequest {
         attempt_id: ConversationAttemptId::new(),
         session_id: SessionId::new(),
         source_message_id: MessageId::new(),
+        provider: ProviderId::Codex,
         transcript_redacted: transcript.to_owned(),
         repository_summary_redacted: "Git availability is not required for answers".to_owned(),
         sandbox: SandboxMode::ReadOnly,

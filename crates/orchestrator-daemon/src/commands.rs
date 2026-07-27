@@ -182,7 +182,7 @@ fn append_message(
             if command.task_id.is_none() {
                 database.submit_derived_client_command(
                     command.command_id,
-                    &conversation_command(command, payload.message_id)?,
+                    &conversation_command(command, payload.message_id, payload.requested_provider)?,
                 )?;
             }
             return Ok(format!("message:{}", payload.message_id));
@@ -209,7 +209,7 @@ fn append_message(
                 &expected,
                 event,
                 command.command_id,
-                &conversation_command(command, payload.message_id)?,
+                &conversation_command(command, payload.message_id, payload.requested_provider)?,
             )
             .map(|_| ())
     } else {
@@ -229,6 +229,7 @@ fn append_message(
 fn conversation_command(
     source: &ClientCommand,
     message_id: orchestrator_domain::MessageId,
+    requested_provider: Option<orchestrator_domain::ProviderId>,
 ) -> Result<ClientCommand, CommandExecutionError> {
     let command_id = ClientCommandId::from_uuid(message_id.into_uuid());
     Ok(ClientCommand {
@@ -238,6 +239,7 @@ fn conversation_command(
         action: ClientCommandAction::RequestConversationTurn,
         payload: serde_json::to_value(RequestConversationTurnCommandPayload {
             source_message_id: message_id,
+            requested_provider,
         })
         .map_err(StateError::from)?,
         idempotency_key: format!("conversation-turn-{message_id}"),
@@ -368,6 +370,7 @@ mod tests {
             serde_json::to_value(AppendMessageCommandPayload {
                 message_id,
                 content: content.to_owned(),
+                requested_provider: None,
             })
             .unwrap_or_default(),
             key,

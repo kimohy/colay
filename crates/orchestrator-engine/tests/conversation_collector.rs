@@ -13,6 +13,7 @@ fn request() -> ConversationRequest {
         attempt_id: ConversationAttemptId::new(),
         session_id: SessionId::new(),
         source_message_id: MessageId::new(),
+        provider: ProviderId::Codex,
         transcript_redacted: "user: why does colay need Git?".to_owned(),
         repository_summary_redacted: "repository availability is unknown".to_owned(),
         sandbox: SandboxMode::ReadOnly,
@@ -74,6 +75,12 @@ fn rejects_identity_mismatch_and_mutable_sandbox() {
     wrong.source_message_id = MessageId::new();
     assert!(matches!(
         collect_conversation_response(&request, wrong),
+        Err(ConversationFailure::IdentityMismatch { .. })
+    ));
+    let mut wrong_provider = response(&request, output.clone());
+    wrong_provider.provider = ProviderId::Claude;
+    assert!(matches!(
+        collect_conversation_response(&request, wrong_provider),
         Err(ConversationFailure::IdentityMismatch { .. })
     ));
     let mut writable = response(&request, output);

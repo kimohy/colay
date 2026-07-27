@@ -1283,6 +1283,7 @@ async fn run_conversation(
         serde_json::to_value(AppendMessageCommandPayload {
             message_id,
             content,
+            requested_provider,
         })?,
         format!("cli-run-message-{message_id}"),
         RUN_REQUESTED_BY,

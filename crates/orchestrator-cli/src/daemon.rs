@@ -285,17 +285,24 @@ async fn serve_foreground(
         signal_task.abort();
         return Ok(());
     };
-    let (planner, planner_provider, conversation): (
+    let (planner, planner_provider, conversation, conversation_providers): (
         Arc<dyn TaskPlanner>,
         ProviderId,
         Arc<dyn ConversationOrchestrator>,
+        Vec<ProviderId>,
     ) = match planner {
         Ok(planner) => {
             let provider = planner.primary_provider();
+            let conversation_providers = planner.conversation_providers();
             let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
                 &planner,
             ));
-            (Arc::new(planner), provider, conversation)
+            (
+                Arc::new(planner),
+                provider,
+                conversation,
+                conversation_providers,
+            )
         }
         Err(error) => {
             let reason = error.to_string();
@@ -305,6 +312,7 @@ async fn serve_foreground(
                 }),
                 ProviderId::Codex,
                 Arc::new(UnavailableConversation { reason }),
+                vec![ProviderId::Codex],
             )
         }
     };
@@ -418,6 +426,7 @@ async fn serve_foreground(
                     repository_root: repository_root.clone(),
                     planner,
                     planner_provider,
+                    conversation_providers,
                     validation_policy: GraphValidationPolicy {
                         eligible_providers: BTreeSet::from([planner_provider]),
                         eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
@@ -577,10 +586,11 @@ async fn build_workspace_runtime(
     let redactor: Arc<dyn MessageRedactor> =
         Arc::new(ProcessMessageRedactor(Redactor::new(&redaction)?));
     let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
-    let (planner, planner_provider, conversation): (
+    let (planner, planner_provider, conversation, conversation_providers): (
         Arc<dyn TaskPlanner>,
         ProviderId,
         Arc<dyn ConversationOrchestrator>,
+        Vec<ProviderId>,
     ) = match OfficialCliTaskPlanner::probe_from_config(
         &config,
         repository,
@@ -591,10 +601,16 @@ async fn build_workspace_runtime(
     {
         Ok(planner) => {
             let provider = planner.primary_provider();
+            let conversation_providers = planner.conversation_providers();
             let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
                 &planner,
             ));
-            (Arc::new(planner), provider, conversation)
+            (
+                Arc::new(planner),
+                provider,
+                conversation,
+                conversation_providers,
+            )
         }
         Err(error) => {
             let reason = error.to_string();
@@ -604,6 +620,7 @@ async fn build_workspace_runtime(
                 }),
                 ProviderId::Codex,
                 Arc::new(UnavailableConversation { reason }),
+                vec![ProviderId::Codex],
             )
         }
     };
@@ -641,6 +658,7 @@ async fn build_workspace_runtime(
             repository_root: repository_root.clone(),
             planner,
             planner_provider,
+            conversation_providers,
             validation_policy: GraphValidationPolicy {
                 eligible_providers: BTreeSet::from([planner_provider]),
                 eligible_profiles: BTreeSet::from([ModelProfile::Standard]),

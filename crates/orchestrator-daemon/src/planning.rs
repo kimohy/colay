@@ -30,6 +30,7 @@ pub struct PlanningServices {
     pub repository_root: PathBuf,
     pub planner: Arc<dyn TaskPlanner>,
     pub planner_provider: ProviderId,
+    pub conversation_providers: Vec<ProviderId>,
     pub validation_policy: GraphValidationPolicy,
     pub integration: Option<crate::IntegrationServices>,
 }
@@ -51,7 +52,7 @@ pub async fn process_next_orchestration_command(
             crate::conversation::request_conversation_turn(
                 database,
                 services.conversation.as_ref(),
-                services.planner_provider,
+                &services.conversation_providers,
                 redactor,
                 &command,
                 now,
@@ -1008,6 +1009,7 @@ mod tests {
             repository_root: std::env::current_dir().unwrap_or_default(),
             planner: planner.clone(),
             planner_provider: ProviderId::Codex,
+            conversation_providers: vec![ProviderId::Codex],
             validation_policy: GraphValidationPolicy {
                 eligible_providers: BTreeSet::from([ProviderId::Codex]),
                 eligible_profiles: BTreeSet::from([ModelProfile::Standard]),

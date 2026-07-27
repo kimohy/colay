@@ -57,6 +57,8 @@ struct CapturingConversation {
     transcript: Arc<Mutex<Option<String>>>,
 }
 
+struct ProviderAwareConversation;
+
 fn verification_plan() -> Vec<VerificationCommand> {
     vec![VerificationCommand {
         executable: "cargo".to_owned(),
@@ -145,6 +147,29 @@ impl ConversationOrchestrator for CapturingConversation {
     }
 }
 
+#[async_trait]
+impl ConversationOrchestrator for ProviderAwareConversation {
+    async fn converse(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        Ok(ConversationResponse {
+            schema_version: orchestrator_domain::SchemaVersion::v1(),
+            attempt_id: request.attempt_id,
+            session_id: request.session_id,
+            source_message_id: request.source_message_id,
+            provider: request.provider,
+            sandbox: SandboxMode::ReadOnly,
+            exit: ConversationExit::Succeeded,
+            output_redacted: serde_json::to_vec(&ConversationOutcome::AnswerComplete {
+                response_redacted: format!("fake-provider:{}", request.provider),
+            })
+            .unwrap_or_default(),
+            evidence_redacted: format!("fake-provider:{}", request.provider),
+        })
+    }
+}
+
 struct FakePlanner;
 
 #[async_trait]
@@ -212,6 +237,14 @@ fn seed_session(
 }
 
 fn append_command(session_id: SessionId, content: &str) -> ClientCommand {
+    append_command_with_provider(session_id, content, None)
+}
+
+fn append_command_with_provider(
+    session_id: SessionId,
+    content: &str,
+    requested_provider: Option<ProviderId>,
+) -> ClientCommand {
     let message_id = MessageId::new();
     ClientCommand {
         command_id: ClientCommandId::new(),
@@ -221,6 +254,7 @@ fn append_command(session_id: SessionId, content: &str) -> ClientCommand {
         payload: serde_json::to_value(AppendMessageCommandPayload {
             message_id,
             content: content.to_owned(),
+            requested_provider,
         })
         .unwrap_or_default(),
         idempotency_key: format!("append-{message_id}"),
@@ -242,6 +276,7 @@ fn services_with_conversation(
         repository_root,
         planner: Arc::new(FakePlanner),
         planner_provider: ProviderId::Codex,
+        conversation_providers: vec![ProviderId::Codex],
         validation_policy: GraphValidationPolicy {
             eligible_providers: BTreeSet::from([ProviderId::Codex]),
             eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
@@ -333,6 +368,75 @@ async fn ordinary_answer_is_automatic_and_creates_no_writable_state()
     assert!(messages[1].1.content_redacted.contains("approved writable"));
     assert!(database.current_requirement_revision(session_id)?.is_none());
     assert_zero_writable_rows(&database_path, &database)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn requested_provider_uses_the_eligible_requested_provider_before_creating_an_attempt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
+    let append = append_command_with_provider(session_id, "inspect", Some(ProviderId::Claude));
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    database.submit_client_command(&append)?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let mut services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(ProviderAwareConversation),
+    );
+    services.conversation_providers =
+        vec![ProviderId::Codex, ProviderId::Claude, ProviderId::Gemini];
+
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    assert_eq!(
+        database
+            .load_conversation_attempt(attempt_id)?
+            .ok_or("conversation attempt is missing")?
+            .provider,
+        ProviderId::Claude
+    );
+    let messages = database.messages_after(session_id, 0, 10)?;
+    assert_eq!(messages[1].1.content_redacted, "fake-provider:claude");
+    Ok(())
+}
+
+#[tokio::test]
+async fn requested_provider_falls_back_before_creating_an_attempt_when_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
+    let append = append_command_with_provider(session_id, "inspect", Some(ProviderId::Agy));
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    database.submit_client_command(&append)?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let mut services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(ProviderAwareConversation),
+    );
+    services.conversation_providers =
+        vec![ProviderId::Codex, ProviderId::Claude, ProviderId::Gemini];
+
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    assert_eq!(
+        database
+            .load_conversation_attempt(attempt_id)?
+            .ok_or("conversation attempt is missing")?
+            .provider,
+        ProviderId::Codex
+    );
+    let messages = database.messages_after(session_id, 0, 10)?;
+    assert_eq!(
+        messages[1].1.content_redacted,
+        "Requested provider agy is unavailable; using codex for this read-only turn.\nfake-provider:codex"
+    );
     Ok(())
 }
 

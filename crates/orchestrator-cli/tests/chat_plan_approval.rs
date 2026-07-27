@@ -477,6 +477,7 @@ fn conversation_to_exact_approval_executes_fake_workers_in_worktrees() -> Result
         serde_json::to_value(AppendMessageCommandPayload {
             message_id: goal_message_id,
             content: "candidate: implement a local task graph".to_owned(),
+            requested_provider: None,
         })?,
         "plan-e2e-goal",
     );
@@ -664,6 +665,7 @@ fn daemon_started_elsewhere_activates_plan_and_execution_for_registered_workspac
         serde_json::to_value(AppendMessageCommandPayload {
             message_id: MessageId::new(),
             content: "candidate: implement a local task graph".to_owned(),
+            requested_provider: None,
         })?,
         "cross-workspace-goal",
     );

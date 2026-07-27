@@ -21,10 +21,36 @@ pub(crate) enum ConversationCommandError {
     State(#[from] StateError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConversationProviderSelection {
+    pub requested: Option<orchestrator_domain::ProviderId>,
+    pub selected: orchestrator_domain::ProviderId,
+    pub used_fallback: bool,
+}
+
+fn select_conversation_provider(
+    requested: Option<orchestrator_domain::ProviderId>,
+    candidates: &[orchestrator_domain::ProviderId],
+) -> Result<ConversationProviderSelection, ConversationCommandError> {
+    let selected = requested
+        .filter(|provider| candidates.contains(provider))
+        .or_else(|| candidates.first().copied())
+        .ok_or_else(|| {
+            ConversationCommandError::Rejected(
+                "no evidenced provider is eligible for this conversation".to_owned(),
+            )
+        })?;
+    Ok(ConversationProviderSelection {
+        requested,
+        selected,
+        used_fallback: requested.is_some_and(|provider| provider != selected),
+    })
+}
+
 pub(crate) async fn request_conversation_turn(
     database: &WorkspaceDatabase<'_>,
     orchestrator: &dyn ConversationOrchestrator,
-    provider: orchestrator_domain::ProviderId,
+    conversation_providers: &[orchestrator_domain::ProviderId],
     redactor: &dyn MessageRedactor,
     command: &ClientCommand,
     now: DateTime<Utc>,
@@ -59,6 +85,8 @@ pub(crate) async fn request_conversation_turn(
             "conversation source must be a final session-level user message".to_owned(),
         ));
     }
+    let provider_selection =
+        select_conversation_provider(payload.requested_provider, conversation_providers)?;
 
     let attempt_id = ConversationAttemptId::from_uuid(command.command_id.into_uuid());
     let stored = database.load_conversation_attempt(attempt_id)?;
@@ -69,7 +97,7 @@ pub(crate) async fn request_conversation_turn(
             attempt_id,
             session_id,
             source_message_id: payload.source_message_id,
-            provider,
+            provider: provider_selection.selected,
             started_at: command.requested_at,
         })?;
         let transcript = database
@@ -85,6 +113,7 @@ pub(crate) async fn request_conversation_turn(
             attempt_id,
             session_id,
             source_message_id: payload.source_message_id,
+            provider: provider_selection.selected,
             transcript_redacted: transcript,
             repository_summary_redacted:
                 "Repository metadata is optional for conversation and required before approval"
@@ -99,6 +128,7 @@ pub(crate) async fn request_conversation_turn(
             response_redacted: "The read-only conversation provider needs attention; your message and session were preserved.".to_owned(),
             evidence_redacted: redactor.redact(&error.to_string()),
         });
+        let outcome = apply_provider_fallback_notice(outcome, provider_selection);
         database.finish_conversation_attempt(attempt_id, &outcome, now)?;
         outcome
     };
@@ -110,6 +140,31 @@ pub(crate) async fn request_conversation_turn(
         &outcome,
     )?;
     Ok(format!("conversation:{attempt_id}"))
+}
+
+fn apply_provider_fallback_notice(
+    mut outcome: ConversationOutcome,
+    selection: ConversationProviderSelection,
+) -> ConversationOutcome {
+    if let Some(requested) = selection.requested.filter(|_| selection.used_fallback) {
+        let notice = format!(
+            "Requested provider {requested} is unavailable; using {} for this read-only turn.\n",
+            selection.selected
+        );
+        match &mut outcome {
+            ConversationOutcome::AnswerComplete { response_redacted }
+            | ConversationOutcome::MoreInformationNeeded {
+                response_redacted, ..
+            }
+            | ConversationOutcome::WorktreeTaskCandidate {
+                response_redacted, ..
+            }
+            | ConversationOutcome::NeedsAttention {
+                response_redacted, ..
+            } => response_redacted.insert_str(0, &notice),
+        }
+    }
+    outcome
 }
 
 fn reconcile_outcome(
@@ -266,5 +321,33 @@ const fn role_name(role: MessageRole) -> &'static str {
         MessageRole::Orchestrator => "orchestrator",
         MessageRole::Agent => "agent",
         MessageRole::System => "system",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use orchestrator_domain::ProviderId;
+
+    use super::select_conversation_provider;
+
+    #[test]
+    fn requested_provider_is_selected_when_it_is_eligible() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let candidates = [ProviderId::Codex, ProviderId::Claude, ProviderId::Gemini];
+        assert_eq!(
+            select_conversation_provider(Some(ProviderId::Claude), &candidates)?.selected,
+            ProviderId::Claude
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_requested_provider_uses_the_first_eligible_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidates = [ProviderId::Codex, ProviderId::Claude, ProviderId::Gemini];
+        let selection = select_conversation_provider(Some(ProviderId::Agy), &candidates)?;
+        assert_eq!(selection.selected, ProviderId::Codex);
+        assert!(selection.used_fallback);
+        Ok(())
     }
 }

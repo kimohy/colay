@@ -602,6 +602,7 @@ mod tests {
             repository_root: PathBuf::from("."),
             planner: Arc::new(UnusedPlanner),
             planner_provider: ProviderId::Codex,
+            conversation_providers: vec![ProviderId::Codex],
             validation_policy: GraphValidationPolicy {
                 eligible_providers: BTreeSet::from([ProviderId::Codex]),
                 eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
