@@ -278,6 +278,7 @@ fn doctor_reports_fake_provider_executable_resolution() -> Result<()> {
 #[test]
 fn first_plan_only_run_initializes_global_state() -> Result<()> {
     let fixture = CliFixture::new()?;
+    fixture.configure_fake_codex()?;
 
     let first = fixture.colay(["run", "inspect repository", "--plan-only"])?;
 
