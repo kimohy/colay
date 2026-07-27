@@ -1,5 +1,28 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## Cross-platform legacy IPC lint refresh: 2026-07-27
+
+The legacy named-pipe endpoint identity path is Windows-only.  Source commit
+`5ef9ed7bb07353226f9aa3966c0011bc78c0f955` now conditionally compiles its
+endpoint variant, state identity lookup, and legacy response validation only on
+Windows (while retaining the validation helper for unit tests). Unix retains
+only schema-v1 primary-socket readiness. This removes the Linux/macOS dead-code
+warnings without lint allowances or a transport behaviour change.
+
+- Windows: `cargo fmt --all -- --check`, full workspace/all-target/all-feature
+  Clippy with `-D warnings`, and `cargo test --workspace --all-features` passed
+  (the final full suite completed in 620.8 seconds).
+- WSL Ubuntu 24.04 using the existing Rust/Cargo 1.95 cache: exact
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+- A fresh release build in
+  `/home/kimohy/.cache/colay-cross-platform-fix-20260727-target` produced
+  `colay` SHA-256
+  `e86e22ea689ebcefcd5dd71cfc6711e8b7e16be8532a1fee5c7811211e490bf0`,
+  Build ID `01921686334714a54f4c39bb229c05e946c80563`, and target
+  `linux/x86_64`. An isolated fake-provider-only runtime check migrated state,
+  started an online daemon from that binary, stopped it, and confirmed the
+  socket was absent afterwards. No real provider executable was invoked.
+
 ## WSL-014: non-Git plan-only Codex invocation omits the public Git-check bypass
 
 - Severity: high
