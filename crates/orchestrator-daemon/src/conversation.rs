@@ -7,8 +7,9 @@ use orchestrator_domain::{
     SchemaVersion, SessionId, TaskEvent,
 };
 use orchestrator_engine::{
-    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationFailureKind, ConversationOrchestrator,
-    ConversationRequest, collect_conversation_response, diagnose_conversation_failure,
+    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationFailure, ConversationFailureKind,
+    ConversationOrchestrator, ConversationRequest, collect_conversation_response,
+    diagnose_conversation_failure,
 };
 use orchestrator_state::{
     ConversationAttemptStatus, NewConversationAttempt, StateError, WorkspaceDatabase,
@@ -143,18 +144,38 @@ pub(crate) async fn request_conversation_turn(
         Ok(response) => collect_conversation_response(&request, response),
         Err(error) => Err(error),
     };
+    finalize_conversation_turn(
+        database,
+        redactor,
+        command,
+        &request,
+        provider_selection,
+        collected,
+        now,
+    )
+}
+
+fn finalize_conversation_turn(
+    database: &WorkspaceDatabase<'_>,
+    redactor: &dyn MessageRedactor,
+    command: &ClientCommand,
+    request: &ConversationRequest,
+    provider_selection: ConversationProviderSelection,
+    collected: Result<ConversationOutcome, ConversationFailure>,
+    now: DateTime<Utc>,
+) -> Result<String, ConversationCommandError> {
     match collected {
         Ok(outcome) => {
             let outcome = apply_provider_fallback_notice(outcome, provider_selection);
-            database.finish_conversation_attempt(attempt_id, &outcome, now)?;
+            database.finish_conversation_attempt(request.attempt_id, &outcome, now)?;
             reconcile_outcome(
                 database,
                 command,
-                session_id,
-                payload.source_message_id,
+                request.session_id,
+                request.source_message_id,
                 &outcome,
             )?;
-            Ok(format!("conversation:{attempt_id}"))
+            Ok(format!("conversation:{}", request.attempt_id))
         }
         Err(failure) => {
             let diagnostic = diagnose_conversation_failure(provider_selection.selected, &failure);
@@ -177,7 +198,7 @@ pub(crate) async fn request_conversation_turn(
             );
             let error_redacted = failure_error_from_outcome(redactor, &outcome);
             database.finalize_conversation_failure(
-                attempt_id,
+                request.attempt_id,
                 status,
                 &outcome,
                 &error_redacted,
@@ -186,8 +207,8 @@ pub(crate) async fn request_conversation_turn(
             reconcile_outcome(
                 database,
                 command,
-                session_id,
-                payload.source_message_id,
+                request.session_id,
+                request.source_message_id,
                 &outcome,
             )?;
             Err(ConversationCommandError::Rejected(error_redacted))
