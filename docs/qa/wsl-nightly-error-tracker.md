@@ -124,7 +124,8 @@ as evidence. The CLI itself exited 0 and displayed the same generic message for 
 `colay --json run --plan-only --provider codex 'scenario:crash qa terminal'` exited 1. The fake
 conversation marker changed from 3 to 4, so exactly one provider conversation process started. The
 schema-v16 attempt was `provider_id = codex`, `status = failed`, and persisted a
-`needs_attention` recovery outcome plus this bounded actionable diagnostic:
+`needs_attention` recovery outcome. The following are selected excerpts from the stored response
+and evidence; they are not one contiguous diagnostic value:
 
 ```text
 codex process failed. Review the redacted evidence, then retry this conversation.
@@ -174,6 +175,54 @@ attempts, worktrees, coordinator leases, and worker leases all remained at zero.
   `/home/kimohy/.cache/colay-task4-d88cc2e-target/release/colay` and target `linux/x86_64`.
   `colay --json daemon stop` returned `state = stopped`; follow-up status remained stopped, PID 1735
   no longer existed, and the isolated Unix socket was released.
+
+### Clean final-HEAD WSL refresh: 2026-07-27
+
+- Exact source HEAD: `9779bd601159fc910ccf2b6614a17fd8cd20bb16`. The worktree was clean
+  before the build. No nightly was published.
+- Fresh Linux-native release command:
+  `cargo build --locked --offline --release --features test-fixtures --bin colay --bin
+  colay-e2e-fake-provider`, using Linux Rust/Cargo 1.95.0, `CARGO_INCREMENTAL=0`, and the new ext4
+  target `/home/kimohy/.cache/colay-task4-final-9779bd6-20260727-target`. It exited 0 in 255.7
+  seconds.
+- The resulting `colay 0.1.0` x86-64 GNU/Linux ELF has Build ID
+  `58e434090b273ad6ba71645005aeb2918f8f0efb` and SHA-256
+  `ebe7578edf7cd9a72c4d0b7d78fc4c889803a4516f6473ad27dd994704a7eb94`. The compiled
+  `colay-e2e-fake-provider` SHA-256 is
+  `8f08d163f99f16f9f8c57dacacb91678bdf90a6ec89575d5bfb4d74d1b6c9170`.
+- The clean QA root was `/home/kimohy/.cache/colay-task4-final-9779bd6-20260727-qa`, with isolated
+  `COLAY_HOME=.../home-evidence`, `TEMP`/`TMP=.../tmp-evidence`, and four separate non-Git
+  workspaces (`eligible`, `codex`, `fallback`, `failure`). None contained `.git` or `.colay` after
+  QA. Every Colay command set `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`; configured executable paths were
+  test-only wrappers delegating to the freshly compiled fake binary. No real provider, credential,
+  account, endpoint, Docker command, push, or merge was used.
+- `colay --json migrate apply` exited 0 and created the per-user schema-v16 database with all 16
+  committed checksums and no pending versions. Final read-only checks reported integrity `ok`, zero
+  foreign-key failures, four sessions, four conversation attempts, and zero tasks, task attempts,
+  worktrees, coordinator leases, and worker leases.
+- `--provider claude 'qa eligible route final 9779bd6'` exited 0, persisted
+  `provider_id=claude`, `status=succeeded`, `outcome=answer_complete`, and produced exactly one
+  Claude conversation argv containing `--permission-mode plan`.
+- `--provider codex 'qa codex route final 9779bd6'` exited 0 and persisted Codex success. The direct,
+  fallback, and failure Codex conversation argv records all contained
+  `exec --skip-git-repo-check --json --sandbox read-only -C <non-Git-workspace> ... -`.
+- Disabled `--provider gemini 'qa fallback route final 9779bd6'` exited 0, persisted Codex success,
+  retained the exact notice `Requested provider gemini is unavailable; using codex for this
+  read-only turn.`, and created no Gemini log. The Codex wrapper recorded the selected process,
+  proving fallback before provider start.
+- `--provider codex 'scenario:crash qa terminal final 9779bd6'` exited 1. The fake conversation
+  marker changed from 3 to 4. The durable attempt was Codex `failed` with `needs_attention`; its
+  exact `response_redacted` was `codex process failed. Review the redacted evidence, then retry this
+  conversation.` The exact 792-byte `error_redacted` and 701-byte evidence are recorded verbatim in
+  `evidence/final-invariants.json`; the corresponding command state was `failed`.
+- The daemon reported online PID 1183, executable from the fresh target, build `0.1.0`, and target
+  `linux/x86_64`. `daemon stop` and follow-up status both exited 0 with `state=stopped`; `/proc/1183`
+  and the isolated `runtime/daemon.sock` were absent, and exact-process inspection found no Colay or
+  fake-provider process from this target.
+- Primary evidence paths are
+  `/home/kimohy/.cache/colay-task4-final-9779bd6-20260727-qa/evidence/{migrate.json,eligible-claude.json,codex-nongit.json,fallback-gemini.json,failure-codex.json,database.json,daemon-online.json,daemon-stop.json,daemon-stopped.json,final-invariants.json}`;
+  full wrapper logs are under `logs-evidence/`, and the marker is
+  `tmp-evidence/colay-fake-conversation-starts.json`.
 
 ## Real-provider QA record: 2026-07-27
 
