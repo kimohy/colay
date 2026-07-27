@@ -13,6 +13,8 @@ use orchestrator_domain::{
     ClientCommand, ClientCommandId, CorrelationId, EventActor, EventId, EventType, GraphRevisionId,
     ProviderHealth, SchemaVersion, SessionId, TaskEvent, TaskId, UsageSnapshot, UsageSource,
 };
+#[cfg(windows)]
+use orchestrator_state::reject_symlink_components;
 use orchestrator_state::{
     ArtifactStore, Database, DatabaseHealth, GlobalStatePaths, LegacyImporter,
     RepositoryStatePaths, ResumeDisposition, RootConfig, SessionListFilter, StateError,
@@ -231,8 +233,28 @@ pub struct DaemonOwnerLock {
 
 impl DaemonOwnerLock {
     pub fn acquire(paths: &GlobalStatePaths) -> Result<Self, IpcError> {
-        ensure_private_directory(&paths.runtime)?;
         let lock_path = paths.runtime.join("daemon.lock");
+
+        #[cfg(windows)]
+        let _bootstrap_guard = windows_owner_bootstrap_guard(paths)?;
+        #[cfg(windows)]
+        let lock_preexisting = lock_path.try_exists().map_err(|source| IpcError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+
+        #[cfg(not(windows))]
+        ensure_private_directory(&paths.runtime)?;
+        #[cfg(windows)]
+        if !lock_preexisting {
+            // The current-user-only kernel mutex makes this the sole bootstrap process.
+            // Harden the directory before the lock file is created so that the new file
+            // inherits a private DACL even before its explicit owner verification.
+            ensure_private_directory(&paths.runtime)?;
+        }
+
+        #[cfg(windows)]
+        reject_symlink_components(&lock_path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -243,19 +265,44 @@ impl DaemonOwnerLock {
                 path: lock_path.clone(),
                 source,
             })?;
+        #[cfg(not(windows))]
         ensure_private_file(&lock_path)?;
         file.try_lock_exclusive().map_err(|error| {
             if lock_is_contended(&error) {
                 IpcError::AlreadyOwned
             } else {
                 IpcError::Io {
-                    path: lock_path,
+                    path: lock_path.clone(),
                     source: error,
                 }
             }
         })?;
+
+        #[cfg(windows)]
+        // Only the file-lock owner may mutate existing shared ACLs. Both artifacts are
+        // private before `acquire` returns, so callers cannot open the database or IPC
+        // listener first. A losing contender returns above without changing either DACL.
+        ensure_private_directory(&paths.runtime)?;
+        #[cfg(windows)]
+        ensure_private_file(&lock_path)?;
         Ok(Self { file })
     }
+}
+
+#[cfg(windows)]
+fn windows_owner_bootstrap_guard(
+    paths: &GlobalStatePaths,
+) -> Result<orchestrator_windows_ipc::CurrentUserMutex, IpcError> {
+    let digest = Sha256::digest(paths.root.to_string_lossy().as_bytes());
+    let suffix = hex::encode(&digest[..16]);
+    let name = format!(r"Local\ColayDaemonOwner-{suffix}");
+    let current_user_sid = orchestrator_state::current_windows_user_sid()?;
+    orchestrator_windows_ipc::acquire_current_user_mutex(&name, &current_user_sid).map_err(
+        |source| IpcError::Io {
+            path: PathBuf::from(name),
+            source,
+        },
+    )
 }
 
 fn lock_is_contended(error: &std::io::Error) -> bool {

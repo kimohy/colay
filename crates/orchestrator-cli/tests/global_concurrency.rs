@@ -352,6 +352,20 @@ fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &str) 
     }
 }
 
+fn assert_clean_daemon_startup(daemon_diagnostics: &str) {
+    let normalized = daemon_diagnostics.to_ascii_lowercase();
+    for forbidden in [
+        "i/o operation failed",
+        "permission hardening failed",
+        "unable to open database file",
+    ] {
+        assert!(
+            !normalized.contains(forbidden),
+            "daemon contender observed {forbidden}: {daemon_diagnostics}"
+        );
+    }
+}
+
 #[test]
 fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()> {
     let fixture = ConcurrencyFixture::new()?;
@@ -360,6 +374,7 @@ fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()
     let daemon_diagnostics = fixture
         .daemon_diagnostics()
         .unwrap_or_else(|error| format!("unavailable: {error:#}"));
+    assert_clean_daemon_startup(&daemon_diagnostics);
 
     assert_eq!(outputs.len(), CLIENT_COUNT);
     for (index, output) in outputs.iter().enumerate() {

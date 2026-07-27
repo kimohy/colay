@@ -5,13 +5,13 @@
 use std::{
     ffi::{OsStr, c_void},
     io, iter,
-    os::windows::io::AsRawHandle as _,
+    os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
     ptr,
 };
 
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use windows_sys::Win32::{
-    Foundation::{ERROR_SUCCESS, LocalFree},
+    Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0},
     Security::{
         Authorization::{
             ConvertSecurityDescriptorToStringSecurityDescriptorW,
@@ -21,6 +21,7 @@ use windows_sys::Win32::{
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
         SECURITY_ATTRIBUTES,
     },
+    System::Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
 };
 
 struct LocalAllocation(*mut c_void);
@@ -35,6 +36,77 @@ impl Drop for LocalAllocation {
             }
         }
     }
+}
+
+pub struct CurrentUserMutex {
+    handle: HANDLE,
+}
+
+impl Drop for CurrentUserMutex {
+    fn drop(&mut self) {
+        // SAFETY: `handle` is a live mutex handle owned by this guard. The guard acquired the
+        // mutex exactly once and closes the handle exactly once after releasing ownership.
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+pub fn acquire_current_user_mutex(
+    name: impl AsRef<OsStr>,
+    current_user_sid: &str,
+) -> io::Result<CurrentUserMutex> {
+    if !valid_sid_text(current_user_sid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "current-user SID is not canonical SID text",
+        ));
+    }
+    let sddl = format!("O:{current_user_sid}D:P(A;;GA;;;{current_user_sid})");
+    let encoded_sddl = sddl.encode_utf16().chain(iter::once(0)).collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `encoded_sddl` is NUL-terminated and live for the call. `descriptor` receives a
+    // LocalAlloc-owned self-relative security descriptor.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            encoded_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _descriptor = LocalAllocation(descriptor.cast());
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: descriptor.cast(),
+        bInheritHandle: 0,
+    };
+    let encoded_name = name
+        .as_ref()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `attributes`, its descriptor, and the NUL-terminated name remain live for this
+    // synchronous call. A successful call returns an owned kernel handle.
+    let handle = unsafe { CreateMutexW(&raw mut attributes, 0, encoded_name.as_ptr()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `handle` is a live waitable mutex handle. `INFINITE` cannot produce a timeout.
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        let error = io::Error::last_os_error();
+        // SAFETY: `handle` is owned by this function and was not acquired on this path.
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(error);
+    }
+    Ok(CurrentUserMutex { handle })
 }
 
 pub fn create_current_user_only_named_pipe(
