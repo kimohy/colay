@@ -274,7 +274,11 @@ impl ConcurrencyFixture {
         let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
             self.colay_home.clone(),
         )?)?;
-        let endpoint = orchestrator_daemon::ipc_endpoint(&paths);
+        let endpoints = orchestrator_daemon::ipc_endpoint_candidates(&paths)?
+            .server_endpoints()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
         let stopped = self.run(&self.repository, &["daemon", "stop"])?;
         if !stopped.status.success() {
             bail!(
@@ -290,9 +294,16 @@ impl ConcurrencyFixture {
             let unreleased =
                 self.count("SELECT count(*) FROM daemon_instances WHERE released_at IS NULL")?;
             #[cfg(unix)]
-            let endpoint_absent = endpoint_is_absent(&endpoint)?;
+            let endpoint_absent = endpoints
+                .iter()
+                .map(|endpoint| endpoint_is_absent(endpoint))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|absent| absent);
             #[cfg(windows)]
-            let endpoint_absent = endpoint_is_absent(&endpoint);
+            let endpoint_absent = endpoints
+                .iter()
+                .all(|endpoint| endpoint_is_absent(endpoint));
             let process_running = process_is_running(pid)?;
             if unreleased == 0 && endpoint_absent && !process_running {
                 return Ok(());
@@ -375,6 +386,15 @@ fn concurrency_fixture_guard() -> MutexGuard<'static, ()> {
 
 impl CommandContext {
     fn run(&self, repository: &Path, args: &[OsString]) -> Result<Output> {
+        self.run_with_colay_home(repository, args, &self.colay_home)
+    }
+
+    fn run_with_colay_home(
+        &self,
+        repository: &Path,
+        args: &[OsString],
+        colay_home: &Path,
+    ) -> Result<Output> {
         #[cfg(windows)]
         let system_root = env::var_os("SystemRoot").context("SystemRoot is not set")?;
         #[cfg(not(windows))]
@@ -396,7 +416,7 @@ impl CommandContext {
             .args(args)
             .current_dir(repository)
             .env_clear()
-            .env("COLAY_HOME", &self.colay_home)
+            .env("COLAY_HOME", colay_home)
             .env("COLAY_TEST_DAEMON_STDERR", daemon_log)
             .env(
                 "COLAY_TEST_DAEMON_CHILD_RESOLUTION",
@@ -605,6 +625,68 @@ fn windows_unicode_and_case_variants_share_one_global_workspace() -> Result<()> 
     assert_clean_client(1, &second, &daemon_diagnostics);
     assert_eq!(fixture.count("SELECT count(*) FROM workspaces")?, 1);
     assert_eq!(fixture.count("SELECT count(*) FROM workspace_paths")?, 1);
+    assert_eq!(fixture.database_files()?, vec![fixture.database()]);
+    fixture.stop_and_verify()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_colay_home_case_aliases_use_one_primary_daemon_endpoint() -> Result<()> {
+    let fixture = ConcurrencyFixture::new()?;
+    let home_name = fixture
+        .colay_home
+        .file_name()
+        .context("COLAY_HOME has no final component")?
+        .to_string_lossy();
+    let differently_cased_home = fixture.root.join(
+        home_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_lowercase() {
+                    character.to_ascii_uppercase()
+                } else if character.is_ascii_uppercase() {
+                    character.to_ascii_lowercase()
+                } else {
+                    character
+                }
+            })
+            .collect::<String>(),
+    );
+
+    let first = fixture.run(&fixture.repository, &["--json", "status"])?;
+    let second_args = [OsString::from("--json"), OsString::from("status")];
+    let second = fixture.command.run_with_colay_home(
+        &fixture.repository,
+        &second_args,
+        &differently_cased_home,
+    )?;
+
+    for (label, output) in [("canonical", &first), ("alias", &second)] {
+        if !output.status.success() {
+            let cleanup = fixture.run(&fixture.repository, &["daemon", "stop"])?;
+            bail!(
+                "{label} COLAY_HOME client failed with {}: stderr={} stdout={}; cleanup={} cleanup_stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+                cleanup.status,
+                String::from_utf8_lossy(&cleanup.stderr),
+            );
+        }
+    }
+
+    fixture.verify_spawned_contenders_resolved()?;
+    let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
+    assert_clean_client(0, &first, &daemon_diagnostics);
+    assert_clean_client(1, &second, &daemon_diagnostics);
+    assert_eq!(fixture.count("SELECT count(*) FROM workspaces")?, 1);
+    assert_eq!(fixture.count("SELECT count(*) FROM workspace_paths")?, 1);
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM daemon_instances WHERE released_at IS NULL")?,
+        1
+    );
     assert_eq!(fixture.database_files()?, vec![fixture.database()]);
     fixture.stop_and_verify()?;
     Ok(())

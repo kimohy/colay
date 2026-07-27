@@ -3,9 +3,12 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::{
-    ffi::{OsStr, c_void},
+    ffi::{OsStr, OsString, c_void},
     io, iter,
-    os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
+    os::windows::{
+        ffi::{OsStrExt as _, OsStringExt as _},
+        io::AsRawHandle as _,
+    },
     path::{Component, Path, PathBuf},
     ptr,
 };
@@ -34,7 +37,7 @@ use windows_sys::Win32::{
         BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
+        GetFileInformationByHandle, GetShortPathNameW, OPEN_EXISTING, READ_CONTROL,
     },
     System::Threading::{
         CreateMutexW, INFINITE, MUTEX_ALL_ACCESS, ReleaseMutex, WaitForSingleObject,
@@ -269,6 +272,35 @@ fn encode_path(path: &Path) -> io::Result<Vec<u16>> {
     }
     encoded.push(0);
     Ok(encoded)
+}
+
+/// Returns the path spelling reported by `GetShortPathNameW`.
+///
+/// When 8.3 name creation is disabled for the containing volume, Windows may return the original
+/// long spelling. Callers must compare the result before treating it as an alternate alias.
+pub fn short_path_name(path: &Path) -> io::Result<PathBuf> {
+    let encoded = encode_path(path)?;
+    // SAFETY: `encoded` is NUL-terminated and live for the call. A null output buffer with zero
+    // capacity asks Windows for the required UTF-16 buffer length.
+    let required = unsafe { GetShortPathNameW(encoded.as_ptr(), ptr::null_mut(), 0) };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut short = vec![0_u16; usize::try_from(required).unwrap_or(usize::MAX)];
+    // SAFETY: `encoded` remains live and NUL-terminated. `short` exposes `required` writable
+    // UTF-16 units, matching the capacity passed to Windows.
+    let written = unsafe { GetShortPathNameW(encoded.as_ptr(), short.as_mut_ptr(), required) };
+    if written == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written >= required {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows short-path length changed between queries",
+        ));
+    }
+    short.truncate(usize::try_from(written).unwrap_or(usize::MAX));
+    Ok(PathBuf::from(OsString::from_wide(&short)))
 }
 
 fn path_error(path: &Path, error: &io::Error) -> io::Error {

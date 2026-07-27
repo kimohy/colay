@@ -1,11 +1,13 @@
-use std::str::FromStr as _;
+use std::{path::Path, str::FromStr as _};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use orchestrator_domain::DaemonInstanceId;
-use rusqlite::{OptionalExtension as _, Row, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension as _, Row, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{Database, StateError, StateResult};
+use crate::{Database, StateError, StateResult, reject_symlink_components};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +62,148 @@ pub enum DaemonStatus {
     Online(DaemonInstance),
     Failed(DaemonInstance),
     Stale(DaemonInstance),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaemonOnlineIdentity {
+    pub instance_id: DaemonInstanceId,
+    pub pid: u32,
+}
+
+/// Reads only the online owner identity from an already-existing expected state database.
+///
+/// This opens `SQLite` read-only, performs no migration or schema mutation, and uses one read
+/// transaction so a concurrent WAL writer cannot mix daemon-instance revisions.
+pub fn read_online_daemon_identity(
+    database_path: &Path,
+    now: DateTime<Utc>,
+) -> StateResult<Option<DaemonOnlineIdentity>> {
+    match database_path.try_exists() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(error) => return Err(StateError::io(database_path, error)),
+    }
+    reject_symlink_components(database_path)?;
+    let mut connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let schema_version: u32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version > crate::STATE_SCHEMA_VERSION {
+        return Err(StateError::FutureSchema {
+            found: schema_version,
+            supported: crate::STATE_SCHEMA_VERSION,
+        });
+    }
+    if schema_version < 4 {
+        transaction.commit()?;
+        return Ok(None);
+    }
+    let identity_row = load_stored_daemon_identity(&transaction, schema_version)?;
+    let identity = identity_row
+        .as_ref()
+        .map(|identity| parse_online_daemon_identity(identity, now))
+        .transpose()?
+        .flatten();
+    transaction.commit()?;
+    Ok(identity)
+}
+
+struct StoredDaemonIdentity {
+    instance_id: String,
+    pid: i64,
+    lease_expires_at: String,
+    phase: Option<String>,
+}
+
+fn load_stored_daemon_identity(
+    transaction: &Transaction<'_>,
+    schema_version: u32,
+) -> StateResult<Option<StoredDaemonIdentity>> {
+    let active_count: u32 = transaction.query_row(
+        "SELECT count(*) FROM daemon_instances WHERE released_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if active_count > 1 {
+        return Err(StateError::InvalidRecord(
+            "multiple unreleased daemon owners exist in the expected state database".to_owned(),
+        ));
+    }
+    if schema_version >= 9 {
+        transaction
+            .query_row(
+                "SELECT instance_id, pid, lease_expires_at, phase
+                 FROM daemon_instances WHERE released_at IS NULL",
+                [],
+                |row| {
+                    Ok(StoredDaemonIdentity {
+                        instance_id: row.get(0)?,
+                        pid: row.get(1)?,
+                        lease_expires_at: row.get(2)?,
+                        phase: Some(row.get(3)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StateError::from)
+    } else {
+        transaction
+            .query_row(
+                "SELECT instance_id, pid, lease_expires_at
+                 FROM daemon_instances WHERE released_at IS NULL",
+                [],
+                |row| {
+                    Ok(StoredDaemonIdentity {
+                        instance_id: row.get(0)?,
+                        pid: row.get(1)?,
+                        lease_expires_at: row.get(2)?,
+                        phase: None,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StateError::from)
+    }
+}
+
+fn parse_online_daemon_identity(
+    identity: &StoredDaemonIdentity,
+    now: DateTime<Utc>,
+) -> StateResult<Option<DaemonOnlineIdentity>> {
+    let instance_id = DaemonInstanceId::from_str(&identity.instance_id).map_err(|error| {
+        StateError::InvalidRecord(format!(
+            "invalid daemon instance identifier in expected state database: {error}"
+        ))
+    })?;
+    let pid = u32::try_from(identity.pid).map_err(|error| {
+        StateError::InvalidRecord(format!(
+            "invalid daemon owner PID in expected state database: {error}"
+        ))
+    })?;
+    if pid == 0 {
+        return Err(StateError::InvalidRecord(
+            "daemon owner PID in expected state database is zero".to_owned(),
+        ));
+    }
+    let lease_expires_at = DateTime::parse_from_rfc3339(&identity.lease_expires_at)
+        .map_err(|error| {
+            StateError::InvalidRecord(format!(
+                "invalid daemon lease expiry in expected state database: {error}"
+            ))
+        })?
+        .with_timezone(&Utc);
+    let online = match identity.phase.as_deref() {
+        None | Some("online") => true,
+        Some("booting" | "probing" | "failed") => false,
+        Some(phase) => {
+            return Err(StateError::InvalidRecord(format!(
+                "invalid daemon phase in expected state database: {phase}"
+            )));
+        }
+    };
+    Ok((online && lease_expires_at > now).then_some(DaemonOnlineIdentity { instance_id, pid }))
 }
 
 impl Database {
@@ -442,7 +586,10 @@ mod tests {
     use chrono::{TimeDelta, TimeZone as _, Utc};
     use orchestrator_domain::DaemonInstanceId;
 
-    use super::{DaemonLeaseRequest, DaemonPhase, DaemonStatus};
+    use super::{
+        DaemonLeaseRequest, DaemonOnlineIdentity, DaemonPhase, DaemonStatus,
+        read_online_daemon_identity,
+    };
     use crate::{Database, StateError, StateResult};
 
     fn timestamp() -> chrono::DateTime<Utc> {
@@ -467,6 +614,228 @@ mod tests {
             .migrate_with_backup(std::path::Path::new("unused"))
             .unwrap_or_else(|error| panic!("migrations: {error}"));
         database
+    }
+
+    #[test]
+    fn read_only_daemon_identity_requires_online_unexpired_expected_database() -> StateResult<()> {
+        let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
+        let database = Database::open(&path)?;
+        database.migrate_with_backup(&root.join("backups"))?;
+        let lease = request(timestamp());
+        database.acquire_daemon_lease(&lease)?;
+
+        assert_eq!(
+            read_online_daemon_identity(&path, timestamp())?,
+            Some(DaemonOnlineIdentity {
+                instance_id: lease.instance_id,
+                pid: lease.pid,
+            })
+        );
+        assert_eq!(
+            read_online_daemon_identity(&path, timestamp() + TimeDelta::seconds(10))?,
+            None
+        );
+        let booting = request(timestamp() + TimeDelta::seconds(10));
+        database.acquire_daemon_startup_lease(&booting)?;
+        assert_eq!(
+            read_online_daemon_identity(&path, booting.started_at)?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_daemon_identity_treats_pre_daemon_schema_as_not_online() -> StateResult<()> {
+        let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
+        let path = directory.path().join("state.db");
+        let connection = rusqlite::Connection::open(&path)?;
+        for schema_version in 1..=3 {
+            connection.pragma_update(None, "user_version", schema_version)?;
+            assert_eq!(read_online_daemon_identity(&path, timestamp())?, None);
+        }
+        drop(connection);
+
+        let connection = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let schema_version: u32 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let daemon_table_count: u32 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'daemon_instances'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(schema_version, 3);
+        assert_eq!(daemon_table_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_daemon_identity_supports_pre_phase_schemas_and_rejects_multiple_owners()
+    -> StateResult<()> {
+        let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
+        let path = directory.path().join("state.db");
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE daemon_instances (
+                instance_id TEXT PRIMARY KEY NOT NULL,
+                pid INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                stop_requested_at TEXT,
+                released_at TEXT
+            );",
+        )?;
+        let lease = request(timestamp());
+        let expires_at = timestamp() + TimeDelta::seconds(10);
+        connection.execute(
+            "INSERT INTO daemon_instances(
+                instance_id, pid, started_at, heartbeat_at, lease_expires_at,
+                stop_requested_at, released_at
+             ) VALUES (?1, ?2, ?3, ?3, ?4, NULL, NULL)",
+            rusqlite::params![
+                lease.instance_id.to_string(),
+                i64::from(lease.pid),
+                timestamp().to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+
+        for schema_version in 4..=8 {
+            connection.pragma_update(None, "user_version", schema_version)?;
+            assert_eq!(
+                read_online_daemon_identity(&path, timestamp())?,
+                Some(DaemonOnlineIdentity {
+                    instance_id: lease.instance_id,
+                    pid: lease.pid,
+                })
+            );
+        }
+
+        connection.execute(
+            "UPDATE daemon_instances SET lease_expires_at = ?1",
+            [timestamp().to_rfc3339()],
+        )?;
+        assert_eq!(read_online_daemon_identity(&path, timestamp())?, None);
+        connection.execute(
+            "UPDATE daemon_instances SET lease_expires_at = ?1, released_at = ?2",
+            [expires_at.to_rfc3339(), timestamp().to_rfc3339()],
+        )?;
+        assert_eq!(read_online_daemon_identity(&path, timestamp())?, None);
+
+        connection.execute("UPDATE daemon_instances SET released_at = NULL", [])?;
+        let second = DaemonInstanceId::new();
+        connection.execute(
+            "INSERT INTO daemon_instances(
+                instance_id, pid, started_at, heartbeat_at, lease_expires_at,
+                stop_requested_at, released_at
+             ) VALUES (?1, 43, ?2, ?2, ?3, NULL, NULL)",
+            rusqlite::params![
+                second.to_string(),
+                timestamp().to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        let Err(error) = read_online_daemon_identity(&path, timestamp()) else {
+            return Err(StateError::InvalidRecord(
+                "multiple unreleased daemon owners did not fail closed".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("multiple unreleased daemon"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_daemon_identity_honors_phase_from_schema_nine() -> StateResult<()> {
+        let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
+        let path = directory.path().join("state.db");
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            "CREATE TABLE daemon_instances (
+                instance_id TEXT PRIMARY KEY NOT NULL,
+                pid INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                stop_requested_at TEXT,
+                released_at TEXT,
+                phase TEXT NOT NULL,
+                startup_error TEXT
+            );
+            PRAGMA user_version = 9;",
+        )?;
+        let lease = request(timestamp());
+        connection.execute(
+            "INSERT INTO daemon_instances(
+                instance_id, pid, started_at, heartbeat_at, lease_expires_at,
+                stop_requested_at, released_at, phase, startup_error
+             ) VALUES (?1, ?2, ?3, ?3, ?4, NULL, NULL, 'online', NULL)",
+            rusqlite::params![
+                lease.instance_id.to_string(),
+                i64::from(lease.pid),
+                timestamp().to_rfc3339(),
+                (timestamp() + TimeDelta::seconds(10)).to_rfc3339(),
+            ],
+        )?;
+        assert_eq!(
+            read_online_daemon_identity(&path, timestamp())?,
+            Some(DaemonOnlineIdentity {
+                instance_id: lease.instance_id,
+                pid: lease.pid,
+            })
+        );
+        for phase in ["booting", "probing", "failed"] {
+            connection.execute("UPDATE daemon_instances SET phase = ?1", [phase])?;
+            assert_eq!(read_online_daemon_identity(&path, timestamp())?, None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn current_schema_read_only_daemon_identity_is_consistent_with_concurrent_wal_heartbeats()
+    -> StateResult<()> {
+        let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
+        let setup = Database::open(&path)?;
+        setup.migrate_with_backup(&root.join("backups"))?;
+        let lease = request(timestamp());
+        setup.acquire_daemon_lease(&lease)?;
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_path = path.clone();
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = std::thread::spawn(move || -> StateResult<()> {
+            let writer = Database::open(writer_path)?;
+            writer_barrier.wait();
+            for offset in 1..=100 {
+                writer.heartbeat_daemon(
+                    lease.instance_id,
+                    timestamp() + TimeDelta::milliseconds(offset),
+                    TimeDelta::seconds(10),
+                )?;
+            }
+            Ok(())
+        });
+        barrier.wait();
+        for _ in 0..100 {
+            assert_eq!(
+                read_online_daemon_identity(&path, timestamp())?,
+                Some(DaemonOnlineIdentity {
+                    instance_id: lease.instance_id,
+                    pid: lease.pid,
+                })
+            );
+        }
+        writer
+            .join()
+            .map_err(|_| StateError::InvalidRecord("heartbeat writer panicked".to_owned()))??;
+        Ok(())
     }
 
     #[test]

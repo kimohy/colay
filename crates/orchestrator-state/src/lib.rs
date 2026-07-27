@@ -47,7 +47,10 @@ pub use config_layers::{
 pub use conversations::{
     ConversationAttemptStatus, NewConversationAttempt, StoredConversationAttempt,
 };
-pub use daemon_instances::{DaemonInstance, DaemonLeaseRequest, DaemonPhase, DaemonStatus};
+pub use daemon_instances::{
+    DaemonInstance, DaemonLeaseRequest, DaemonOnlineIdentity, DaemonPhase, DaemonStatus,
+    read_online_daemon_identity,
+};
 pub use database::{
     Database, DatabaseHealth, OutboxRecord, WorkspaceDatabase, WorkspaceOutboxRecord,
 };

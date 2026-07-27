@@ -295,10 +295,80 @@ struct WindowsOwnerBootstrapGuard {
     _directory_tree: orchestrator_windows_ipc::CurrentUserDirectoryTree,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IpcEndpointCandidates {
+    primary: PathBuf,
+    #[cfg(windows)]
+    legacy: PathBuf,
+    #[cfg(windows)]
+    serve_legacy: bool,
+}
+
+impl IpcEndpointCandidates {
+    #[must_use]
+    pub fn primary(&self) -> &Path {
+        &self.primary
+    }
+
+    #[must_use]
+    pub fn legacy(&self) -> Option<&Path> {
+        #[cfg(windows)]
+        {
+            Some(&self.legacy)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn server_endpoints(&self) -> Vec<&Path> {
+        let endpoints = vec![self.primary.as_path()];
+        #[cfg(windows)]
+        {
+            let mut endpoints = endpoints;
+            if self.serve_legacy && self.legacy != self.primary {
+                endpoints.push(self.legacy.as_path());
+            }
+            endpoints
+        }
+        #[cfg(not(windows))]
+        {
+            endpoints
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PreparedWindowsIpcIdentity {
+    digest: String,
+    current_user_sid: String,
+    directory_tree: orchestrator_windows_ipc::CurrentUserDirectoryTree,
+}
+
 #[cfg(windows)]
 fn windows_owner_bootstrap_guard(
     paths: &GlobalStatePaths,
 ) -> Result<WindowsOwnerBootstrapGuard, IpcError> {
+    let identity = prepare_windows_ipc_identity(paths)?;
+    let name = windows_owner_mutex_name(&identity.digest);
+    let mutex =
+        orchestrator_windows_ipc::acquire_current_user_mutex(&name, &identity.current_user_sid)
+            .map_err(|source| IpcError::Io {
+                path: PathBuf::from(name),
+                source,
+            })?;
+    Ok(WindowsOwnerBootstrapGuard {
+        _mutex: mutex,
+        _directory_tree: identity.directory_tree,
+    })
+}
+
+#[cfg(windows)]
+fn prepare_windows_ipc_identity(
+    paths: &GlobalStatePaths,
+) -> Result<PreparedWindowsIpcIdentity, IpcError> {
     let current_user_sid = orchestrator_state::current_windows_user_sid()?;
     let directory_tree = orchestrator_windows_ipc::ensure_current_user_only_directory_tree(
         &paths.root,
@@ -309,15 +379,11 @@ fn windows_owner_bootstrap_guard(
         source,
     })?;
     let canonical_root = windows_canonical_state_root(paths)?;
-    let name = windows_owner_mutex_name(&canonical_root, &current_user_sid);
-    let mutex = orchestrator_windows_ipc::acquire_current_user_mutex(&name, &current_user_sid)
-        .map_err(|source| IpcError::Io {
-            path: PathBuf::from(name),
-            source,
-        })?;
-    Ok(WindowsOwnerBootstrapGuard {
-        _mutex: mutex,
-        _directory_tree: directory_tree,
+    let digest = windows_ipc_identity_digest(&canonical_root, &current_user_sid);
+    Ok(PreparedWindowsIpcIdentity {
+        digest,
+        current_user_sid,
+        directory_tree,
     })
 }
 
@@ -333,13 +399,13 @@ fn windows_canonical_state_root(paths: &GlobalStatePaths) -> Result<PathBuf, Ipc
 }
 
 #[cfg(windows)]
-fn windows_owner_mutex_name(canonical_root: &Path, current_user_sid: &str) -> String {
+fn windows_ipc_identity_digest(canonical_root: &Path, current_user_sid: &str) -> String {
     use std::os::windows::ffi::OsStrExt as _;
 
     let root_units = canonical_root.as_os_str().encode_wide().collect::<Vec<_>>();
     let sid_bytes = current_user_sid.as_bytes();
     let mut digest = Sha256::new();
-    digest.update(b"colay-daemon-owner-bootstrap-v2\0");
+    digest.update(b"colay-daemon-windows-ipc-identity-v2\0");
     digest.update(
         u64::try_from(root_units.len())
             .unwrap_or(u64::MAX)
@@ -355,12 +421,63 @@ fn windows_owner_mutex_name(canonical_root: &Path, current_user_sid: &str) -> St
     );
     digest.update(sid_bytes);
     let digest = digest.finalize();
-    let suffix = hex::encode(&digest[..16]);
+    hex::encode(&digest[..16])
+}
+
+#[cfg(windows)]
+fn windows_owner_mutex_name(identity_digest: &str) -> String {
     // Microsoft documents `Global\` as the namespace for one system-wide named instance across
     // logon sessions. Its SeCreateGlobalPrivilege check is limited to file-mapping and symbolic-
     // link objects, not mutexes. CreateMutexW errors still fail closed; there is no `Local\`
     // fallback. The SID-qualified hash and verified current-user-only DACL prevent broader access.
-    format!(r"Global\ColayDaemonOwner-{suffix}")
+    format!(r"Global\ColayDaemonOwner-v2-{identity_digest}")
+}
+
+#[cfg(windows)]
+fn windows_primary_pipe_name(identity_digest: &str) -> String {
+    format!(r"\\.\pipe\colay-v2-{identity_digest}")
+}
+
+#[cfg(windows)]
+fn windows_endpoint_candidates_from_identity(
+    paths: &GlobalStatePaths,
+    identity_digest: &str,
+) -> IpcEndpointCandidates {
+    let legacy_digest = Sha256::digest(paths.root.to_string_lossy().as_bytes());
+    let legacy_suffix = hex::encode(&legacy_digest[..16]);
+    IpcEndpointCandidates {
+        primary: PathBuf::from(windows_primary_pipe_name(identity_digest)),
+        legacy: PathBuf::from(format!(r"\\.\pipe\colay-{legacy_suffix}")),
+        // A v1 client cannot prove which non-Unicode root a lossy legacy name represents.
+        // New clients may still probe it because they validate the v1 instance against the
+        // expected read-only state database before sending their real request.
+        serve_legacy: paths.root.to_str().is_some(),
+    }
+}
+
+pub fn ipc_endpoint_candidates(
+    paths: &GlobalStatePaths,
+) -> Result<IpcEndpointCandidates, IpcError> {
+    #[cfg(unix)]
+    {
+        Ok(IpcEndpointCandidates {
+            primary: paths.runtime.join("daemon.sock"),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let identity = prepare_windows_ipc_identity(paths)?;
+        Ok(windows_endpoint_candidates_from_identity(
+            paths,
+            &identity.digest,
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(IpcEndpointCandidates {
+            primary: paths.runtime.join("daemon.ipc"),
+        })
+    }
 }
 
 fn lock_is_contended(error: &std::io::Error) -> bool {
@@ -389,7 +506,7 @@ pub struct IpcServer {
     #[cfg(unix)]
     listener: tokio::net::UnixListener,
     #[cfg(windows)]
-    pipe_name: String,
+    pipe_names: Vec<String>,
     #[cfg(windows)]
     pipe_owner_sid: String,
     database: Arc<Database>,
@@ -435,8 +552,20 @@ impl IpcServer {
         }
         #[cfg(windows)]
         {
+            let candidates = ipc_endpoint_candidates(paths)?;
+            let pipe_names = candidates
+                .server_endpoints()
+                .into_iter()
+                .map(|endpoint| {
+                    endpoint.to_str().map(str::to_owned).ok_or_else(|| {
+                        IpcError::Protocol(
+                            "derived Windows named-pipe endpoint is not Unicode".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Self {
-                pipe_name: ipc_endpoint(paths).to_string_lossy().into_owned(),
+                pipe_names,
                 pipe_owner_sid: orchestrator_state::current_windows_user_sid()?,
                 database,
                 paths: paths.clone(),
@@ -533,51 +662,103 @@ impl IpcServer {
         writer: mpsc::Sender<WriterRequest>,
         cancellation: CancellationToken,
     ) -> Result<(), IpcError> {
-        use tokio::net::windows::named_pipe::ServerOptions;
+        let listener_cancellation = cancellation.child_token();
+        let mut listeners = JoinSet::new();
+        for pipe_name in self.pipe_names {
+            let pipe_owner_sid = self.pipe_owner_sid.clone();
+            let database = Arc::clone(&self.database);
+            let paths = self.paths.clone();
+            let writer = writer.clone();
+            let cancellation = listener_cancellation.clone();
+            listeners.spawn(async move {
+                accept_windows_pipe_loop(
+                    pipe_name,
+                    pipe_owner_sid,
+                    database,
+                    paths,
+                    writer,
+                    cancellation,
+                )
+                .await
+            });
+        }
+        drop(writer);
 
-        let mut first_instance = true;
-        let mut connections = JoinSet::new();
-        loop {
-            let mut options = ServerOptions::new();
-            options
-                .first_pipe_instance(first_instance)
-                .reject_remote_clients(true);
-            let server = orchestrator_windows_ipc::create_current_user_only_named_pipe(
-                &options,
-                &self.pipe_name,
-                &self.pipe_owner_sid,
-            )
-            .map_err(|source| IpcError::Io {
-                path: PathBuf::from(&self.pipe_name),
-                source,
-            })?;
-            first_instance = false;
-            tokio::select! {
-                () = cancellation.cancelled() => break,
-                connected = server.connect() => {
-                    connected.map_err(|source| IpcError::Io {
-                        path: PathBuf::from(&self.pipe_name),
-                        source,
-                    })?;
-                    let connection_writer = writer.clone();
-                    let connection_database = Arc::clone(&self.database);
-                    let connection_paths = self.paths.clone();
-                    connections.spawn(async move {
-                        handle_connection(
-                            server,
-                            connection_database,
-                            connection_paths,
-                            connection_writer,
-                        ).await
+        let mut first_error = None;
+        while let Some(joined) = listeners.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                    listener_cancellation.cancel();
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| {
+                        IpcError::Protocol(format!(
+                            "Windows named-pipe listener task failed: {error}"
+                        ))
                     });
+                    listener_cancellation.cancel();
                 }
             }
-            while connections.try_join_next().is_some() {}
         }
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
+}
+
+#[cfg(windows)]
+async fn accept_windows_pipe_loop(
+    pipe_name: String,
+    pipe_owner_sid: String,
+    database: Arc<Database>,
+    paths: GlobalStatePaths,
+    writer: mpsc::Sender<WriterRequest>,
+    cancellation: CancellationToken,
+) -> Result<(), IpcError> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mut first_instance = true;
+    let mut connections = JoinSet::new();
+    loop {
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(first_instance)
+            .reject_remote_clients(true);
+        let server = orchestrator_windows_ipc::create_current_user_only_named_pipe(
+            &options,
+            &pipe_name,
+            &pipe_owner_sid,
+        )
+        .map_err(|source| IpcError::Io {
+            path: PathBuf::from(&pipe_name),
+            source,
+        })?;
+        first_instance = false;
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            connected = server.connect() => {
+                connected.map_err(|source| IpcError::Io {
+                    path: PathBuf::from(&pipe_name),
+                    source,
+                })?;
+                let connection_writer = writer.clone();
+                let connection_database = Arc::clone(&database);
+                let connection_paths = paths.clone();
+                connections.spawn(async move {
+                    handle_connection(
+                        server,
+                        connection_database,
+                        connection_paths,
+                        connection_writer,
+                    ).await
+                });
+            }
+        }
+        while connections.try_join_next().is_some() {}
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -588,16 +769,11 @@ pub fn windows_named_pipe_security_descriptor(
 }
 
 #[must_use]
+#[cfg(not(windows))]
 pub fn ipc_endpoint(paths: &GlobalStatePaths) -> PathBuf {
     #[cfg(unix)]
     {
         paths.runtime.join("daemon.sock")
-    }
-    #[cfg(windows)]
-    {
-        let digest = Sha256::digest(paths.root.to_string_lossy().as_bytes());
-        let suffix = hex::encode(&digest[..16]);
-        PathBuf::from(format!(r"\\.\pipe\colay-{suffix}"))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1830,7 +2006,11 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     #[cfg(windows)]
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, path::PathBuf};
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::OsStringExt as _,
+        path::{Path, PathBuf},
+    };
 
     use chrono::Utc;
     use orchestrator_domain::{
@@ -1846,7 +2026,11 @@ mod tests {
         resume_workspace_task, workspace_conversation, workspace_projection,
     };
     #[cfg(windows)]
-    use super::{windows_owner_bootstrap_guard, windows_owner_mutex_name};
+    use super::{
+        ipc_endpoint_candidates, windows_canonical_state_root,
+        windows_endpoint_candidates_from_identity, windows_ipc_identity_digest,
+        windows_owner_bootstrap_guard, windows_owner_mutex_name, windows_primary_pipe_name,
+    };
     use orchestrator_state::{
         DaemonLeaseRequest, Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord,
         WorkspaceReadRequest,
@@ -1854,7 +2038,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_owner_mutex_name_uses_canonical_case_insensitive_identity()
+    fn windows_ipc_identity_uses_canonical_case_insensitive_state_root()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().join("Daemon-Identity");
@@ -1865,21 +2049,25 @@ mod tests {
         let sid = "S-1-5-21-100-200-300-400";
 
         assert_eq!(canonical, alias_canonical);
-        assert!(windows_owner_mutex_name(&canonical, sid).starts_with(r"Global\"));
+        let identity = windows_ipc_identity_digest(&canonical, sid);
+        let alias_identity = windows_ipc_identity_digest(&alias_canonical, sid);
+
+        assert_eq!(identity, alias_identity);
+        assert!(windows_owner_mutex_name(&identity).starts_with(r"Global\"));
         assert_eq!(
-            windows_owner_mutex_name(&canonical, sid),
-            windows_owner_mutex_name(&alias_canonical, sid)
+            windows_owner_mutex_name(&identity).strip_prefix(r"Global\ColayDaemonOwner-v2-"),
+            windows_primary_pipe_name(&identity).strip_prefix(r"\\.\pipe\colay-v2-")
         );
         assert_ne!(
-            windows_owner_mutex_name(&canonical, sid),
-            windows_owner_mutex_name(&canonical, "S-1-5-21-100-200-300-401")
+            identity,
+            windows_ipc_identity_digest(&canonical, "S-1-5-21-100-200-300-401")
         );
         Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_owner_mutex_name_hashes_non_unicode_units_losslessly() {
+    fn windows_ipc_identity_hashes_non_unicode_units_losslessly() {
         let prefix = [u16::from(b'C'), u16::from(b':'), u16::from(b'\\')];
         let mut unpaired_units = prefix.to_vec();
         unpaired_units.push(0xD800);
@@ -1890,9 +2078,99 @@ mod tests {
         let sid = "S-1-5-21-100-200-300-400";
 
         assert_ne!(
-            windows_owner_mutex_name(&unpaired, sid),
-            windows_owner_mutex_name(&replacement, sid)
+            windows_ipc_identity_digest(&unpaired, sid),
+            windows_ipc_identity_digest(&replacement, sid)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_short_state_root_alias_uses_the_same_primary_endpoint_when_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("Colay State Root Long Name");
+        std::fs::create_dir_all(&root)?;
+        let short_root = orchestrator_windows_ipc::short_path_name(&root)?;
+
+        if short_root == root {
+            eprintln!(
+                "GetShortPathNameW returned the original path; this volume has no 8.3 alias for the test root"
+            );
+            assert_eq!(short_root, root);
+            return Ok(());
+        }
+
+        let paths = |root: PathBuf| GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+        let long_paths = paths(root);
+        let short_paths = paths(short_root);
+        assert_eq!(
+            windows_canonical_state_root(&long_paths)?,
+            windows_canonical_state_root(&short_paths)?
+        );
+        assert_eq!(
+            ipc_endpoint_candidates(&long_paths)?.primary(),
+            ipc_endpoint_candidates(&short_paths)?.primary()
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_endpoint_candidates_preserve_primary_and_version_one_legacy_names() {
+        use sha2::{Digest as _, Sha256};
+
+        let root = PathBuf::from(r"C:\Users\current\Colay");
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root: root.clone(),
+        };
+        let identity = "0123456789abcdef0123456789abcdef";
+        let candidates = windows_endpoint_candidates_from_identity(&paths, identity);
+        let legacy_digest = Sha256::digest(root.to_string_lossy().as_bytes());
+        let legacy_suffix = hex::encode(&legacy_digest[..16]);
+
+        assert_eq!(
+            candidates.primary(),
+            Path::new(r"\\.\pipe\colay-v2-0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            candidates.legacy(),
+            Some(Path::new(&format!(r"\\.\pipe\colay-{legacy_suffix}")))
+        );
+        assert_eq!(candidates.server_endpoints().len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_non_unicode_root_keeps_legacy_client_candidate_but_not_server_listener() {
+        let mut units = vec![u16::from(b'C'), u16::from(b':'), u16::from(b'\\')];
+        units.push(0xD800);
+        let root = PathBuf::from(OsString::from_wide(&units));
+        let paths = GlobalStatePaths {
+            database: root.join("state/state.db"),
+            backups: root.join("state/backups"),
+            workspaces: root.join("data/workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        };
+
+        let candidates =
+            windows_endpoint_candidates_from_identity(&paths, "0123456789abcdef0123456789abcdef");
+
+        assert!(candidates.legacy().is_some());
+        assert_eq!(candidates.server_endpoints(), [candidates.primary()]);
     }
 
     #[cfg(windows)]

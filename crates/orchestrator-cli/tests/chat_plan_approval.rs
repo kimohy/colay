@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
-use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse, ipc_endpoint};
+use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse, ipc_endpoint_candidates};
 use orchestrator_domain::{
     AppendMessageCommandPayload, ApproveGraphCommandPayload, ClientCommand, ClientCommandAction,
     ClientCommandId, ClientCommandState, CreateSessionCommandPayload, GraphValidationSummary,
@@ -178,7 +178,8 @@ impl Fixture {
             action: action.to_owned(),
             payload,
         };
-        tokio::runtime::Runtime::new()?.block_on(send_ipc_request(ipc_endpoint(&paths), request))
+        let endpoint = ipc_endpoint_candidates(&paths)?.primary().to_path_buf();
+        tokio::runtime::Runtime::new()?.block_on(send_ipc_request(endpoint, request))
     }
 
     fn wait_online(&self) -> Result<()> {
