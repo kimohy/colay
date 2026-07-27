@@ -6,14 +6,15 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
+#[cfg(windows)]
 use chrono::Utc;
 use orchestrator_daemon::{
     IPC_SCHEMA_VERSION, IpcEndpointCandidates, IpcRequest, IpcResponse, ipc_endpoint_candidates,
 };
 use orchestrator_domain::DaemonInstanceId;
-use orchestrator_state::{
-    GlobalStatePaths, StateEnvironment, WorkspaceId, read_online_daemon_identity,
-};
+#[cfg(windows)]
+use orchestrator_state::read_online_daemon_identity;
+use orchestrator_state::{GlobalStatePaths, StateEnvironment, WorkspaceId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use uuid::Uuid;
@@ -46,6 +47,7 @@ struct DaemonEndpoint {
 #[derive(Clone, Copy, Debug)]
 enum EndpointValidation {
     Primary,
+    #[cfg(windows)]
     Legacy(LegacyDaemonIdentity),
 }
 
@@ -57,6 +59,7 @@ impl DaemonEndpoint {
         }
     }
 
+    #[cfg(windows)]
     fn legacy(path: &Path, identity: LegacyDaemonIdentity) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -207,18 +210,25 @@ async fn discover_live_endpoint(
         Err(error) => return Err(error).context("primary daemon endpoint is not healthy"),
     }
 
-    let Some(legacy_path) = candidates.legacy() else {
-        return Ok(None);
-    };
-    let Some(expected) = expected_legacy_daemon_identity(paths)? else {
-        return Ok(None);
-    };
-    let legacy = DaemonEndpoint::legacy(legacy_path, expected);
-    match ping(paths, &legacy).await {
-        Ok(readiness) => Ok(Some((legacy, readiness))),
-        Err(error) if endpoint_is_unavailable(&error) => Ok(None),
-        Err(error) => Err(error)
-            .context("legacy daemon endpoint failed expected state-root identity validation"),
+    #[cfg(windows)]
+    {
+        let Some(legacy_path) = candidates.legacy() else {
+            return Ok(None);
+        };
+        let Some(expected) = expected_legacy_daemon_identity(paths)? else {
+            return Ok(None);
+        };
+        let legacy = DaemonEndpoint::legacy(legacy_path, expected);
+        return match ping(paths, &legacy).await {
+            Ok(readiness) => Ok(Some((legacy, readiness))),
+            Err(error) if endpoint_is_unavailable(&error) => Ok(None),
+            Err(error) => Err(error)
+                .context("legacy daemon endpoint failed expected state-root identity validation"),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(None)
     }
 }
 
@@ -296,6 +306,7 @@ fn legacy_status_identity(response: &IpcResponse) -> Result<LegacyDaemonIdentity
     })
 }
 
+#[cfg(windows)]
 fn expected_legacy_daemon_identity(
     paths: &GlobalStatePaths,
 ) -> Result<Option<LegacyDaemonIdentity>> {
@@ -309,6 +320,7 @@ fn expected_legacy_daemon_identity(
     )
 }
 
+#[cfg(any(windows, test))]
 fn validate_legacy_daemon_identity(
     observed: LegacyDaemonIdentity,
     expected: LegacyDaemonIdentity,
@@ -698,7 +710,8 @@ fn configure_background_process(command: &mut Command) {
 }
 
 async fn open_response_stream(
-    paths: &GlobalStatePaths,
+    #[cfg(windows)] paths: &GlobalStatePaths,
+    #[cfg(not(windows))] _paths: &GlobalStatePaths,
     endpoint: &DaemonEndpoint,
     request: &IpcRequest,
 ) -> Result<IpcResponseStream> {
@@ -709,9 +722,6 @@ async fn open_response_stream(
         let stream = tokio::net::UnixStream::connect(&endpoint.path).await?;
         match endpoint.validation {
             EndpointValidation::Primary => response_stream(stream, &encoded).await,
-            EndpointValidation::Legacy(_) => {
-                bail!("legacy daemon endpoints are unsupported on Unix")
-            }
         }
     }
     #[cfg(windows)]
@@ -739,11 +749,12 @@ async fn open_response_stream(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (paths, endpoint, encoded);
+        let _ = (_paths, endpoint, encoded);
         bail!("local IPC is unsupported on this platform")
     }
 }
 
+#[cfg(any(windows, test))]
 async fn response_stream_with_legacy_identity<S>(
     stream: S,
     request: &IpcRequest,
