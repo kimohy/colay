@@ -26,9 +26,9 @@ use windows_sys::Win32::{
             GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
         },
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
@@ -482,8 +482,6 @@ fn verify_single_current_user_ace(
     expected_access: u32,
     expected_ace_flags: u32,
 ) -> io::Result<()> {
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-
     let mut size = ACL_SIZE_INFORMATION::default();
     let size_loaded = unsafe {
         // SAFETY: `dacl` is live and `size` is writable for the declared structure length.
@@ -511,32 +509,106 @@ fn verify_single_current_user_ace(
     if ace_loaded == 0 {
         return Err(io::Error::last_os_error());
     }
-    let header = unsafe {
-        // SAFETY: GetAce returned a pointer to a valid ACE with a common ACE header.
-        &*ace.cast::<ACE_HEADER>()
+    let acl_bytes_in_use = usize::try_from(size.AclBytesInUse).unwrap_or(usize::MAX);
+    let ace_offset = (ace as usize).checked_sub(dacl as usize).ok_or_else(|| {
+        invalid_mutex_security("secured object ACE pointer precedes its containing ACL")
+    })?;
+    let expected_sid_length = unsafe {
+        // SAFETY: `expected_sid` is the live SID returned by ConvertStringSidToSidW.
+        GetLengthSid(expected_sid)
     };
-    if header.AceType != ACCESS_ALLOWED_ACE_TYPE
-        || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
-    {
+    if expected_sid_length == 0 {
+        return Err(invalid_mutex_security("expected SID has zero length"));
+    }
+    let expected_sid_length = usize::try_from(expected_sid_length).unwrap_or(usize::MAX);
+    let acl_bytes = unsafe {
+        // SAFETY: GetAclInformation reports `AclBytesInUse` initialized bytes for this live ACL.
+        std::slice::from_raw_parts(dacl.cast::<u8>(), acl_bytes_in_use)
+    };
+    let expected_sid_bytes = unsafe {
+        // SAFETY: GetLengthSid reports the initialized length of this live expected SID.
+        std::slice::from_raw_parts(expected_sid.cast::<u8>(), expected_sid_length)
+    };
+    validate_current_user_ace_bytes(
+        acl_bytes,
+        acl_bytes_in_use,
+        ace_offset,
+        expected_sid_bytes,
+        expected_access,
+        expected_ace_flags,
+    )
+}
+
+fn validate_current_user_ace_bytes(
+    acl_bytes: &[u8],
+    acl_bytes_in_use: usize,
+    ace_offset: usize,
+    expected_sid: &[u8],
+    expected_access: u32,
+    expected_ace_flags: u32,
+) -> io::Result<()> {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    let bounded_acl = acl_bytes.get(..acl_bytes_in_use).ok_or_else(|| {
+        invalid_mutex_security("ACL bytes-in-use exceeds the available ACL buffer")
+    })?;
+    let header_end = ace_offset
+        .checked_add(std::mem::size_of::<ACE_HEADER>())
+        .ok_or_else(|| invalid_mutex_security("ACE header range overflows"))?;
+    let header = bounded_acl
+        .get(ace_offset..header_end)
+        .ok_or_else(|| invalid_mutex_security("ACE header extends past ACL bytes-in-use"))?;
+    let ace_type = header[std::mem::offset_of!(ACE_HEADER, AceType)];
+    let ace_flags = header[std::mem::offset_of!(ACE_HEADER, AceFlags)];
+    let size_offset = std::mem::offset_of!(ACE_HEADER, AceSize);
+    let ace_size = usize::from(u16::from_le_bytes([
+        header[size_offset],
+        header[size_offset + 1],
+    ]));
+    let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+    if ace_size < sid_offset {
+        return Err(invalid_mutex_security("ACE is truncated before SidStart"));
+    }
+    let ace_end = ace_offset
+        .checked_add(ace_size)
+        .ok_or_else(|| invalid_mutex_security("ACE range overflows"))?;
+    let ace_record = bounded_acl
+        .get(ace_offset..ace_end)
+        .ok_or_else(|| invalid_mutex_security("ACE extends past ACL bytes-in-use"))?;
+    let expected_ace_size = sid_offset
+        .checked_add(expected_sid.len())
+        .ok_or_else(|| invalid_mutex_security("expected ACE size overflows"))?;
+    if ace_size != expected_ace_size {
+        return Err(invalid_mutex_security(
+            "ACE size does not exactly match the expected SID length",
+        ));
+    }
+    if ace_type != ACCESS_ALLOWED_ACE_TYPE || u32::from(ace_flags) != expected_ace_flags {
         return Err(invalid_mutex_security(
             "secured object DACL contains a non-canonical allow entry",
         ));
     }
-    let allowed = unsafe {
-        // SAFETY: The type and size checks above establish a complete ACCESS_ALLOWED_ACE.
-        &*ace.cast::<ACCESS_ALLOWED_ACE>()
-    };
-    if u32::from(allowed.Header.AceFlags) != expected_ace_flags || allowed.Mask != expected_access {
+    let mask_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask);
+    let mask_end = mask_offset
+        .checked_add(std::mem::size_of::<u32>())
+        .ok_or_else(|| invalid_mutex_security("ACE mask range overflows"))?;
+    let mask_bytes = ace_record
+        .get(mask_offset..mask_end)
+        .ok_or_else(|| invalid_mutex_security("ACE is truncated before its access mask"))?;
+    let mask = u32::from_le_bytes(
+        mask_bytes
+            .try_into()
+            .map_err(|_| invalid_mutex_security("ACE access mask has an invalid length"))?,
+    );
+    if mask != expected_access {
         return Err(invalid_mutex_security(
             "secured object DACL contains a non-canonical allow entry",
         ));
     }
-    let trustee = (&raw const allowed.SidStart).cast_mut().cast::<c_void>();
-    if unsafe {
-        // SAFETY: `trustee` points to the variable-length SID following the validated allow ACE.
-        EqualSid(trustee, expected_sid)
-    } == 0
-    {
+    let trustee = ace_record
+        .get(sid_offset..)
+        .ok_or_else(|| invalid_mutex_security("ACE is truncated before its trustee SID"))?;
+    if trustee != expected_sid {
         return Err(invalid_mutex_security("unexpected secured object trustee"));
     }
     Ok(())
@@ -689,12 +761,153 @@ mod tests {
     };
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+    use windows_sys::Win32::{
+        Security::{ACCESS_ALLOWED_ACE, ACE_HEADER},
+        System::Threading::MUTEX_ALL_ACCESS,
+    };
 
     use super::{
         LocalAllocation, acquire_current_user_mutex, create_and_verify_current_user_directory,
         encode_path, ensure_current_user_only_directory_tree, kernel_mutex_owner_sid,
-        wait_status_result,
+        validate_current_user_ace_bytes, wait_status_result,
     };
+
+    const TEST_ACE_OFFSET: usize = 8;
+    const TEST_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+
+    fn exact_test_ace() -> Vec<u8> {
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let ace_size = sid_offset + TEST_SID.len();
+        let mut bytes = vec![0_u8; TEST_ACE_OFFSET + ace_size];
+        bytes[TEST_ACE_OFFSET + std::mem::offset_of!(ACE_HEADER, AceType)] = 0;
+        bytes[TEST_ACE_OFFSET + std::mem::offset_of!(ACE_HEADER, AceFlags)] = 0;
+        bytes[TEST_ACE_OFFSET + std::mem::offset_of!(ACE_HEADER, AceSize)
+            ..TEST_ACE_OFFSET + std::mem::offset_of!(ACE_HEADER, AceSize) + 2]
+            .copy_from_slice(&u16::try_from(ace_size).unwrap_or(u16::MAX).to_le_bytes());
+        bytes[TEST_ACE_OFFSET + std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask)
+            ..TEST_ACE_OFFSET + std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask) + 4]
+            .copy_from_slice(&MUTEX_ALL_ACCESS.to_le_bytes());
+        bytes[TEST_ACE_OFFSET + sid_offset..].copy_from_slice(&TEST_SID);
+        bytes
+    }
+
+    fn set_test_ace_size(bytes: &mut [u8], size: usize) {
+        let offset = TEST_ACE_OFFSET + std::mem::offset_of!(ACE_HEADER, AceSize);
+        bytes[offset..offset + 2]
+            .copy_from_slice(&u16::try_from(size).unwrap_or(u16::MAX).to_le_bytes());
+    }
+
+    #[test]
+    fn bounded_ace_verifier_accepts_valid_exact_buffer() -> io::Result<()> {
+        let bytes = exact_test_ace();
+        validate_current_user_ace_bytes(
+            &bytes,
+            bytes.len(),
+            TEST_ACE_OFFSET,
+            &TEST_SID,
+            MUTEX_ALL_ACCESS,
+            0,
+        )
+    }
+
+    #[test]
+    fn bounded_ace_verifier_rejects_truncated_sid_start() {
+        let mut bytes = exact_test_ace();
+        set_test_ace_size(
+            &mut bytes,
+            std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart) - 1,
+        );
+
+        assert!(
+            validate_current_user_ace_bytes(
+                &bytes,
+                bytes.len(),
+                TEST_ACE_OFFSET,
+                &TEST_SID,
+                MUTEX_ALL_ACCESS,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_ace_verifier_rejects_ace_extending_past_acl_bytes_in_use() {
+        let bytes = exact_test_ace();
+
+        assert!(
+            validate_current_user_ace_bytes(
+                &bytes,
+                bytes.len() - 1,
+                TEST_ACE_OFFSET,
+                &TEST_SID,
+                MUTEX_ALL_ACCESS,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_ace_verifier_rejects_overlong_sid() {
+        let mut bytes = exact_test_ace();
+        bytes.push(0);
+        set_test_ace_size(
+            &mut bytes,
+            std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart) + TEST_SID.len() + 1,
+        );
+
+        assert!(
+            validate_current_user_ace_bytes(
+                &bytes,
+                bytes.len(),
+                TEST_ACE_OFFSET,
+                &TEST_SID,
+                MUTEX_ALL_ACCESS,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_ace_verifier_rejects_short_sid() {
+        let mut bytes = exact_test_ace();
+        set_test_ace_size(
+            &mut bytes,
+            std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart) + TEST_SID.len() - 1,
+        );
+
+        assert!(
+            validate_current_user_ace_bytes(
+                &bytes,
+                bytes.len(),
+                TEST_ACE_OFFSET,
+                &TEST_SID,
+                MUTEX_ALL_ACCESS,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_ace_verifier_rejects_wrong_ace_type() {
+        let mut bytes = exact_test_ace();
+        bytes[TEST_ACE_OFFSET + std::mem::offset_of!(ACE_HEADER, AceType)] = 1;
+
+        assert!(
+            validate_current_user_ace_bytes(
+                &bytes,
+                bytes.len(),
+                TEST_ACE_OFFSET,
+                &TEST_SID,
+                MUTEX_ALL_ACCESS,
+                0,
+            )
+            .is_err()
+        );
+    }
 
     fn create_test_directory(path: &Path, sddl: &str) -> io::Result<()> {
         let encoded_sddl = sddl

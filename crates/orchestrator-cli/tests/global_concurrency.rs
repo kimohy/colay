@@ -7,7 +7,10 @@ use std::{
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::{Arc, Barrier, Mutex, MutexGuard},
+    sync::{
+        Arc, Barrier, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -32,7 +35,8 @@ struct CommandContext {
     executable: PathBuf,
     path: OsString,
     colay_home: PathBuf,
-    daemon_log: PathBuf,
+    daemon_log_directory: PathBuf,
+    next_daemon_log: Arc<AtomicU64>,
     temp: PathBuf,
 }
 
@@ -80,11 +84,14 @@ impl ConcurrencyFixture {
         let path = env::join_paths(
             std::iter::once(executable_parent).chain(env::split_paths(&inherited_path)),
         )?;
+        let daemon_log_directory = root.join("daemon-stderr");
+        fs::create_dir_all(&daemon_log_directory)?;
         let command = CommandContext {
             executable,
             path,
             colay_home: colay_home.clone(),
-            daemon_log: root.join("daemon-stderr.log"),
+            daemon_log_directory,
+            next_daemon_log: Arc::new(AtomicU64::new(1)),
             temp: root.clone(),
         };
         Ok(Self {
@@ -160,12 +167,26 @@ impl ConcurrencyFixture {
             })
         })?;
         let instances = rows.collect::<Result<Vec<_>, _>>()?;
-        let stderr = fs::read_to_string(&self.command.daemon_log).with_context(|| {
-            format!(
-                "failed to read daemon stderr log {}",
-                self.command.daemon_log.display()
-            )
-        })?;
+        let mut daemon_logs = fs::read_dir(&self.command.daemon_log_directory)
+            .with_context(|| {
+                format!(
+                    "failed to read daemon stderr directory {}",
+                    self.command.daemon_log_directory.display()
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        daemon_logs.sort_by_key(std::fs::DirEntry::file_name);
+        let mut stderr_records = Vec::new();
+        for entry in daemon_logs {
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read daemon stderr log {}", path.display()))?;
+            stderr_records.extend(contents.lines().map(str::to_owned));
+        }
+        let stderr = stderr_records.join("\n");
         Ok(DaemonDiagnostics { instances, stderr })
     }
 
@@ -304,12 +325,17 @@ impl CommandContext {
         let system_root = "/";
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
+        let daemon_log = self.daemon_log_directory.join(format!(
+            "daemon-stderr-{}-{}.log",
+            std::process::id(),
+            self.next_daemon_log.fetch_add(1, Ordering::Relaxed)
+        ));
         let status = Command::new(&self.executable)
             .args(args)
             .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
-            .env("COLAY_TEST_DAEMON_STDERR", &self.daemon_log)
+            .env("COLAY_TEST_DAEMON_STDERR", daemon_log)
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", &self.path)
             .env("PATHEXT", ".EXE;.CMD")
@@ -372,8 +398,8 @@ fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &Daemo
 }
 
 fn validate_daemon_diagnostics(daemon_diagnostics: &DaemonDiagnostics) -> Result<()> {
-    const ERROR_PREFIX: &str = "error: ";
-    const EXPECTED_CONTENDER: &str = "daemon singleton is already owned by another process";
+    const EXPECTED_CONTENDER_RECORD: &str =
+        "error: daemon singleton is already owned by another process";
 
     for instance in &daemon_diagnostics.instances {
         if !instance.startup_error.is_empty() {
@@ -388,22 +414,12 @@ fn validate_daemon_diagnostics(daemon_diagnostics: &DaemonDiagnostics) -> Result
         }
     }
 
-    let mut remaining = daemon_diagnostics.stderr.as_str();
-    loop {
-        remaining = remaining.trim_start();
-        if remaining.is_empty() {
-            return Ok(());
+    for record in daemon_diagnostics.stderr.lines() {
+        if !record.is_empty() && record != EXPECTED_CONTENDER_RECORD {
+            bail!("unexpected daemon contender stderr record: {record:?}");
         }
-        if let Some(rest) = remaining.strip_prefix(ERROR_PREFIX) {
-            remaining = rest;
-            continue;
-        }
-        if let Some(rest) = remaining.strip_prefix(EXPECTED_CONTENDER) {
-            remaining = rest;
-            continue;
-        }
-        bail!("unexpected daemon contender stderr: {remaining:?}");
     }
+    Ok(())
 }
 
 #[test]
@@ -418,13 +434,39 @@ fn daemon_diagnostics_allow_only_expected_owner_contention() -> Result<()> {
         }],
         stderr: concat!(
             "error: daemon singleton is already owned by another process\n",
-            "error: error: daemon singleton is already owned by another process",
-            "daemon singleton is already owned by another process\n",
+            "error: daemon singleton is already owned by another process\n",
         )
         .to_owned(),
     };
 
     validate_daemon_diagnostics(&diagnostics)
+}
+
+#[test]
+fn daemon_diagnostics_reject_non_exact_owner_contention_records() {
+    let invalid_records = [
+        "daemon singleton is already owned by another process\n",
+        "error: \n",
+        "error: error: daemon singleton is already owned by another process\n",
+        concat!(
+            "error: daemon singleton is already owned by another process",
+            "daemon singleton is already owned by another process\n",
+        ),
+        " error: daemon singleton is already owned by another process\n",
+        "error: daemon singleton is already owned by another process \n",
+        "error: daemon singleton is already owned by another process: extra\n",
+    ];
+
+    for stderr in invalid_records {
+        let diagnostics = DaemonDiagnostics {
+            instances: Vec::new(),
+            stderr: stderr.to_owned(),
+        };
+        assert!(
+            validate_daemon_diagnostics(&diagnostics).is_err(),
+            "accepted non-exact daemon diagnostic record {stderr:?}"
+        );
+    }
 }
 
 #[test]

@@ -356,7 +356,11 @@ fn windows_owner_mutex_name(canonical_root: &Path, current_user_sid: &str) -> St
     digest.update(sid_bytes);
     let digest = digest.finalize();
     let suffix = hex::encode(&digest[..16]);
-    format!(r"Local\ColayDaemonOwner-{suffix}")
+    // Microsoft documents `Global\` as the namespace for one system-wide named instance across
+    // logon sessions. Its SeCreateGlobalPrivilege check is limited to file-mapping and symbolic-
+    // link objects, not mutexes. CreateMutexW errors still fail closed; there is no `Local\`
+    // fallback. The SID-qualified hash and verified current-user-only DACL prevent broader access.
+    format!(r"Global\ColayDaemonOwner-{suffix}")
 }
 
 fn lock_is_contended(error: &std::io::Error) -> bool {
@@ -1861,6 +1865,7 @@ mod tests {
         let sid = "S-1-5-21-100-200-300-400";
 
         assert_eq!(canonical, alias_canonical);
+        assert!(windows_owner_mutex_name(&canonical, sid).starts_with(r"Global\"));
         assert_eq!(
             windows_owner_mutex_name(&canonical, sid),
             windows_owner_mutex_name(&alias_canonical, sid)
