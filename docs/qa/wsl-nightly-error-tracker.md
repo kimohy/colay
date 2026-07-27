@@ -260,6 +260,90 @@ attempts, worktrees, coordinator leases, and worker leases all remained at zero.
 - Agy: not installed, so no real inference attempt was possible.
 - Automated tests/CI remain fake-provider-only as required. These were bounded manual QA calls.
 
+## Clean-install real-provider QA refresh: 2026-07-28
+
+- Public npm `nightly` still resolved to `0.1.1-nightly.20260726.46acc8d`; it does not contain the
+  reviewed WSL-014 through WSL-016 fixes. The isolated Linux native binary SHA-256 was
+  `aed1775eb1e3fc15b0eb0a605e4f186f09f4bb0e69344ca3c10dab9f0d153743`, with ELF Build ID
+  `a284e7cdb28951622c359b91e0ea9b7c7bef618b`.
+- A clean npm install under WSL's default Node `18.19.1` completed with `EBADENGINE` instead of
+  failing, then the installed `colay` command refused to start because Node 22 or newer is
+  required. Adding an isolated Node `22.23.1` to PATH made the same installation run normally.
+  This is consistent with WSL-001's documented runtime boundary, but the install-success then
+  first-run-failure sequence remains noticeable user friction.
+- A fresh isolated `COLAY_HOME` migrated from schema 0 to 15. `doctor` reported database integrity
+  `ok`, zero foreign-key violations, and the daemon started online from the installed nightly.
+  Four separate non-Git workspaces contained neither `.git` nor `.colay`.
+- Compatibility probes reported Claude `2.1.217`, Gemini `0.51.0`, and Agy `1.1.5`/`1.1.7` as
+  healthy; Codex was correctly disabled because the Windows npm installation lacked the Linux
+  native optional package.
+- Bounded manual `run --plan-only --provider` calls requested Claude, Gemini, Agy, and Codex. All
+  four commands exited 0 and all four durable attempts used `provider_id=claude`,
+  `status=succeeded`, and the same generic `needs_attention` outcome after the Claude process
+  exited 1. This reconfirms that WSL-015 and WSL-016 are source-fixed but not deployed in the
+  current public nightly.
+- Direct adapter-equivalent manual calls established the external causes without exposing
+  credentials: Claude authentication initialized but billing returned `Credit balance is too
+  low`; Gemini rejected the current individual account/client as `UNSUPPORTED_CLIENT`; Agy exited
+  0 without an answer because headless plan mode auto-denied a required command permission; and
+  Codex could not start from the cross-OS npm installation.
+- The reviewed source candidate (`5ef9ed7`, Linux binary SHA-256
+  `e86e22ea689ebcefcd5dd71cfc6711e8b7e16be8532a1fee5c7811211e490bf0`) was checked against the
+  same real providers in a second isolated state root. It selected Claude, Gemini, and Agy exactly
+  as requested, returned exit 1 for each provider failure, and persisted three schema-v16
+  `status=failed` attempts with provider-specific bounded recovery messages. Database integrity
+  was `ok`, foreign-key violations were zero, and tasks, task attempts, worktrees, coordinator
+  leases, and worker leases remained zero in both the public-nightly and candidate databases.
+- Both isolated daemons stopped cleanly. PIDs 2595 and 4392, all `daemon.sock` files, and all
+  provider processes were absent after cleanup. Evidence is under
+  `/home/kimohy/.cache/colay-real-provider-qa-20260728/evidence`.
+- These were bounded manual user QA calls, not automated tests or CI. No credential value was
+  printed or copied.
+
+## WSL-017: compatibility health conflates public CLI probes with account readiness
+
+- Severity: medium
+- Status: open
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence and impact
+
+`compatibility` and `doctor` marked Gemini, Claude, and Agy `healthy` after only version/help
+capability probes. The immediately following real read-only calls could not produce an answer:
+Gemini rejected the account/client tier, Claude had no billing credit, and Agy could not satisfy
+its headless permission contract. `inference_requests=0` correctly describes the safe probe, but a
+normal user can reasonably interpret `healthy` as ready for a task.
+
+### Expected correction
+
+- Separate binary compatibility from account/runtime readiness in the status vocabulary.
+- When a provider exposes a non-inference authentication or entitlement status command, include it
+  in `doctor` without printing account identifiers or credentials.
+- Otherwise report `compatible; account readiness unverified` rather than `healthy`, and keep an
+  explicitly opted-in live check separate because it can consume quota or incur cost.
+
+## WSL-018: provider failure evidence overwhelms the actionable diagnostic
+
+- Severity: medium
+- Status: open
+- Observed source candidate: `5ef9ed7`
+
+### Evidence and impact
+
+The source candidate correctly classified and failed all three provider attempts, but the Gemini
+error appended repeated `unknown event: gemini.stderr` entries plus a provider-internal JavaScript
+stack. The Agy evidence relayed its suggestion to use `--dangerously-skip-permissions`, even though
+Colay must not recommend bypassing its read-only permission boundary. The useful one-line recovery
+message appears first, but a terminal user then receives a long and potentially misleading raw
+diagnostic.
+
+### Expected correction
+
+- Keep the concise classified recovery message on normal stderr and in the default TUI view.
+- Deduplicate unknown-event summaries and bound stack output by lines as well as bytes.
+- Store detailed redacted evidence for an explicit diagnostic view, but suppress provider advice
+  that asks users to disable permission controls; replace it with Colay-safe configuration guidance.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
