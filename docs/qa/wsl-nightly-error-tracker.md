@@ -1,5 +1,104 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## WSL-014: non-Git plan-only Codex invocation omits the public Git-check bypass
+
+- Severity: high
+- Status: open
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence and root cause
+
+Real-provider QA in an isolated non-Git WSL workspace selected Codex `0.145.0`, but the
+conversation ended as `Crashed { exit_code: Some(1) }`. Replaying Colay's exact public CLI
+arguments reproduced the provider error:
+
+```text
+codex exec --json --sandbox read-only -C <non-git-workspace> -
+Not inside a trusted directory and --skip-git-repo-check was not specified.
+```
+
+`CodexInvocation::exec` emits `exec --json --sandbox ... -C ... -` but does not emit
+`--skip-git-repo-check`. This conflicts with Colay's conversation-first contract, which allows
+read-only plan conversations before a Git repository exists. Adding that public option passed the
+Git gate and reached authentication, proving the immediate cause; the subsequent request was
+blocked by the local Codex login's expired/reused refresh token.
+
+### Expected correction and verification
+
+- Gate `--skip-git-repo-check` by observed capability and use it only for read-only conversation
+  or planning. It is safe to include for Git workspaces and avoids a second Git probe.
+- Keep writable task Git preflight unchanged.
+- Add fake-provider contract coverage for the exact argv in Git and non-Git workspaces.
+- In manual WSL QA, a valid Codex login must produce an `answer_complete` conversation attempt.
+
+## WSL-015: `run --plan-only --provider` records a preference but ignores it for execution
+
+- Severity: high
+- Status: open
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence and root cause
+
+With all default providers enabled, `colay --json run --plan-only --provider claude PING` returned
+`requested_provider: "claude"`, while the durable `conversation_attempts.provider_id` for the new
+attempt was `codex`. `OfficialCliConversationOrchestrator::converse` always calls
+`self.planner.primary_provider()`; the requested provider stored in the requirement envelope is not
+part of `ConversationRequest` provider selection. Disabling Codex and raising Claude's configured
+priority made the next attempt use Claude, confirming that configured priority, not `--provider`,
+controls execution.
+
+### Expected correction and verification
+
+- Carry the requested provider as typed routing input into the conversation request.
+- Honor an eligible requested provider. When it is disabled, missing, or incompatible before process
+  start, fall back by configured priority and report the requested and selected providers.
+- Never fall back to another provider after the selected provider process starts.
+- Assert CLI output, attempt `provider_id`, and spawned fake binary identity all agree.
+
+## WSL-016: distinct provider failures collapse to success plus generic needs-attention
+
+- Severity: high
+- Status: open
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence
+
+Real Codex, Claude, and Gemini attempts all exited 1 for different reasons:
+
+- Codex: non-Git trust check; after bypass, local authentication returned HTTP 401 with
+  `refresh_token_reused`/`token_expired`.
+- Claude: the CLI initialized successfully, then returned `billing_error` with
+  `Credit balance is too low`.
+- Gemini: the CLI returned `IneligibleTierError` / `UNSUPPORTED_CLIENT` for the current individual
+  Code Assist tier.
+
+Colay persisted every attempt as `status = succeeded`, `error_redacted = NULL`, with the same
+`outcome = needs_attention` and only `conversation lifecycle ended in Crashed { exit_code: Some(1) }`
+as evidence. The CLI itself exited 0 and displayed the same generic message for all three cases.
+
+### Expected correction and verification
+
+- Persist a terminal failure status when the provider process crashes before a valid
+  `ConversationOutcome` is parsed.
+- Retain a bounded, redacted provider error classification and actionable message (authentication,
+  quota/billing, unsupported account/client, compatibility, or process failure).
+- Keep secrets and raw credentials out of state and output.
+- Add fake JSONL/stream-JSON fixtures for these terminal cases and assert CLI exit semantics,
+  attempt status, and redacted diagnostics.
+
+## Real-provider QA record: 2026-07-27
+
+- Environment: WSL 2 Ubuntu 24.04, isolated `COLAY_HOME`, non-Git Linux-native workspace.
+- Colay: `0.1.1-nightly.20260726.46acc8d`.
+- Codex: `0.145.0`; public CLI started, but no model response because local authentication requires
+  sign-in again.
+- Claude: `2.1.217`; provider stream initialized, but no model response because the account credit
+  balance is too low.
+- Gemini: `0.51.0`; provider process started, but the configured individual tier rejects this client
+  as unsupported.
+- Agy: not installed, so no real inference attempt was possible.
+- Automated tests/CI remain fake-provider-only as required. These were bounded manual QA calls.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
@@ -125,20 +224,24 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-26
+- 마지막 갱신: 2026-07-27
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
   `0.1.1-nightly.20260726.b086448`, `0.1.1-nightly.20260726.20b7654`,
-  `0.1.1-nightly.20260726.b2daed0`
+  `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
-- 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
+- 기본 원칙: 자동화 테스트와 CI는 fake provider만 사용한다. 실제 provider inference는 사용자가
+  명시적으로 승인한 격리 수동 QA에서만 제한적으로 호출한다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
 
 ## Issue index
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
+| `WSL-014` | high | open | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
+| `WSL-015` | high | open | `--provider` preference is recorded but ignored for conversation execution |
+| `WSL-016` | high | open | provider failures are persisted as succeeded and reduced to generic needs-attention |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
