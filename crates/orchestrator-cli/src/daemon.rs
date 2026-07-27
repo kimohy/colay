@@ -312,7 +312,7 @@ async fn serve_foreground(
                 }),
                 ProviderId::Codex,
                 Arc::new(UnavailableConversation { reason }),
-                vec![ProviderId::Codex],
+                unavailable_conversation_providers(),
             )
         }
     };
@@ -620,7 +620,7 @@ async fn build_workspace_runtime(
                 }),
                 ProviderId::Codex,
                 Arc::new(UnavailableConversation { reason }),
-                vec![ProviderId::Codex],
+                unavailable_conversation_providers(),
             )
         }
     };
@@ -855,6 +855,10 @@ struct UnavailablePlanner {
     reason: String,
 }
 
+fn unavailable_conversation_providers() -> Vec<ProviderId> {
+    Vec::new()
+}
+
 struct UnavailableConversation {
     reason: String,
 }
@@ -914,8 +918,13 @@ mod tests {
     use super::{
         StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
         finish_unless_daemon_cancelled, stop_response_disconnect, stopped_endpoint_error,
-        supervise_daemon_runtime,
+        supervise_daemon_runtime, unavailable_conversation_providers,
     };
+
+    #[test]
+    fn unavailable_planner_has_no_eligible_conversation_provider() {
+        assert!(unavailable_conversation_providers().is_empty());
+    }
 
     #[tokio::test]
     async fn workspace_activation_setup_is_dropped_when_daemon_is_cancelled() {

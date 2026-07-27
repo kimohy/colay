@@ -441,6 +441,40 @@ async fn requested_provider_falls_back_before_creating_an_attempt_when_unavailab
 }
 
 #[tokio::test]
+async fn unavailable_activation_shape_with_no_eligible_provider_creates_no_attempt_or_notice()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let database = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &database)?;
+    let append = append_command_with_provider(session_id, "inspect", Some(ProviderId::Agy));
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    database.submit_client_command(&append)?;
+    process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+    let mut services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(ProviderAwareConversation),
+    );
+    services.conversation_providers = Vec::new();
+
+    process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now()).await?;
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    assert!(database.load_conversation_attempt(attempt_id)?.is_none());
+    let messages = database.messages_after(session_id, 0, 10)?;
+    assert_eq!(messages.len(), 1);
+    let command_id = ClientCommandId::from_uuid(source_message_id.into_uuid());
+    assert_eq!(
+        database
+            .load_client_command(command_id)?
+            .ok_or("conversation command is missing")?
+            .state,
+        ClientCommandState::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn provider_transcript_includes_latest_message_after_two_hundred_turns()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, workspace_id, database_path) = database()?;
