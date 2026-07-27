@@ -103,9 +103,7 @@ pub(crate) async fn request_conversation_turn(
         return match existing.status {
             ConversationAttemptStatus::Succeeded => Ok(format!("conversation:{attempt_id}")),
             ConversationAttemptStatus::Failed | ConversationAttemptStatus::Cancelled => Err(
-                ConversationCommandError::Rejected(existing.error_redacted.clone().unwrap_or_else(
-                    || "conversation provider failed without redacted evidence".to_owned(),
-                )),
+                ConversationCommandError::Rejected(failure_error_from_outcome(redactor, outcome)),
             ),
             ConversationAttemptStatus::Running => Err(ConversationCommandError::Rejected(
                 "running conversation attempt unexpectedly has an outcome".to_owned(),
@@ -177,13 +175,7 @@ pub(crate) async fn request_conversation_turn(
                 },
                 provider_selection,
             );
-            let error_redacted = bounded_redacted(
-                redactor,
-                &format!(
-                    "{} Evidence: {evidence_redacted}",
-                    outcome_response(&outcome)
-                ),
-            );
+            let error_redacted = failure_error_from_outcome(redactor, &outcome);
             database.finalize_conversation_failure(
                 attempt_id,
                 status,
@@ -224,6 +216,25 @@ fn nonblank_failure_evidence(evidence_redacted: String) -> String {
     } else {
         evidence_redacted
     }
+}
+
+fn failure_error_from_outcome(
+    redactor: &dyn MessageRedactor,
+    outcome: &ConversationOutcome,
+) -> String {
+    let evidence_redacted = match outcome {
+        ConversationOutcome::NeedsAttention {
+            evidence_redacted, ..
+        } => nonblank_failure_evidence(bounded_redacted(redactor, evidence_redacted)),
+        _ => "stored conversation failure requires operator review".to_owned(),
+    };
+    bounded_redacted(
+        redactor,
+        &format!(
+            "{} Evidence: {evidence_redacted}",
+            outcome_response(outcome)
+        ),
+    )
 }
 
 fn bounded_redacted(redactor: &dyn MessageRedactor, value: &str) -> String {

@@ -28,34 +28,82 @@ CREATE TABLE conversation_attempts (
         OR (status = 'succeeded' AND outcome_json IS NOT NULL AND error_redacted IS NULL AND completed_at IS NOT NULL)
         OR (status IN ('failed', 'cancelled')
             AND outcome_json IS NOT NULL
-            AND coalesce(json_extract(outcome_json, '$.outcome') = 'needs_attention', 0)
+            AND coalesce(
+                json_type(outcome_json, '$.outcome') = 'text'
+                AND json_extract(outcome_json, '$.outcome') = 'needs_attention'
+                AND json_type(outcome_json, '$.response_redacted') = 'text'
+                AND length(trim(
+                    json_extract(outcome_json, '$.response_redacted'),
+                    char(9, 10, 11, 12, 13, 32, 133, 160, 5760,
+                         8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                         8232, 8233, 8239, 8287, 12288)
+                )) > 0
+                AND json_type(outcome_json, '$.evidence_redacted') = 'text'
+                AND length(trim(
+                    json_extract(outcome_json, '$.evidence_redacted'),
+                    char(9, 10, 11, 12, 13, 32, 133, 160, 5760,
+                         8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                         8232, 8233, 8239, 8287, 12288)
+                )) > 0
+                AND length(CAST(
+                    json_extract(outcome_json, '$.evidence_redacted') AS BLOB
+                )) <= 16384,
+                0
+            )
             AND error_redacted IS NOT NULL
+            AND length(trim(
+                error_redacted,
+                char(9, 10, 11, 12, 13, 32, 133, 160, 5760,
+                     8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                     8232, 8233, 8239, 8287, 12288)
+            )) > 0
+            AND length(CAST(error_redacted AS BLOB)) <= 16384
             AND completed_at IS NOT NULL)
     )
 ) STRICT;
 
+WITH normalized_attempts AS (
+    SELECT workspace_id, attempt_id, session_id, source_message_id, provider_id, status,
+           outcome_json, started_at, completed_at,
+           CASE
+               WHEN status NOT IN ('failed', 'cancelled') THEN error_redacted
+               WHEN error_redacted IS NULL
+                    OR length(trim(
+                        error_redacted,
+                        char(9, 10, 11, 12, 13, 32, 133, 160, 5760,
+                             8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+                             8232, 8233, 8239, 8287, 12288)
+                    )) = 0
+                   THEN 'Previous conversation failed. Review provider configuration and retry.'
+               WHEN length(CAST(
+                   ('Previous conversation failed. Review this redacted evidence and retry: '
+                    || error_redacted) AS BLOB
+               )) <= 16384
+                   THEN 'Previous conversation failed. Review this redacted evidence and retry: '
+                        || error_redacted
+               ELSE 'Previous conversation failed. Review this redacted evidence and retry: '
+                    || substr(error_redacted, 1, 4060) || '[truncated]'
+           END AS normalized_error_redacted
+    FROM conversation_attempts_v15
+)
 INSERT INTO conversation_attempts(
     workspace_id, attempt_id, session_id, source_message_id, provider_id, status,
     outcome_json, error_redacted, started_at, completed_at
 )
 SELECT workspace_id, attempt_id, session_id, source_message_id, provider_id, status,
        CASE
-           WHEN status IN ('failed', 'cancelled') AND outcome_json IS NULL THEN
+           WHEN status IN ('failed', 'cancelled') THEN
                json_object(
                    'outcome', 'needs_attention',
                    'response_redacted',
                    'A previous conversation attempt did not complete successfully. Review the redacted evidence, then retry this conversation.',
                    'evidence_redacted',
-                   CASE
-                       WHEN trim(error_redacted) = '' THEN 'legacy conversation failure'
-                       WHEN length(CAST(error_redacted AS BLOB)) <= 16384 THEN error_redacted
-                       ELSE substr(error_redacted, 1, 4093) || '[truncated]'
-                   END
+                   normalized_error_redacted
                )
            ELSE outcome_json
        END,
-       error_redacted, started_at, completed_at
-FROM conversation_attempts_v15;
+       normalized_error_redacted, started_at, completed_at
+FROM normalized_attempts;
 
 DROP TABLE conversation_attempts_v15;
 

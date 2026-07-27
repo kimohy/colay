@@ -781,6 +781,87 @@ async fn provider_failures_are_terminal_actionable_and_preserve_the_session()
 }
 
 #[tokio::test]
+async fn provider_failure_replay_normalizes_legacy_terminal_errors_without_starting_provider()
+-> Result<(), Box<dyn std::error::Error>> {
+    for legacy_error in [
+        String::new(),
+        "x".repeat(CONVERSATION_MAX_EVIDENCE_BYTES * 2),
+        "\u{d55c}".repeat(CONVERSATION_MAX_EVIDENCE_BYTES),
+    ] {
+        let (database, workspace_id, database_path) = database()?;
+        let database = database.workspace(workspace_id);
+        let session_id = seed_session(&database_path, &database)?;
+        let append = append_command(session_id, "replay legacy failure");
+        let source_message_id =
+            serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?
+                .message_id;
+        database.submit_client_command(&append)?;
+        process_next_client_command(&database, &IdentityRedactor, Utc::now())?;
+        let command_id = ClientCommandId::from_uuid(source_message_id.into_uuid());
+        let command = database
+            .load_client_command(command_id)?
+            .ok_or("conversation command is missing")?;
+        let attempt_id = ConversationAttemptId::from_uuid(command_id.into_uuid());
+        database.begin_conversation_attempt(&NewConversationAttempt {
+            attempt_id,
+            session_id,
+            source_message_id,
+            provider: ProviderId::Codex,
+            started_at: command.requested_at,
+        })?;
+        let stored_outcome = ConversationOutcome::NeedsAttention {
+            response_redacted: "Reconnect the provider, then retry this conversation.".to_owned(),
+            evidence_redacted: "legacy provider failure".to_owned(),
+        };
+        with_workspace(&database_path, &database, |connection| {
+            connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+            connection.execute(
+                "UPDATE conversation_attempts
+                 SET status = 'failed', outcome_json = ?1, error_redacted = ?2,
+                     completed_at = ?3
+                 WHERE attempt_id = ?4 AND status = 'running'",
+                params![
+                    serde_json::to_string(&stored_outcome)?,
+                    legacy_error,
+                    Utc::now().to_rfc3339(),
+                    attempt_id.to_string(),
+                ],
+            )?;
+            connection.execute_batch("PRAGMA ignore_check_constraints = OFF;")?;
+            Ok(())
+        })?;
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut services = services_with_conversation(
+            tempfile::tempdir()?.path().to_path_buf(),
+            Arc::new(FailingConversation {
+                fixture: FailureFixture::Error(ConversationFailure::Invocation {
+                    reason: "must not run".to_owned(),
+                    evidence_redacted: "must not run".to_owned(),
+                }),
+                starts: Arc::clone(&starts),
+            }),
+        );
+        services.conversation_providers.clear();
+        process_next_orchestration_command(&database, &services, &IdentityRedactor, Utc::now())
+            .await?;
+
+        let replayed = database
+            .load_client_command(command_id)?
+            .ok_or("replayed conversation command is missing")?;
+        assert_eq!(replayed.state, ClientCommandState::Failed);
+        let replayed_error = replayed.outcome.ok_or("replayed error is missing")?;
+        assert!(!replayed_error.trim().is_empty());
+        assert!(replayed_error.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+        assert!(replayed_error.contains("Reconnect the provider"));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(database.messages_after(session_id, 0, 10)?.len(), 2);
+        assert_zero_writable_rows(&database_path, &database)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn complete_candidate_in_non_git_directory_preserves_plan_until_writable_approval()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, workspace_id, database_path) = database()?;
