@@ -178,7 +178,12 @@ impl ConcurrencyFixture {
         daemon_logs.sort_by_key(std::fs::DirEntry::file_name);
         let mut stderr_records = Vec::new();
         for entry in daemon_logs {
-            if !entry.file_type()?.is_file() {
+            if !entry.file_type()?.is_file()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("daemon-stderr-")
+            {
                 continue;
             }
             let path = entry.path();
@@ -188,6 +193,57 @@ impl ConcurrencyFixture {
         }
         let stderr = stderr_records.join("\n");
         Ok(DaemonDiagnostics { instances, stderr })
+    }
+
+    fn verify_spawned_contenders_resolved(&self) -> Result<()> {
+        let mut stderr_logs = Vec::new();
+        let mut resolutions = Vec::new();
+        for entry in fs::read_dir(&self.command.daemon_log_directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_prefix("daemon-stderr-")
+                .and_then(|name| name.strip_suffix(".log"))
+            {
+                stderr_logs.push(id.to_owned());
+            } else if let Some(id) = name
+                .strip_prefix("daemon-child-resolution-")
+                .and_then(|name| name.strip_suffix(".log"))
+            {
+                resolutions.push((id.to_owned(), fs::read_to_string(entry.path())?));
+            }
+        }
+        stderr_logs.sort();
+        resolutions.sort_by(|left, right| left.0.cmp(&right.0));
+        let resolution_ids = resolutions
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if stderr_logs.is_empty() || stderr_logs != resolution_ids {
+            bail!(
+                "daemon contenders were not all resolved before diagnostics: stderr={stderr_logs:?} resolutions={resolution_ids:?}"
+            );
+        }
+        let owner_count = resolutions
+            .iter()
+            .filter(|(_, resolution)| resolution.starts_with("owner:"))
+            .count();
+        if owner_count != 1 {
+            bail!("expected one spawned live owner resolution, found {owner_count}");
+        }
+        for (id, resolution) in resolutions {
+            let valid = resolution
+                .strip_prefix("owner:")
+                .or_else(|| resolution.strip_prefix("reaped:"))
+                .is_some_and(|pid| pid.parse::<u32>().is_ok());
+            if !valid {
+                bail!("invalid daemon child resolution for {id}: {resolution:?}");
+            }
+        }
+        Ok(())
     }
 
     fn database_files(&self) -> Result<Vec<PathBuf>> {
@@ -325,17 +381,27 @@ impl CommandContext {
         let system_root = "/";
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
-        let daemon_log = self.daemon_log_directory.join(format!(
-            "daemon-stderr-{}-{}.log",
+        let command_id = format!(
+            "{}-{}",
             std::process::id(),
             self.next_daemon_log.fetch_add(1, Ordering::Relaxed)
-        ));
+        );
+        let daemon_log = self
+            .daemon_log_directory
+            .join(format!("daemon-stderr-{command_id}.log"));
+        let daemon_child_resolution = self
+            .daemon_log_directory
+            .join(format!("daemon-child-resolution-{command_id}.log"));
         let status = Command::new(&self.executable)
             .args(args)
             .current_dir(repository)
             .env_clear()
             .env("COLAY_HOME", &self.colay_home)
             .env("COLAY_TEST_DAEMON_STDERR", daemon_log)
+            .env(
+                "COLAY_TEST_DAEMON_CHILD_RESOLUTION",
+                daemon_child_resolution,
+            )
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", &self.path)
             .env("PATHEXT", ".EXE;.CMD")
@@ -500,6 +566,7 @@ fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()
     let fixture = ConcurrencyFixture::new()?;
 
     let outputs = fixture.run_parallel_status_and_plan_clients(CLIENT_COUNT)?;
+    fixture.verify_spawned_contenders_resolved()?;
     let daemon_diagnostics = fixture.daemon_diagnostics()?;
     validate_daemon_diagnostics(&daemon_diagnostics)?;
 

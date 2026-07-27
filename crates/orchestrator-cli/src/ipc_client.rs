@@ -128,7 +128,7 @@ impl IpcResponseStream {
     }
 }
 
-async fn ping(paths: &GlobalStatePaths) -> Result<()> {
+async fn ping(paths: &GlobalStatePaths) -> Result<u32> {
     let request = IpcRequest {
         schema_version: IPC_SCHEMA_VERSION,
         request_id: Uuid::now_v7().to_string(),
@@ -141,7 +141,30 @@ async fn ping(paths: &GlobalStatePaths) -> Result<()> {
         .await
         .context("timed out waiting for the user daemon readiness response")??
         .ok_or_else(|| endpoint_refused("user daemon closed readiness IPC without replying"))?;
-    ensure_success(&response)
+    ready_owner_pid(&response)
+}
+
+fn ready_owner_pid(response: &IpcResponse) -> Result<u32> {
+    ensure_success(response)?;
+    if response
+        .outcome
+        .pointer("/data/ready")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        bail!("user daemon readiness response was not ready");
+    }
+    let owner_pid = response
+        .outcome
+        .pointer("/data/owner_pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("user daemon omitted its authoritative owner PID"))?;
+    let owner_pid = u32::try_from(owner_pid)
+        .context("user daemon returned an owner PID outside the u32 range")?;
+    if owner_pid == 0 {
+        bail!("user daemon returned an invalid zero owner PID");
+    }
+    Ok(owner_pid)
 }
 
 fn endpoint_refused(message: &'static str) -> std::io::Error {
@@ -199,25 +222,65 @@ async fn wait_until_ready(
     explicit_config: Option<&Path>,
 ) -> Result<()> {
     let started = Instant::now();
+    let deadline = started + CONNECT_TIMEOUT;
     let mut child: Option<Child> = None;
     let mut spawn_attempted = false;
     let mut last_child_exit = None;
     loop {
-        if ping(paths).await.is_ok() {
-            return Ok(());
+        if let Ok(owner_pid) = ping(paths).await {
+            match classify_ready_child(child.as_ref().map(Child::id), owner_pid) {
+                ReadyChildDisposition::NoSpawn => return Ok(()),
+                ReadyChildDisposition::LiveOwner => {
+                    record_startup_child_resolution("owner", owner_pid)?;
+                    return Ok(());
+                }
+                ReadyChildDisposition::ReapContender => {
+                    let process = child
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("daemon contender child was lost before reaping"))?;
+                    let child_pid = process.id();
+                    loop {
+                        match poll_non_owner_contender(process, Instant::now() >= deadline)? {
+                            ReapProgress::Pending => {
+                                tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+                            }
+                            ReapProgress::Reaped(_) => {
+                                record_startup_child_resolution("reaped", child_pid)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
         }
-        if let Some(process) = child.as_mut()
-            && let Some(exit) = process.try_wait().context("cannot inspect daemon child")?
-        {
-            last_child_exit = Some(exit);
-            child = None;
+        if let Some(process) = child.as_mut() {
+            match poll_non_owner_contender(process, false)? {
+                ReapProgress::Pending => {}
+                ReapProgress::Reaped(exit) => {
+                    record_startup_child_resolution("reaped", process.id())?;
+                    last_child_exit = Some(exit);
+                    child = None;
+                }
+            }
         }
         spawn_contender_once(&mut child, &mut spawn_attempted, || {
             spawn_server(repository, explicit_config)
         })?;
-        if started.elapsed() >= CONNECT_TIMEOUT {
+        if Instant::now() >= deadline {
             if let Some(process) = child.as_mut() {
-                let _ = process.kill();
+                match inspect_child_at_startup_deadline(process) {
+                    Ok(Some(exit)) => {
+                        record_startup_child_resolution("reaped", process.id())?;
+                        last_child_exit = Some(exit);
+                    }
+                    Ok(None) => bail!("daemon child remained pending after startup deadline"),
+                    Err(cleanup_error) => {
+                        bail!(
+                            "user daemon did not publish IPC within {} seconds: {cleanup_error}",
+                            CONNECT_TIMEOUT.as_secs()
+                        );
+                    }
+                }
             }
             if let Some(exit) = last_child_exit {
                 bail!("user daemon contenders exited before IPC readiness; last exit: {exit}");
@@ -228,6 +291,116 @@ async fn wait_until_ready(
             );
         }
         tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn record_startup_child_resolution(disposition: &str, pid: u32) -> Result<()> {
+    let Some(path) = std::env::var_os("COLAY_TEST_DAEMON_CHILD_RESOLUTION") else {
+        return Ok(());
+    };
+    std::fs::write(&path, format!("{disposition}:{pid}")).with_context(|| {
+        format!(
+            "cannot record daemon child resolution at {}",
+            Path::new(&path).display()
+        )
+    })
+}
+
+#[cfg(not(feature = "test-fixtures"))]
+fn record_startup_child_resolution(_disposition: &str, _pid: u32) -> Result<()> {
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyChildDisposition {
+    NoSpawn,
+    LiveOwner,
+    ReapContender,
+}
+
+fn classify_ready_child(child_pid: Option<u32>, owner_pid: u32) -> ReadyChildDisposition {
+    match child_pid {
+        None => ReadyChildDisposition::NoSpawn,
+        Some(child_pid) if child_pid == owner_pid => ReadyChildDisposition::LiveOwner,
+        Some(_) => ReadyChildDisposition::ReapContender,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReapProgress {
+    Pending,
+    Reaped(String),
+}
+
+trait StartupChild {
+    fn id(&self) -> u32;
+    fn try_wait(&mut self) -> std::io::Result<Option<String>>;
+    fn terminate_and_reap(&mut self) -> std::io::Result<()>;
+}
+
+impl StartupChild for Child {
+    fn id(&self) -> u32 {
+        Child::id(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<String>> {
+        Child::try_wait(self).map(|exit| exit.map(|status| status.to_string()))
+    }
+
+    fn terminate_and_reap(&mut self) -> std::io::Result<()> {
+        match Child::kill(self) {
+            Ok(()) => Child::wait(self).map(|_| ()),
+            Err(kill_error) => match Child::try_wait(self) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(std::io::Error::new(
+                    kill_error.kind(),
+                    format!(
+                        "cannot terminate daemon child {} and it may still be running: {kill_error}",
+                        Child::id(self)
+                    ),
+                )),
+                Err(wait_error) => Err(std::io::Error::new(
+                    wait_error.kind(),
+                    format!(
+                        "cannot terminate daemon child {} ({kill_error}) or inspect it afterward ({wait_error})",
+                        Child::id(self)
+                    ),
+                )),
+            },
+        }
+    }
+}
+
+fn poll_non_owner_contender(
+    child: &mut impl StartupChild,
+    deadline_reached: bool,
+) -> Result<ReapProgress> {
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(exit)) => Ok(ReapProgress::Reaped(exit)),
+        Ok(None) if !deadline_reached => Ok(ReapProgress::Pending),
+        Ok(None) => {
+            child
+                .terminate_and_reap()
+                .with_context(|| format!("cannot clean up timed-out daemon child {pid}"))?;
+            bail!("daemon contender {pid} did not exit before the startup deadline")
+        }
+        Err(inspect_error) => {
+            if let Err(cleanup_error) = child.terminate_and_reap() {
+                bail!(
+                    "cannot inspect daemon child {pid}: {inspect_error}; cleanup also failed: {cleanup_error}"
+                );
+            }
+            Err(inspect_error).context("cannot inspect daemon child")
+        }
+    }
+}
+
+fn inspect_child_at_startup_deadline(child: &mut impl StartupChild) -> Result<Option<String>> {
+    match poll_non_owner_contender(child, true)? {
+        ReapProgress::Pending => Ok(None),
+        ReapProgress::Reaped(exit) => Ok(Some(exit)),
     }
 }
 
@@ -369,13 +542,183 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, collections::VecDeque, io};
     #[cfg(windows)]
-    use std::{future, io, time::Instant};
+    use std::{future, time::Instant};
 
-    use super::spawn_contender_once;
     #[cfg(windows)]
     use super::{RESPONSE_TIMEOUT, open_windows_pipe_with_retry};
+    use super::{
+        ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
+        inspect_child_at_startup_deadline, poll_non_owner_contender, ready_owner_pid,
+        spawn_contender_once,
+    };
+    use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcResponse};
+    use serde_json::json;
+
+    struct FakeStartupChild {
+        pid: u32,
+        observations: VecDeque<io::Result<Option<String>>>,
+        cleanup_count: usize,
+        cleanup_fails: bool,
+    }
+
+    impl FakeStartupChild {
+        fn new(pid: u32, observations: Vec<io::Result<Option<String>>>) -> Self {
+            Self {
+                pid,
+                observations: observations.into(),
+                cleanup_count: 0,
+                cleanup_fails: false,
+            }
+        }
+    }
+
+    impl StartupChild for FakeStartupChild {
+        fn id(&self) -> u32 {
+            self.pid
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<String>> {
+            self.observations.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn terminate_and_reap(&mut self) -> io::Result<()> {
+            self.cleanup_count += 1;
+            if self.cleanup_fails {
+                Err(io::Error::other("wait failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn readiness_response_requires_authoritative_owner_pid() -> anyhow::Result<()> {
+        let response = IpcResponse {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "ping".to_owned(),
+            outcome: json!({"status": "ok", "data": {"ready": true, "owner_pid": 42}}),
+        };
+        assert_eq!(ready_owner_pid(&response)?, 42);
+
+        for invalid in [
+            json!({"status": "ok", "data": {"ready": true}}),
+            json!({"status": "ok", "data": {"ready": false, "owner_pid": 42}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 0}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": "42"}}),
+        ] {
+            let response = IpcResponse {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "ping".to_owned(),
+                outcome: invalid,
+            };
+            assert!(ready_owner_pid(&response).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ready_spawned_owner_remains_live() {
+        assert_eq!(
+            classify_ready_child(Some(42), 42),
+            ReadyChildDisposition::LiveOwner
+        );
+    }
+
+    #[test]
+    fn ready_without_spawn_needs_no_child_action() {
+        assert_eq!(
+            classify_ready_child(None, 42),
+            ReadyChildDisposition::NoSpawn
+        );
+    }
+
+    #[test]
+    fn ready_non_owner_child_is_reaped_after_exit() -> anyhow::Result<()> {
+        assert_eq!(
+            classify_ready_child(Some(41), 42),
+            ReadyChildDisposition::ReapContender
+        );
+        let mut child = FakeStartupChild::new(41, vec![Ok(Some("exit code: 1".to_owned()))]);
+
+        assert_eq!(
+            poll_non_owner_contender(&mut child, false)?,
+            ReapProgress::Reaped("exit code: 1".to_owned())
+        );
+        assert_eq!(child.cleanup_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_non_owner_is_not_returned_before_exit() -> anyhow::Result<()> {
+        let mut child =
+            FakeStartupChild::new(41, vec![Ok(None), Ok(Some("exit code: 1".to_owned()))]);
+
+        assert_eq!(
+            poll_non_owner_contender(&mut child, false)?,
+            ReapProgress::Pending
+        );
+        assert_eq!(
+            poll_non_owner_contender(&mut child, false)?,
+            ReapProgress::Reaped("exit code: 1".to_owned())
+        );
+        assert_eq!(child.cleanup_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn child_inspection_error_cleans_up_exact_contender() -> anyhow::Result<()> {
+        let mut child = FakeStartupChild::new(41, vec![Err(io::Error::other("inspection failed"))]);
+
+        let Err(error) = poll_non_owner_contender(&mut child, false) else {
+            anyhow::bail!("inspection failure unexpectedly succeeded");
+        };
+        assert!(error.to_string().contains("cannot inspect daemon child"));
+        assert_eq!(child.cleanup_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn child_timeout_terminates_and_reaps_exact_contender() -> anyhow::Result<()> {
+        let mut child = FakeStartupChild::new(41, vec![Ok(None)]);
+
+        let Err(error) = poll_non_owner_contender(&mut child, true) else {
+            anyhow::bail!("expired contender unexpectedly remained pending");
+        };
+        assert!(error.to_string().contains("startup deadline"));
+        assert_eq!(child.cleanup_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn child_wait_failure_is_reported_after_one_cleanup_attempt() -> anyhow::Result<()> {
+        let mut child = FakeStartupChild::new(41, vec![Ok(None)]);
+        child.cleanup_fails = true;
+
+        let Err(error) = poll_non_owner_contender(&mut child, true) else {
+            anyhow::bail!("failed contender cleanup unexpectedly succeeded");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot clean up timed-out daemon child")
+        );
+        assert_eq!(child.cleanup_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn child_exit_at_deadline_is_reported_without_cleanup() -> anyhow::Result<()> {
+        let mut child = FakeStartupChild::new(41, vec![Ok(Some("exit code: 1".to_owned()))]);
+
+        assert_eq!(
+            inspect_child_at_startup_deadline(&mut child)?,
+            Some("exit code: 1".to_owned())
+        );
+        assert_eq!(child.cleanup_count, 0);
+        Ok(())
+    }
 
     #[test]
     fn startup_contender_is_spawned_at_most_once() -> anyhow::Result<()> {

@@ -868,7 +868,7 @@ fn dispatch_read_request(
     request: &IpcRequest,
 ) -> Option<IpcResponse> {
     let result = match request.action.as_str() {
-        "daemon.ping" => Ok(json!({"ready": true})),
+        "daemon.ping" => Ok(json!({"ready": true, "owner_pid": std::process::id()})),
         "daemon.status" => database
             .daemon_status(Utc::now())
             .map(|status| json!({"status": status}))
