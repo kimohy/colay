@@ -25,7 +25,9 @@ pub use codex::{
 };
 pub use error::ProviderError;
 pub use gemini::{GeminiAdapter, GeminiAdapterConfig};
-pub use normalize::{classify_provider_quota, parse_claude_event, parse_gemini_event};
+pub use normalize::{
+    classify_provider_quota, normalize_provider_diagnostic, parse_claude_event, parse_gemini_event,
+};
 pub use orchestrator_process::{ExecutableKind, ExecutableValidationContext, ResolvedExecutable};
 pub use process_runtime::ProcessAdapterRuntime;
 pub use usage_probe::{
