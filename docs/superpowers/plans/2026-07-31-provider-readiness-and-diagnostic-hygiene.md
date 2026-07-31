@@ -260,7 +260,7 @@ does not contain the raw flag.
 Run:
 
 ```text
-cargo test -p colay conversation_orchestrator::tests::evidence --features test-fixtures -- --nocapture
+cargo test -p colay --lib conversation_orchestrator::tests::evidence --features test-fixtures -- --nocapture
 ```
 
 Expected: FAIL because evidence is still appended directly to a `Vec<String>`.
@@ -294,7 +294,7 @@ events still fail closed but use one bounded summary.
 Run:
 
 ```text
-cargo test -p colay conversation_orchestrator --features test-fixtures
+cargo test -p colay --lib conversation_orchestrator --features test-fixtures
 cargo test -p colay --test chat_conversation_fake_provider --features test-fixtures
 ```
 
