@@ -69,6 +69,7 @@ struct ProviderFailureCase {
     fixture: FailureFixture,
     expected_status: ConversationAttemptStatus,
     expected_action: &'static str,
+    expected_evidence: &'static str,
 }
 
 struct ProviderFailureRun {
@@ -103,6 +104,7 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
             }),
             expected_status: ConversationAttemptStatus::Failed,
             expected_action: "authenticate",
+            expected_evidence: "credential [REDACTED] expired",
         },
         ProviderFailureCase {
             name: "quota",
@@ -113,6 +115,7 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
             },
             expected_status: ConversationAttemptStatus::Failed,
             expected_action: "quota or billing",
+            expected_evidence: "Credit balance is too low",
         },
         ProviderFailureCase {
             name: "unsupported client",
@@ -122,6 +125,7 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
             }),
             expected_status: ConversationAttemptStatus::Failed,
             expected_action: "not supported",
+            expected_evidence: "account rejected this client",
         },
         ProviderFailureCase {
             name: "timeout",
@@ -132,6 +136,7 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
             },
             expected_status: ConversationAttemptStatus::Failed,
             expected_action: "timed out",
+            expected_evidence: "provider exceeded its deadline",
         },
         ProviderFailureCase {
             name: "cancellation",
@@ -142,6 +147,7 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
             },
             expected_status: ConversationAttemptStatus::Cancelled,
             expected_action: "cancelled",
+            expected_evidence: "request was cancelled",
         },
         ProviderFailureCase {
             name: "malformed output",
@@ -152,6 +158,7 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
             },
             expected_status: ConversationAttemptStatus::Failed,
             expected_action: "incompatible",
+            expected_evidence: "provider returned malformed output",
         },
         ProviderFailureCase {
             name: "nonzero exit",
@@ -160,10 +167,13 @@ fn provider_failure_cases() -> Vec<ProviderFailureCase> {
                     exit_code: Some(17),
                 },
                 output_redacted: Vec::new(),
-                evidence_redacted: "provider exited 17".to_owned(),
+                evidence_redacted:
+                    "provider exited 17\nat internal_one (provider.js:1:1)\nat internal_two (provider.js:2:1)"
+                        .to_owned(),
             },
             expected_status: ConversationAttemptStatus::Failed,
             expected_action: "process failed",
+            expected_evidence: "provider exited 17",
         },
     ]
 }
@@ -750,6 +760,12 @@ fn assert_terminal_provider_failure(
         "fixture: {}: {error}",
         case.name
     );
+    assert!(!error.contains("Evidence:"), "fixture: {}", case.name);
+    assert!(
+        !error.contains(case.expected_evidence),
+        "fixture: {} leaked detailed evidence: {error}",
+        case.name
+    );
     let outcome = attempt.outcome.ok_or("missing recovery outcome")?;
     let ConversationOutcome::NeedsAttention {
         response_redacted,
@@ -769,6 +785,11 @@ fn assert_terminal_provider_failure(
         case.name
     );
     assert!(evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert!(
+        evidence_redacted.contains(case.expected_evidence),
+        "fixture: {} lost detailed evidence: {evidence_redacted}",
+        case.name
+    );
 
     let command = workspace
         .load_client_command(run.command_id)?
@@ -779,14 +800,14 @@ fn assert_terminal_provider_failure(
         "fixture: {}",
         case.name
     );
+    let command_outcome = command.outcome.unwrap_or_default();
     assert!(
-        command
-            .outcome
-            .unwrap_or_default()
-            .contains(case.expected_action),
+        command_outcome.contains(case.expected_action),
         "fixture: {}",
         case.name
     );
+    assert!(!command_outcome.contains("Evidence:"));
+    assert!(!command_outcome.contains(case.expected_evidence));
     let messages = workspace.messages_after(run.session_id, 0, 10)?;
     assert_eq!(messages.len(), 2, "fixture: {}", case.name);
     assert_eq!(messages[1].1.content_redacted, response_redacted);
@@ -819,14 +840,14 @@ async fn assert_terminal_provider_failure_replay(
         "fixture: {}",
         case.name
     );
+    let replayed_outcome = replayed_command.outcome.unwrap_or_default();
     assert!(
-        replayed_command
-            .outcome
-            .unwrap_or_default()
-            .contains(case.expected_action),
+        replayed_outcome.contains(case.expected_action),
         "fixture: {}",
         case.name
     );
+    assert!(!replayed_outcome.contains("Evidence:"));
+    assert!(!replayed_outcome.contains(case.expected_evidence));
     assert_eq!(
         workspace.messages_after(run.session_id, 0, 10)?.len(),
         2,

@@ -243,19 +243,7 @@ fn failure_error_from_outcome(
     redactor: &dyn MessageRedactor,
     outcome: &ConversationOutcome,
 ) -> String {
-    let evidence_redacted = match outcome {
-        ConversationOutcome::NeedsAttention {
-            evidence_redacted, ..
-        } => nonblank_failure_evidence(bounded_redacted(redactor, evidence_redacted)),
-        _ => "stored conversation failure requires operator review".to_owned(),
-    };
-    bounded_redacted(
-        redactor,
-        &format!(
-            "{} Evidence: {evidence_redacted}",
-            outcome_response(outcome)
-        ),
-    )
+    bounded_redacted(redactor, outcome_response(outcome))
 }
 
 fn bounded_redacted(redactor: &dyn MessageRedactor, value: &str) -> String {
