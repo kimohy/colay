@@ -379,8 +379,36 @@ fn normalize_provider_timestamps(document: &mut Value) {
                 health.remove("checked_at");
                 health.remove("latency_ms");
             }
+            if let Some(readiness) = provider
+                .get_mut("account_readiness")
+                .and_then(Value::as_object_mut)
+            {
+                readiness.remove("checked_at");
+            }
         }
     }
+}
+
+fn assert_account_readiness_unverified(document: &Value) -> Result<()> {
+    let providers = document["data"]["providers"]
+        .as_array()
+        .context("provider list missing")?;
+    assert!(!providers.is_empty());
+    for provider in providers {
+        assert_eq!(
+            provider["account_readiness"]["status"], "unverified",
+            "provider report claimed account readiness: {provider}"
+        );
+        assert!(
+            provider["account_readiness"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("safe public probes")),
+            "provider report omitted the readiness boundary: {provider}"
+        );
+        assert!(provider["account_readiness"]["checked_at"].is_string());
+    }
+    assert_eq!(document["data"]["inference_requests"], 0);
+    Ok(())
 }
 
 #[test]
@@ -421,9 +449,21 @@ fn doctor_reports_global_workspace_and_operational_checks() -> Result<()> {
         "provider_gemini",
         "provider_agy",
     ] {
+        let check = check_named(&document, provider)?;
+        assert_eq!(check["status"], "warn");
+        assert!(
+            check["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("account readiness unverified")),
+            "{provider} did not expose the account-readiness boundary"
+        );
+        assert_eq!(
+            check["data"]["provider"]["account_readiness"]["status"],
+            "unverified"
+        );
         assert_eq!(
             PathBuf::from(
-                check_named(&document, provider)?["data"]["configured_executable"]
+                check["data"]["configured_executable"]
                     .as_str()
                     .with_context(|| format!("{provider} did not resolve a fake provider"))?
             ),
@@ -522,6 +562,8 @@ fn compatibility_is_a_behavioral_alias_of_doctor_providers() -> Result<()> {
     assert_eq!(doctor["data"]["schema_version"], "2");
     assert_eq!(compatibility["schema_version"], "2");
     assert_eq!(compatibility["data"]["schema_version"], "2");
+    assert_account_readiness_unverified(&doctor)?;
+    assert_account_readiness_unverified(&compatibility)?;
     doctor["command"] = json!("provider_doctor");
     compatibility["command"] = json!("provider_doctor");
     normalize_provider_timestamps(&mut doctor);
