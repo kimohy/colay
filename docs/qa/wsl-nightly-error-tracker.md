@@ -303,8 +303,9 @@ attempts, worktrees, coordinator leases, and worker leases all remained at zero.
 ## WSL-017: compatibility health conflates public CLI probes with account readiness
 
 - Severity: medium
-- Status: open
+- Status: fixed in source candidate; nightly verification pending
 - Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+- Verified source candidate: `97a813b`
 
 ### Evidence and impact
 
@@ -322,11 +323,25 @@ normal user can reasonably interpret `healthy` as ready for a task.
 - Otherwise report `compatible; account readiness unverified` rather than `healthy`, and keep an
   explicitly opted-in live check separate because it can consume quota or incur cost.
 
+### Source candidate verification (2026-07-31)
+
+- Built the candidate natively on Ubuntu 24.04 WSL2 with Rust 1.95.0 and an isolated
+  `COLAY_HOME`. `compatibility` and `doctor` made zero inference requests.
+- Claude 2.1.217 and Agy 1.1.7 remained binary-compatible/healthy while the new independent
+  `account_readiness.status` was `unverified`. Every provider doctor check was `warn` with the
+  explicit detail `account readiness unverified`; `doctor` itself completed successfully.
+- `migrate apply` created and migrated only the per-user global database to schema 16. The test
+  workspace never gained a `.colay` directory.
+- A deliberately opted-in live call then proved why the distinction matters: Claude reported
+  unavailable quota/billing and Agy reported an incompatible read-only conversation protocol.
+  Neither safe compatibility command inferred readiness from these account/runtime outcomes.
+
 ## WSL-018: provider failure evidence overwhelms the actionable diagnostic
 
 - Severity: medium
-- Status: open
+- Status: fixed in source candidate; nightly verification pending
 - Observed source candidate: `5ef9ed7`
+- Verified source candidate: `97a813b`
 
 ### Evidence and impact
 
@@ -343,6 +358,22 @@ diagnostic.
 - Deduplicate unknown-event summaries and bound stack output by lines as well as bytes.
 - Store detailed redacted evidence for an explicit diagnostic view, but suppress provider advice
   that asks users to disable permission controls; replace it with Colay-safe configuration guidance.
+
+### Source candidate verification (2026-07-31)
+
+- Real Claude and Agy plan-only calls each exited 1 with one concise actionable message. Normal
+  stderr contained no provider stack, `Evidence:` section, repeated unknown-event lines, or unsafe
+  permission-bypass flag.
+- The global database persisted both attempts as `failed` with the same concise classified error.
+  Detailed redacted evidence was bounded to 120 bytes/3 lines for Claude and 251 bytes/4 lines for
+  Agy. Neither outcome contained `--dangerously-skip-permissions`; the Agy evidence contained the
+  Colay-owned safe replacement `unsafe permission bypass`.
+- After stopping the isolated daemon, SQLite reported `integrity_check=ok`, zero foreign-key
+  violations, zero tasks/task attempts/worktrees/coordinator leases/worker leases, one registered
+  workspace, and two conversation attempts. The workspace-local `.colay` path remained absent.
+- This was bounded manual user QA, not an automated test or CI inference. No credential value was
+  printed or copied. Supporting JSON and database evidence is under
+  `/home/kimohy/.cache/colay-readiness-qa-20260731`.
 
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
