@@ -25,6 +25,7 @@ pub enum FakeRuntimeScenario {
     MalformedOutput,
     UnknownEvent,
     ProcessCrash,
+    DiagnosticNoise,
     Timeout,
     SecretOutput,
 }
@@ -100,6 +101,11 @@ impl FakeAdapterRuntime {
             .filter(|job| job.cancelled)
             .count()
     }
+
+    /// Returns the number of fake jobs started by this runtime.
+    pub async fn started_job_count(&self) -> usize {
+        self.jobs.lock().await.len()
+    }
 }
 
 #[async_trait]
@@ -151,7 +157,10 @@ impl AdapterRuntime for FakeAdapterRuntime {
             })
             .collect::<VecDeque<_>>();
         if provider == ProviderId::Agy && self.scenario != FakeRuntimeScenario::Timeout {
-            let exit_code = if self.scenario == FakeRuntimeScenario::ProcessCrash {
+            let exit_code = if matches!(
+                self.scenario,
+                FakeRuntimeScenario::ProcessCrash | FakeRuntimeScenario::DiagnosticNoise
+            ) {
                 17
             } else {
                 0
@@ -179,7 +188,9 @@ impl AdapterRuntime for FakeAdapterRuntime {
                 },
             }),
             exit_code: match self.scenario {
-                FakeRuntimeScenario::ProcessCrash => Some(17),
+                FakeRuntimeScenario::ProcessCrash | FakeRuntimeScenario::DiagnosticNoise => {
+                    Some(17)
+                }
                 FakeRuntimeScenario::Timeout => None,
                 _ => Some(0),
             },
@@ -189,10 +200,19 @@ impl AdapterRuntime for FakeAdapterRuntime {
             },
             tree_termination_error: None,
             stdout: Vec::new(),
-            stderr: if self.scenario == FakeRuntimeScenario::ProcessCrash {
-                b"fake process crash".to_vec()
-            } else {
-                Vec::new()
+            stderr: match self.scenario {
+                FakeRuntimeScenario::ProcessCrash => b"fake process crash".to_vec(),
+                FakeRuntimeScenario::DiagnosticNoise => b"unsupported account for this client\n\
+                    at first (client.js:1:1)\n\
+                    at second (client.js:2:1)\n\
+                    at third (client.js:3:1)\n\
+                    at fourth (client.js:4:1)\n\
+                    at fifth (client.js:5:1)\n\
+                    at sixth (client.js:6:1)\n\
+                    at sixth (client.js:6:1)\n\
+                    retry with --dangerously-skip-permissions"
+                    .to_vec(),
+                _ => Vec::new(),
             },
             truncated: false,
         };
@@ -371,6 +391,11 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Gemini, FakeRuntimeScenario::TerminalError) => {
             vec![r#"{"type":"error","message":"Credit balance is too low"}"#]
         }
+        (ProviderId::Gemini, FakeRuntimeScenario::DiagnosticNoise) => vec![
+            r#"{"type":"stderr","message":"provider diagnostic"}"#,
+            r#"{"type":"stderr","message":"provider diagnostic"}"#,
+            r#"{"type":"stderr","message":"provider diagnostic"}"#,
+        ],
         (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::UnknownEvent) => {
             vec![r#"{"type":"new_optional_event","payload":1}"#]
         }
@@ -390,7 +415,12 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Agy, FakeRuntimeScenario::SecretOutput) => {
             vec!["api_key=supersecretvalue"]
         }
-        (_, FakeRuntimeScenario::ProcessCrash | FakeRuntimeScenario::Timeout) => Vec::new(),
+        (
+            _,
+            FakeRuntimeScenario::ProcessCrash
+            | FakeRuntimeScenario::DiagnosticNoise
+            | FakeRuntimeScenario::Timeout,
+        ) => Vec::new(),
     };
     lines
         .into_iter()

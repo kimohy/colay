@@ -7,8 +7,8 @@ use orchestrator_domain::{
     ProviderCapabilities, ProviderId, SandboxMode, SessionId,
 };
 use orchestrator_engine::{
-    ConversationExit, ConversationFailure, ConversationOrchestrator, ConversationRequest,
-    collect_conversation_response,
+    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationExit, ConversationFailure,
+    ConversationOrchestrator, ConversationRequest, collect_conversation_response,
 };
 use orchestrator_providers::AdapterRuntime;
 use orchestrator_state::RootConfig;
@@ -253,4 +253,81 @@ async fn cancelling_a_conversation_future_cancels_the_active_fake_provider_job()
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     Err("active fake provider job was not cancelled when the conversation future ended".into())
+}
+
+#[tokio::test]
+async fn noisy_provider_failure_is_deduplicated_bounded_and_safe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::DiagnosticNoise,
+    )?);
+    let adapter_runtime: Arc<dyn AdapterRuntime> = runtime.clone();
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.codex = None;
+    config.orchestrator.providers.claude = None;
+    config.orchestrator.providers.agy = None;
+    config
+        .orchestrator
+        .providers
+        .gemini
+        .as_mut()
+        .ok_or("gemini config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        adapter_runtime,
+        &[capability_for(ProviderId::Gemini)],
+        ModelProfile::Standard,
+    )?;
+    let mut request = request("bounded diagnostic noise");
+    request.provider = ProviderId::Gemini;
+
+    let response = orchestrator.converse(request.clone()).await?;
+
+    assert_eq!(
+        response.exit,
+        ConversationExit::Crashed {
+            exit_code: Some(17)
+        }
+    );
+    assert!(response.output_redacted.is_empty());
+    assert_eq!(
+        response.evidence_redacted.matches("gemini.stderr").count(),
+        1
+    );
+    assert!(response.evidence_redacted.contains("3 occurrences"));
+    assert!(response.evidence_redacted.contains("unsupported account"));
+    assert!(
+        response
+            .evidence_redacted
+            .contains("Colay did not enable it")
+    );
+    assert!(
+        response
+            .evidence_redacted
+            .contains("provider stack frames omitted")
+    );
+    assert!(
+        !response
+            .evidence_redacted
+            .contains("dangerously-skip-permissions")
+    );
+    assert!(response.evidence_redacted.lines().count() <= 64);
+    assert!(response.evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert_eq!(runtime.started_job_count().await, 1);
+    assert!(matches!(
+        collect_conversation_response(&request, response),
+        Err(ConversationFailure::Lifecycle {
+            exit: ConversationExit::Crashed {
+                exit_code: Some(17)
+            },
+            ..
+        })
+    ));
+    Ok(())
 }
