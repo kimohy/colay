@@ -61,8 +61,8 @@ assert_eq!(document["data"]["inference_requests"], 0);
 Run:
 
 ```text
-cargo test -p orchestrator-cli --features test-fixtures --test global_doctor compatibility_is_a_behavioral_alias_of_doctor_providers -- --exact
-cargo test -p orchestrator-cli --features test-fixtures --test default_startup future_codex_version_is_writable_by_minimum_version_policy -- --exact
+cargo test -p colay --features test-fixtures --test global_doctor compatibility_is_a_behavioral_alias_of_doctor_providers -- --exact
+cargo test -p colay --features test-fixtures --test default_startup future_codex_version_is_writable_by_minimum_version_policy -- --exact
 ```
 
 Expected: FAIL because `account_readiness` is absent and a healthy fake provider
@@ -124,8 +124,8 @@ report. Do not change routing's use of `ProviderHealth`.
 Run:
 
 ```text
-cargo test -p orchestrator-cli --test global_doctor --features test-fixtures
-cargo test -p orchestrator-cli --test default_startup --features test-fixtures
+cargo test -p colay --test global_doctor --features test-fixtures
+cargo test -p colay --test default_startup --features test-fixtures
 ```
 
 Expected: PASS.
@@ -260,7 +260,7 @@ does not contain the raw flag.
 Run:
 
 ```text
-cargo test -p orchestrator-cli conversation_orchestrator::tests::evidence --features test-fixtures -- --nocapture
+cargo test -p colay conversation_orchestrator::tests::evidence --features test-fixtures -- --nocapture
 ```
 
 Expected: FAIL because evidence is still appended directly to a `Vec<String>`.
@@ -294,8 +294,8 @@ events still fail closed but use one bounded summary.
 Run:
 
 ```text
-cargo test -p orchestrator-cli conversation_orchestrator --features test-fixtures
-cargo test -p orchestrator-cli --test chat_conversation_fake_provider --features test-fixtures
+cargo test -p colay conversation_orchestrator --features test-fixtures
+cargo test -p colay --test chat_conversation_fake_provider --features test-fixtures
 ```
 
 Expected: PASS.
@@ -343,7 +343,7 @@ Run:
 
 ```text
 cargo test -p orchestrator-test-support --test provider_e2e
-cargo test -p orchestrator-cli --test chat_conversation_fake_provider --features test-fixtures
+cargo test -p colay --test chat_conversation_fake_provider --features test-fixtures
 ```
 
 Expected: PASS.
@@ -431,9 +431,9 @@ cargo test -p orchestrator-engine
 **Step 2: Run relevant CLI and daemon integrations**
 
 ```text
-cargo test -p orchestrator-cli --test global_doctor --features test-fixtures
-cargo test -p orchestrator-cli --test default_startup --features test-fixtures
-cargo test -p orchestrator-cli --test chat_conversation_fake_provider --features test-fixtures
+cargo test -p colay --test global_doctor --features test-fixtures
+cargo test -p colay --test default_startup --features test-fixtures
+cargo test -p colay --test chat_conversation_fake_provider --features test-fixtures
 cargo test -p orchestrator-daemon --test conversation_flow --features test-fixtures
 ```
 
@@ -480,7 +480,7 @@ cargo test --workspace --all-features
 **Step 4: Build the release candidate and smoke-test Windows**
 
 ```text
-cargo build --release -p orchestrator-cli
+cargo build --release -p colay
 target\release\colay.exe --version
 target\release\colay.exe --json compatibility
 target\release\colay.exe --json doctor
