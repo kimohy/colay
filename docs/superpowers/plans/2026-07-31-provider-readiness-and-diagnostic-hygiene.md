@@ -383,7 +383,7 @@ outcome shown to noninteractive callers.
 Run:
 
 ```text
-cargo test -p orchestrator-daemon --features test-fixtures --test conversation_flow provider_failures_are_terminal_actionable_and_preserve_the_session -- --exact --nocapture
+cargo test -p orchestrator-daemon --test conversation_flow provider_failures_are_terminal_actionable_and_preserve_the_session -- --exact --nocapture
 ```
 
 Expected: FAIL because `failure_error_from_outcome` currently appends
@@ -402,7 +402,7 @@ Run:
 
 ```text
 cargo test -p orchestrator-engine --test conversation_collector
-cargo test -p orchestrator-daemon --test conversation_flow --features test-fixtures
+cargo test -p orchestrator-daemon --test conversation_flow
 ```
 
 Expected: PASS.
@@ -434,7 +434,7 @@ cargo test -p orchestrator-engine
 cargo test -p colay --test global_doctor --features test-fixtures
 cargo test -p colay --test default_startup --features test-fixtures
 cargo test -p colay --test chat_conversation_fake_provider --features test-fixtures
-cargo test -p orchestrator-daemon --test conversation_flow --features test-fixtures
+cargo test -p orchestrator-daemon --test conversation_flow
 ```
 
 **Step 3: Inspect the diff for architecture violations**
