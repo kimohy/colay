@@ -650,7 +650,9 @@ mod tests {
     #[test]
     fn read_only_daemon_identity_treats_pre_daemon_schema_as_not_online() -> StateResult<()> {
         let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
-        let path = directory.path().join("state.db");
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
         let connection = rusqlite::Connection::open(&path)?;
         for schema_version in 1..=3 {
             connection.pragma_update(None, "user_version", schema_version)?;
@@ -678,7 +680,9 @@ mod tests {
     fn read_only_daemon_identity_supports_pre_phase_schemas_and_rejects_multiple_owners()
     -> StateResult<()> {
         let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
-        let path = directory.path().join("state.db");
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
         let connection = rusqlite::Connection::open(&path)?;
         connection.execute_batch(
             "CREATE TABLE daemon_instances (
@@ -753,7 +757,9 @@ mod tests {
     #[test]
     fn read_only_daemon_identity_honors_phase_from_schema_nine() -> StateResult<()> {
         let directory = tempfile::tempdir().map_err(|error| StateError::io("temp", error))?;
-        let path = directory.path().join("state.db");
+        let root = std::fs::canonicalize(directory.path())
+            .map_err(|error| StateError::io("temp", error))?;
+        let path = root.join("state.db");
         let connection = rusqlite::Connection::open(&path)?;
         connection.execute_batch(
             "CREATE TABLE daemon_instances (
