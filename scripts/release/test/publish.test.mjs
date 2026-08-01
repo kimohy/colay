@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { main, publishRelease } from "../publish.mjs";
+import { main, publishRelease, registryVisibilityPolicy } from "../publish.mjs";
 
 const version = "0.1.1-nightly.20260719.a1b2c3d";
 const nativeNames = [
@@ -14,6 +14,15 @@ const nativeNames = [
   "@kimohy/colay-win32-x64",
 ];
 const rootName = "@kimohy/colay";
+
+test("production registry visibility policy tolerates two minutes of propagation", () => {
+  assert.equal(registryVisibilityPolicy.attempts, 7);
+  assert.equal(registryVisibilityPolicy.retryDelayMs, 20_000);
+  assert.equal(
+    (registryVisibilityPolicy.attempts - 1) * registryVisibilityPolicy.retryDelayMs,
+    120_000,
+  );
+});
 
 function sha512Integrity(name) {
   return `sha512-${createHash("sha512").update(`${name}\n`).digest("base64")}`;
