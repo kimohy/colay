@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use codex_compat::{CodexItem, CodexItemPhase, CompatEvent, QuotaErrorKind};
 use orchestrator_domain::{
@@ -11,6 +13,56 @@ use crate::ProviderError;
 #[must_use]
 pub fn classify_provider_quota(text: &str, value: Option<&Value>) -> Option<QuotaErrorKind> {
     codex_compat::classify_quota_error(text, value)
+}
+
+/// Reduces provider-authored diagnostic text to stable, inert evidence.
+#[must_use]
+pub fn normalize_provider_diagnostic(provider: ProviderId, input: &str) -> String {
+    const SAFE_PERMISSION_BOUNDARY: &str =
+        "provider requested an unsafe permission bypass; Colay did not enable it";
+    const MAX_STACK_FRAMES: usize = 4;
+
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    let mut retained_stack_frames = 0_usize;
+    let mut omitted_stack_frames = 0_usize;
+
+    for raw_line in input.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line = if line.contains("--dangerously-skip-permissions") {
+            SAFE_PERMISSION_BOUNDARY
+        } else {
+            line
+        };
+        if !seen.insert(line.to_owned()) {
+            continue;
+        }
+        if is_provider_stack_frame(provider, line) {
+            if retained_stack_frames >= MAX_STACK_FRAMES {
+                omitted_stack_frames = omitted_stack_frames.saturating_add(1);
+                continue;
+            }
+            retained_stack_frames = retained_stack_frames.saturating_add(1);
+        }
+        normalized.push(line.to_owned());
+    }
+
+    if omitted_stack_frames > 0 {
+        normalized.push(format!(
+            "[{omitted_stack_frames} provider stack frames omitted]"
+        ));
+    }
+    normalized.join("\n")
+}
+
+fn is_provider_stack_frame(provider: ProviderId, line: &str) -> bool {
+    matches!(
+        provider,
+        ProviderId::Claude | ProviderId::Gemini | ProviderId::Agy
+    ) && line.starts_with("at ")
 }
 
 pub(crate) fn normalize_codex_event(event: CompatEvent) -> Result<WorkerEvent, ProviderError> {
@@ -551,5 +603,63 @@ mod tests {
             "path": "../outside"
         }));
         assert!(matches!(event, Err(ProviderError::UnsafePath(_))));
+    }
+
+    #[test]
+    fn diagnostic_replaces_unsafe_permission_bypass_advice() {
+        let diagnostic = normalize_provider_diagnostic(
+            ProviderId::Agy,
+            "Permission denied. Retry with --dangerously-skip-permissions to continue.",
+        );
+
+        assert_eq!(
+            diagnostic,
+            "provider requested an unsafe permission bypass; Colay did not enable it"
+        );
+        assert!(!diagnostic.contains("dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn diagnostic_compacts_gemini_javascript_stack() {
+        let diagnostic = normalize_provider_diagnostic(
+            ProviderId::Gemini,
+            "unsupported account\r\n\
+             at first (client.js:1:1)\r\n\
+             at second (client.js:2:1)\r\n\
+             at third (client.js:3:1)\r\n\
+             at fourth (client.js:4:1)\r\n\
+             at fifth (client.js:5:1)\r\n\
+             at sixth (client.js:6:1)\r\n\
+             at sixth (client.js:6:1)\r\n",
+        );
+
+        assert!(diagnostic.starts_with("unsupported account\n"));
+        assert_eq!(diagnostic.matches("at sixth").count(), 0);
+        assert!(diagnostic.contains("[2 provider stack frames omitted]"));
+        assert_eq!(diagnostic.lines().count(), 6);
+    }
+
+    #[test]
+    fn diagnostic_preserves_failure_classification_terms() {
+        for (provider, input, marker) in [
+            (
+                ProviderId::Claude,
+                "authentication failed",
+                "authentication",
+            ),
+            (
+                ProviderId::Claude,
+                "Credit balance is too low",
+                "Credit balance",
+            ),
+            (
+                ProviderId::Gemini,
+                "unsupported account for this client",
+                "unsupported account",
+            ),
+        ] {
+            let diagnostic = normalize_provider_diagnostic(provider, input);
+            assert!(diagnostic.contains(marker), "{provider}: {diagnostic}");
+        }
     }
 }

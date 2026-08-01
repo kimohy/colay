@@ -112,6 +112,14 @@ impl OfficialCliTaskPlanner {
 
     #[must_use]
     pub fn primary_provider(&self) -> ProviderId {
+        self.conversation_providers()
+            .into_iter()
+            .next()
+            .unwrap_or(ProviderId::Codex)
+    }
+
+    #[must_use]
+    pub fn conversation_providers(&self) -> Vec<ProviderId> {
         let mut candidates = self
             .capabilities
             .keys()
@@ -123,8 +131,9 @@ impl OfficialCliTaskPlanner {
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.cmp(left));
         candidates
-            .first()
-            .map_or(ProviderId::Codex, |(_, provider)| *provider)
+            .into_iter()
+            .map(|(_, provider)| provider)
+            .collect()
     }
 
     fn select_provider(&self, request: &PlannerRequest) -> Result<ProviderId, PlannerFailure> {

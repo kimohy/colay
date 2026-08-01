@@ -23,13 +23,15 @@ mod test_support;
 pub use commands::{CommandProcessingResult, MessageRedactor, process_next_client_command};
 pub use execution::ExecutionServices;
 pub use integration::IntegrationServices;
+#[cfg(not(windows))]
+pub use ipc::ipc_endpoint;
 #[cfg(windows)]
 pub use ipc::windows_named_pipe_security_descriptor;
 pub use ipc::{
-    DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, IpcServer,
-    WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceActivation, WorkspaceArtifactDiagnostics,
+    DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcEndpointCandidates, IpcError, IpcRequest, IpcResponse,
+    IpcServer, WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceActivation, WorkspaceArtifactDiagnostics,
     WorkspaceArtifactScope, WorkspaceAuditDiagnostics, WorkspaceDoctorDiagnostics,
-    WorkspaceDoctorLookup, ipc_endpoint,
+    WorkspaceDoctorLookup, ipc_endpoint_candidates,
 };
 pub use planning::{PlanningServices, process_next_orchestration_command};
 
@@ -602,6 +604,7 @@ mod tests {
             repository_root: PathBuf::from("."),
             planner: Arc::new(UnusedPlanner),
             planner_provider: ProviderId::Codex,
+            conversation_providers: vec![ProviderId::Codex],
             validation_policy: GraphValidationPolicy {
                 eligible_providers: BTreeSet::from([ProviderId::Codex]),
                 eligible_profiles: BTreeSet::from([ModelProfile::Standard]),

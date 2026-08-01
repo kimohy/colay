@@ -107,6 +107,11 @@ impl CodexInvocation {
             });
         }
 
+        if request.sandbox == CodexSandbox::ReadOnly
+            && capabilities.skip_git_repo_check.is_available()
+        {
+            args.push("--skip-git-repo-check".to_owned());
+        }
         args.push("--json".to_owned());
         args.push("--sandbox".to_owned());
         args.push(request.sandbox.as_cli_value().to_owned());
@@ -269,6 +274,70 @@ mod tests {
                 .args
                 .iter()
                 .any(|arg| arg.contains("model_reasoning_effort=\"medium\""))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exec_adds_skip_git_repo_check_once_for_read_only_requests() -> Result<(), CompatibilityError>
+    {
+        let request = CodexRequest {
+            working_directory: PathBuf::from("repo"),
+            prompt: "do the task".to_owned(),
+            model: None,
+            effort: None,
+            sandbox: CodexSandbox::ReadOnly,
+            resume_session: None,
+            output_schema: None,
+        };
+        let capabilities = CodexCapabilities {
+            exec: CapabilitySupport::Advertised,
+            jsonl_output: CapabilitySupport::Advertised,
+            read_only_sandbox: CapabilitySupport::Advertised,
+            skip_git_repo_check: CapabilitySupport::Advertised,
+            ..CodexCapabilities::default()
+        };
+
+        let invocation = CodexInvocation::exec("codex", &request, &capabilities)?;
+
+        assert_eq!(
+            invocation
+                .args
+                .iter()
+                .filter(|argument| argument.as_str() == "--skip-git-repo-check")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exec_never_adds_skip_git_repo_check_for_workspace_write_requests()
+    -> Result<(), CompatibilityError> {
+        let request = CodexRequest {
+            working_directory: PathBuf::from("repo"),
+            prompt: "do the task".to_owned(),
+            model: None,
+            effort: None,
+            sandbox: CodexSandbox::WorkspaceWrite,
+            resume_session: None,
+            output_schema: None,
+        };
+        let capabilities = CodexCapabilities {
+            exec: CapabilitySupport::Advertised,
+            jsonl_output: CapabilitySupport::Advertised,
+            workspace_write_sandbox: CapabilitySupport::Verified,
+            skip_git_repo_check: CapabilitySupport::Advertised,
+            ..CodexCapabilities::default()
+        };
+
+        let invocation = CodexInvocation::exec("codex", &request, &capabilities)?;
+
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|argument| argument == "--skip-git-repo-check")
         );
         Ok(())
     }

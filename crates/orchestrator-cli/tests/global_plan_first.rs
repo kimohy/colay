@@ -142,6 +142,18 @@ impl PlanFixture {
             })
             .map_err(Into::into)
     }
+
+    fn database(&self) -> Result<Connection> {
+        Connection::open(self.colay_home.join("state/state.db")).map_err(Into::into)
+    }
+
+    fn fake_conversation_starts(&self) -> Result<u64> {
+        let marker = fs::read(self.root.join("colay-fake-conversation-starts.json"))?;
+        let marker: serde_json::Value = serde_json::from_slice(&marker)?;
+        marker["invocation_count"]
+            .as_u64()
+            .context("fake conversation marker has no invocation_count")
+    }
 }
 
 impl Drop for PlanFixture {
@@ -194,5 +206,48 @@ fn plan_only_session_cannot_be_promoted_by_same_command() -> Result<()> {
     );
     assert_eq!(fixture.tasks()?, 0);
     assert_eq!(fixture.worktrees()?, 0);
+    Ok(())
+}
+
+#[test]
+fn provider_failure_exits_nonzero_with_actionable_redacted_outcome() -> Result<()> {
+    let fixture = PlanFixture::non_git()?;
+    let output = fixture.colay(["run", "--plan-only", "scenario:crash"])?;
+    assert!(
+        !output.status.success(),
+        "provider failure unexpectedly exited zero: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("process failed"), "{stderr}");
+    assert!(!stderr.contains("supersecretvalue"), "{stderr}");
+
+    let database = fixture.database()?;
+    let (status, outcome_json, error_redacted): (String, String, String) = database.query_row(
+        "SELECT status, outcome_json, error_redacted FROM conversation_attempts LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(status, "failed");
+    assert!(outcome_json.contains("needs_attention"));
+    assert!(error_redacted.contains("process failed"));
+    let (command_state, command_outcome): (String, String) = database.query_row(
+        "SELECT state, outcome FROM client_commands
+         WHERE action = 'request_conversation_turn' LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(command_state, "failed");
+    assert!(command_outcome.contains("process failed"));
+    for table in [
+        "tasks",
+        "task_attempts",
+        "worktrees",
+        "coordinator_leases",
+        "worker_leases",
+    ] {
+        assert_eq!(fixture.count(table)?, 0, "unexpected row in {table}");
+    }
+    assert_eq!(fixture.fake_conversation_starts()?, 1);
     Ok(())
 }

@@ -544,17 +544,11 @@ async fn doctor(
     doctor_state_checks(repository, &executable, &mut checks).await;
     checks.push(git_health_check(repository));
     for report in collect_provider_reports(effective).await {
-        let status = match report.health.status {
-            HealthStatus::Healthy => CheckStatus::Pass,
-            HealthStatus::Degraded | HealthStatus::Unhealthy | HealthStatus::Unknown => {
-                CheckStatus::Warn
-            }
-        };
-        let detail = report
-            .health
-            .detail
-            .clone()
-            .unwrap_or_else(|| "safe public provider probes completed".to_owned());
+        let status = CheckStatus::Warn;
+        let compatibility = report.health.detail.as_deref().unwrap_or("compatible");
+        let detail = format!(
+            "{compatibility}; account readiness unverified (safe public probes do not make an inference request)"
+        );
         let resolution = provider_config(&effective.config().orchestrator, report.provider).map(
             |config| async {
                 diagnostic_command(
@@ -1039,22 +1033,27 @@ async fn collect_provider_reports(effective: &EffectiveConfig) -> Vec<ProviderRe
             Ok((health, capabilities)) => ProviderReport {
                 provider,
                 enabled: config.enabled,
+                account_readiness: AccountReadinessReport::unverified(health.checked_at),
                 health,
                 capabilities,
             },
-            Err(error) => ProviderReport {
-                provider,
-                enabled: config.enabled,
-                health: ProviderHealth {
+            Err(error) => {
+                let health = ProviderHealth {
                     provider,
                     status: HealthStatus::Unhealthy,
                     checked_at: Utc::now(),
                     latency_ms: None,
                     consecutive_failures: 1,
                     detail: Some(error.to_string()),
-                },
-                capabilities: ProviderCapabilities::unsupported(provider),
-            },
+                };
+                ProviderReport {
+                    provider,
+                    enabled: config.enabled,
+                    account_readiness: AccountReadinessReport::unverified(health.checked_at),
+                    health,
+                    capabilities: ProviderCapabilities::unsupported(provider),
+                }
+            }
         });
     }
     reports
@@ -1283,6 +1282,7 @@ async fn run_conversation(
         serde_json::to_value(AppendMessageCommandPayload {
             message_id,
             content,
+            requested_provider,
         })?,
         format!("cli-run-message-{message_id}"),
         RUN_REQUESTED_BY,
@@ -7057,8 +7057,34 @@ struct DoctorProvidersReport {
 struct ProviderReport {
     provider: ProviderId,
     enabled: bool,
+    account_readiness: AccountReadinessReport,
     health: ProviderHealth,
     capabilities: ProviderCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountReadinessStatus {
+    Unverified,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AccountReadinessReport {
+    status: AccountReadinessStatus,
+    detail: String,
+    checked_at: DateTime<Utc>,
+}
+
+impl AccountReadinessReport {
+    fn unverified(checked_at: DateTime<Utc>) -> Self {
+        Self {
+            status: AccountReadinessStatus::Unverified,
+            detail:
+                "account readiness unverified; safe public probes do not make an inference request"
+                    .to_owned(),
+            checked_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

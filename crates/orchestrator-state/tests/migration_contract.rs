@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use orchestrator_domain::{
@@ -51,7 +51,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(initial.current_version, 1);
     assert_eq!(
         initial.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 
     let dry_run = database.dry_run_migrations()?;
@@ -120,7 +120,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(backup_status.current_version, 1);
     assert_eq!(
         backup_status.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     Ok(())
 }
@@ -141,6 +141,7 @@ fn v14_plan_only_requester_is_backfilled_into_authoritative_invocation_fence()
         .workspace_id;
     let command_id = ClientCommandId::new();
     with_database_connection(&database, |connection| {
+        restore_v15_conversation_attempts_schema(connection)?;
         connection.execute_batch(
             "DROP TABLE client_command_invocations;
              DELETE FROM schema_migrations WHERE version = 15;
@@ -175,6 +176,597 @@ fn v14_plan_only_requester_is_backfilled_into_authoritative_invocation_fence()
         assert!(plan_only);
         Ok(())
     })?;
+    Ok(())
+}
+
+struct V15ConversationFixture {
+    _directory: tempfile::TempDir,
+    database_path: PathBuf,
+    database: Database,
+    data: V15ConversationData,
+}
+
+struct V15ConversationData {
+    workspace_id: WorkspaceId,
+    session_id: String,
+    message_id: String,
+    running_id: String,
+    succeeded_id: String,
+    failed_id: String,
+    null_error_id: String,
+    blank_error_id: String,
+    whitespace_error_id: String,
+    oversized_ascii_id: String,
+    oversized_unicode_id: String,
+    oversized_ascii: String,
+    oversized_unicode: String,
+    now: String,
+}
+
+fn create_v15_conversation_fixture() -> Result<V15ConversationFixture, Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let root = std::fs::canonicalize(directory.path())?;
+    let database_path = root.join("state.db");
+    let database = Database::open(&database_path)?;
+    database.migrate_with_backup(&root.join("backups"))?;
+    let workspace_root = root.join("workspace");
+    std::fs::create_dir_all(&workspace_root)?;
+    let workspace_id = database
+        .resolve_repository_workspace(&workspace_root)?
+        .workspace_id;
+    let data = V15ConversationData {
+        workspace_id,
+        session_id: uuid::Uuid::now_v7().to_string(),
+        message_id: uuid::Uuid::now_v7().to_string(),
+        running_id: uuid::Uuid::now_v7().to_string(),
+        succeeded_id: uuid::Uuid::now_v7().to_string(),
+        failed_id: uuid::Uuid::now_v7().to_string(),
+        null_error_id: uuid::Uuid::now_v7().to_string(),
+        blank_error_id: uuid::Uuid::now_v7().to_string(),
+        whitespace_error_id: uuid::Uuid::now_v7().to_string(),
+        oversized_ascii_id: uuid::Uuid::now_v7().to_string(),
+        oversized_unicode_id: uuid::Uuid::now_v7().to_string(),
+        oversized_ascii: "x".repeat(20 * 1024),
+        oversized_unicode: "한".repeat(6 * 1024),
+        now: Utc::now().to_rfc3339(),
+    };
+    Ok(V15ConversationFixture {
+        _directory: directory,
+        database_path,
+        database,
+        data,
+    })
+}
+
+fn seed_v15_session_and_message(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO sessions(
+            workspace_id, session_id, schema_version, revision, title, state,
+            created_at, updated_at)
+         VALUES (?1, ?2, '1.0', 0, 'v15 migration', 'drafting', ?3, ?3)",
+        params![data.workspace_id.to_string(), data.session_id, data.now],
+    )?;
+    connection.execute(
+        "INSERT INTO conversation_messages(
+            workspace_id, message_id, session_id, ordinal, role, kind, state,
+            content_redacted, created_at, finalized_at)
+         VALUES (?1, ?2, ?3, 1, 'user', 'user_message', 'final',
+                 'migration source', ?4, ?4)",
+        params![
+            data.workspace_id.to_string(),
+            data.message_id,
+            data.session_id,
+            data.now
+        ],
+    )?;
+    Ok(())
+}
+
+fn seed_v15_preserved_attempts(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO conversation_attempts(
+            workspace_id, attempt_id, session_id, source_message_id, provider_id,
+            status, started_at)
+         VALUES (?1, ?2, ?3, ?4, 'codex', 'running', ?5)",
+        params![
+            data.workspace_id.to_string(),
+            data.running_id,
+            data.session_id,
+            data.message_id,
+            data.now
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO conversation_attempts(
+            workspace_id, attempt_id, session_id, source_message_id, provider_id,
+            status, outcome_json, started_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, 'codex', 'succeeded', ?5, ?6, ?6)",
+        params![
+            data.workspace_id.to_string(),
+            data.succeeded_id,
+            data.session_id,
+            data.message_id,
+            r#"{"outcome":"answer_complete","response_redacted":"preserved"}"#,
+            data.now,
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO conversation_attempts(
+            workspace_id, attempt_id, session_id, source_message_id, provider_id,
+            status, error_redacted, started_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, 'codex', 'failed', 'legacy failure', ?5, ?5)",
+        params![
+            data.workspace_id.to_string(),
+            data.failed_id,
+            data.session_id,
+            data.message_id,
+            data.now
+        ],
+    )?;
+    Ok(())
+}
+
+fn seed_v15_recovery_attempts(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> rusqlite::Result<()> {
+    connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+    connection.execute(
+        "INSERT INTO conversation_attempts(
+            workspace_id, attempt_id, session_id, source_message_id, provider_id,
+            status, error_redacted, started_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, 'codex', 'failed', NULL, ?5, ?5)",
+        params![
+            data.workspace_id.to_string(),
+            data.null_error_id,
+            data.session_id,
+            data.message_id,
+            data.now
+        ],
+    )?;
+    connection.execute_batch("PRAGMA ignore_check_constraints = OFF;")?;
+    for (attempt_id, error_redacted) in [
+        (&data.blank_error_id, ""),
+        (&data.whitespace_error_id, " \t "),
+    ] {
+        insert_v15_failed_attempt(connection, data, attempt_id, "cancelled", error_redacted)?;
+    }
+    for (attempt_id, error_redacted) in [
+        (&data.oversized_ascii_id, &data.oversized_ascii),
+        (&data.oversized_unicode_id, &data.oversized_unicode),
+    ] {
+        insert_v15_failed_attempt(connection, data, attempt_id, "failed", error_redacted)?;
+    }
+    Ok(())
+}
+
+fn insert_v15_failed_attempt(
+    connection: &Connection,
+    data: &V15ConversationData,
+    attempt_id: &str,
+    status: &str,
+    error_redacted: &str,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO conversation_attempts(
+            workspace_id, attempt_id, session_id, source_message_id, provider_id,
+            status, error_redacted, started_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, 'codex', ?5, ?6, ?7, ?7)",
+        params![
+            data.workspace_id.to_string(),
+            attempt_id,
+            data.session_id,
+            data.message_id,
+            status,
+            error_redacted,
+            data.now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn seed_v15_conversation_attempts(
+    database: &Database,
+    data: &V15ConversationData,
+) -> Result<(), StateError> {
+    with_database_connection(database, |connection| {
+        restore_v15_conversation_attempts_schema(connection)?;
+        seed_v15_session_and_message(connection, data)?;
+        seed_v15_preserved_attempts(connection, data)?;
+        seed_v15_recovery_attempts(connection, data)?;
+        Ok(())
+    })
+}
+
+fn assert_v15_preserved_attempts(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> Result<(), StateError> {
+    let running: (String, Option<String>, Option<String>, Option<String>) = connection.query_row(
+        "SELECT status, outcome_json, error_redacted, completed_at
+             FROM conversation_attempts WHERE workspace_id = ?1 AND attempt_id = ?2",
+        params![data.workspace_id.to_string(), data.running_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(running, ("running".to_owned(), None, None, None));
+
+    let succeeded: (String, String, Option<String>) = connection.query_row(
+        "SELECT status, outcome_json, error_redacted FROM conversation_attempts
+         WHERE workspace_id = ?1 AND attempt_id = ?2",
+        params![data.workspace_id.to_string(), data.succeeded_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(succeeded.0, "succeeded");
+    assert_eq!(
+        succeeded.1,
+        r#"{"outcome":"answer_complete","response_redacted":"preserved"}"#
+    );
+    assert_eq!(succeeded.2, None);
+
+    let failed: (String, String, String) = connection.query_row(
+        "SELECT status, outcome_json, error_redacted FROM conversation_attempts
+         WHERE workspace_id = ?1 AND attempt_id = ?2",
+        params![data.workspace_id.to_string(), data.failed_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(failed.0, "failed");
+    assert_eq!(
+        failed.2,
+        "Previous conversation failed. Review this redacted evidence and retry: legacy failure"
+    );
+    let failed_outcome: serde_json::Value = serde_json::from_str(&failed.1)?;
+    assert_eq!(failed_outcome["outcome"], "needs_attention");
+    assert_eq!(failed_outcome["evidence_redacted"], failed.2);
+    Ok(())
+}
+
+fn assert_v15_normalized_recovery_attempts(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> Result<(), StateError> {
+    for (attempt_id, expected_status) in [
+        (&data.null_error_id, "failed"),
+        (&data.blank_error_id, "cancelled"),
+        (&data.whitespace_error_id, "cancelled"),
+    ] {
+        let (status, outcome_json, error_redacted, completed_at): (String, String, String, String) =
+            connection.query_row(
+                "SELECT status, outcome_json, error_redacted, completed_at
+             FROM conversation_attempts WHERE workspace_id = ?1 AND attempt_id = ?2",
+                params![data.workspace_id.to_string(), attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(status, expected_status);
+        assert_eq!(completed_at, data.now);
+        assert_eq!(
+            error_redacted,
+            "Previous conversation failed. Review provider configuration and retry."
+        );
+        let outcome: serde_json::Value = serde_json::from_str(&outcome_json)?;
+        assert_eq!(outcome["outcome"], "needs_attention");
+        assert_eq!(outcome["evidence_redacted"], error_redacted);
+    }
+    for (attempt_id, original_error) in [
+        (&data.oversized_ascii_id, &data.oversized_ascii),
+        (&data.oversized_unicode_id, &data.oversized_unicode),
+    ] {
+        let (outcome_json, error_redacted): (String, String) = connection.query_row(
+            "SELECT outcome_json, error_redacted FROM conversation_attempts
+             WHERE workspace_id = ?1 AND attempt_id = ?2",
+            params![data.workspace_id.to_string(), attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let outcome: serde_json::Value = serde_json::from_str(&outcome_json)?;
+        let evidence = outcome["evidence_redacted"].as_str().ok_or_else(|| {
+            StateError::InvalidRecord("legacy recovery evidence is not a string".to_owned())
+        })?;
+        assert!(evidence.len() <= 16 * 1024);
+        assert!(evidence.ends_with("[truncated]"));
+        assert!(evidence.starts_with(
+            "Previous conversation failed. Review this redacted evidence and retry: "
+        ));
+        assert_eq!(error_redacted, evidence);
+        assert_ne!(&error_redacted, original_error);
+    }
+    Ok(())
+}
+
+fn assert_v16_accepts_valid_failure_writes(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> Result<(), StateError> {
+    for status in ["failed", "cancelled"] {
+        connection.execute(
+            "INSERT INTO conversation_attempts(
+                workspace_id, attempt_id, session_id, source_message_id, provider_id,
+                status, outcome_json, error_redacted, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, 'codex', ?5, ?6, 'new failure', ?7, ?7)",
+            params![
+                data.workspace_id.to_string(),
+                uuid::Uuid::now_v7().to_string(),
+                data.session_id,
+                data.message_id,
+                status,
+                r#"{"outcome":"needs_attention","response_redacted":"retry","evidence_redacted":"new failure"}"#,
+                data.now,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_v16_rejects_invalid_terminal_combinations(
+    connection: &Connection,
+    data: &V15ConversationData,
+) {
+    let invalid_rows = [
+        ("running", Some("{}"), None, None),
+        (
+            "succeeded",
+            Some("{}"),
+            Some("error"),
+            Some(data.now.as_str()),
+        ),
+        ("failed", None, Some("error"), Some(data.now.as_str())),
+        ("failed", Some("{}"), Some("error"), Some(data.now.as_str())),
+        (
+            "failed",
+            Some(r#"{"outcome":"answer_complete","response_redacted":"wrong"}"#),
+            Some("error"),
+            Some(data.now.as_str()),
+        ),
+        (
+            "cancelled",
+            Some("{}"),
+            Some("error"),
+            Some(data.now.as_str()),
+        ),
+        ("cancelled", Some("{}"), None, Some(data.now.as_str())),
+    ];
+    for (status, outcome, error, completed) in invalid_rows {
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO conversation_attempts(
+                        workspace_id, attempt_id, session_id, source_message_id,
+                        provider_id, status, outcome_json, error_redacted, started_at,
+                        completed_at)
+                     VALUES (?1, ?2, ?3, ?4, 'codex', ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        data.workspace_id.to_string(),
+                        uuid::Uuid::now_v7().to_string(),
+                        data.session_id,
+                        data.message_id,
+                        status,
+                        outcome,
+                        error,
+                        data.now,
+                        completed,
+                    ],
+                )
+                .is_err(),
+            "invalid terminal combination for {status} was accepted"
+        );
+    }
+}
+
+fn assert_v16_rejects_invalid_failure_outcomes(
+    connection: &Connection,
+    data: &V15ConversationData,
+) {
+    let oversized_evidence = format!(
+        r#"{{"outcome":"needs_attention","response_redacted":"retry","evidence_redacted":"{}"}}"#,
+        "x".repeat(16 * 1024 + 1)
+    );
+    let invalid_failure_outcomes = [
+        r#"{"outcome":"needs_attention"}"#,
+        r#"{"outcome":"needs_attention","response_redacted":null,"evidence_redacted":"evidence"}"#,
+        r#"{"outcome":"needs_attention","response_redacted":"retry","evidence_redacted":null}"#,
+        r#"{"outcome":"needs_attention","response_redacted":17,"evidence_redacted":"evidence"}"#,
+        r#"{"outcome":"needs_attention","response_redacted":"retry","evidence_redacted":17}"#,
+        r#"{"outcome":"needs_attention","response_redacted":"  ","evidence_redacted":"evidence"}"#,
+        r#"{"outcome":"needs_attention","response_redacted":"\u2003","evidence_redacted":"evidence"}"#,
+        r#"{"outcome":"needs_attention","response_redacted":"retry","evidence_redacted":" \t "}"#,
+        r#"{"outcome":"needs_attention","response_redacted":"retry","evidence_redacted":"\u2003"}"#,
+        oversized_evidence.as_str(),
+        "{not-json}",
+    ];
+    for status in ["failed", "cancelled"] {
+        for outcome_json in invalid_failure_outcomes {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO conversation_attempts(
+                            workspace_id, attempt_id, session_id, source_message_id,
+                            provider_id, status, outcome_json, error_redacted, started_at,
+                            completed_at)
+                         VALUES (?1, ?2, ?3, ?4, 'codex', ?5, ?6,
+                                 'actionable failure', ?7, ?7)",
+                        params![
+                            data.workspace_id.to_string(),
+                            uuid::Uuid::now_v7().to_string(),
+                            data.session_id,
+                            data.message_id,
+                            status,
+                            outcome_json,
+                            data.now,
+                        ],
+                    )
+                    .is_err(),
+                "invalid {status} outcome was accepted: {outcome_json}"
+            );
+        }
+    }
+}
+
+fn assert_v16_rejects_invalid_failure_errors(connection: &Connection, data: &V15ConversationData) {
+    for status in ["failed", "cancelled"] {
+        for error_redacted in ["", " \t ", "\u{2003}", &"x".repeat(16 * 1024 + 1)] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO conversation_attempts(
+                            workspace_id, attempt_id, session_id, source_message_id,
+                            provider_id, status, outcome_json, error_redacted, started_at,
+                            completed_at)
+                         VALUES (?1, ?2, ?3, ?4, 'codex', ?5,
+                                 '{\"outcome\":\"needs_attention\",\"response_redacted\":\"retry\",\"evidence_redacted\":\"actionable failure\"}',
+                                 ?6, ?7, ?7)",
+                        params![
+                            data.workspace_id.to_string(),
+                            uuid::Uuid::now_v7().to_string(),
+                            data.session_id,
+                            data.message_id,
+                            status,
+                            error_redacted,
+                            data.now,
+                        ],
+                    )
+                    .is_err(),
+                "invalid {status} error was accepted"
+            );
+        }
+    }
+}
+
+fn assert_v16_conversation_attempt_integrity(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> Result<(), StateError> {
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO conversation_attempts(
+                    workspace_id, attempt_id, session_id, source_message_id, provider_id,
+                    status, started_at)
+                 VALUES (?1, ?2, 'missing-session', ?3, 'codex', 'running', ?4)",
+                params![
+                    data.workspace_id.to_string(),
+                    uuid::Uuid::now_v7().to_string(),
+                    data.message_id,
+                    data.now,
+                ],
+            )
+            .is_err()
+    );
+    let trigger_count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'trigger'
+         AND name IN ('conversation_attempts_immutable_identity',
+                      'conversation_attempts_single_completion',
+                      'conversation_attempts_no_delete')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(trigger_count, 3);
+    let index_count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index'
+         AND name = 'conversation_attempts_session_time'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(index_count, 1);
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    assert_eq!(integrity, "ok");
+    let foreign_key_failures: i64 =
+        connection.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    assert_eq!(foreign_key_failures, 0);
+    Ok(())
+}
+
+#[test]
+fn v15_conversation_attempts_gain_durable_failure_outcomes_without_losing_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let V15ConversationFixture {
+        _directory,
+        database_path,
+        database,
+        data,
+    } = create_v15_conversation_fixture()?;
+    seed_v15_conversation_attempts(&database, &data)?;
+
+    // This fixture deliberately represents a legacy row that violates the v15 CHECK.
+    // Apply the registered migration directly so backup integrity validation does not
+    // reject the recovery input before v16 can normalize it.
+    drop(database);
+    let mut connection = Connection::open(&database_path)?;
+    let migrated = MigrationManager::apply(&mut connection)?;
+    drop(connection);
+    let database = Database::open(&database_path)?;
+    assert_eq!(migrated.current_version, 16);
+    with_database_connection(&database, |connection| {
+        assert_v15_preserved_attempts(connection, &data)?;
+
+        assert_v15_normalized_recovery_attempts(connection, &data)?;
+
+        assert_v16_accepts_valid_failure_writes(connection, &data)?;
+
+        assert_v16_rejects_invalid_terminal_combinations(connection, &data);
+
+        assert_v16_rejects_invalid_failure_outcomes(connection, &data);
+        assert_v16_rejects_invalid_failure_errors(connection, &data);
+        assert_v16_conversation_attempt_integrity(connection, &data)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn restore_v15_conversation_attempts_schema(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "PRAGMA defer_foreign_keys = ON;
+         DROP TRIGGER conversation_attempts_immutable_identity;
+         DROP TRIGGER conversation_attempts_single_completion;
+         DROP TRIGGER conversation_attempts_no_delete;
+         DROP INDEX conversation_attempts_session_time;
+         ALTER TABLE conversation_attempts RENAME TO conversation_attempts_after_v15;
+         CREATE TABLE conversation_attempts (
+             workspace_id TEXT NOT NULL DEFAULT (current_workspace()),
+             attempt_id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             source_message_id TEXT NOT NULL,
+             provider_id TEXT NOT NULL CHECK (provider_id IN ('gemini', 'codex', 'claude', 'agy')),
+             status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
+             outcome_json TEXT CHECK (outcome_json IS NULL OR json_valid(outcome_json)),
+             error_redacted TEXT,
+             started_at TEXT NOT NULL,
+             completed_at TEXT,
+             PRIMARY KEY(workspace_id, attempt_id),
+             FOREIGN KEY(workspace_id, session_id)
+                 REFERENCES sessions(workspace_id, session_id) ON DELETE RESTRICT,
+             FOREIGN KEY(workspace_id, source_message_id)
+                 REFERENCES conversation_messages(workspace_id, message_id) ON DELETE RESTRICT,
+             CHECK (
+                 (status = 'running' AND outcome_json IS NULL AND error_redacted IS NULL AND completed_at IS NULL)
+                 OR (status = 'succeeded' AND outcome_json IS NOT NULL AND error_redacted IS NULL AND completed_at IS NOT NULL)
+                 OR (status IN ('failed', 'cancelled') AND outcome_json IS NULL AND error_redacted IS NOT NULL AND completed_at IS NOT NULL)
+             )
+         ) STRICT;
+         INSERT INTO conversation_attempts
+         SELECT * FROM conversation_attempts_after_v15;
+         DROP TABLE conversation_attempts_after_v15;
+         CREATE INDEX conversation_attempts_session_time
+             ON conversation_attempts(workspace_id, session_id, started_at DESC);
+         CREATE TRIGGER conversation_attempts_immutable_identity
+         BEFORE UPDATE OF workspace_id, attempt_id, session_id, source_message_id,
+                          provider_id, started_at ON conversation_attempts
+         BEGIN SELECT RAISE(ABORT, 'conversation attempt identity is immutable'); END;
+         CREATE TRIGGER conversation_attempts_single_completion
+         BEFORE UPDATE OF status, outcome_json, error_redacted, completed_at
+         ON conversation_attempts
+         WHEN OLD.status <> 'running' OR NEW.status = 'running' OR NEW.completed_at IS NULL
+         BEGIN SELECT RAISE(ABORT, 'conversation attempt completion is append-once'); END;
+         CREATE TRIGGER conversation_attempts_no_delete BEFORE DELETE ON conversation_attempts
+         BEGIN SELECT RAISE(ABORT, 'conversation attempts are append-only'); END;
+         DELETE FROM schema_migrations WHERE version = 16;
+         PRAGMA user_version = 15;",
+    )?;
     Ok(())
 }
 

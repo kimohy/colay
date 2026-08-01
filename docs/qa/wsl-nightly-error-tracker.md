@@ -1,5 +1,380 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## Cross-platform legacy IPC lint refresh: 2026-07-27
+
+The legacy named-pipe endpoint identity path is Windows-only.  Source commit
+`5ef9ed7bb07353226f9aa3966c0011bc78c0f955` now conditionally compiles its
+endpoint variant, state identity lookup, and legacy response validation only on
+Windows (while retaining the validation helper for unit tests). Unix retains
+only schema-v1 primary-socket readiness. This removes the Linux/macOS dead-code
+warnings without lint allowances or a transport behaviour change.
+
+- Windows: `cargo fmt --all -- --check`, full workspace/all-target/all-feature
+  Clippy with `-D warnings`, and `cargo test --workspace --all-features` passed
+  (the final full suite completed in 620.8 seconds).
+- WSL Ubuntu 24.04 using the existing Rust/Cargo 1.95 cache: exact
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+- A fresh release build in
+  `/home/kimohy/.cache/colay-cross-platform-fix-20260727-target` produced
+  `colay` SHA-256
+  `e86e22ea689ebcefcd5dd71cfc6711e8b7e16be8532a1fee5c7811211e490bf0`,
+  Build ID `01921686334714a54f4c39bb229c05e946c80563`, and target
+  `linux/x86_64`. An isolated fake-provider-only runtime check migrated state,
+  started an online daemon from that binary, stopped it, and confirmed the
+  socket was absent afterwards. No real provider executable was invoked.
+
+## WSL-014: non-Git plan-only Codex invocation omits the public Git-check bypass
+
+- Severity: high
+- Status: fixed
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence and root cause
+
+Real-provider QA in an isolated non-Git WSL workspace selected Codex `0.145.0`, but the
+conversation ended as `Crashed { exit_code: Some(1) }`. Replaying Colay's exact public CLI
+arguments reproduced the provider error:
+
+```text
+codex exec --json --sandbox read-only -C <non-git-workspace> -
+Not inside a trusted directory and --skip-git-repo-check was not specified.
+```
+
+`CodexInvocation::exec` emits `exec --json --sandbox ... -C ... -` but does not emit
+`--skip-git-repo-check`. This conflicts with Colay's conversation-first contract, which allows
+read-only plan conversations before a Git repository exists. Adding that public option passed the
+Git gate and reached authentication, proving the immediate cause; the subsequent request was
+blocked by the local Codex login's expired/reused refresh token.
+
+### Expected correction and verification
+
+- Gate `--skip-git-repo-check` by observed capability and use it only for read-only conversation
+  or planning. It is safe to include for Git workspaces and avoids a second Git probe.
+- Keep writable task Git preflight unchanged.
+- Add fake-provider contract coverage for the exact argv in Git and non-Git workspaces.
+- In manual WSL QA, a valid Codex login must produce an `answer_complete` conversation attempt.
+
+### Verified correction: 2026-07-27
+
+Source HEAD `d88cc2e30c64ad91e7edae3a5edcad3e99e01eba` was built with Linux Rust 1.95
+into a new ext4 target. In a non-Git ext4 workspace, the fake Codex executable recorded:
+
+```text
+exec --skip-git-repo-check --json --sandbox read-only -C \
+  /home/kimohy/.cache/colay-task4-d88cc2e-qa/workspaces/codex \
+  --model gpt-5.6-terra -c model_reasoning_effort="medium" -
+```
+
+The CLI exited 0, and the schema-v16 attempt was `provider_id = codex`,
+`status = succeeded`, `outcome = answer_complete`. The workspace contained neither `.git` nor
+`.colay`, and the database contained zero tasks, task attempts, worktrees, coordinator leases, and
+worker leases. The option was advertised by the test-only capability wrapper and the process was the
+compiled `colay-e2e-fake-provider`; no real provider or account state was used.
+
+## WSL-015: `run --plan-only --provider` records a preference but ignores it for execution
+
+- Severity: high
+- Status: fixed
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence and root cause
+
+With all default providers enabled, `colay --json run --plan-only --provider claude PING` returned
+`requested_provider: "claude"`, while the durable `conversation_attempts.provider_id` for the new
+attempt was `codex`. `OfficialCliConversationOrchestrator::converse` always calls
+`self.planner.primary_provider()`; the requested provider stored in the requirement envelope is not
+part of `ConversationRequest` provider selection. Disabling Codex and raising Claude's configured
+priority made the next attempt use Claude, confirming that configured priority, not `--provider`,
+controls execution.
+
+### Expected correction and verification
+
+- Carry the requested provider as typed routing input into the conversation request.
+- Honor an eligible requested provider. When it is disabled, missing, or incompatible before process
+  start, fall back by configured priority and report the requested and selected providers.
+- Never fall back to another provider after the selected provider process starts.
+- Assert CLI output, attempt `provider_id`, and spawned fake binary identity all agree.
+
+### Verified correction: 2026-07-27
+
+`colay --json run --plan-only --provider claude 'qa eligible route'` exited 0 with
+`requested_provider = claude`; the durable attempt was `provider_id = claude`,
+`status = succeeded`, `outcome = answer_complete`, and the Claude fake marker recorded exactly one
+`--permission-mode plan` invocation. In a separate non-Git workspace,
+`--provider gemini 'qa fallback route'` requested a disabled provider and exited 0 with:
+
+```text
+Requested provider gemini is unavailable; using codex for this read-only turn.
+```
+
+That attempt was persisted as `provider_id = codex` and `status = succeeded`. No Gemini wrapper log
+was created, while the Codex fake marker recorded the selected process, proving fallback occurred
+before provider start rather than as runtime failover.
+
+## WSL-016: distinct provider failures collapse to success plus generic needs-attention
+
+- Severity: high
+- Status: fixed
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+
+### Evidence
+
+Real Codex, Claude, and Gemini attempts all exited 1 for different reasons:
+
+- Codex: non-Git trust check; after bypass, local authentication returned HTTP 401 with
+  `refresh_token_reused`/`token_expired`.
+- Claude: the CLI initialized successfully, then returned `billing_error` with
+  `Credit balance is too low`.
+- Gemini: the CLI returned `IneligibleTierError` / `UNSUPPORTED_CLIENT` for the current individual
+  Code Assist tier.
+
+Colay persisted every attempt as `status = succeeded`, `error_redacted = NULL`, with the same
+`outcome = needs_attention` and only `conversation lifecycle ended in Crashed { exit_code: Some(1) }`
+as evidence. The CLI itself exited 0 and displayed the same generic message for all three cases.
+
+### Expected correction and verification
+
+- Persist a terminal failure status when the provider process crashes before a valid
+  `ConversationOutcome` is parsed.
+- Retain a bounded, redacted provider error classification and actionable message (authentication,
+  quota/billing, unsupported account/client, compatibility, or process failure).
+- Keep secrets and raw credentials out of state and output.
+- Add fake JSONL/stream-JSON fixtures for these terminal cases and assert CLI exit semantics,
+  attempt status, and redacted diagnostics.
+
+### Verified correction: 2026-07-27
+
+`colay --json run --plan-only --provider codex 'scenario:crash qa terminal'` exited 1. The fake
+conversation marker changed from 3 to 4, so exactly one provider conversation process started. The
+schema-v16 attempt was `provider_id = codex`, `status = failed`, and persisted a
+`needs_attention` recovery outcome. The following are selected excerpts from the stored response
+and evidence; they are not one contiguous diagnostic value:
+
+```text
+codex process failed. Review the redacted evidence, then retry this conversation.
+conversation lifecycle ended in Crashed { exit_code: Some(17) }
+fake conversation provider crash
+```
+
+The corresponding `request_conversation_turn` command was also `failed`; no secret value or raw
+credential appeared. Database integrity was `ok`, foreign-key violations were zero, and tasks, task
+attempts, worktrees, coordinator leases, and worker leases all remained at zero.
+
+## WSL-014 through WSL-016 closure record: 2026-07-27
+
+- Source identity: `d88cc2e30c64ad91e7edae3a5edcad3e99e01eba`, local source version
+  `colay 0.1.0`. No nightly was published. The issue fixes are anchored by `afba6c3` (Codex argv),
+  `24e2f61` and `cddd95b` (provider routing/preflight), and `f1e8a18` plus `6e5ff83` (terminal
+  failure persistence and validation); the closure build includes all reviewed follow-up commits
+  through `d88cc2e`.
+- Final exact-HEAD Windows gates passed:
+  `cargo fmt --all -- --check`;
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`; and
+  `cargo test --workspace --all-features` (all workspace and doc tests, 560.3 seconds). Focused
+  exact-HEAD checks also passed:
+  `cargo test -p colay --test global_concurrency --all-features -- --nocapture` (6),
+  `cargo test -p colay --test global_daemon --all-features -- --nocapture` (7),
+  `cargo test -p colay --test daemon_lifecycle --all-features -- --nocapture` (5), and
+  `cargo test -p orchestrator-daemon --all-features -- --nocapture` (29 unit, 15 conversation,
+  1 integration). The issue-focused Windows matrix had previously passed 161 tests with zero
+  failures.
+- Linux-native build command:
+  `cargo build --locked --offline --release --features test-fixtures --bin colay --bin
+  colay-e2e-fake-provider`, with `CARGO_TARGET_DIR=/home/kimohy/.cache/colay-task4-d88cc2e-target`.
+  It completed in 257.6 seconds. The x86-64 GNU/Linux ELF `colay` SHA-256 was
+  `67665fee4e779beb3732497656ff93e6da1188e391c40c0c2dde6df5623c6657`; the fake-provider SHA-256
+  was `8f08d163f99f16f9f8c57dacacb91678bdf90a6ec89575d5bfb4d74d1b6c9170`.
+- WSL environment: Ubuntu 24.04 on WSL 2 kernel `6.18.33.2-microsoft-standard-WSL2`, Linux Rust
+  1.95.0, isolated ext4 `COLAY_HOME=/home/kimohy/.cache/colay-task4-d88cc2e-qa/home-evidence`,
+  ext4 cache/target, and four separate non-Git workspaces. `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` was
+  set for every Colay command. `colay --json migrate apply` migrated a fresh database from schema 0
+  through 16 with the committed checksums and no pending versions.
+- Final database evidence: four sessions and four attempts in order—Claude succeeded
+  `answer_complete`, Codex succeeded `answer_complete`, disabled-Gemini request selected Codex and
+  succeeded `answer_complete`, and Codex crash failed with `needs_attention`. The fake conversation
+  marker was 4 total; the failure-only delta was one. No real Codex, Claude, Gemini, or Agy inference
+  ran, and no credential or provider-account state was accessed.
+- Cleanup: online daemon PID 1735 reported executable
+  `/home/kimohy/.cache/colay-task4-d88cc2e-target/release/colay` and target `linux/x86_64`.
+  `colay --json daemon stop` returned `state = stopped`; follow-up status remained stopped, PID 1735
+  no longer existed, and the isolated Unix socket was released.
+
+### Clean final-HEAD WSL refresh: 2026-07-27
+
+- Exact source HEAD: `9779bd601159fc910ccf2b6614a17fd8cd20bb16`. The worktree was clean
+  before the build. No nightly was published.
+- Fresh Linux-native release command:
+  `cargo build --locked --offline --release --features test-fixtures --bin colay --bin
+  colay-e2e-fake-provider`, using Linux Rust/Cargo 1.95.0, `CARGO_INCREMENTAL=0`, and the new ext4
+  target `/home/kimohy/.cache/colay-task4-final-9779bd6-20260727-target`. It exited 0 in 255.7
+  seconds.
+- The resulting `colay 0.1.0` x86-64 GNU/Linux ELF has Build ID
+  `58e434090b273ad6ba71645005aeb2918f8f0efb` and SHA-256
+  `ebe7578edf7cd9a72c4d0b7d78fc4c889803a4516f6473ad27dd994704a7eb94`. The compiled
+  `colay-e2e-fake-provider` SHA-256 is
+  `8f08d163f99f16f9f8c57dacacb91678bdf90a6ec89575d5bfb4d74d1b6c9170`.
+- The clean QA root was `/home/kimohy/.cache/colay-task4-final-9779bd6-20260727-qa`, with isolated
+  `COLAY_HOME=.../home-evidence`, `TEMP`/`TMP=.../tmp-evidence`, and four separate non-Git
+  workspaces (`eligible`, `codex`, `fallback`, `failure`). None contained `.git` or `.colay` after
+  QA. Every Colay command set `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`; configured executable paths were
+  test-only wrappers delegating to the freshly compiled fake binary. No real provider, credential,
+  account, endpoint, Docker command, push, or merge was used.
+- `colay --json migrate apply` exited 0 and created the per-user schema-v16 database with all 16
+  committed checksums and no pending versions. Final read-only checks reported integrity `ok`, zero
+  foreign-key failures, four sessions, four conversation attempts, and zero tasks, task attempts,
+  worktrees, coordinator leases, and worker leases.
+- `--provider claude 'qa eligible route final 9779bd6'` exited 0, persisted
+  `provider_id=claude`, `status=succeeded`, `outcome=answer_complete`, and produced exactly one
+  Claude conversation argv containing `--permission-mode plan`.
+- `--provider codex 'qa codex route final 9779bd6'` exited 0 and persisted Codex success. The direct,
+  fallback, and failure Codex conversation argv records all contained
+  `exec --skip-git-repo-check --json --sandbox read-only -C <non-Git-workspace> ... -`.
+- Disabled `--provider gemini 'qa fallback route final 9779bd6'` exited 0, persisted Codex success,
+  retained the exact notice `Requested provider gemini is unavailable; using codex for this
+  read-only turn.`, and created no Gemini log. The Codex wrapper recorded the selected process,
+  proving fallback before provider start.
+- `--provider codex 'scenario:crash qa terminal final 9779bd6'` exited 1. The fake conversation
+  marker changed from 3 to 4. The durable attempt was Codex `failed` with `needs_attention`; its
+  exact `response_redacted` was `codex process failed. Review the redacted evidence, then retry this
+  conversation.` The exact 792-byte `error_redacted` and 701-byte evidence are recorded verbatim in
+  `evidence/final-invariants.json`; the corresponding command state was `failed`.
+- The daemon reported online PID 1183, executable from the fresh target, build `0.1.0`, and target
+  `linux/x86_64`. `daemon stop` and follow-up status both exited 0 with `state=stopped`; `/proc/1183`
+  and the isolated `runtime/daemon.sock` were absent, and exact-process inspection found no Colay or
+  fake-provider process from this target.
+- Primary evidence paths are
+  `/home/kimohy/.cache/colay-task4-final-9779bd6-20260727-qa/evidence/{migrate.json,eligible-claude.json,codex-nongit.json,fallback-gemini.json,failure-codex.json,database.json,daemon-online.json,daemon-stop.json,daemon-stopped.json,final-invariants.json}`;
+  full wrapper logs are under `logs-evidence/`, and the marker is
+  `tmp-evidence/colay-fake-conversation-starts.json`.
+
+## Real-provider QA record: 2026-07-27
+
+- Environment: WSL 2 Ubuntu 24.04, isolated `COLAY_HOME`, non-Git Linux-native workspace.
+- Colay: `0.1.1-nightly.20260726.46acc8d`.
+- Codex: `0.145.0`; public CLI started, but no model response because local authentication requires
+  sign-in again.
+- Claude: `2.1.217`; provider stream initialized, but no model response because the account credit
+  balance is too low.
+- Gemini: `0.51.0`; provider process started, but the configured individual tier rejects this client
+  as unsupported.
+- Agy: not installed, so no real inference attempt was possible.
+- Automated tests/CI remain fake-provider-only as required. These were bounded manual QA calls.
+
+## Clean-install real-provider QA refresh: 2026-07-28
+
+- Public npm `nightly` still resolved to `0.1.1-nightly.20260726.46acc8d`; it does not contain the
+  reviewed WSL-014 through WSL-016 fixes. The isolated Linux native binary SHA-256 was
+  `aed1775eb1e3fc15b0eb0a605e4f186f09f4bb0e69344ca3c10dab9f0d153743`, with ELF Build ID
+  `a284e7cdb28951622c359b91e0ea9b7c7bef618b`.
+- A clean npm install under WSL's default Node `18.19.1` completed with `EBADENGINE` instead of
+  failing, then the installed `colay` command refused to start because Node 22 or newer is
+  required. Adding an isolated Node `22.23.1` to PATH made the same installation run normally.
+  This is consistent with WSL-001's documented runtime boundary, but the install-success then
+  first-run-failure sequence remains noticeable user friction.
+- A fresh isolated `COLAY_HOME` migrated from schema 0 to 15. `doctor` reported database integrity
+  `ok`, zero foreign-key violations, and the daemon started online from the installed nightly.
+  Four separate non-Git workspaces contained neither `.git` nor `.colay`.
+- Compatibility probes reported Claude `2.1.217`, Gemini `0.51.0`, and Agy `1.1.5`/`1.1.7` as
+  healthy; Codex was correctly disabled because the Windows npm installation lacked the Linux
+  native optional package.
+- Bounded manual `run --plan-only --provider` calls requested Claude, Gemini, Agy, and Codex. All
+  four commands exited 0 and all four durable attempts used `provider_id=claude`,
+  `status=succeeded`, and the same generic `needs_attention` outcome after the Claude process
+  exited 1. This reconfirms that WSL-015 and WSL-016 are source-fixed but not deployed in the
+  current public nightly.
+- Direct adapter-equivalent manual calls established the external causes without exposing
+  credentials: Claude authentication initialized but billing returned `Credit balance is too
+  low`; Gemini rejected the current individual account/client as `UNSUPPORTED_CLIENT`; Agy exited
+  0 without an answer because headless plan mode auto-denied a required command permission; and
+  Codex could not start from the cross-OS npm installation.
+- The reviewed source candidate (`5ef9ed7`, Linux binary SHA-256
+  `e86e22ea689ebcefcd5dd71cfc6711e8b7e16be8532a1fee5c7811211e490bf0`) was checked against the
+  same real providers in a second isolated state root. It selected Claude, Gemini, and Agy exactly
+  as requested, returned exit 1 for each provider failure, and persisted three schema-v16
+  `status=failed` attempts with provider-specific bounded recovery messages. Database integrity
+  was `ok`, foreign-key violations were zero, and tasks, task attempts, worktrees, coordinator
+  leases, and worker leases remained zero in both the public-nightly and candidate databases.
+- Both isolated daemons stopped cleanly. PIDs 2595 and 4392, all `daemon.sock` files, and all
+  provider processes were absent after cleanup. Evidence is under
+  `/home/kimohy/.cache/colay-real-provider-qa-20260728/evidence`.
+- These were bounded manual user QA calls, not automated tests or CI. No credential value was
+  printed or copied.
+
+## WSL-017: compatibility health conflates public CLI probes with account readiness
+
+- Severity: medium
+- Status: fixed in source candidate; nightly verification pending
+- Observed nightly: `0.1.1-nightly.20260726.46acc8d`
+- Verified source candidate: `97a813b`
+
+### Evidence and impact
+
+`compatibility` and `doctor` marked Gemini, Claude, and Agy `healthy` after only version/help
+capability probes. The immediately following real read-only calls could not produce an answer:
+Gemini rejected the account/client tier, Claude had no billing credit, and Agy could not satisfy
+its headless permission contract. `inference_requests=0` correctly describes the safe probe, but a
+normal user can reasonably interpret `healthy` as ready for a task.
+
+### Expected correction
+
+- Separate binary compatibility from account/runtime readiness in the status vocabulary.
+- When a provider exposes a non-inference authentication or entitlement status command, include it
+  in `doctor` without printing account identifiers or credentials.
+- Otherwise report `compatible; account readiness unverified` rather than `healthy`, and keep an
+  explicitly opted-in live check separate because it can consume quota or incur cost.
+
+### Source candidate verification (2026-07-31)
+
+- Built the candidate natively on Ubuntu 24.04 WSL2 with Rust 1.95.0 and an isolated
+  `COLAY_HOME`. `compatibility` and `doctor` made zero inference requests.
+- Claude 2.1.217 and Agy 1.1.7 remained binary-compatible/healthy while the new independent
+  `account_readiness.status` was `unverified`. Every provider doctor check was `warn` with the
+  explicit detail `account readiness unverified`; `doctor` itself completed successfully.
+- `migrate apply` created and migrated only the per-user global database to schema 16. The test
+  workspace never gained a `.colay` directory.
+- A deliberately opted-in live call then proved why the distinction matters: Claude reported
+  unavailable quota/billing and Agy reported an incompatible read-only conversation protocol.
+  Neither safe compatibility command inferred readiness from these account/runtime outcomes.
+
+## WSL-018: provider failure evidence overwhelms the actionable diagnostic
+
+- Severity: medium
+- Status: fixed in source candidate; nightly verification pending
+- Observed source candidate: `5ef9ed7`
+- Verified source candidate: `97a813b`
+
+### Evidence and impact
+
+The source candidate correctly classified and failed all three provider attempts, but the Gemini
+error appended repeated `unknown event: gemini.stderr` entries plus a provider-internal JavaScript
+stack. The Agy evidence relayed its suggestion to use `--dangerously-skip-permissions`, even though
+Colay must not recommend bypassing its read-only permission boundary. The useful one-line recovery
+message appears first, but a terminal user then receives a long and potentially misleading raw
+diagnostic.
+
+### Expected correction
+
+- Keep the concise classified recovery message on normal stderr and in the default TUI view.
+- Deduplicate unknown-event summaries and bound stack output by lines as well as bytes.
+- Store detailed redacted evidence for an explicit diagnostic view, but suppress provider advice
+  that asks users to disable permission controls; replace it with Colay-safe configuration guidance.
+
+### Source candidate verification (2026-07-31)
+
+- Real Claude and Agy plan-only calls each exited 1 with one concise actionable message. Normal
+  stderr contained no provider stack, `Evidence:` section, repeated unknown-event lines, or unsafe
+  permission-bypass flag.
+- The global database persisted both attempts as `failed` with the same concise classified error.
+  Detailed redacted evidence was bounded to 120 bytes/3 lines for Claude and 251 bytes/4 lines for
+  Agy. Neither outcome contained `--dangerously-skip-permissions`; the Agy evidence contained the
+  Colay-owned safe replacement `unsafe permission bypass`.
+- After stopping the isolated daemon, SQLite reported `integrity_check=ok`, zero foreign-key
+  violations, zero tasks/task attempts/worktrees/coordinator leases/worker leases, one registered
+  workspace, and two conversation attempts. The workspace-local `.colay` path remained absent.
+- This was bounded manual user QA, not an automated test or CI inference. No credential value was
+  printed or copied. Supporting JSON and database evidence is under
+  `/home/kimohy/.cache/colay-readiness-qa-20260731`.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
@@ -125,20 +500,24 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-26
+- 마지막 갱신: 2026-07-27
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
   `0.1.1-nightly.20260726.b086448`, `0.1.1-nightly.20260726.20b7654`,
-  `0.1.1-nightly.20260726.b2daed0`
+  `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
-- 기본 원칙: 실제 provider inference를 QA에서 호출하지 않는다.
+- 기본 원칙: 자동화 테스트와 CI는 fake provider만 사용한다. 실제 provider inference는 사용자가
+  명시적으로 승인한 격리 수동 QA에서만 제한적으로 호출한다.
 - 상태 값: `open`, `workaround-confirmed`, `fix-in-progress`, `fixed`, `closed`
 
 ## Issue index
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
+| `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
+| `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
+| `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |

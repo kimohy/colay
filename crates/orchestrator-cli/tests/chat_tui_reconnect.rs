@@ -188,6 +188,7 @@ fn chat_tui_help_and_durable_reconnect_keep_daemon_alive() -> Result<()> {
         serde_json::to_value(AppendMessageCommandPayload {
             message_id,
             content: "authorization=super-secret-token".to_owned(),
+            requested_provider: None,
         })?,
         format!("reconnect-message-{message_id}"),
     ))?;

@@ -7,7 +7,10 @@ use std::{
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::{Arc, Barrier, Mutex, MutexGuard},
+    sync::{
+        Arc, Barrier, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -32,8 +35,24 @@ struct CommandContext {
     executable: PathBuf,
     path: OsString,
     colay_home: PathBuf,
-    daemon_log: PathBuf,
+    daemon_log_directory: PathBuf,
+    next_daemon_log: Arc<AtomicU64>,
     temp: PathBuf,
+}
+
+#[derive(Debug)]
+struct DaemonDiagnostic {
+    pid: i64,
+    phase: String,
+    startup_error: String,
+    stop_requested_at: String,
+    released_at: String,
+}
+
+#[derive(Debug)]
+struct DaemonDiagnostics {
+    instances: Vec<DaemonDiagnostic>,
+    stderr: String,
 }
 
 impl ConcurrencyFixture {
@@ -65,11 +84,14 @@ impl ConcurrencyFixture {
         let path = env::join_paths(
             std::iter::once(executable_parent).chain(env::split_paths(&inherited_path)),
         )?;
+        let daemon_log_directory = root.join("daemon-stderr");
+        fs::create_dir_all(&daemon_log_directory)?;
         let command = CommandContext {
             executable,
             path,
             colay_home: colay_home.clone(),
-            daemon_log: root.join("daemon-stderr.log"),
+            daemon_log_directory,
+            next_daemon_log: Arc::new(AtomicU64::new(1)),
             temp: root.clone(),
         };
         Ok(Self {
@@ -128,7 +150,7 @@ impl ConcurrencyFixture {
             .map_err(Into::into)
     }
 
-    fn daemon_diagnostics(&self) -> Result<String> {
+    fn daemon_diagnostics(&self) -> Result<DaemonDiagnostics> {
         let connection = Connection::open(self.database())?;
         let mut statement = connection.prepare(
             "SELECT pid, phase, COALESCE(startup_error, ''), \
@@ -136,18 +158,92 @@ impl ConcurrencyFixture {
              FROM daemon_instances ORDER BY started_at",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok(format!(
-                "pid={} phase={} startup_error={:?} stop_requested_at={:?} released_at={:?}",
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?
-            ))
+            Ok(DaemonDiagnostic {
+                pid: row.get(0)?,
+                phase: row.get(1)?,
+                startup_error: row.get(2)?,
+                stop_requested_at: row.get(3)?,
+                released_at: row.get(4)?,
+            })
         })?;
-        let rows = rows.collect::<Result<Vec<_>, _>>()?.join("; ");
-        let daemon_log = fs::read_to_string(&self.command.daemon_log).unwrap_or_default();
-        Ok(format!("{rows}; daemon_stderr={daemon_log:?}"))
+        let instances = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut daemon_logs = fs::read_dir(&self.command.daemon_log_directory)
+            .with_context(|| {
+                format!(
+                    "failed to read daemon stderr directory {}",
+                    self.command.daemon_log_directory.display()
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        daemon_logs.sort_by_key(std::fs::DirEntry::file_name);
+        let mut stderr_records = Vec::new();
+        for entry in daemon_logs {
+            if !entry.file_type()?.is_file()
+                || !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("daemon-stderr-")
+            {
+                continue;
+            }
+            let path = entry.path();
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read daemon stderr log {}", path.display()))?;
+            stderr_records.extend(contents.lines().map(str::to_owned));
+        }
+        let stderr = stderr_records.join("\n");
+        Ok(DaemonDiagnostics { instances, stderr })
+    }
+
+    fn verify_spawned_contenders_resolved(&self) -> Result<()> {
+        let mut stderr_logs = Vec::new();
+        let mut resolutions = Vec::new();
+        for entry in fs::read_dir(&self.command.daemon_log_directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_prefix("daemon-stderr-")
+                .and_then(|name| name.strip_suffix(".log"))
+            {
+                stderr_logs.push(id.to_owned());
+            } else if let Some(id) = name
+                .strip_prefix("daemon-child-resolution-")
+                .and_then(|name| name.strip_suffix(".log"))
+            {
+                resolutions.push((id.to_owned(), fs::read_to_string(entry.path())?));
+            }
+        }
+        stderr_logs.sort();
+        resolutions.sort_by(|left, right| left.0.cmp(&right.0));
+        let resolution_ids = resolutions
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if stderr_logs.is_empty() || stderr_logs != resolution_ids {
+            bail!(
+                "daemon contenders were not all resolved before diagnostics: stderr={stderr_logs:?} resolutions={resolution_ids:?}"
+            );
+        }
+        let owner_count = resolutions
+            .iter()
+            .filter(|(_, resolution)| resolution.starts_with("owner:"))
+            .count();
+        if owner_count != 1 {
+            bail!("expected one spawned live owner resolution, found {owner_count}");
+        }
+        for (id, resolution) in resolutions {
+            let valid = resolution
+                .strip_prefix("owner:")
+                .or_else(|| resolution.strip_prefix("reaped:"))
+                .is_some_and(|pid| pid.parse::<u32>().is_ok());
+            if !valid {
+                bail!("invalid daemon child resolution for {id}: {resolution:?}");
+            }
+        }
+        Ok(())
     }
 
     fn database_files(&self) -> Result<Vec<PathBuf>> {
@@ -178,7 +274,11 @@ impl ConcurrencyFixture {
         let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
             self.colay_home.clone(),
         )?)?;
-        let endpoint = orchestrator_daemon::ipc_endpoint(&paths);
+        let endpoints = orchestrator_daemon::ipc_endpoint_candidates(&paths)?
+            .server_endpoints()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
         let stopped = self.run(&self.repository, &["daemon", "stop"])?;
         if !stopped.status.success() {
             bail!(
@@ -194,9 +294,16 @@ impl ConcurrencyFixture {
             let unreleased =
                 self.count("SELECT count(*) FROM daemon_instances WHERE released_at IS NULL")?;
             #[cfg(unix)]
-            let endpoint_absent = endpoint_is_absent(&endpoint)?;
+            let endpoint_absent = endpoints
+                .iter()
+                .map(|endpoint| endpoint_is_absent(endpoint))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|absent| absent);
             #[cfg(windows)]
-            let endpoint_absent = endpoint_is_absent(&endpoint);
+            let endpoint_absent = endpoints
+                .iter()
+                .all(|endpoint| endpoint_is_absent(endpoint));
             let process_running = process_is_running(pid)?;
             if unreleased == 0 && endpoint_absent && !process_running {
                 return Ok(());
@@ -279,18 +386,42 @@ fn concurrency_fixture_guard() -> MutexGuard<'static, ()> {
 
 impl CommandContext {
     fn run(&self, repository: &Path, args: &[OsString]) -> Result<Output> {
+        self.run_with_colay_home(repository, args, &self.colay_home)
+    }
+
+    fn run_with_colay_home(
+        &self,
+        repository: &Path,
+        args: &[OsString],
+        colay_home: &Path,
+    ) -> Result<Output> {
         #[cfg(windows)]
         let system_root = env::var_os("SystemRoot").context("SystemRoot is not set")?;
         #[cfg(not(windows))]
         let system_root = "/";
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
+        let command_id = format!(
+            "{}-{}",
+            std::process::id(),
+            self.next_daemon_log.fetch_add(1, Ordering::Relaxed)
+        );
+        let daemon_log = self
+            .daemon_log_directory
+            .join(format!("daemon-stderr-{command_id}.log"));
+        let daemon_child_resolution = self
+            .daemon_log_directory
+            .join(format!("daemon-child-resolution-{command_id}.log"));
         let status = Command::new(&self.executable)
             .args(args)
             .current_dir(repository)
             .env_clear()
-            .env("COLAY_HOME", &self.colay_home)
-            .env("COLAY_TEST_DAEMON_STDERR", &self.daemon_log)
+            .env("COLAY_HOME", colay_home)
+            .env("COLAY_TEST_DAEMON_STDERR", daemon_log)
+            .env(
+                "COLAY_TEST_DAEMON_CHILD_RESOLUTION",
+                daemon_child_resolution,
+            )
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", &self.path)
             .env("PATHEXT", ".EXE;.CMD")
@@ -330,13 +461,13 @@ fn toml_path(path: &Path) -> String {
     )
 }
 
-fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &str) {
+fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &DaemonDiagnostics) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let normalized = stderr.to_ascii_lowercase();
     assert!(
         output.status.success(),
-        "client {index} failed with {}: {stderr}; stdout: {stdout}; daemon: {daemon_diagnostics}",
+        "client {index} failed with {}: {stderr}; stdout: {stdout}; daemon: {daemon_diagnostics:?}",
         output.status,
     );
     for forbidden in [
@@ -352,14 +483,112 @@ fn assert_clean_client(index: usize, output: &Output, daemon_diagnostics: &str) 
     }
 }
 
+fn validate_daemon_diagnostics(daemon_diagnostics: &DaemonDiagnostics) -> Result<()> {
+    const EXPECTED_CONTENDER_RECORD: &str =
+        "error: daemon singleton is already owned by another process";
+
+    for instance in &daemon_diagnostics.instances {
+        if !instance.startup_error.is_empty() {
+            bail!(
+                "daemon {} entered phase {} with startup_error {:?}; stop_requested_at={:?} released_at={:?}",
+                instance.pid,
+                instance.phase,
+                instance.startup_error,
+                instance.stop_requested_at,
+                instance.released_at
+            );
+        }
+    }
+
+    for record in daemon_diagnostics.stderr.lines() {
+        if !record.is_empty() && record != EXPECTED_CONTENDER_RECORD {
+            bail!("unexpected daemon contender stderr record: {record:?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn daemon_diagnostics_allow_only_expected_owner_contention() -> Result<()> {
+    let diagnostics = DaemonDiagnostics {
+        instances: vec![DaemonDiagnostic {
+            pid: 42,
+            phase: "online".to_owned(),
+            startup_error: String::new(),
+            stop_requested_at: String::new(),
+            released_at: String::new(),
+        }],
+        stderr: concat!(
+            "error: daemon singleton is already owned by another process\n",
+            "error: daemon singleton is already owned by another process\n",
+        )
+        .to_owned(),
+    };
+
+    validate_daemon_diagnostics(&diagnostics)
+}
+
+#[test]
+fn daemon_diagnostics_reject_non_exact_owner_contention_records() {
+    let invalid_records = [
+        "daemon singleton is already owned by another process\n",
+        "error: \n",
+        "error: error: daemon singleton is already owned by another process\n",
+        concat!(
+            "error: daemon singleton is already owned by another process",
+            "daemon singleton is already owned by another process\n",
+        ),
+        " error: daemon singleton is already owned by another process\n",
+        "error: daemon singleton is already owned by another process \n",
+        "error: daemon singleton is already owned by another process: extra\n",
+    ];
+
+    for stderr in invalid_records {
+        let diagnostics = DaemonDiagnostics {
+            instances: Vec::new(),
+            stderr: stderr.to_owned(),
+        };
+        assert!(
+            validate_daemon_diagnostics(&diagnostics).is_err(),
+            "accepted non-exact daemon diagnostic record {stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn daemon_diagnostics_reject_persisted_startup_error() {
+    let diagnostics = DaemonDiagnostics {
+        instances: vec![DaemonDiagnostic {
+            pid: 42,
+            phase: "failed".to_owned(),
+            startup_error: "unable to open database file".to_owned(),
+            stop_requested_at: String::new(),
+            released_at: String::new(),
+        }],
+        stderr: String::new(),
+    };
+
+    assert!(validate_daemon_diagnostics(&diagnostics).is_err());
+}
+
+#[test]
+fn daemon_diagnostics_reject_unexpected_contender_output() {
+    let diagnostics = DaemonDiagnostics {
+        instances: Vec::new(),
+        stderr: "error: IPC I/O failed at daemon.lock: access denied\n".to_owned(),
+    };
+
+    assert!(validate_daemon_diagnostics(&diagnostics).is_err());
+}
+
 #[test]
 fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()> {
     let fixture = ConcurrencyFixture::new()?;
 
     let outputs = fixture.run_parallel_status_and_plan_clients(CLIENT_COUNT)?;
-    let daemon_diagnostics = fixture
-        .daemon_diagnostics()
-        .unwrap_or_else(|error| format!("unavailable: {error:#}"));
+    fixture.verify_spawned_contenders_resolved()?;
+    let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
 
     assert_eq!(outputs.len(), CLIENT_COUNT);
     for (index, output) in outputs.iter().enumerate() {
@@ -391,10 +620,73 @@ fn windows_unicode_and_case_variants_share_one_global_workspace() -> Result<()> 
     let second = fixture.run(&differently_cased, &["--json", "status"])?;
 
     let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
     assert_clean_client(0, &first, &daemon_diagnostics);
     assert_clean_client(1, &second, &daemon_diagnostics);
     assert_eq!(fixture.count("SELECT count(*) FROM workspaces")?, 1);
     assert_eq!(fixture.count("SELECT count(*) FROM workspace_paths")?, 1);
+    assert_eq!(fixture.database_files()?, vec![fixture.database()]);
+    fixture.stop_and_verify()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_colay_home_case_aliases_use_one_primary_daemon_endpoint() -> Result<()> {
+    let fixture = ConcurrencyFixture::new()?;
+    let home_name = fixture
+        .colay_home
+        .file_name()
+        .context("COLAY_HOME has no final component")?
+        .to_string_lossy();
+    let differently_cased_home = fixture.root.join(
+        home_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_lowercase() {
+                    character.to_ascii_uppercase()
+                } else if character.is_ascii_uppercase() {
+                    character.to_ascii_lowercase()
+                } else {
+                    character
+                }
+            })
+            .collect::<String>(),
+    );
+
+    let first = fixture.run(&fixture.repository, &["--json", "status"])?;
+    let second_args = [OsString::from("--json"), OsString::from("status")];
+    let second = fixture.command.run_with_colay_home(
+        &fixture.repository,
+        &second_args,
+        &differently_cased_home,
+    )?;
+
+    for (label, output) in [("canonical", &first), ("alias", &second)] {
+        if !output.status.success() {
+            let cleanup = fixture.run(&fixture.repository, &["daemon", "stop"])?;
+            bail!(
+                "{label} COLAY_HOME client failed with {}: stderr={} stdout={}; cleanup={} cleanup_stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+                cleanup.status,
+                String::from_utf8_lossy(&cleanup.stderr),
+            );
+        }
+    }
+
+    fixture.verify_spawned_contenders_resolved()?;
+    let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
+    assert_clean_client(0, &first, &daemon_diagnostics);
+    assert_clean_client(1, &second, &daemon_diagnostics);
+    assert_eq!(fixture.count("SELECT count(*) FROM workspaces")?, 1);
+    assert_eq!(fixture.count("SELECT count(*) FROM workspace_paths")?, 1);
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM daemon_instances WHERE released_at IS NULL")?,
+        1
+    );
     assert_eq!(fixture.database_files()?, vec![fixture.database()]);
     fixture.stop_and_verify()?;
     Ok(())
@@ -407,7 +699,9 @@ fn unix_socket_is_private_and_owned_with_the_colay_home() -> Result<()> {
 
     let fixture = ConcurrencyFixture::new()?;
     let output = fixture.run(&fixture.repository, &["--json", "status"])?;
-    assert_clean_client(0, &output, &fixture.daemon_diagnostics()?);
+    let daemon_diagnostics = fixture.daemon_diagnostics()?;
+    validate_daemon_diagnostics(&daemon_diagnostics)?;
+    assert_clean_client(0, &output, &daemon_diagnostics);
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         fixture.colay_home.clone(),
     )?)?;

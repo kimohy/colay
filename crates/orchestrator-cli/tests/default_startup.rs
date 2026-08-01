@@ -278,6 +278,7 @@ fn doctor_reports_fake_provider_executable_resolution() -> Result<()> {
 #[test]
 fn first_plan_only_run_initializes_global_state() -> Result<()> {
     let fixture = CliFixture::new()?;
+    fixture.configure_fake_codex()?;
 
     let first = fixture.colay(["run", "inspect repository", "--plan-only"])?;
 
@@ -345,6 +346,13 @@ fn future_codex_version_is_writable_by_minimum_version_policy() -> Result<()> {
     assert_eq!(codex["capabilities"]["version"], "0.145.0");
     assert_eq!(codex["capabilities"]["writable"], "advertised");
     assert_eq!(codex["health"]["status"], "degraded");
+    assert_eq!(codex["account_readiness"]["status"], "unverified");
+    assert!(
+        codex["account_readiness"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("safe public probes"))
+    );
+    assert!(codex["account_readiness"]["checked_at"].is_string());
     assert!(
         codex["health"]["detail"]
             .as_str()

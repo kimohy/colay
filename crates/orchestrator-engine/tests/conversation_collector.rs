@@ -3,8 +3,9 @@ use orchestrator_domain::{
     SessionId,
 };
 use orchestrator_engine::{
-    CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit, ConversationFailure, ConversationRequest,
-    ConversationResponse, collect_conversation_response,
+    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
+    ConversationFailure, ConversationFailureKind, ConversationRequest, ConversationResponse,
+    collect_conversation_response, diagnose_conversation_failure,
 };
 use serde_json::json;
 
@@ -13,6 +14,7 @@ fn request() -> ConversationRequest {
         attempt_id: ConversationAttemptId::new(),
         session_id: SessionId::new(),
         source_message_id: MessageId::new(),
+        provider: ProviderId::Codex,
         transcript_redacted: "user: why does colay need Git?".to_owned(),
         repository_summary_redacted: "repository availability is unknown".to_owned(),
         sandbox: SandboxMode::ReadOnly,
@@ -76,6 +78,12 @@ fn rejects_identity_mismatch_and_mutable_sandbox() {
         collect_conversation_response(&request, wrong),
         Err(ConversationFailure::IdentityMismatch { .. })
     ));
+    let mut wrong_provider = response(&request, output.clone());
+    wrong_provider.provider = ProviderId::Claude;
+    assert!(matches!(
+        collect_conversation_response(&request, wrong_provider),
+        Err(ConversationFailure::IdentityMismatch { .. })
+    ));
     let mut writable = response(&request, output);
     writable.sandbox = SandboxMode::WorkspaceWrite;
     assert_eq!(
@@ -117,4 +125,92 @@ fn lifecycle_failure_is_preserved_without_parsing() {
         collect_conversation_response(&request, failed),
         Err(ConversationFailure::Lifecycle { .. })
     ));
+}
+
+#[test]
+fn classifies_provider_failures_into_actionable_vendor_neutral_diagnostics() {
+    let cases = [
+        (
+            ConversationFailure::Invocation {
+                reason: "token_expired".to_owned(),
+                evidence_redacted: "credential was [redacted]".to_owned(),
+            },
+            ConversationFailureKind::Authentication,
+            "codex could not authenticate. Reauthenticate the selected provider, then retry this conversation.",
+        ),
+        (
+            ConversationFailure::Invocation {
+                reason: "Credit balance is too low".to_owned(),
+                evidence_redacted: "billing request was rejected".to_owned(),
+            },
+            ConversationFailureKind::QuotaOrBilling,
+            "codex cannot continue because quota or billing is unavailable. Check the selected provider's quota or billing, then retry this conversation.",
+        ),
+        (
+            ConversationFailure::Invocation {
+                reason: "UNSUPPORTED_CLIENT".to_owned(),
+                evidence_redacted: "account rejected this client".to_owned(),
+            },
+            ConversationFailureKind::UnsupportedClientOrAccount,
+            "codex is not supported by the installed client or current account. Update the selected provider client or use a supported account, then retry this conversation.",
+        ),
+        (
+            ConversationFailure::Invocation {
+                reason: "No supported transport is available".to_owned(),
+                evidence_redacted: "client capability probe failed".to_owned(),
+            },
+            ConversationFailureKind::Compatibility,
+            "codex is incompatible with the required read-only conversation protocol. Update or reconfigure the selected provider client, then retry this conversation.",
+        ),
+        (
+            ConversationFailure::Lifecycle {
+                exit: ConversationExit::TimedOut,
+                evidence_redacted: "provider exceeded its deadline".to_owned(),
+            },
+            ConversationFailureKind::Timeout,
+            "codex timed out. Check the selected provider's availability, then retry this conversation.",
+        ),
+        (
+            ConversationFailure::Lifecycle {
+                exit: ConversationExit::Cancelled,
+                evidence_redacted: "request was cancelled".to_owned(),
+            },
+            ConversationFailureKind::Cancelled,
+            "codex was cancelled. Retry this conversation when you are ready.",
+        ),
+        (
+            ConversationFailure::Lifecycle {
+                exit: ConversationExit::Crashed {
+                    exit_code: Some(17),
+                },
+                evidence_redacted: "provider exited 17".to_owned(),
+            },
+            ConversationFailureKind::ProcessFailure,
+            "codex process failed. Review the redacted evidence, then retry this conversation.",
+        ),
+    ];
+
+    for (failure, expected_kind, expected_response) in cases {
+        let diagnostic = diagnose_conversation_failure(ProviderId::Codex, &failure);
+        assert_eq!(diagnostic.kind, expected_kind, "failure: {failure}");
+        assert_eq!(
+            diagnostic.response_redacted, expected_response,
+            "failure: {failure}"
+        );
+    }
+}
+
+#[test]
+fn failure_diagnostic_evidence_is_bounded() {
+    let diagnostic = diagnose_conversation_failure(
+        ProviderId::Codex,
+        &ConversationFailure::Invocation {
+            reason: "unknown provider failure".to_owned(),
+            evidence_redacted: "x".repeat(CONVERSATION_MAX_EVIDENCE_BYTES * 2),
+        },
+    );
+
+    assert_eq!(diagnostic.kind, ConversationFailureKind::ProcessFailure);
+    assert!(diagnostic.evidence_redacted.ends_with("[truncated]"));
+    assert!(diagnostic.evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
 }

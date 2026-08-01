@@ -285,17 +285,24 @@ async fn serve_foreground(
         signal_task.abort();
         return Ok(());
     };
-    let (planner, planner_provider, conversation): (
+    let (planner, planner_provider, conversation, conversation_providers): (
         Arc<dyn TaskPlanner>,
         ProviderId,
         Arc<dyn ConversationOrchestrator>,
+        Vec<ProviderId>,
     ) = match planner {
         Ok(planner) => {
             let provider = planner.primary_provider();
+            let conversation_providers = planner.conversation_providers();
             let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
                 &planner,
             ));
-            (Arc::new(planner), provider, conversation)
+            (
+                Arc::new(planner),
+                provider,
+                conversation,
+                conversation_providers,
+            )
         }
         Err(error) => {
             let reason = error.to_string();
@@ -305,6 +312,7 @@ async fn serve_foreground(
                 }),
                 ProviderId::Codex,
                 Arc::new(UnavailableConversation { reason }),
+                unavailable_conversation_providers(),
             )
         }
     };
@@ -418,6 +426,7 @@ async fn serve_foreground(
                     repository_root: repository_root.clone(),
                     planner,
                     planner_provider,
+                    conversation_providers,
                     validation_policy: GraphValidationPolicy {
                         eligible_providers: BTreeSet::from([planner_provider]),
                         eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
@@ -559,6 +568,53 @@ where
     }
 }
 
+struct WorkspacePlanningAdapters {
+    planner: Arc<dyn TaskPlanner>,
+    planner_provider: ProviderId,
+    conversation: Arc<dyn ConversationOrchestrator>,
+    conversation_providers: Vec<ProviderId>,
+}
+
+async fn build_workspace_planning_adapters(
+    config: &RootConfig,
+    repository: &Path,
+    runtime: &Arc<dyn AdapterRuntime>,
+) -> WorkspacePlanningAdapters {
+    match OfficialCliTaskPlanner::probe_from_config(
+        config,
+        repository,
+        Arc::clone(runtime),
+        ModelProfile::Standard,
+    )
+    .await
+    {
+        Ok(planner) => {
+            let planner_provider = planner.primary_provider();
+            let conversation_providers = planner.conversation_providers();
+            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
+                &planner,
+            ));
+            WorkspacePlanningAdapters {
+                planner: Arc::new(planner),
+                planner_provider,
+                conversation,
+                conversation_providers,
+            }
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            WorkspacePlanningAdapters {
+                planner: Arc::new(UnavailablePlanner {
+                    reason: reason.clone(),
+                }),
+                planner_provider: ProviderId::Codex,
+                conversation: Arc::new(UnavailableConversation { reason }),
+                conversation_providers: unavailable_conversation_providers(),
+            }
+        }
+    }
+}
+
 async fn build_workspace_runtime(
     repository: &Path,
     explicit_config: Option<&Path>,
@@ -577,36 +633,12 @@ async fn build_workspace_runtime(
     let redactor: Arc<dyn MessageRedactor> =
         Arc::new(ProcessMessageRedactor(Redactor::new(&redaction)?));
     let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::new(redaction));
-    let (planner, planner_provider, conversation): (
-        Arc<dyn TaskPlanner>,
-        ProviderId,
-        Arc<dyn ConversationOrchestrator>,
-    ) = match OfficialCliTaskPlanner::probe_from_config(
-        &config,
-        repository,
-        Arc::clone(&runtime),
-        ModelProfile::Standard,
-    )
-    .await
-    {
-        Ok(planner) => {
-            let provider = planner.primary_provider();
-            let conversation = Arc::new(OfficialCliConversationOrchestrator::from_task_planner(
-                &planner,
-            ));
-            (Arc::new(planner), provider, conversation)
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            (
-                Arc::new(UnavailablePlanner {
-                    reason: reason.clone(),
-                }),
-                ProviderId::Codex,
-                Arc::new(UnavailableConversation { reason }),
-            )
-        }
-    };
+    let WorkspacePlanningAdapters {
+        planner,
+        planner_provider,
+        conversation,
+        conversation_providers,
+    } = build_workspace_planning_adapters(&config, repository, &runtime).await;
     let executor = Arc::new(OfficialCliTaskExecutor::new(&config, repository, runtime)?);
     let integration = IntegrationServices {
         manager: Arc::new(GitIntegrationManager::new(
@@ -641,6 +673,7 @@ async fn build_workspace_runtime(
             repository_root: repository_root.clone(),
             planner,
             planner_provider,
+            conversation_providers,
             validation_policy: GraphValidationPolicy {
                 eligible_providers: BTreeSet::from([planner_provider]),
                 eligible_profiles: BTreeSet::from([ModelProfile::Standard]),
@@ -837,6 +870,10 @@ struct UnavailablePlanner {
     reason: String,
 }
 
+fn unavailable_conversation_providers() -> Vec<ProviderId> {
+    Vec::new()
+}
+
 struct UnavailableConversation {
     reason: String,
 }
@@ -896,8 +933,13 @@ mod tests {
     use super::{
         StartupLeaseGuard, fail_and_release_spawned_lease, fail_startup_without_heartbeat,
         finish_unless_daemon_cancelled, stop_response_disconnect, stopped_endpoint_error,
-        supervise_daemon_runtime,
+        supervise_daemon_runtime, unavailable_conversation_providers,
     };
+
+    #[test]
+    fn unavailable_planner_has_no_eligible_conversation_provider() {
+        assert!(unavailable_conversation_providers().is_empty());
+    }
 
     #[tokio::test]
     async fn workspace_activation_setup_is_dropped_when_daemon_is_cancelled() {

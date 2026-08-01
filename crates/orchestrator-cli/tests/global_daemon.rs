@@ -337,31 +337,64 @@ fn second_daemon_owner_is_rejected_without_displacing_the_live_owner() -> Result
 
 #[cfg(windows)]
 #[test]
-fn windows_pipe_dacl_grants_access_only_to_the_current_user_sid() -> Result<()> {
+fn windows_primary_and_legacy_pipes_serve_v1_with_current_user_only_dacls() -> Result<()> {
     let fixture = GlobalDaemonFixture::new()?;
     let started = fixture.run(["status"])?;
-    assert!(started.status.success());
+    assert!(
+        started.status.success(),
+        "status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         fixture.colay_home.clone(),
     )?)?;
-    let endpoint = orchestrator_daemon::ipc_endpoint(&paths);
+    let candidates = orchestrator_daemon::ipc_endpoint_candidates(&paths)?;
+    let endpoints = candidates
+        .server_endpoints()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    assert_eq!(endpoints.len(), 2);
     let runtime = tokio::runtime::Runtime::new()?;
-    let descriptor = runtime.block_on(async {
-        let client = tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint)?;
-        orchestrator_daemon::windows_named_pipe_security_descriptor(&client)
-    })?;
     let sid = current_windows_user_sid()?;
+    for endpoint in endpoints {
+        let (descriptor, status) = runtime.block_on(async {
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-    let grants_current_user = descriptor.contains(&format!(";;;{sid})"))
-        // Windows may render the well-known local Administrator SID with its SDDL alias.
-        || (sid.rsplit('-').next() == Some("500") && descriptor.contains(";;;LA)"));
-    assert!(
-        grants_current_user,
-        "pipe descriptor {descriptor:?} does not grant the current user SID {sid}"
-    );
-    assert_eq!(descriptor.matches("(A;").count(), 1);
-    for broad_principal in ["WD", "AN", "AU", "BU"] {
-        assert!(!descriptor.contains(&format!(";;;{broad_principal})")));
+            let mut client =
+                tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint)?;
+            let descriptor = orchestrator_daemon::windows_named_pipe_security_descriptor(&client)?;
+            let request = IpcRequest {
+                schema_version: IPC_SCHEMA_VERSION,
+                request_id: "legacy-v1-status".to_owned(),
+                workspace_id: None,
+                action: "daemon.status".to_owned(),
+                payload: json!({}),
+            };
+            client.write_all(&serde_json::to_vec(&request)?).await?;
+            client.write_all(b"\n").await?;
+            let mut response = String::new();
+            BufReader::new(client).read_line(&mut response).await?;
+            Ok::<_, anyhow::Error>((
+                descriptor,
+                serde_json::from_str::<serde_json::Value>(&response)?,
+            ))
+        })?;
+
+        let grants_current_user = descriptor.contains(&format!(";;;{sid})"))
+            // Windows may render the well-known local Administrator SID with its SDDL alias.
+            || (sid.rsplit('-').next() == Some("500") && descriptor.contains(";;;LA)"));
+        assert!(
+            grants_current_user,
+            "pipe descriptor {descriptor:?} does not grant the current user SID {sid}"
+        );
+        assert_eq!(descriptor.matches("(A;").count(), 1);
+        for broad_principal in ["WD", "AN", "AU", "BU"] {
+            assert!(!descriptor.contains(&format!(";;;{broad_principal})")));
+        }
+        assert_eq!(status["outcome"]["status"], "ok");
+        assert_eq!(status["outcome"]["data"]["status"]["state"], "online");
     }
     Ok(())
 }

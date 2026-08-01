@@ -284,6 +284,7 @@ async fn typed_preview_and_approval_apply_only_to_dedicated_integration_worktree
         repository_root: repository.clone(),
         planner: Arc::new(UnusedPlanner),
         planner_provider: ProviderId::Codex,
+        conversation_providers: vec![ProviderId::Codex],
         validation_policy: GraphValidationPolicy {
             eligible_providers: BTreeSet::from([ProviderId::Codex]),
             eligible_profiles: BTreeSet::from([ModelProfile::Standard]),

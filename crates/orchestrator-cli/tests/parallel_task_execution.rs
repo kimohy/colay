@@ -376,6 +376,7 @@ async fn real_fake_cli_processes_run_parallel_tasks_and_restart_without_duplicat
         repository_root: repository.clone(),
         planner: Arc::new(UnusedPlanner),
         planner_provider: ProviderId::Codex,
+        conversation_providers: vec![ProviderId::Codex],
         validation_policy: GraphValidationPolicy {
             eligible_providers: BTreeSet::from([ProviderId::Codex]),
             eligible_profiles: BTreeSet::from([ModelProfile::Standard]),

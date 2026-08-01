@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ClientCommandId, GraphRevisionId, MessageId, RequirementRevisionId, SchemaVersion, SessionId,
-    TaskId,
+    ClientCommandId, GraphRevisionId, MessageId, ProviderId, RequirementRevisionId, SchemaVersion,
+    SessionId, TaskId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +241,8 @@ impl CreateSessionCommandPayload {
 pub struct AppendMessageCommandPayload {
     pub message_id: MessageId,
     pub content: String,
+    #[serde(default)]
+    pub requested_provider: Option<ProviderId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +253,8 @@ pub struct RequestPlanCommandPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestConversationTurnCommandPayload {
     pub source_message_id: MessageId,
+    #[serde(default)]
+    pub requested_provider: Option<ProviderId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +617,7 @@ mod tests {
         let append = AppendMessageCommandPayload {
             message_id: MessageId::new(),
             content: "continue task-03".to_owned(),
+            requested_provider: None,
         };
         assert_eq!(append.validate(), Ok(()));
         assert_eq!(
@@ -636,6 +641,7 @@ mod tests {
             AppendMessageCommandPayload {
                 message_id: MessageId::new(),
                 content: String::new(),
+                requested_provider: None,
             }
             .validate()
             .is_err()

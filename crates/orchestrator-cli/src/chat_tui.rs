@@ -243,6 +243,7 @@ impl SqliteWorkspaceDriver {
             payload: serde_json::to_value(AppendMessageCommandPayload {
                 message_id,
                 content,
+                requested_provider: None,
             })
             .map_err(driver_error)?,
             idempotency_key: format!("chat-message-{message_id}"),
