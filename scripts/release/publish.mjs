@@ -13,8 +13,10 @@ const NATIVE_PACKAGES = Object.freeze([
   "@kimohy/colay-win32-x64",
 ]);
 const PUBLIC_TAGS = new Set(["nightly", "beta", "latest"]);
-const VISIBILITY_ATTEMPTS = 7;
-const RETRY_DELAY_MS = 2_000;
+export const registryVisibilityPolicy = Object.freeze({
+  attempts: 7,
+  retryDelayMs: 20_000,
+});
 
 function fail(message) {
   throw new Error(`Invalid npm publication: ${message}`);
@@ -144,7 +146,7 @@ async function validateTarballs(tarballsDir, records) {
 }
 
 async function defaultRetryDelay() {
-  await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+  await new Promise((resolve) => setTimeout(resolve, registryVisibilityPolicy.retryDelayMs));
 }
 
 function requireClient(npmClient) {
@@ -155,15 +157,15 @@ function requireClient(npmClient) {
 }
 
 async function waitForIntegrity({ npmClient, name, version, integrity, retryDelay }) {
-  for (let attempt = 0; attempt < VISIBILITY_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < registryVisibilityPolicy.attempts; attempt += 1) {
     const visible = await npmClient.viewIntegrity(name, version);
     if (visible === integrity) return;
     if (visible !== undefined && visible !== null) {
       fail(`integrity mismatch for ${name}@${version}: expected ${integrity}, found ${visible}`);
     }
-    if (attempt + 1 < VISIBILITY_ATTEMPTS) await retryDelay();
+    if (attempt + 1 < registryVisibilityPolicy.attempts) await retryDelay();
   }
-  fail(`${name}@${version} did not become visible with the published integrity after six retries`);
+  fail(`${name}@${version} did not become visible with the published integrity after ${registryVisibilityPolicy.attempts - 1} retries`);
 }
 
 async function verifyOrPublish({ npmClient, record, tag, retryDelay }) {
@@ -195,16 +197,16 @@ function manualRecoveryMessage({ version, distTag, channelVersion = undefined })
 }
 
 async function requireRootChannel({ npmClient, version, distTag, rootState, retryDelay }) {
-  for (let attempt = 0; attempt < VISIBILITY_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < registryVisibilityPolicy.attempts; attempt += 1) {
     const channelVersion = await npmClient.viewChannelVersion(ROOT_PACKAGE, distTag);
     if (channelVersion === version) return;
     if (rootState === "existing" && channelVersion !== undefined && channelVersion !== null) {
       fail(manualRecoveryMessage({ version, distTag, channelVersion }));
     }
-    if (attempt + 1 < VISIBILITY_ATTEMPTS) await retryDelay();
+    if (attempt + 1 < registryVisibilityPolicy.attempts) await retryDelay();
   }
   if (rootState === "existing") fail(manualRecoveryMessage({ version, distTag }));
-  fail(`newly published root package ${ROOT_PACKAGE}@${version} did not become the ${distTag} channel target after six retries`);
+  fail(`newly published root package ${ROOT_PACKAGE}@${version} did not become the ${distTag} channel target after ${registryVisibilityPolicy.attempts - 1} retries`);
 }
 
 export async function publishRelease({ tarballsDir, version, distTag, npmClient, retryDelay = defaultRetryDelay }) {

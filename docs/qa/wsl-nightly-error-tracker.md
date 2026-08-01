@@ -1,5 +1,44 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## 2026-08-02 deployed-nightly and real-provider QA refresh
+
+- PR #13 merged as `7380e7ee94c3fc32c730d112834d37fb977d6d5c`. Its first release run failed
+  because the release staging test still expected state schema 15 while the generated manifest
+  correctly reported schema 16. PR #14 changed that contract to 16 and merged as
+  `4dc8708c5dd79152c868dcf1a5549a741d76396d` after all six push/PR Ubuntu, macOS, and Windows CI
+  jobs passed.
+- Release run `30705747645` passed classify, all three native builds, validation, all three smoke
+  jobs, and attestation. Its first npm publication attempt published the Darwin package but failed
+  closed because npm did not expose the immutable integrity within the six 2-second retry delays.
+  A failed-job rerun safely recognized the existing matching package, published the remaining
+  packages, and completed successfully. Public `nightly` then resolved to
+  `0.1.1-nightly.20260801.4dc8708`, and the root plus all three native packages reported that exact
+  version and a registry integrity.
+- `REL-001` (medium, source-fixed; next-nightly verification pending): the production registry
+  visibility policy allowed only about 12 seconds of propagation. The release remains fail-closed
+  and idempotent, but the fixed bounded policy keeps seven reads/six retries and increases the
+  delay to 20 seconds, for a maximum 120-second propagation window. A unit contract fixes the
+  attempts, delay, and total window.
+- Clean WSL 2 Ubuntu 24.04 QA installed the deployed nightly and an isolated Node `22.23.2` under
+  `/home/kimohy/.colay-qa/20260802-0042`; the host Node `18.19.1` was intentionally excluded because
+  Colay requires Node 22 or newer. `colay --version` matched the npm nightly. The workspace was a
+  Linux-native non-Git directory and never gained `.colay` or any other file.
+- With a fresh isolated `COLAY_HOME`, `doctor` and `compatibility` exited 0 with
+  `inference_requests = 0`. Claude `2.1.217` and Agy `1.1.8` were binary-compatible while account
+  readiness remained explicitly unverified. `migrate apply` created only the user-global database
+  and applied schema 1 through 16 without a local config file. Daemon start, status, restart, final
+  status, and stop all succeeded; restart replaced both the instance ID and PID.
+- Three bounded manual real-provider calls were made outside automated tests/CI. Requested Claude
+  reached the provider and returned the concise quota/billing-unavailable classification. Requested
+  Agy reached the provider and returned the concise incompatible read-only protocol classification.
+  Plain `colay run hello` in the non-Git workspace entered conversation routing and reached Claude,
+  rather than returning a Git repository or revision error. No raw provider stack, evidence dump,
+  unsafe permission bypass, credential, task, or worktree was produced.
+- After daemon cleanup, SQLite reported `integrity_check = ok`, zero foreign-key violations, and
+  schema 16. One workspace, one session, and three redacted failed conversation attempts all used
+  the same `workspace_id`; tasks, worktrees, and command evidence were zero. The global state
+  directory and database modes were `0700` and `0600`, and final daemon status was stopped.
+
 ## Cross-platform legacy IPC lint refresh: 2026-07-27
 
 The legacy named-pipe endpoint identity path is Windows-only.  Source commit
