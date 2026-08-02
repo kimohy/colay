@@ -615,10 +615,7 @@ fn graph_approval_authority_mismatch_is_refused_before_target_mutation() -> Test
              validation_hash = NULL,
              base_commit = NULL
          WHERE workspace_id = ?1 AND revision_id = ?2",
-        params![
-            RESERVED_LEGACY_WORKSPACE,
-            graph.revision_id.to_string(),
-        ],
+        params![RESERVED_LEGACY_WORKSPACE, graph.revision_id.to_string(),],
     )?;
     restore_legacy_graph_approval_fixture_trigger(&fixture)?;
     let source_before = fixture.source_evidence_hashes()?;
