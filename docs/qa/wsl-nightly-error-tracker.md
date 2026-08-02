@@ -1,5 +1,36 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## 2026-08-02 PR #16 deployed-nightly verification
+
+- PR #16 passed duplicate push/pull-request CI matrices on Ubuntu, macOS, and Windows, then merged
+  as `8f2654ac43d2f8260cd529790f62357f7059523a`. Release run `30749716792` passed classify,
+  all three native builds, immutable bundle validation, all three platform smoke jobs,
+  attestation, and npm publication. Public `nightly` resolved to
+  `0.1.1-nightly.20260802.8f2654a`, matching the merge commit prefix.
+- WSL 2 Ubuntu 24.04 clean-installed that exact nightly into the fresh timestamped npm prefix
+  `/home/kimohy/.cache/colay-nightly-8f2654a.RxBSYz/prefix`, using the user's existing Node
+  `22.23.1` only as the launcher runtime. The installed Linux package was the matching version and
+  selected an x86-64 static PIE native binary. The existing global npm installation was not
+  changed.
+- A private copy of the affected schema-8 legacy store and an isolated `COLAY_HOME` reproduced the
+  upgrade boundary without mutating user state. Pre-migration `doctor` exited 0, reported
+  `legacy_import.pending = true`, source schema 8, and `inference_requests = 0`. `migrate apply`
+  created schema 16. `daemon start` then reached IPC `online` from the deployed nightly instead of
+  returning `user daemon contenders exited before IPC readiness`.
+- Read-only database inspection found one completed import ledger row, 51 imported rows, and the
+  historical graph preserved with `status = invalid`. Source and global integrity checks returned
+  `ok` with zero foreign-key violations. The original and copied legacy database SHA-256 remained
+  identical before and after:
+  `d6a7c0dbd90b0109fa500c80ef77963726a6659eb87e52520c05e0b57aed22bc`.
+- Bounded manual provider QA exposed two follow-ups. Real Codex `0.146.0` completed inference but
+  returned an `answer_complete` object with `response` rather than the strict
+  `response_redacted` field, so Colay correctly failed closed but the conversation was unusable
+  (`WSL-020`). Claude reached its CLI and reported quota/billing unavailable; Gemini reached its
+  CLI and reported authentication unavailable. Those two account states are not Colay defects.
+- After the completed import and daemon stop, offline `doctor` still reported the same fingerprint
+  as `legacy_import.pending = true`, despite the matching durable ledger row (`WSL-021`). Final
+  daemon status was stopped; all QA state remains isolated under the timestamped QA root.
+
 ## 2026-08-02 deployed-nightly and real-provider QA refresh
 
 - PR #13 merged as `7380e7ee94c3fc32c730d112834d37fb977d6d5c`. Its first release run failed
@@ -417,7 +448,7 @@ diagnostic.
 ## WSL-019: unsealed legacy invalid graph prevents daemon startup
 
 - Severity: high
-- Status: source-fixed; deployed-nightly verification pending
+- Status: fixed
 - Observed nightly: `0.1.1-nightly.20260801.3f4e2f7`
 - Observed executable: `/home/kimohy/.nvm/versions/node/v22.23.1/bin/colay`
 - Verified source candidate: `72d9bc6315b1c57d92b27231be4e94c5a5000b68`
@@ -504,10 +535,80 @@ details capped at 256 characters.
   binary passes `17/17`. These tests use separate isolated state rather than the copied user
   configuration. No real Codex, Claude, Gemini, or Agy inference ran.
 
-The reviewed source candidate is verified, but the preserved public-nightly path has not been
-rerun with a nightly containing these commits. Deployed-nightly verification therefore remains
-pending; the issue must not move to `fixed` until that clean installation and preserved-state
-startup succeed.
+### Deployed-nightly verification: 2026-08-02
+
+PR #16 merged as `8f2654ac43d2f8260cd529790f62357f7059523a` after all six PR CI checks passed.
+Release run `30749716792` published `0.1.1-nightly.20260802.8f2654a`. A fresh WSL npm prefix,
+private schema-8 source copy, and isolated `COLAY_HOME` reproduced the exact legacy boundary.
+`doctor`, schema-16 migration, daemon start/status, import, stop, and final status all exited 0.
+The daemon reached `online` with the deployed nightly executable; the global import ledger recorded
+51 rows, and one unsealed `invalid` graph was preserved. Both databases passed integrity and
+foreign-key checks, and the original source hash was unchanged. This closes the startup defect.
+The post-import doctor display discrepancy is tracked separately as `WSL-021`.
+
+## WSL-020: real Codex answer omits the strict conversation response field
+
+- Severity: high
+- Status: open
+- Observed nightly: `0.1.1-nightly.20260802.8f2654a`
+- Observed provider: Codex `0.146.0`
+
+### Evidence and root cause
+
+In the isolated non-Git WSL workspace, plain `colay run hello` selected Codex and completed one
+read-only inference. The provider returned a concise `answer_complete` JSON object, but used the
+field `response`. Colay's provider-neutral `ConversationOutcome` contract requires
+`response_redacted` and denies unknown fields, so the attempt correctly persisted as terminal
+`failed` with a bounded compatibility diagnostic:
+
+```text
+conversation output is not one strict outcome JSON object:
+unknown field `response`, expected `response_redacted`
+```
+
+The compatibility probe had correctly verified the read-only sandbox and reported the output
+schema option as advertised. The conversation request nevertheless set no output schema, and its
+prompt named the internal `ConversationOutcome` type without enumerating the exact JSON shapes or
+required field names. Fake-provider tests hard-code valid `response_redacted` fixtures and therefore
+cannot detect this prompt-to-provider contract omission.
+
+### Expected correction and verification
+
+- Put the exact provider-neutral outcome shapes and required field names in the conversation
+  request; use a verified provider output-schema mechanism where supported without weakening the
+  strict deserializer.
+- Add a fake or deterministic contract fixture that captures the actual prompt/schema supplied to
+  the adapter and fails when `response_redacted` is absent from that contract.
+- Re-run a bounded real Codex turn from a fresh nightly and require a successful
+  `answer_complete` attempt with no task or worktree creation.
+
+## WSL-021: doctor reports a completed legacy import as pending
+
+- Severity: medium
+- Status: open
+- Observed nightly: `0.1.1-nightly.20260802.8f2654a`
+
+### Evidence and impact
+
+After successful daemon startup/import and clean shutdown, offline `doctor` reported
+`legacy_import.pending = true` for source fingerprint
+`d66ffeb6ca0b4f2e6a4646b4adf5c6cbbde771c1247c65c5cd7d1e265c4967ab`. Read-only inspection of
+the schema-16 global database found one `legacy_imports` row with that exact fingerprint and
+workspace, `result_json.imported = true`, 51 imported rows, and the preserved invalid graph.
+
+The import engine is correct, but the offline doctor projection describes source readiness without
+correlating it with the durable import ledger. Users can therefore believe a completed import is
+still pending and may repeat maintenance steps unnecessarily. Live-daemon doctor instead reports
+that import readiness is unavailable through IPC, so neither mode currently presents a clear
+"already imported" state.
+
+### Expected correction and verification
+
+- Correlate source fingerprint and workspace with `legacy_imports` under the same read-only doctor
+  snapshot and report a distinct completed/already-imported state.
+- Preserve the existing pre-import pending result and source-free bounded failure diagnostics.
+- Add offline and live-daemon integration coverage for before-import, after-import, and mismatched
+  fingerprint cases.
 
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
@@ -634,12 +735,13 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-07-27
+- 마지막 갱신: 2026-08-02
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
   `0.1.1-nightly.20260726.b086448`, `0.1.1-nightly.20260726.20b7654`,
-  `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`
+  `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`,
+  `0.1.1-nightly.20260801.3f4e2f7`, `0.1.1-nightly.20260802.8f2654a`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 자동화 테스트와 CI는 fake provider만 사용한다. 실제 provider inference는 사용자가
   명시적으로 승인한 격리 수동 QA에서만 제한적으로 호출한다.
@@ -652,7 +754,9 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
-| `WSL-019` | high | source-fixed; deployed-nightly verification pending | unsealed legacy invalid graph prevents daemon startup |
+| `WSL-019` | high | fixed | unsealed legacy invalid graph prevents daemon startup |
+| `WSL-020` | high | open | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
+| `WSL-021` | medium | open | doctor reports an already completed legacy import as pending |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
@@ -1541,8 +1645,27 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
 9. `완료`: 500ms reconnect 테스트를 condition-based wait로 바꿨다 (`WSL-007`).
 10. `완료`: config 파일이 없는 기존 DB도 기본 설정으로 migration할 수 있게 하고,
     명시적 config 누락은 계속 fail-closed로 유지한다 (`WSL-009`).
+11. `open`: 실제 provider에게 strict `ConversationOutcome` JSON shape를 전달하고 검증된
+    output-schema 기능을 연결한다 (`WSL-020`).
+12. `open`: doctor가 source fingerprint와 완료 import ledger를 대조해 pending과
+    already-imported를 구분한다 (`WSL-021`).
 
 ## Update log
+
+### 2026-08-02
+
+- PR #16의 Ubuntu/macOS/Windows CI 6개 통과, merge commit `8f2654ac`, Release run
+  `30749716792`, npm nightly `0.1.1-nightly.20260802.8f2654a`를 확인했다.
+- WSL Ubuntu 24.04의 새 npm prefix와 격리된 `COLAY_HOME`에서 schema-8 private source를
+  검사하고 schema 16 migration, legacy import, daemon online/status/stop을 완료했다. 원본
+  legacy DB hash는 변경되지 않았고 양쪽 DB integrity와 foreign key 검사는 통과했다.
+- 이 배포 검증으로 `WSL-019`를 `fixed`로 전환했다.
+- 실제 Codex `0.146.0`이 생성한 정상 답변 JSON이 prompt에 누락된 strict field 계약 때문에
+  거부되는 `WSL-020`을 추가했다. Claude quota와 Gemini authentication 실패는 계정 상태로
+  분리했다.
+- 완료 import ledger와 동일 fingerprint가 있는데도 offline doctor가 pending으로 표시하는
+  `WSL-021`을 추가했다. QA daemon은 stopped로 정리했고 timestamped 증거 디렉터리는
+  보존했다.
 
 ### 2026-07-23
 
