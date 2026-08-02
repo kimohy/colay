@@ -1362,7 +1362,11 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
             }
         }
     }
-    let approval_mismatches: i64 = connection.query_row(
+    validate_source_graph_approvals(connection)
+}
+
+fn validate_source_graph_approvals(connection: &Connection) -> StateResult<()> {
+    let mismatches: i64 = connection.query_row(
         "SELECT count(*) FROM graph_approvals AS approval \
          JOIN graph_revisions AS revision \
            ON revision.workspace_id = approval.workspace_id \
@@ -1378,7 +1382,7 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
         [RESERVED_LEGACY_WORKSPACE],
         |row| row.get(0),
     )?;
-    if approval_mismatches != 0 {
+    if mismatches != 0 {
         return Err(StateError::InvalidRecord(
             "legacy graph approvals do not match their sealed graph authority".to_owned(),
         ));
