@@ -45,10 +45,10 @@ use orchestrator_providers::{
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
     ControlAction, DaemonStatus, Database, EffectiveConfig, EventLog, GlobalStatePaths,
-    LeaseRenewal, MigratableConfigDocument, NewTaskAttemptRecord, NewWorktreeRecord,
-    OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig,
-    RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask, WorkerLease,
-    WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
+    LeaseRenewal, LegacyImporter, MigratableConfigDocument, NewTaskAttemptRecord,
+    NewWorktreeRecord, OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths,
+    RootConfig, RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask,
+    WorkerLease, WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -541,7 +541,7 @@ async fn doctor(
     if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
         checks.push(Check::warn("wsl_mixed_git_checkout", warning));
     }
-    doctor_state_checks(repository, &executable, &mut checks).await;
+    doctor_state_checks(repository, effective.config(), &executable, &mut checks).await;
     checks.push(git_health_check(repository));
     for report in collect_provider_reports(effective).await {
         let status = CheckStatus::Warn;
@@ -594,7 +594,12 @@ async fn doctor(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut Vec<Check>) {
+async fn doctor_state_checks(
+    repository: &Path,
+    config: &RootConfig,
+    executable: &Path,
+    checks: &mut Vec<Check>,
+) {
     let paths = match GlobalStatePaths::resolve(&StateEnvironment::from_process()) {
         Ok(paths) => paths,
         Err(error) => {
@@ -604,6 +609,7 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
     };
     match crate::daemon::acquire_maintenance() {
         Ok(maintenance) => {
+            checks.push(legacy_import_check(repository, config, &maintenance.paths));
             let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
                 Ok(Some(database)) => database,
                 Ok(None) => {
@@ -724,6 +730,7 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
             );
         }
         Err(lock_error) => {
+            checks.push(live_daemon_legacy_import_check(repository, config));
             let response = match crate::ipc_client::DaemonClient::doctor_lookup(repository).await {
                 Ok(response) => response,
                 Err(ipc_error) => {
@@ -783,6 +790,52 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
                 executable,
             );
         }
+    }
+}
+
+fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalStatePaths) -> Check {
+    let source = match StatePaths::from_config(repository, config) {
+        Ok(source) => source,
+        Err(error) => return Check::fail("legacy_import", error.to_string()),
+    };
+    match LegacyImporter::inspect(&source, paths) {
+        Ok(Some(plan)) => Check::with_data(
+            "legacy_import",
+            true,
+            json!({
+                "pending": true,
+                "source_schema_version": plan.source_schema_version,
+                "source_fingerprint": plan.source_fingerprint,
+                "source_database": source.database,
+            }),
+        ),
+        Ok(None) => Check::with_data(
+            "legacy_import",
+            true,
+            json!({"pending": false, "source_database": source.database}),
+        ),
+        Err(error) => Check::fail("legacy_import", error.to_string()),
+    }
+}
+
+fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Check {
+    let source = match StatePaths::from_config(repository, config) {
+        Ok(source) => source,
+        Err(error) => return Check::fail("legacy_import", error.to_string()),
+    };
+    if source.database.exists() {
+        Check::with_status_data(
+            "legacy_import",
+            CheckStatus::Warn,
+            "import readiness is unavailable through live-daemon IPC",
+            json!({"source_database": source.database}),
+        )
+    } else {
+        Check::with_data(
+            "legacy_import",
+            true,
+            json!({"pending": false, "source_database": source.database}),
+        )
     }
 }
 
