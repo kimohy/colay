@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 use chrono::Utc;
@@ -18,7 +19,7 @@ use orchestrator_domain::{
 };
 use orchestrator_state::{
     ArtifactStore, Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig,
-    StateEnvironment, StoredArtifact, TaskListFilter,
+    StateEnvironment, StateError, StoredArtifact, TaskListFilter,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -42,6 +43,307 @@ const LEGACY_MIGRATIONS: &[(u32, &str, &str)] = &[
 const DURABLE_SESSIONS_MIGRATION: &str =
     include_str!("../../../migrations/0004_durable_sessions.sql");
 const NONCANONICAL_INVALID_VALIDATION_JSON: &str = "{ \"errors\" : [ \"cycle\" ] }";
+static LEGACY_IMPORT_COMPLETION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn legacy_import_completion_preserves_durable_truth_and_accepts_a_read_only_snapshot() -> TestResult
+{
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+
+    assert_eq!(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        )?,
+        None
+    );
+    let first =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    assert!(first.imported);
+
+    let snapshot = Database::open_read_only_snapshot(fixture.global.path())?
+        .ok_or("global state snapshot was not created")?;
+    assert_ne!(snapshot.path(), fixture.global.path());
+    let completed = LegacyImporter::completed_import(
+        &snapshot,
+        fixture.workspace_id,
+        &plan.source_fingerprint,
+        &fixture.paths,
+    )?
+    .ok_or("matching import was not discoverable")?;
+    assert!(completed.imported);
+    assert_eq!(completed.source_fingerprint, plan.source_fingerprint);
+
+    let replay =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    assert!(!replay.imported);
+    Ok(())
+}
+
+#[test]
+fn legacy_import_completion_returns_none_for_a_different_sealed_fingerprint() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let different_fingerprint = "0".repeat(64);
+    assert_ne!(different_fingerprint, plan.source_fingerprint);
+
+    assert_eq!(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &different_fingerprint,
+            &fixture.paths,
+        )?,
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_mismatched_indexed_workspace() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let other_repository = fixture.root.path().join("other-repository");
+    fs::create_dir_all(&other_repository)?;
+    let other_workspace = fixture
+        .global
+        .resolve_repository_workspace(&other_repository)?
+        .workspace_id;
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_imports SET workspace_id = ?1 WHERE source_fingerprint = ?2",
+        params![other_workspace.to_string(), plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "mismatched indexed workspace",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_mismatched_indexed_manifest() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let different_manifest = "0".repeat(64);
+    assert_ne!(different_manifest, imported.manifest_hash);
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_imports SET manifest_hash = ?1 WHERE source_fingerprint = ?2",
+        params![different_manifest, plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "mismatched indexed manifest",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_structurally_invalid_result_json() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_imports SET result_json = '{}' WHERE source_fingerprint = ?1",
+        [&plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "structurally invalid import result JSON",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_missing_id_mapping() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    seed_target_task_id_collision(&fixture)?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    assert!(imported.id_mapping_count > 0);
+    Connection::open(fixture.global.path())?.execute(
+        "DELETE FROM legacy_import_id_mappings WHERE rowid = (\
+             SELECT rowid FROM legacy_import_id_mappings WHERE source_fingerprint = ?1 LIMIT 1\
+         )",
+        [&plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "missing ID mapping",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_changed_id_mapping() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    seed_target_task_id_collision(&fixture)?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    assert!(imported.id_mapping_count > 0);
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_import_id_mappings SET target_id = ?1 WHERE rowid = (\
+             SELECT rowid FROM legacy_import_id_mappings WHERE source_fingerprint = ?2 LIMIT 1\
+         )",
+        params![uuid::Uuid::now_v7().to_string(), plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "changed ID mapping",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_damaged_imported_audit_chain() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE task_events SET event_hash = ?1 WHERE workspace_id = ?2 AND sequence = 1",
+        params!["f".repeat(64), fixture.workspace_id.to_string()],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "damaged imported audit chain",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_missing_import_anchor() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .append_event(audit_event(None, "existing target evidence"))?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let anchor_sequence = imported
+        .anchor_sequence
+        .ok_or("merged import did not record an anchor")?;
+    Connection::open(fixture.global.path())?.execute(
+        "DELETE FROM task_events WHERE workspace_id = ?1 AND sequence = ?2",
+        params![
+            fixture.workspace_id.to_string(),
+            i64::try_from(anchor_sequence)?
+        ],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "missing import anchor",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_missing_published_import() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    fs::remove_file(imported.published_path.join("legacy.db"))?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "missing published import",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_mismatched_published_import() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    fs::write(
+        imported
+            .published_path
+            .join(format!("tasks/{}/evidence.txt", fixture.task_id)),
+        b"tampered after import",
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan.source_fingerprint,
+            &fixture.paths,
+        ),
+        "mismatched published import",
+    )
+}
 
 #[test]
 fn legacy_repository_state_imports_once_without_source_mutation() -> TestResult {
@@ -2076,6 +2378,37 @@ fn target_mutation_counts(fixture: &ImportFixture) -> TestResult<(i64, i64, i64,
         )?,
         regular_file_count(&fixture.paths.backups)?,
     ))
+}
+
+fn seed_target_task_id_collision(fixture: &ImportFixture) -> TestResult {
+    let mut existing = TaskEnvelope::new("existing target task", "existing request", Utc::now());
+    existing.task_id = fixture.task_id;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .create_task_envelope(&existing)?;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .append_event(audit_event(
+            Some(fixture.task_id),
+            "existing target collision evidence",
+        ))?;
+    Ok(())
+}
+
+fn lock_legacy_import_completion_test() -> MutexGuard<'static, ()> {
+    LEGACY_IMPORT_COMPLETION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn assert_invalid_record<T>(result: Result<T, StateError>, context: &str) -> TestResult {
+    match result {
+        Err(StateError::InvalidRecord(_)) => Ok(()),
+        Err(error) => Err(format!("{context} returned {error:?} instead of InvalidRecord").into()),
+        Ok(_) => Err(format!("{context} was accepted").into()),
+    }
 }
 
 fn assert_only_pretransaction_backup_added(

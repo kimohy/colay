@@ -293,6 +293,22 @@ impl LegacyImporter {
         }))
     }
 
+    /// Returns a fully validated durable import result for the requested sealed source, if one
+    /// exists. This query performs no writes and accepts read-only database snapshots.
+    pub fn completed_import(
+        global: &Database,
+        target: WorkspaceId,
+        source_fingerprint: &str,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<Option<LegacyImportResult>> {
+        let connection = global.raw_lock()?;
+        let result = load_recorded_result_in(&connection, target, source_fingerprint)?;
+        if let Some(result) = result.as_ref() {
+            validate_published_import(result, target, paths)?;
+        }
+        Ok(result)
+    }
+
     /// Imports a sealed plan into one registry-selected workspace. All database rows and the
     /// ledger entry share one transaction; staged files are atomically renamed before commit and
     /// removed automatically if that commit fails.
@@ -310,7 +326,7 @@ impl LegacyImporter {
         ensure_target_database(global, target)?;
         if let Some(existing) = load_existing_result(global, target, plan)? {
             validate_published_import(&existing, target, paths)?;
-            return Ok(existing);
+            return Ok(replayed_apply_result(existing));
         }
         let inspected = Self::inspect(&plan.source, paths)?.ok_or_else(|| {
             StateError::InvalidRecord("legacy source disappeared before import".to_owned())
@@ -323,7 +339,7 @@ impl LegacyImporter {
             LegacyImportStaging::acquire(&workspace_paths.root, &plan.source_fingerprint)?;
         if let Some(existing) = load_existing_result(global, target, plan)? {
             validate_published_import(&existing, target, paths)?;
-            return Ok(existing);
+            return Ok(replayed_apply_result(existing));
         }
         staging.prepare()?;
         let staged_database = capture_staged_database(plan, &scratch, &staging)?;
@@ -416,7 +432,7 @@ fn apply_transaction(
 ) -> StateResult<LegacyImportResult> {
     let transaction = connection.transaction()?;
     if let Some(existing) = load_existing_result_in(&transaction, target, plan)? {
-        return Ok(existing);
+        return Ok(replayed_apply_result(existing));
     }
     let target_string = target.to_string();
     let workspace_exists = transaction.query_row(
@@ -2195,11 +2211,32 @@ fn load_existing_result_in(
     target: WorkspaceId,
     plan: &LegacyImportPlan,
 ) -> StateResult<Option<LegacyImportResult>> {
+    let result = load_recorded_result_in(connection, target, &plan.source_fingerprint)?;
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    if result.manifest_hash != plan.manifest_hash
+        || result.legacy_event_count != plan.event_evidence.count
+        || result.legacy_event_root_hash != plan.event_evidence.root_hash
+        || result.legacy_event_tip_hash != plan.event_evidence.tip_hash
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy import ledger result does not match its sealed source plan".to_owned(),
+        ));
+    }
+    Ok(Some(result))
+}
+
+fn load_recorded_result_in(
+    connection: &Connection,
+    target: WorkspaceId,
+    source_fingerprint: &str,
+) -> StateResult<Option<LegacyImportResult>> {
     let row: Option<(String, String, String, String)> = connection
         .query_row(
             "SELECT workspace_id, manifest_hash, imported_at, result_json FROM main.legacy_imports \
              WHERE source_fingerprint = ?1",
-            [&plan.source_fingerprint],
+            [source_fingerprint],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
@@ -2211,23 +2248,39 @@ fn load_existing_result_in(
             "legacy import fingerprint is already recorded for a different workspace".to_owned(),
         ));
     }
-    let mut result: LegacyImportResult = serde_json::from_str(&result_json)?;
+    let result: LegacyImportResult = serde_json::from_str(&result_json).map_err(|error| {
+        StateError::InvalidRecord(format!(
+            "legacy import ledger result JSON is invalid: {error}"
+        ))
+    })?;
     if !result.imported
-        || result.source_fingerprint != plan.source_fingerprint
+        || result.source_fingerprint != source_fingerprint
         || result.workspace_id != target
         || result.manifest_hash != manifest_hash
         || result.imported_at.to_rfc3339() != imported_at
-        || result.legacy_event_count != plan.event_evidence.count
-        || result.legacy_event_root_hash != plan.event_evidence.root_hash
-        || result.legacy_event_tip_hash != plan.event_evidence.tip_hash
     {
         return Err(StateError::InvalidRecord(
             "legacy import ledger result does not match its indexed columns".to_owned(),
         ));
     }
-    validate_replayed_audit(connection, &result)?;
-    result.imported = false;
+    validate_replayed_audit(connection, &result).map_err(durable_audit_validation_error)?;
     Ok(Some(result))
+}
+
+fn durable_audit_validation_error(error: StateError) -> StateError {
+    match error {
+        error @ (StateError::InvalidEventChain { .. } | StateError::Json(_)) => {
+            StateError::InvalidRecord(format!(
+                "legacy import durable audit evidence is invalid: {error}"
+            ))
+        }
+        error => error,
+    }
+}
+
+fn replayed_apply_result(mut result: LegacyImportResult) -> LegacyImportResult {
+    result.imported = false;
+    result
 }
 
 fn validate_replayed_audit(
@@ -2379,8 +2432,24 @@ fn validate_published_import(
             "legacy import ledger points outside its fingerprint namespace".to_owned(),
         ));
     }
+    match fs::symlink_metadata(&expected) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) | Err(_) => {
+            return Err(StateError::InvalidRecord(
+                "published legacy import directory is missing or invalid".to_owned(),
+            ));
+        }
+    }
     reject_symlink_components(&expected)?;
     let database = expected.join(SOURCE_SNAPSHOT_NAME);
+    match fs::symlink_metadata(&database) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) | Err(_) => {
+            return Err(StateError::InvalidRecord(
+                "published legacy import database is missing or invalid".to_owned(),
+            ));
+        }
+    }
     let database_sha256 = sha256_file(&database)?;
     let database_length = file_length(&database)?;
     let files = manifest_files_below(&expected, Some(SOURCE_SNAPSHOT_NAME))?;
