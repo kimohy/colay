@@ -82,6 +82,10 @@ const RUN_REQUESTED_BY: &str = "local-cli-run";
 const RUN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RUN_COMMAND_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+const LEGACY_IMPORT_DETAIL_MAX_CHARS: usize = 256;
+const LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL: &str = "legacy import source has an incomplete proposal seal; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_INVALID_SOURCE_DETAIL: &str = "legacy import source failed integrity validation; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_PATH_DETAIL: &str = "legacy import readiness could not resolve the repository-local database path; review repository configuration, then rerun `colay doctor`";
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -796,7 +800,7 @@ async fn doctor_state_checks(
 fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalStatePaths) -> Check {
     let source = match StatePaths::from_config(repository, config) {
         Ok(source) => source,
-        Err(error) => return Check::fail("legacy_import", error.to_string()),
+        Err(_) => return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL),
     };
     match LegacyImporter::inspect(&source, paths) {
         Ok(Some(plan)) => Check::with_data(
@@ -814,14 +818,14 @@ fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalSta
             true,
             json!({"pending": false, "source_database": source.database}),
         ),
-        Err(error) => Check::fail("legacy_import", error.to_string()),
+        Err(error) => legacy_import_inspection_failure_check(&error),
     }
 }
 
 fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Check {
     let source = match StatePaths::from_config(repository, config) {
         Ok(source) => source,
-        Err(error) => return Check::fail("legacy_import", error.to_string()),
+        Err(_) => return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL),
     };
     if source.database.exists() {
         Check::with_status_data(
@@ -837,6 +841,28 @@ fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Ch
             json!({"pending": false, "source_database": source.database}),
         )
     }
+}
+
+fn legacy_import_inspection_failure_check(error: &StateError) -> Check {
+    let detail = match error {
+        StateError::InvalidRecord(reason)
+            if reason == "legacy graph revision has an incomplete proposal seal" =>
+        {
+            LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL
+        }
+        _ => LEGACY_IMPORT_INVALID_SOURCE_DETAIL,
+    };
+    legacy_import_failure_check(detail)
+}
+
+fn legacy_import_failure_check(detail: &str) -> Check {
+    Check::fail(
+        "legacy_import",
+        detail
+            .chars()
+            .take(LEGACY_IMPORT_DETAIL_MAX_CHARS)
+            .collect::<String>(),
+    )
 }
 
 fn append_live_doctor_diagnostics(

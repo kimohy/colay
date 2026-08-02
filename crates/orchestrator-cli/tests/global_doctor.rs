@@ -54,6 +54,9 @@ const MIGRATIONS_THROUGH_V8: &[(u32, &str, &str)] = &[
         include_str!("../../../migrations/0008_result_integration.sql"),
     ),
 ];
+const LEGACY_IMPORT_DETAIL_MAX_CHARS: usize = 256;
+const LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL: &str = "legacy import source has an incomplete proposal seal; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_INVALID_SOURCE_DETAIL: &str = "legacy import source failed integrity validation; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
 
 struct DoctorFixture {
     _temp: tempfile::TempDir,
@@ -151,6 +154,49 @@ impl DoctorFixture {
                 proposal_hash,
                 serde_json::to_string(&json!({"errors":["cycle"]}))?,
                 created_at,
+            ],
+        )?;
+        Ok(database)
+    }
+
+    fn seed_repository_legacy_sensitive_graph_mismatch_schema_v8(
+        &self,
+        sensitive_revision_id: &str,
+    ) -> Result<PathBuf> {
+        let proposal_hash = "a".repeat(64);
+        let database = self.seed_repository_legacy_invalid_graph_schema_v8_with_proposal_hash(
+            Some(&proposal_hash),
+        )?;
+        let connection = Connection::open(&database)?;
+        connection.execute(
+            "UPDATE graph_revisions SET status = 'planning' WHERE revision_id = ?1",
+            ["01987d4e-2a54-7000-8000-000000000003"],
+        )?;
+        let proposal = json!({
+            "schema_version": "1",
+            "revision_id": "01987d4e-2a54-7000-8000-000000000003",
+            "session_id": "01987d4e-2a54-7000-8000-000000000001",
+            "goal_message_id": "01987d4e-2a54-7000-8000-000000000002",
+            "planner_provider": "codex",
+            "proposed_at": "2026-08-02T00:00:00Z",
+            "nodes": [],
+        });
+        let validation = json!({
+            "node_count": 0,
+            "edge_count": 0,
+            "topological_order": [],
+            "maximum_parallel_width": 0,
+            "configured_parallel_workers": 1,
+        });
+        connection.execute(
+            "UPDATE graph_revisions
+             SET revision_id = ?1, status = 'invalid', proposal_json = ?2, validation_json = ?3
+             WHERE revision_id = ?4",
+            params![
+                sensitive_revision_id,
+                serde_json::to_string(&proposal)?,
+                serde_json::to_string(&validation)?,
+                "01987d4e-2a54-7000-8000-000000000003",
             ],
         )?;
         Ok(database)
@@ -767,7 +813,7 @@ fn doctor_does_not_query_future_columns_from_schema_eight_legacy_workspace() -> 
 }
 
 #[test]
-fn doctor_reports_import_ready_invalid_graph_source() -> Result<()> {
+fn legacy_import_doctor_reports_import_ready_invalid_graph_source() -> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
@@ -808,7 +854,7 @@ fn doctor_reports_import_ready_invalid_graph_source() -> Result<()> {
 }
 
 #[test]
-fn doctor_fails_a_structurally_invalid_legacy_graph_source() -> Result<()> {
+fn legacy_import_doctor_fails_an_incomplete_proposal_seal_without_mutation() -> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
@@ -833,12 +879,50 @@ fn doctor_fails_a_structurally_invalid_legacy_graph_source() -> Result<()> {
     assert_eq!(document["data"]["passed"], false);
     let check = check_named(&document, "legacy_import")?;
     assert_eq!(check["status"], "fail");
+    assert_eq!(check["detail"], LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL);
+    assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    let global_rows_after = Connection::open(fixture.global_database())?.query_row(
+        "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    assert_eq!(global_rows_after, global_rows_before);
+    assert_eq!(document["data"]["inference_requests"], 0);
+    Ok(())
+}
+
+#[test]
+fn legacy_import_doctor_redacts_and_bounds_repository_controlled_graph_errors() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.seed_current_global_workspace()?;
+    fixture.configure_fake_providers()?;
+    let sensitive_marker = format!("sensitive-doctor-marker-{}", "x".repeat(4_096));
+    let legacy_database =
+        fixture.seed_repository_legacy_sensitive_graph_mismatch_schema_v8(&sensitive_marker)?;
+    let source_before = Sha256::digest(fs::read(&legacy_database)?);
+    let global_rows_before = Connection::open(fixture.global_database())?.query_row(
+        "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
     assert!(
-        check["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("incomplete proposal seal")),
-        "unexpected legacy import detail: {check}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(document["data"]["passed"], false);
+    let check = check_named(&document, "legacy_import")?;
+    assert_eq!(check["status"], "fail");
+    let detail = check["detail"]
+        .as_str()
+        .context("legacy import detail is missing")?;
+    assert_eq!(detail, LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+    assert!(!detail.contains(&sensitive_marker));
+    assert!(detail.chars().count() <= LEGACY_IMPORT_DETAIL_MAX_CHARS);
     assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
     let global_rows_after = Connection::open(fixture.global_database())?.query_row(
         "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
@@ -917,6 +1001,9 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_import = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_import["status"], "pass");
+    assert_eq!(legacy_import["data"]["pending"], false);
     assert_eq!(
         check_named(&document, "state")?["data"]["via"],
         "daemon_ipc"
@@ -1002,6 +1089,16 @@ fn live_doctor_in_unregistered_legacy_workspace_is_read_only() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_import = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_import["status"], "warn");
+    assert_eq!(
+        legacy_import["detail"],
+        "import readiness is unavailable through live-daemon IPC"
+    );
+    assert_eq!(
+        legacy_import["data"]["source_database"],
+        json!(&legacy_database)
+    );
     assert_eq!(check_named(&document, "workspace")?["status"], "warn");
     assert_eq!(fs::read(&legacy_database)?, legacy_bytes);
     let after_rows = Connection::open(fixture.global_database())?.query_row(
