@@ -45,10 +45,10 @@ use orchestrator_providers::{
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
     ControlAction, DaemonStatus, Database, EffectiveConfig, EventLog, GlobalStatePaths,
-    LeaseRenewal, MigratableConfigDocument, NewTaskAttemptRecord, NewWorktreeRecord,
-    OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths, RootConfig,
-    RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask, WorkerLease,
-    WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
+    LeaseRenewal, LegacyImporter, MigratableConfigDocument, NewTaskAttemptRecord,
+    NewWorktreeRecord, OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths,
+    RootConfig, RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask,
+    WorkerLease, WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -82,6 +82,10 @@ const RUN_REQUESTED_BY: &str = "local-cli-run";
 const RUN_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RUN_COMMAND_MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+const LEGACY_IMPORT_DETAIL_MAX_CHARS: usize = 256;
+const LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL: &str = "legacy import source has an incomplete proposal seal; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_INVALID_SOURCE_DETAIL: &str = "legacy import source failed integrity validation; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_PATH_DETAIL: &str = "legacy import readiness could not resolve the repository-local database path; review repository configuration, then rerun `colay doctor`";
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -541,7 +545,7 @@ async fn doctor(
     if let Some(warning) = mixed_git_checkout_warning(repository, std::env::consts::OS) {
         checks.push(Check::warn("wsl_mixed_git_checkout", warning));
     }
-    doctor_state_checks(repository, &executable, &mut checks).await;
+    doctor_state_checks(repository, effective.config(), &executable, &mut checks).await;
     checks.push(git_health_check(repository));
     for report in collect_provider_reports(effective).await {
         let status = CheckStatus::Warn;
@@ -594,7 +598,12 @@ async fn doctor(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut Vec<Check>) {
+async fn doctor_state_checks(
+    repository: &Path,
+    config: &RootConfig,
+    executable: &Path,
+    checks: &mut Vec<Check>,
+) {
     let paths = match GlobalStatePaths::resolve(&StateEnvironment::from_process()) {
         Ok(paths) => paths,
         Err(error) => {
@@ -604,6 +613,7 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
     };
     match crate::daemon::acquire_maintenance() {
         Ok(maintenance) => {
+            checks.push(legacy_import_check(repository, config, &maintenance.paths));
             let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
                 Ok(Some(database)) => database,
                 Ok(None) => {
@@ -724,6 +734,7 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
             );
         }
         Err(lock_error) => {
+            checks.push(live_daemon_legacy_import_check(repository, config));
             let response = match crate::ipc_client::DaemonClient::doctor_lookup(repository).await {
                 Ok(response) => response,
                 Err(ipc_error) => {
@@ -784,6 +795,72 @@ async fn doctor_state_checks(repository: &Path, executable: &Path, checks: &mut 
             );
         }
     }
+}
+
+fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalStatePaths) -> Check {
+    let Ok(source) = StatePaths::from_config(repository, config) else {
+        return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
+    };
+    match LegacyImporter::inspect(&source, paths) {
+        Ok(Some(plan)) => Check::with_data(
+            "legacy_import",
+            true,
+            json!({
+                "pending": true,
+                "source_schema_version": plan.source_schema_version,
+                "source_fingerprint": plan.source_fingerprint,
+                "source_database": source.database,
+            }),
+        ),
+        Ok(None) => Check::with_data(
+            "legacy_import",
+            true,
+            json!({"pending": false, "source_database": source.database}),
+        ),
+        Err(error) => legacy_import_inspection_failure_check(&error),
+    }
+}
+
+fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Check {
+    let Ok(source) = StatePaths::from_config(repository, config) else {
+        return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
+    };
+    if source.database.exists() {
+        Check::with_status_data(
+            "legacy_import",
+            CheckStatus::Warn,
+            "import readiness is unavailable through live-daemon IPC",
+            json!({"source_database": source.database}),
+        )
+    } else {
+        Check::with_data(
+            "legacy_import",
+            true,
+            json!({"pending": false, "source_database": source.database}),
+        )
+    }
+}
+
+fn legacy_import_inspection_failure_check(error: &StateError) -> Check {
+    let detail = match error {
+        StateError::InvalidRecord(reason)
+            if reason == "legacy graph revision has an incomplete proposal seal" =>
+        {
+            LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL
+        }
+        _ => LEGACY_IMPORT_INVALID_SOURCE_DETAIL,
+    };
+    legacy_import_failure_check(detail)
+}
+
+fn legacy_import_failure_check(detail: &str) -> Check {
+    Check::fail(
+        "legacy_import",
+        detail
+            .chars()
+            .take(LEGACY_IMPORT_DETAIL_MAX_CHARS)
+            .collect::<String>(),
+    )
 }
 
 fn append_live_doctor_diagnostics(

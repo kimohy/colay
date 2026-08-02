@@ -414,6 +414,101 @@ diagnostic.
   printed or copied. Supporting JSON and database evidence is under
   `/home/kimohy/.cache/colay-readiness-qa-20260731`.
 
+## WSL-019: unsealed legacy invalid graph prevents daemon startup
+
+- Severity: high
+- Status: source-fixed; deployed-nightly verification pending
+- Observed nightly: `0.1.1-nightly.20260801.3f4e2f7`
+- Observed executable: `/home/kimohy/.nvm/versions/node/v22.23.1/bin/colay`
+- Verified source candidate: `72d9bc6315b1c57d92b27231be4e94c5a5000b68`
+
+### Evidence and root cause
+
+These opening observations come from the controller's pre-implementation read-only reproduction
+of the public nightly, not from the later isolated source candidate. User-provided command evidence
+established the executable and version above and the generic pre-IPC symptom that every daemon
+contender exited with status 1. The controller's public-nightly `doctor` exited 0 and reported
+user-global root `/home/kimohy/.local/state/colay`, database `state.db`, schema 16, integrity true,
+zero foreign-key violations, daemon stopped, `/home/kimohy` registered, and
+`inference_requests = 0`. Public-nightly daemon start reproduced the same generic contender exit
+and left no daemon process or `daemon_instances` row. A bounded foreground daemon run exited 1
+before IPC and identified a missing required `node_count` field.
+
+The controller's read-only source query of `/home/kimohy/.colay/orchestrator.db` reported
+authoritative schema 8 and one legitimate unsealed graph attempt with `status = invalid`, absent
+proposal JSON/hash, and validation top-level key `errors` containing an array of count 1. No prompt
+content or historical validation message was printed or recorded.
+
+The source database is authoritatively schema 8. Legacy inspection upgrades only its guarded
+private snapshot through schema 13 before graph validation; earlier wording that called the source
+itself schema 13 conflated those two stages. `validate_source_graphs` then unconditionally decoded
+every `validation_json` value as `GraphValidationSummary`, even though that typed successful-plan
+shape requires `node_count` and an unsealed invalid attempt deliberately retains arbitrary
+structured validation evidence. The importer rejected the valid historical row before the daemon
+could register its lease or publish IPC.
+
+Source commit `89b9edb` now parses validation as JSON first and deserializes
+`GraphValidationSummary` only when both proposal and hash exist. Unsealed rows preserve their
+validation evidence and require absent row-level authority. Final-review safety commit `c48e4c9`
+accepts that unsealed shape only for `planning`, `invalid`, `cancelled`, and `superseded`, rejects
+unsealed `awaiting_approval` and `approved`, and null-safely binds every approval proposal/session/
+requirement/validation/base field to the sealed revision. Incomplete proposal/hash pairs, malformed
+JSON, seal/identity/authority mismatches, and approvals of unsealed revisions continue to fail
+before target mutation. Commits `360d3c8` and `72d9bc6` add read-only legacy import readiness to
+`doctor` and point bounded contender exits to that diagnostic; final-review safety commit
+`029ca24` replaces repository-controlled importer errors with fixed, actionable, source-value-free
+details capped at 256 characters.
+
+### Source candidate verification: 2026-08-02
+
+- Focused Windows gates at exact source HEAD passed: format and diff checks; legacy import `26/26`
+  in 220.6 seconds; global doctor `16/16` in 53.4 seconds; global daemon `7/7` in 43.4 seconds;
+  and daemon lifecycle `5/5` in 21.7 seconds. Required format passed in 4.1 seconds and
+  all-target/all-feature Clippy with `-D warnings` passed in 10.7 seconds.
+- The first full Windows workspace run reached the existing `WIN-003` environment flake: two
+  tests received OS error 5 while launching trusted `icacls.exe`. Each failed test then passed
+  alone three times. A fresh-target audit later reproduced the same spawn-denial class in an
+  unrelated test, while a controller-side sequential read-only `icacls.exe` probe passed `20/20`
+  and found no active Cargo or Colay process. The final exact normal-target
+  `cargo test --workspace --all-features` run passed every workspace target, feature, integration
+  test, and doc test in 735.6 seconds. No product change was made for `WIN-003`.
+- WSL used Ubuntu 24.04 on WSL2 kernel `6.18.33.2-microsoft-standard-WSL2` with Linux Rust/Cargo
+  1.95.0. An initial byte copy of the Windows worktree retained CRLF migration bytes and correctly
+  failed checksum validation; that QA root is preserved as harness evidence. The corrected source
+  was exported from Git object bytes at exact HEAD into
+  `/home/kimohy/.cache/colay-wsl019.XajHfk`. Exported `migrations/0001_core.sql` contained zero
+  CRLF sequences and had SHA-256
+  `28d9a2ec035472bc31df087dc579b24e23b280ccfcd1557ea2649ebe67266305`.
+- The fresh Linux-native build completed in 109 seconds. Candidate `colay` SHA-256 was
+  `cde795a0a003375015a19d4709d776ca94b0792db77239da137765412c50d734`, ELF Build ID
+  `81633da4f86a6aad97af821ffc579e38586e06b6`, version `0.1.0`, target `linux/x86_64`.
+  The compiled `colay-e2e-fake-provider` SHA-256 was
+  `a585190ce4048dc508de16841f11fd2f1d0a174301d0f816f07a16542e8a5921`.
+- With private copied state, isolated `COLAY_HOME`, and
+  `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`, `doctor` exited 0 in 14.263 seconds, reported the schema-8
+  source import-ready, and reported zero inference requests. `migrate apply` exited 0 in 6.859
+  seconds, created the schema-16 global database, and recorded one legacy import. Daemon start
+  reached online in 15.527 seconds from the candidate executable; status was online, stop exited 0,
+  and final status was stopped. Final exact-process and Unix-socket counts were both zero.
+- Read-only SQLite inspection reported `integrity_check = ok` and zero foreign-key violations for
+  both the copied schema-8 source and schema-16 global database. Each retained exactly one
+  `invalid` graph with absent proposal/hash and an `errors` array; the global database had one
+  workspace and one legacy-import ledger row. The original and copied source database SHA-256
+  remained identical before and after:
+  `d6a7c0dbd90b0109fa500c80ef77963726a6659eb87e52520c05e0b57aed22bc`.
+- The required fake-only chat integration passed `4/4`. At the prior WSL source-candidate HEAD, the
+  brief's literal `legacy_import` filter matched zero `global_doctor` test names, so the historical
+  command completed with 16 tests filtered out; the substantive supplemental binary passed
+  `16/16`. The final-review fix wave renamed the diagnostics and added the redaction regression:
+  the same documented filter now selects and passes `3/3`, and the full amended `global_doctor`
+  binary passes `17/17`. These tests use separate isolated state rather than the copied user
+  configuration. No real Codex, Claude, Gemini, or Agy inference ran.
+
+The reviewed source candidate is verified, but the preserved public-nightly path has not been
+rerun with a nightly containing these commits. Deployed-nightly verification therefore remains
+pending; the issue must not move to `fixed` until that clean installation and preserved-state
+startup succeed.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
@@ -557,6 +652,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
+| `WSL-019` | high | source-fixed; deployed-nightly verification pending | unsealed legacy invalid graph prevents daemon startup |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
