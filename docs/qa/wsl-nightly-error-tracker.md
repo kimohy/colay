@@ -424,13 +424,20 @@ diagnostic.
 
 ### Evidence and root cause
 
-The public nightly returned only the generic pre-IPC symptom that every daemon contender exited
-with status 1. A bounded foreground run identified a missing required `node_count` field, without
-making a provider request. The healthy user-global database was at schema 16, while the preserved
-repository-local source contained one legitimate unsealed graph attempt with these structural
-properties: `status = invalid`, absent proposal JSON and proposal hash, and a validation object
-whose `errors` member is an array. No prompt content or historical validation message is recorded
-here.
+These opening observations come from the controller's pre-implementation read-only reproduction
+of the public nightly, not from the later isolated source candidate. User-provided command evidence
+established the executable and version above and the generic pre-IPC symptom that every daemon
+contender exited with status 1. The controller's public-nightly `doctor` exited 0 and reported
+user-global root `/home/kimohy/.local/state/colay`, database `state.db`, schema 16, integrity true,
+zero foreign-key violations, daemon stopped, `/home/kimohy` registered, and
+`inference_requests = 0`. Public-nightly daemon start reproduced the same generic contender exit
+and left no daemon process or `daemon_instances` row. A bounded foreground daemon run exited 1
+before IPC and identified a missing required `node_count` field.
+
+The controller's read-only source query of `/home/kimohy/.colay/orchestrator.db` reported
+authoritative schema 8 and one legitimate unsealed graph attempt with `status = invalid`, absent
+proposal JSON/hash, and validation top-level key `errors` containing an array of count 1. No prompt
+content or historical validation message was printed or recorded.
 
 The source database is authoritatively schema 8. Legacy inspection upgrades only its guarded
 private snapshot through schema 13 before graph validation; earlier wording that called the source
