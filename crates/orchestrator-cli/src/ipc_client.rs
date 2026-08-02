@@ -484,7 +484,7 @@ async fn wait_until_ready(
                 }
             }
             if let Some(exit) = last_child_exit {
-                bail!("user daemon contenders exited before IPC readiness; last exit: {exit}");
+                bail!("{}", daemon_contenders_exited_message(&exit));
             }
             bail!(
                 "user daemon did not publish IPC within {} seconds",
@@ -605,6 +605,12 @@ impl StartupChild for Child {
             },
         }
     }
+}
+
+fn daemon_contenders_exited_message(exit: &str) -> String {
+    format!(
+        "user daemon contenders exited before IPC readiness; last exit: {exit}; run `colay doctor` for startup diagnostics"
+    )
 }
 
 fn poll_non_owner_contender(
@@ -830,9 +836,9 @@ mod tests {
 
     use super::{
         LegacyDaemonIdentity, PingReadiness, ReadyChildDisposition, ReapProgress, StartupChild,
-        classify_ready_child, inspect_child_at_startup_deadline, legacy_status_identity,
-        legacy_status_request, ping_readiness, poll_non_owner_contender, resolve_ready_child,
-        response_stream_with_legacy_identity, spawn_contender_once,
+        classify_ready_child, daemon_contenders_exited_message, inspect_child_at_startup_deadline,
+        legacy_status_identity, legacy_status_request, ping_readiness, poll_non_owner_contender,
+        resolve_ready_child, response_stream_with_legacy_identity, spawn_contender_once,
         validate_legacy_daemon_identity,
     };
     #[cfg(windows)]
@@ -840,6 +846,15 @@ mod tests {
     use anyhow::Context as _;
     use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse};
     use serde_json::json;
+
+    #[test]
+    fn contender_exit_diagnostic_points_to_doctor_without_claiming_a_cause() {
+        let message = daemon_contenders_exited_message("exit status: 1");
+        assert!(message.contains("exited before IPC readiness"));
+        assert!(message.contains("last exit: exit status: 1"));
+        assert!(message.contains("run `colay doctor`"));
+        assert!(!message.contains("node_count"));
+    }
 
     struct FakeStartupChild {
         pid: u32,
