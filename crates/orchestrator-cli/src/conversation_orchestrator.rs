@@ -190,13 +190,8 @@ impl OfficialCliConversationOrchestrator {
             source_message_id: request.source_message_id,
             transcript_redacted: &request.transcript_redacted,
             repository_summary_redacted: &request.repository_summary_redacted,
-            allowed_outcomes: [
-                "answer_complete",
-                "more_information_needed",
-                "worktree_task_candidate",
-                "needs_attention",
-            ],
-            required_output: "Return exactly one ConversationOutcome JSON object and no fences or prose",
+            canonical_output_contract: &CANONICAL_OUTPUT_CONTRACT,
+            required_output: "Return exactly one JSON object with no fences or prose. response_redacted is the required response key. Unknown fields are forbidden.",
             requirements_contract: "Requirement snapshots use objective, in_scope, out_of_scope, constraints, acceptance_criteria, verification_plan, risks, and open_questions. Each verification_plan item is {executable,args}; never return shell command strings or shell interpreters.",
             timeout_seconds,
             stdout_limit: CONVERSATION_MAX_OUTPUT_BYTES,
@@ -238,12 +233,37 @@ struct ConversationPrompt<'a> {
     source_message_id: orchestrator_domain::MessageId,
     transcript_redacted: &'a str,
     repository_summary_redacted: &'a str,
-    allowed_outcomes: [&'static str; 4],
+    canonical_output_contract: &'static [ConversationOutputContract; 4],
     required_output: &'static str,
     requirements_contract: &'static str,
     timeout_seconds: u64,
     stdout_limit: usize,
 }
+
+#[derive(Serialize)]
+struct ConversationOutputContract {
+    outcome: &'static str,
+    required_fields: &'static [&'static str],
+}
+
+const CANONICAL_OUTPUT_CONTRACT: [ConversationOutputContract; 4] = [
+    ConversationOutputContract {
+        outcome: "answer_complete",
+        required_fields: &["response_redacted"],
+    },
+    ConversationOutputContract {
+        outcome: "more_information_needed",
+        required_fields: &["response_redacted", "requirements"],
+    },
+    ConversationOutputContract {
+        outcome: "worktree_task_candidate",
+        required_fields: &["response_redacted", "requirements"],
+    },
+    ConversationOutputContract {
+        outcome: "needs_attention",
+        required_fields: &["response_redacted", "evidence_redacted"],
+    },
+];
 
 #[async_trait]
 impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
@@ -482,5 +502,69 @@ mod tests {
         assert!(evidence.contains("Colay did not enable it"));
         assert!(evidence.contains("unsupported account"));
         assert!(evidence.contains("[1 provider stack frames omitted]"));
+    }
+
+    #[test]
+    fn conversation_prompt_lists_canonical_shapes() -> Result<(), Box<dyn std::error::Error>> {
+        let prompt = serde_json::to_value(ConversationPrompt {
+            schema_version: SchemaVersion::V1,
+            attempt_id: orchestrator_domain::ConversationAttemptId::new(),
+            session_id: orchestrator_domain::SessionId::new(),
+            source_message_id: orchestrator_domain::MessageId::new(),
+            transcript_redacted: "What changed?",
+            repository_summary_redacted: "Read-only repository summary",
+            canonical_output_contract: &CANONICAL_OUTPUT_CONTRACT,
+            required_output: "Return exactly one JSON object with no fences or prose. response_redacted is the required response key. Unknown fields are forbidden.",
+            requirements_contract: "requirements contract",
+            timeout_seconds: 60,
+            stdout_limit: CONVERSATION_MAX_OUTPUT_BYTES,
+        })?;
+
+        assert_eq!(
+            prompt["canonical_output_contract"],
+            serde_json::json!([
+                {
+                    "outcome": "answer_complete",
+                    "required_fields": ["response_redacted"]
+                },
+                {
+                    "outcome": "more_information_needed",
+                    "required_fields": ["response_redacted", "requirements"]
+                },
+                {
+                    "outcome": "worktree_task_candidate",
+                    "required_fields": ["response_redacted", "requirements"]
+                },
+                {
+                    "outcome": "needs_attention",
+                    "required_fields": ["response_redacted", "evidence_redacted"]
+                }
+            ])
+        );
+        assert!(
+            prompt
+                .as_object()
+                .is_some_and(|prompt| !prompt.contains_key("allowed_outcomes"))
+        );
+        assert!(
+            prompt["canonical_output_contract"]
+                .as_array()
+                .is_some_and(|shapes| shapes.iter().all(|shape| {
+                    shape["required_fields"]
+                        .as_array()
+                        .is_some_and(|fields| fields.iter().all(|field| field != "response"))
+                }))
+        );
+        assert!(
+            prompt["required_output"]
+                .as_str()
+                .is_some_and(|required_output| {
+                    required_output.contains("response_redacted")
+                        && required_output.contains("Unknown fields are forbidden")
+                        && required_output.contains("exactly one JSON object")
+                        && required_output.contains("no fences or prose")
+                })
+        );
+        Ok(())
     }
 }

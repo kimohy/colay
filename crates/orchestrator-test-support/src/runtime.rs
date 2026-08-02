@@ -28,6 +28,7 @@ pub enum FakeRuntimeScenario {
     DiagnosticNoise,
     Timeout,
     SecretOutput,
+    ConversationResponseAlias,
 }
 
 #[derive(Debug)]
@@ -140,9 +141,11 @@ impl AdapterRuntime for FakeAdapterRuntime {
     ) -> Result<WorkerHandle, ProviderError> {
         self.ensure_fake(&invocation.executable)?;
         let lines = if request.objective == "Conduct a read-only conversation turn"
-            && self.scenario == FakeRuntimeScenario::Success
-        {
-            conversation_lines(provider, &request.prompt)
+            && matches!(
+                self.scenario,
+                FakeRuntimeScenario::Success | FakeRuntimeScenario::ConversationResponseAlias
+            ) {
+            conversation_lines(provider, &request.prompt, self.scenario)
         } else {
             scenario_lines(provider, self.scenario)
         };
@@ -419,7 +422,8 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
             _,
             FakeRuntimeScenario::ProcessCrash
             | FakeRuntimeScenario::DiagnosticNoise
-            | FakeRuntimeScenario::Timeout,
+            | FakeRuntimeScenario::Timeout
+            | FakeRuntimeScenario::ConversationResponseAlias,
         ) => Vec::new(),
     };
     lines
@@ -428,13 +432,22 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         .collect()
 }
 
-fn conversation_lines(provider: ProviderId, prompt: &str) -> Vec<Vec<u8>> {
+fn conversation_lines(
+    provider: ProviderId,
+    prompt: &str,
+    scenario: FakeRuntimeScenario,
+) -> Vec<Vec<u8>> {
     let prompt: serde_json::Value = serde_json::from_str(prompt).unwrap_or_default();
     let transcript = prompt
         .get("transcript_redacted")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let outcome = if transcript.contains("needs-info") {
+    let outcome = if scenario == FakeRuntimeScenario::ConversationResponseAlias {
+        serde_json::json!({
+            "outcome": "answer_complete",
+            "response": "Hello! How can I help?"
+        })
+    } else if transcript.contains("needs-info") {
         serde_json::json!({
             "outcome": "more_information_needed",
             "response_redacted": "Which crate and acceptance boundary should be used?",
@@ -721,7 +734,7 @@ fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
         eprintln!("fake conversation provider crash");
         std::process::exit(17);
     }
-    for line in conversation_lines(provider, &prompt) {
+    for line in conversation_lines(provider, &prompt, FakeRuntimeScenario::Success) {
         println!("{}", String::from_utf8_lossy(&line));
     }
     true

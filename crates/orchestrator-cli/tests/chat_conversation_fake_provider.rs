@@ -132,6 +132,52 @@ async fn ordinary_question_uses_bounded_read_only_fake_provider_without_worktree
 }
 
 #[tokio::test]
+async fn fake_provider_response_alias_normalizes_to_canonical_session_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::ConversationResponseAlias,
+    )?);
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.agy = None;
+    config.orchestrator.providers.claude = None;
+    config
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+    let request = request("Compatibility response alias");
+
+    let response = orchestrator.converse(request.clone()).await?;
+    assert_eq!(response.exit, ConversationExit::Succeeded);
+    let outcome = collect_conversation_response(&request, response)?;
+    let persisted_output = serde_json::to_value(outcome)?;
+
+    assert_eq!(
+        persisted_output,
+        serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Hello! How can I help?"
+        })
+    );
+    assert!(persisted_output.get("response").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn fake_provider_emits_interview_and_candidate_outcomes()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
