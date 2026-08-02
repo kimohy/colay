@@ -798,9 +798,8 @@ async fn doctor_state_checks(
 }
 
 fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalStatePaths) -> Check {
-    let source = match StatePaths::from_config(repository, config) {
-        Ok(source) => source,
-        Err(_) => return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL),
+    let Ok(source) = StatePaths::from_config(repository, config) else {
+        return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
     };
     match LegacyImporter::inspect(&source, paths) {
         Ok(Some(plan)) => Check::with_data(
@@ -823,9 +822,8 @@ fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalSta
 }
 
 fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Check {
-    let source = match StatePaths::from_config(repository, config) {
-        Ok(source) => source,
-        Err(_) => return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL),
+    let Ok(source) = StatePaths::from_config(repository, config) else {
+        return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
     };
     if source.database.exists() {
         Check::with_status_data(
