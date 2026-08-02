@@ -20,7 +20,7 @@ Running the same binary as a bounded foreground daemon exposed the hidden bootst
 error: JSON serialization failed: missing field 'node_count' at line 1 column 72
 ```
 
-The user-global database was healthy at schema 16, and `colay doctor` passed. The failure occurred while registering `/home/kimohy` and inspecting its repository-local schema-13 legacy store at `/home/kimohy/.colay/orchestrator.db`. That store contains one legitimate terminal graph revision with these non-sensitive structural properties:
+The user-global database was healthy at schema 16, and `colay doctor` passed. The failure occurred while registering `/home/kimohy` and inspecting its authoritative repository-local schema-8 legacy store at `/home/kimohy/.colay/orchestrator.db`. Inspection migrates only a guarded private snapshot through schema 13 before graph validation. The authoritative store contains one legitimate terminal graph revision with these non-sensitive structural properties:
 
 - `status = invalid`;
 - `proposal_json IS NULL`;
@@ -70,16 +70,17 @@ For each graph revision:
 3. When both proposal and hash are absent:
    - preserve the validation value exactly as historical evidence;
    - require row-level authority columns to be absent; and
-   - reject any graph approval that targets the unsealed revision.
+   - accept only `planning`, `invalid`, `cancelled`, or `superseded`; and
+   - reject `awaiting_approval`, `approved`, or any graph approval that targets the unsealed revision.
 4. When exactly one of proposal or hash is present, reject the source as an incomplete sealed document.
 
-This accommodates the domain's existing `NewGraphAttempt::invalid` representation without introducing status-specific fabricated data. The optional-pair invariant is more durable than enumerating statuses because terminal and superseded revisions may legitimately have different payload shapes depending on when transition occurred.
+This accommodates the domain's existing `NewGraphAttempt::invalid` representation without fabricating data, while failing closed for statuses that represent an approvable or approved graph and therefore require a proposal seal.
 
 `rewrite_graphs` already selects only rows with a non-null proposal. It continues to rewrite typed proposals and validation summaries and recompute their seals. Unsealed rows remain byte-for-byte unchanged by the graph rewrite path and are copied with the rest of the sealed source snapshot.
 
 ### Approval integrity
 
-The existing approval hash comparison is retained for sealed revisions. Validation also explicitly rejects approvals whose target revision has no proposal/hash pair. This avoids relying on SQL `NULL` comparison behavior and prevents an orphaned approval from passing validation.
+For sealed revisions, approval validation uses null-safe equality for the proposal hash, session ID, requirement revision ID, validation hash, and base commit. Validation also explicitly rejects approvals whose target revision has no proposal/hash pair. This avoids relying on SQL `NULL` comparison behavior and prevents an orphaned, stale, or authority-shifted approval from passing validation.
 
 No approval is synthesized, removed, or rewritten for an unsealed historical attempt.
 
@@ -91,7 +92,7 @@ Doctor emits a dedicated `legacy_import` check:
 
 - pass when no repository-local legacy store exists;
 - pass with structural plan data when inspection succeeds;
-- fail with the bounded importer error when inspection finds an incompatible or invalid source; and
+- fail with a fixed, actionable, source-value-free reason capped at 256 characters when inspection finds an incompatible or invalid source; and
 - report that the check is unavailable when maintenance ownership cannot be obtained and the live daemon path cannot inspect the repository source.
 
 The check does not expose prompt content, validation error text, credentials, or raw JSON. It reports only import readiness, source schema, and non-sensitive plan metadata already suitable for diagnostics.
@@ -108,20 +109,21 @@ After the importer correction, the reproduced WSL store should start normally. T
 - A sealed proposal still requires a typed successful validation summary and an exact recomputed seal.
 - Optional authority columns must agree exactly with typed validation authority for sealed rows and must all be absent for unsealed rows.
 - Any proposal/hash mismatch, malformed JSON, unsupported graph schema, identity mismatch, forged authority, or approval of an unsealed revision fails before target state mutation.
+- Unsealed `awaiting_approval` and `approved` revisions fail before target mutation; unsealed `planning`, `invalid`, `cancelled`, and `superseded` revisions remain compatible.
 - Inspection and failed import leave the source database bytes, global rows, import ledger, events, artifacts, and published legacy snapshot unchanged.
-- Diagnostic output remains bounded and redacted; no provider request is made.
+- Legacy-import diagnostic reasons contain no source identifiers or nested/raw errors, remain capped at 256 characters, and preserve a fixed public distinction for an incomplete proposal seal. No provider request is made.
 
 ## Testing Strategy
 
 ### State-layer TDD regressions
 
-The first failing regression creates a schema-13 repository-local database through existing fixtures and persists an invalid graph attempt with `proposal_json = NULL`, `proposal_hash = NULL`, and `validation_json = {"errors":["cycle"]}`. It asserts:
+The first failing regression uses an existing private post-migration schema-13 fixture stage corresponding to a guarded snapshot of an authoritative schema-8 source. It persists an invalid graph attempt with `proposal_json = NULL`, `proposal_hash = NULL`, and deliberately noncanonical valid `validation_json` text. It asserts:
 
 - `LegacyImporter::inspect` succeeds;
 - `LegacyImporter::apply` imports the workspace;
 - the imported graph retains `status = invalid`;
 - proposal and hash remain absent;
-- validation JSON remains semantically identical;
+- validation JSON remains byte-for-byte identical as SQLite `TEXT`;
 - no graph approval is created; and
 - source database bytes remain unchanged.
 
@@ -131,7 +133,9 @@ Additional regressions assert:
 - a proposal without a hash, or a hash without a proposal, fails closed;
 - row-level authority on an unsealed graph fails closed;
 - an approval targeting an unsealed graph fails closed; and
-- malformed validation JSON fails closed.
+- an approval whose nullable session/requirement/validation/base authority differs from its sealed graph fails closed;
+- unsealed `awaiting_approval` and `approved` revisions fail closed while the four historical unsealed statuses remain accepted; and
+- malformed unsealed validation JSON fails closed even when the fixture bypasses its JSON `CHECK` only to construct the corrupted source.
 
 ### CLI diagnostic regressions
 
@@ -139,6 +143,8 @@ Fake/local fixtures verify that:
 
 - `doctor` passes `legacy_import` for no source and for an import-ready invalid graph source;
 - `doctor` fails `legacy_import` for a structurally invalid source without starting a provider or mutating state;
+- a long sensitive repository-controlled identifier never appears in the fixed, capped `legacy_import` detail;
+- live-daemon doctor reports pass with `pending=false` when the local source is absent and the stable unavailable-through-live-daemon-IPC warning plus source path when it exists;
 - the pre-IPC contender failure contains the `colay doctor` recovery instruction; and
 - normal daemon startup behavior and child cleanup remain unchanged.
 

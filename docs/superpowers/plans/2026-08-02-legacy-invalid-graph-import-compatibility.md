@@ -4,7 +4,7 @@
 
 **Goal:** Preserve legitimate unsealed legacy graph attempts during user-global import, expose import readiness through `doctor`, and make pre-IPC daemon exits actionable.
 
-**Architecture:** Legacy graph validation branches on the persisted proposal/hash pair: sealed graphs retain typed summary, authority, identity, and hash checks; unsealed graphs retain arbitrary valid JSON evidence and require absent row authority. CLI diagnostics reuse the guarded `LegacyImporter::inspect` path without mutating source or target state, while startup failures point users to `colay doctor` instead of capturing raw stderr.
+**Architecture:** Legacy graph validation branches on the persisted proposal/hash pair and status: sealed graphs retain typed summary, authority, identity, and hash checks; unsealed `planning`, `invalid`, `cancelled`, and `superseded` graphs retain arbitrary valid JSON evidence and require absent row authority, while unsealed `awaiting_approval` and `approved` graphs fail closed. Approval rows bind null-safely to every sealed graph authority field. CLI diagnostics reuse the guarded `LegacyImporter::inspect` path without mutating source or target state and publish only fixed, source-value-free, bounded reasons, while startup failures point users to `colay doctor` instead of capturing raw stderr.
 
 **Tech Stack:** Rust 1.95, rusqlite, serde/serde_json, anyhow, existing orchestrator-state snapshot/import infrastructure, Cargo integration tests, WSL 2 Ubuntu 24.04.
 
@@ -23,7 +23,7 @@
 
 ## File Map
 
-- `crates/orchestrator-state/src/legacy_import.rs`: validate sealed and unsealed graph payloads using distinct invariants; reject approvals of unsealed revisions.
+- `crates/orchestrator-state/src/legacy_import.rs`: validate sealed and unsealed graph payloads using distinct status/shape invariants; reject approvals of unsealed revisions and null-safely bind approvals to sealed graph authority.
 - `crates/orchestrator-state/tests/legacy_import.rs`: reproduce `{"errors":[...]}` invalid graph evidence and verify preservation, failure boundaries, and source immutability.
 - `crates/orchestrator-cli/src/app.rs`: add the `legacy_import` doctor check and pass effective configuration into state diagnostics.
 - `crates/orchestrator-cli/tests/global_doctor.rs`: exercise import-ready and blocked repository-local stores through the public `doctor` command with fake providers.
@@ -42,7 +42,7 @@
 
 - [ ] **Step 1: Add an invalid-graph preservation fixture and failing regression**
 
-Add a helper beside `seed_source_graph` that creates a schema-13 graph using the existing seed, then converts it to the exact unsealed shape:
+Add a helper beside `seed_source_graph` that creates a graph in the private post-migration schema-13 fixture stage used to model the guarded inspection snapshot of an authoritative schema-8 source, then converts it to the exact unsealed shape:
 
 ```rust
 fn seed_invalid_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
@@ -57,7 +57,7 @@ fn seed_invalid_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
              base_commit = NULL
          WHERE workspace_id = ?2 AND revision_id = ?3",
         params![
-            serde_json::to_string(&json!({"errors": ["cycle"]}))?,
+            "{ \"errors\" : [ \"cycle\" ] }",
             RESERVED_LEGACY_WORKSPACE,
             graph.revision_id.to_string(),
         ],
@@ -66,7 +66,7 @@ fn seed_invalid_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
 }
 ```
 
-Add `invalid_graph_evidence_imports_without_source_mutation`. It must hash source evidence before inspection, call inspect/apply, resolve the mapped revision through `legacy_import_id_mappings`, and assert the target row is exactly `("invalid", None, None, json!({"errors":["cycle"]}))`. Assert zero `graph_approvals` for the mapped revision and unchanged source hashes.
+Add `invalid_graph_evidence_imports_without_source_mutation`. It must hash source evidence before inspection, call inspect/apply, resolve the mapped revision through `legacy_import_id_mappings`, and assert the target row preserves the deliberately noncanonical validation SQLite `TEXT` byte-for-byte together with `("invalid", None, None)`. Assert zero `graph_approvals` for the mapped revision and unchanged source hashes.
 
 - [ ] **Step 2: Run the preservation regression and verify RED**
 
@@ -96,9 +96,11 @@ WHERE revision_id = ?1;
 
 Bind `"e".repeat(64)` as `?2`. Each test calls `LegacyImporter::inspect`, expects `persisted record is invalid`, and verifies target mutation counts and source evidence remain unchanged. Add an unsealed-approval test by clearing proposal/hash and inserting a `graph_approvals` row with `"f".repeat(64)` as its fixture hash; inspection must reject it rather than allowing SQL `NULL` comparison to hide the mismatch.
 
+Add separate regressions for unsealed `awaiting_approval` and `approved` rows, plus a characterization matrix that retains unsealed `planning`, `invalid`, `cancelled`, and `superseded`. Add a sealed approval regression that sets the approval session/requirement/validation/base authority columns to `NULL` while the graph remains authoritative; null-safe comparison must reject it before target mutation. Add malformed unsealed validation JSON coverage by enabling SQLite `ignore_check_constraints` only on the fixture corruption connection, then assert rejection with corrupted source bytes and target mutation counts unchanged.
+
 - [ ] **Step 4: Implement shape-aware validation**
 
-In `validate_source_graphs`, parse `validation_json` first as `serde_json::Value`, normalize row authority without lossy `Option::zip`, and branch on `(proposal, hash)`:
+In `validate_source_graphs`, select `status`, parse `validation_json` first as `serde_json::Value`, normalize row authority without lossy `Option::zip`, and branch on `(proposal, hash)`:
 
 ```rust
 let validation_value: serde_json::Value = serde_json::from_str(&validation_json)?;
@@ -115,21 +117,25 @@ let row_authority = match (requirement, validation_hash, base) {
 };
 
 match (proposal, hash) {
-    (None, None) if row_authority.is_none() => {}
+    (None, None) if row_authority.is_none() => match status.as_str() {
+        "planning" | "invalid" | "cancelled" | "superseded" => {}
+        "awaiting_approval" | "approved" => return Err(/* proposal seal required */),
+        _ => return Err(/* unsupported status */),
+    },
     (Some(json), Some(hash)) => {
         let validation: GraphValidationSummary =
             serde_json::from_value(validation_value)?;
         // Retain the existing proposal identity, schema, authority, and hash checks.
     }
     _ => {
-        return Err(StateError::InvalidRecord(format!(
-            "legacy graph revision {revision} has an incomplete proposal seal"
-        )));
+        return Err(StateError::InvalidRecord(
+            "legacy graph revision has an incomplete proposal seal".to_owned(),
+        ));
     }
 }
 ```
 
-Change the approval mismatch query to reject `revision.proposal_hash IS NULL`, `revision.proposal_json IS NULL`, or a differing approval hash. Do not modify `rewrite_graphs`; its `proposal_json IS NOT NULL` filter is the intended sealed-only rewrite boundary.
+Change the approval mismatch query to reject `revision.proposal_hash IS NULL`, `revision.proposal_json IS NULL`, or null-safe inequality (`IS NOT`) between approval and revision proposal hash, session ID, requirement revision ID, validation hash, or base commit. Do not modify `rewrite_graphs`; its `proposal_json IS NOT NULL` filter is the intended sealed-only rewrite boundary.
 
 - [ ] **Step 5: Run state regressions and verify GREEN**
 
@@ -138,6 +144,8 @@ Run:
 ```text
 cargo test -p orchestrator-state --test legacy_import invalid_graph -- --nocapture
 cargo test -p orchestrator-state --test legacy_import graph -- --nocapture
+cargo test -p orchestrator-state --test legacy_import unsealed_ -- --nocapture
+cargo test -p orchestrator-state --test legacy_import graph_approval_authority_mismatch_is_refused_before_target_mutation -- --nocapture --exact
 cargo test -p orchestrator-state --all-features
 ```
 
@@ -176,7 +184,7 @@ Use `serde_json::to_string(&json!({"errors":["cycle"]}))` for `?4`. This source 
 
 - [ ] **Step 2: Add public doctor RED regressions**
 
-Add `doctor_reports_import_ready_invalid_graph_source`:
+Add `legacy_import_doctor_reports_import_ready_invalid_graph_source`:
 
 1. seed a current global workspace and fake provider configuration;
 2. seed the repository-local invalid graph store;
@@ -185,7 +193,7 @@ Add `doctor_reports_import_ready_invalid_graph_source`:
 5. assert exit success, `check_named(..., "legacy_import")["status"] == "pass"`, `pending == true`, and the reported source schema is 8; and
 6. assert the source hash and global workspace/import-ledger counts are unchanged.
 
-Add `doctor_fails_a_structurally_invalid_legacy_graph_source` by changing the seeded row to retain `proposal_json = NULL` but set a 64-character `proposal_hash`. Doctor remains a reporting command and therefore exits successfully; assert the report has `data.passed == false`, the `legacy_import` check is `fail`, its detail mentions `incomplete proposal seal`, and no provider inference or state mutation occurs.
+Add `legacy_import_doctor_fails_an_incomplete_proposal_seal_without_mutation` by changing the seeded row to retain `proposal_json = NULL` but set a 64-character `proposal_hash`. Doctor remains a reporting command and therefore exits successfully; assert the report has `data.passed == false`, the `legacy_import` check is `fail`, its detail equals the fixed incomplete-proposal remediation reason, and no provider inference or state mutation occurs. Add a public long-sensitive-identifier regression asserting the generic fixed remediation reason, maximum 256-character detail, marker absence, successful process exit, `passed=false`, source/target immutability, and zero inference requests.
 
 - [ ] **Step 3: Run doctor tests and verify RED**
 
@@ -209,7 +217,7 @@ fn legacy_import_check(
 ) -> Check {
     let source = match StatePaths::from_config(repository, config) {
         Ok(source) => source,
-        Err(error) => return Check::fail("legacy_import", error.to_string()),
+        Err(_) => return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL),
     };
     match LegacyImporter::inspect(&source, paths) {
         Ok(Some(plan)) => Check::with_data(
@@ -227,12 +235,12 @@ fn legacy_import_check(
             true,
             json!({"pending": false, "source_database": source.database}),
         ),
-        Err(error) => Check::fail("legacy_import", error.to_string()),
+        Err(error) => legacy_import_inspection_failure_check(&error),
     }
 }
 ```
 
-Call it immediately after acquiring maintenance ownership, before any early return for absent or pending global schema. When maintenance ownership is held by a live daemon, resolve the configured repository-local path without opening it: emit pass if its database is absent and warn that import readiness is unavailable through live-daemon IPC if it exists. Do not start a provider or mutate global rows.
+Map every inspection failure to a fixed, actionable, source-value-free reason, cap the result at 256 characters, and preserve a distinct fixed reason only for `legacy graph revision has an incomplete proposal seal`. Never publish the source error string, record identifier, nested SQLite/JSON error, or raw input. Call the check immediately after acquiring maintenance ownership, before any early return for absent or pending global schema. When maintenance ownership is held by a live daemon, resolve the configured repository-local path without opening it: emit pass with `pending=false` if its database is absent and warn with the exact `import readiness is unavailable through live-daemon IPC` detail plus source database path if it exists. Do not start a provider or mutate global rows.
 
 - [ ] **Step 5: Run focused and existing doctor tests**
 
@@ -378,7 +386,7 @@ Add a section containing:
 
 - nightly `0.1.1-nightly.20260801.3f4e2f7` and NVM executable path;
 - generic contender error and bounded foreground `node_count` diagnostic;
-- schema-16 global DB health and the schema-13 unsealed invalid graph structure;
+- schema-16 global DB health, the authoritative schema-8 source, and the unsealed invalid graph structure observed only after its guarded private snapshot migrates through schema 13;
 - root cause in unconditional `GraphValidationSummary` deserialization;
 - exact focused/full Windows and WSL source verification results;
 - original source database before/after hash equality; and

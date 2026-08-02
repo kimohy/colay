@@ -449,10 +449,15 @@ could register its lease or publish IPC.
 
 Source commit `89b9edb` now parses validation as JSON first and deserializes
 `GraphValidationSummary` only when both proposal and hash exist. Unsealed rows preserve their
-validation evidence, require absent row-level authority, and cannot be approved. Incomplete
-proposal/hash pairs, malformed JSON, seal/identity/authority mismatches, and approvals of unsealed
-revisions continue to fail before target mutation. Commits `360d3c8` and `72d9bc6` add read-only
-legacy import readiness to `doctor` and point bounded contender exits to that diagnostic.
+validation evidence and require absent row-level authority. Final-review safety commit `c48e4c9`
+accepts that unsealed shape only for `planning`, `invalid`, `cancelled`, and `superseded`, rejects
+unsealed `awaiting_approval` and `approved`, and null-safely binds every approval proposal/session/
+requirement/validation/base field to the sealed revision. Incomplete proposal/hash pairs, malformed
+JSON, seal/identity/authority mismatches, and approvals of unsealed revisions continue to fail
+before target mutation. Commits `360d3c8` and `72d9bc6` add read-only legacy import readiness to
+`doctor` and point bounded contender exits to that diagnostic; final-review safety commit
+`029ca24` replaces repository-controlled importer errors with fixed, actionable, source-value-free
+details capped at 256 characters.
 
 ### Source candidate verification: 2026-08-02
 
@@ -491,12 +496,13 @@ legacy import readiness to `doctor` and point bounded contender exits to that di
   workspace and one legacy-import ledger row. The original and copied source database SHA-256
   remained identical before and after:
   `d6a7c0dbd90b0109fa500c80ef77963726a6659eb87e52520c05e0b57aed22bc`.
-- The required fake-only chat integration passed `4/4`. The brief's literal `legacy_import` filter
-  currently matches zero `global_doctor` test names, so that exact command completed with 16 tests
-  filtered out; the substantive supplemental full `global_doctor` integration binary passed
-  `16/16`, including import-ready and structurally-invalid legacy graph diagnostics. These tests
-  used separate isolated state rather than the copied user configuration. No real Codex, Claude,
-  Gemini, or Agy inference ran.
+- The required fake-only chat integration passed `4/4`. At the prior WSL source-candidate HEAD, the
+  brief's literal `legacy_import` filter matched zero `global_doctor` test names, so the historical
+  command completed with 16 tests filtered out; the substantive supplemental binary passed
+  `16/16`. The final-review fix wave renamed the diagnostics and added the redaction regression:
+  the same documented filter now selects and passes `3/3`, and the full amended `global_doctor`
+  binary passes `17/17`. These tests use separate isolated state rather than the copied user
+  configuration. No real Codex, Claude, Gemini, or Agy inference ran.
 
 The reviewed source candidate is verified, but the preserved public-nightly path has not been
 rerun with a nightly containing these commits. Deployed-nightly verification therefore remains
