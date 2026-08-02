@@ -1274,7 +1274,7 @@ fn validate_source_verifications(connection: &Connection) -> StateResult<()> {
 
 fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
     let mut statement = connection.prepare(
-        "SELECT revision_id, session_id, goal_message_id, proposal_hash, proposal_json, \
+        "SELECT revision_id, session_id, goal_message_id, status, proposal_hash, proposal_json, \
                 validation_json, requirement_revision_id, validation_hash, base_commit \
          FROM graph_revisions WHERE workspace_id = ?1",
     )?;
@@ -1283,12 +1283,13 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
     for row in rows {
@@ -1296,6 +1297,7 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
             revision,
             session,
             goal,
+            status,
             hash,
             proposal,
             validation_json,
@@ -1316,7 +1318,19 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
             }
         };
         match (proposal, hash) {
-            (None, None) if row_authority.is_none() => {}
+            (None, None) if row_authority.is_none() => match status.as_str() {
+                "planning" | "invalid" | "cancelled" | "superseded" => {}
+                "awaiting_approval" | "approved" => {
+                    return Err(StateError::InvalidRecord(
+                        "legacy unsealed graph status requires a proposal seal".to_owned(),
+                    ));
+                }
+                _ => {
+                    return Err(StateError::InvalidRecord(
+                        "legacy graph revision has an unsupported status".to_owned(),
+                    ));
+                }
+            },
             (Some(json), Some(hash)) => {
                 let validation: GraphValidationSummary = serde_json::from_value(validation_value)?;
                 let proposal: TaskGraphProposal = serde_json::from_str(&json)?;
@@ -1342,9 +1356,9 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
                 }
             }
             _ => {
-                return Err(StateError::InvalidRecord(format!(
-                    "legacy graph revision {revision} has an incomplete proposal seal"
-                )));
+                return Err(StateError::InvalidRecord(
+                    "legacy graph revision has an incomplete proposal seal".to_owned(),
+                ));
             }
         }
     }
@@ -1354,15 +1368,19 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
            ON revision.workspace_id = approval.workspace_id \
          AND revision.revision_id = approval.revision_id \
          WHERE approval.workspace_id = ?1 \
-           AND (revision.proposal_hash IS NULL \
-                OR revision.proposal_json IS NULL \
-                OR approval.proposal_hash <> revision.proposal_hash)",
+            AND (revision.proposal_hash IS NULL \
+                 OR revision.proposal_json IS NULL \
+                 OR approval.proposal_hash IS NOT revision.proposal_hash \
+                 OR approval.session_id IS NOT revision.session_id \
+                 OR approval.requirement_revision_id IS NOT revision.requirement_revision_id \
+                 OR approval.validation_hash IS NOT revision.validation_hash \
+                 OR approval.base_commit IS NOT revision.base_commit)",
         [RESERVED_LEGACY_WORKSPACE],
         |row| row.get(0),
     )?;
     if approval_mismatches != 0 {
         return Err(StateError::InvalidRecord(
-            "legacy graph approvals do not match their proposal seals".to_owned(),
+            "legacy graph approvals do not match their sealed graph authority".to_owned(),
         ));
     }
     Ok(())

@@ -41,6 +41,7 @@ const LEGACY_MIGRATIONS: &[(u32, &str, &str)] = &[
 ];
 const DURABLE_SESSIONS_MIGRATION: &str =
     include_str!("../../../migrations/0004_durable_sessions.sql");
+const NONCANONICAL_INVALID_VALIDATION_JSON: &str = "{ \"errors\" : [ \"cycle\" ] }";
 
 #[test]
 fn legacy_repository_state_imports_once_without_source_mutation() -> TestResult {
@@ -499,10 +500,7 @@ fn invalid_graph_evidence_imports_without_source_mutation() -> TestResult {
     assert_eq!(status, "invalid");
     assert_eq!(proposal_hash, None);
     assert_eq!(proposal_json, None);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&validation_json)?,
-        json!({"errors": ["cycle"]})
-    );
+    assert_eq!(validation_json, NONCANONICAL_INVALID_VALIDATION_JSON);
     let approval_count: i64 = connection.query_row(
         "SELECT count(*) FROM graph_approvals WHERE workspace_id = ?1 AND revision_id = ?2",
         params![fixture.workspace_id.to_string(), mapped_revision],
@@ -601,6 +599,103 @@ fn unsealed_graph_approval_is_refused_before_target_mutation() -> TestResult {
     assert!(error.to_string().contains("persisted record is invalid"));
     assert_eq!(target_before, target_mutation_counts(&fixture)?);
     assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
+}
+
+#[test]
+fn graph_approval_authority_mismatch_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_approved_source_graph(&fixture)?;
+    allow_legacy_graph_approval_fixture_mutation(&fixture)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE graph_approvals
+         SET session_id = NULL,
+             requirement_revision_id = NULL,
+             validation_hash = NULL,
+             base_commit = NULL
+         WHERE workspace_id = ?1 AND revision_id = ?2",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            graph.revision_id.to_string(),
+        ],
+    )?;
+    restore_legacy_graph_approval_fixture_trigger(&fixture)?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let target_before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
+        .err()
+        .ok_or("graph approval authority mismatch was accepted")?;
+
+    assert!(error.to_string().contains("persisted record is invalid"));
+    assert_eq!(target_before, target_mutation_counts(&fixture)?);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
+}
+
+#[test]
+fn unsealed_awaiting_approval_graph_is_refused_before_target_mutation() -> TestResult {
+    assert_unsealed_status_refused("awaiting_approval")
+}
+
+#[test]
+fn unsealed_approved_graph_is_refused_before_target_mutation() -> TestResult {
+    assert_unsealed_status_refused("approved")
+}
+
+#[test]
+fn unsealed_historical_status_matrix_remains_importable() -> TestResult {
+    for status in ["planning", "invalid", "cancelled", "superseded"] {
+        let fixture = ImportFixture::new()?;
+        migrate_source_to_v13(&fixture)?;
+        seed_unsealed_source_graph(&fixture, status, NONCANONICAL_INVALID_VALIDATION_JSON)?;
+        let source_before = fixture.source_evidence_hashes()?;
+        let target_before = target_mutation_counts(&fixture)?;
+
+        assert!(
+            LegacyImporter::inspect(&fixture.source, &fixture.paths)?.is_some(),
+            "unsealed {status} graph was rejected"
+        );
+        assert_eq!(target_before, target_mutation_counts(&fixture)?);
+        assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_unsealed_validation_json_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_source_graph(&fixture, "planning", false)?;
+    allow_legacy_graph_fixture_mutation(&fixture)?;
+    let connection = Connection::open(&fixture.source.database)?;
+    connection.pragma_update(None, "ignore_check_constraints", true)?;
+    connection.execute(
+        "UPDATE graph_revisions
+         SET proposal_hash = NULL, proposal_json = NULL,
+             validation_json = ?1,
+             requirement_revision_id = NULL, validation_hash = NULL, base_commit = NULL
+         WHERE workspace_id = ?2 AND revision_id = ?3",
+        params![
+            "{\"errors\":[",
+            RESERVED_LEGACY_WORKSPACE,
+            graph.revision_id.to_string(),
+        ],
+    )?;
+    connection.pragma_update(None, "ignore_check_constraints", false)?;
+    drop(connection);
+    restore_legacy_graph_fixture_triggers(&fixture)?;
+    let corrupted_source = fixture.source_evidence_hashes()?;
+    let target_before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
+        .err()
+        .ok_or("malformed unsealed validation JSON was accepted")?;
+
+    assert!(error.to_string().contains("persisted record is invalid"));
+    assert_eq!(target_before, target_mutation_counts(&fixture)?);
+    assert_eq!(corrupted_source, fixture.source_evidence_hashes()?);
     Ok(())
 }
 
@@ -1249,7 +1344,15 @@ fn seed_approved_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> 
 }
 
 fn seed_invalid_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
-    let graph = seed_source_graph(fixture, "invalid", false)?;
+    seed_unsealed_source_graph(fixture, "invalid", NONCANONICAL_INVALID_VALIDATION_JSON)
+}
+
+fn seed_unsealed_source_graph(
+    fixture: &ImportFixture,
+    status: &str,
+    validation_json: &str,
+) -> TestResult<GraphSeed> {
+    let graph = seed_source_graph(fixture, status, false)?;
     allow_legacy_graph_fixture_mutation(fixture)?;
     Connection::open(&fixture.source.database)?.execute(
         "UPDATE graph_revisions
@@ -1261,13 +1364,30 @@ fn seed_invalid_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
              base_commit = NULL
          WHERE workspace_id = ?2 AND revision_id = ?3",
         params![
-            serde_json::to_string(&json!({"errors": ["cycle"]}))?,
+            validation_json,
             RESERVED_LEGACY_WORKSPACE,
             graph.revision_id.to_string(),
         ],
     )?;
     restore_legacy_graph_fixture_triggers(fixture)?;
     Ok(graph)
+}
+
+fn assert_unsealed_status_refused(status: &str) -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    seed_unsealed_source_graph(&fixture, status, NONCANONICAL_INVALID_VALIDATION_JSON)?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let target_before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
+        .err()
+        .ok_or_else(|| format!("unsealed {status} graph was accepted"))?;
+
+    assert!(error.to_string().contains("persisted record is invalid"));
+    assert_eq!(target_before, target_mutation_counts(&fixture)?);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
 }
 
 fn allow_legacy_graph_fixture_mutation(fixture: &ImportFixture) -> TestResult {
@@ -1289,6 +1409,21 @@ fn restore_legacy_graph_fixture_triggers(fixture: &ImportFixture) -> TestResult 
          BEFORE UPDATE OF requirement_revision_id, validation_hash, base_commit ON graph_revisions \
          WHEN OLD.status <> 'planning' \
          BEGIN SELECT RAISE(ABORT, 'graph validation authority is immutable'); END;",
+    )?;
+    Ok(())
+}
+
+fn allow_legacy_graph_approval_fixture_mutation(fixture: &ImportFixture) -> TestResult {
+    Connection::open(&fixture.source.database)?
+        .execute_batch("DROP TRIGGER graph_approvals_no_update;")?;
+    Ok(())
+}
+
+fn restore_legacy_graph_approval_fixture_trigger(fixture: &ImportFixture) -> TestResult {
+    Connection::open(&fixture.source.database)?.execute_batch(
+        "CREATE TRIGGER graph_approvals_no_update
+         BEFORE UPDATE ON graph_approvals
+         BEGIN SELECT RAISE(ABORT, 'graph approvals are append-only'); END;",
     )?;
     Ok(())
 }
