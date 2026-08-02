@@ -454,6 +454,157 @@ fn approved_graph_collision_rewrites_only_scratch_and_propagates_hash() -> TestR
 }
 
 #[test]
+fn invalid_graph_evidence_imports_without_source_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_invalid_source_graph(&fixture)?;
+    seed_target_graph_collision(&fixture, &graph)?;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .append_event(audit_event(
+            None,
+            "existing invalid graph collision evidence",
+        ))?;
+    let source_before = fixture.source_evidence_hashes()?;
+
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let result =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+
+    let connection = Connection::open(fixture.global.path())?;
+    let mapped_revision: String = connection.query_row(
+        "SELECT target_id FROM legacy_import_id_mappings \
+         WHERE source_fingerprint = ?1 AND workspace_id = ?2 \
+           AND entity_type = 'graph_revisions.revision_id' AND source_id = ?3",
+        params![
+            result.source_fingerprint,
+            fixture.workspace_id.to_string(),
+            graph.revision_id.to_string()
+        ],
+        |row| row.get(0),
+    )?;
+    let (status, proposal_hash, proposal_json, validation_json): (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = connection.query_row(
+        "SELECT status, proposal_hash, proposal_json, validation_json FROM graph_revisions \
+         WHERE workspace_id = ?1 AND revision_id = ?2",
+        params![fixture.workspace_id.to_string(), mapped_revision],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(status, "invalid");
+    assert_eq!(proposal_hash, None);
+    assert_eq!(proposal_json, None);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&validation_json)?,
+        json!({"errors": ["cycle"]})
+    );
+    let approval_count: i64 = connection.query_row(
+        "SELECT count(*) FROM graph_approvals WHERE workspace_id = ?1 AND revision_id = ?2",
+        params![fixture.workspace_id.to_string(), mapped_revision],
+        |row| row.get(0),
+    )?;
+    assert_eq!(approval_count, 0);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
+}
+
+#[test]
+fn incomplete_graph_proposal_seal_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_source_graph(&fixture, "awaiting_approval", false)?;
+    allow_legacy_graph_fixture_mutation(&fixture)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE graph_revisions SET proposal_hash = NULL WHERE revision_id = ?1",
+        [graph.revision_id.to_string()],
+    )?;
+    restore_legacy_graph_fixture_triggers(&fixture)?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let target_before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
+        .err()
+        .ok_or("incomplete graph proposal seal was accepted")?;
+
+    assert!(error.to_string().contains("persisted record is invalid"));
+    assert_eq!(target_before, target_mutation_counts(&fixture)?);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
+}
+
+#[test]
+fn unsealed_graph_with_row_authority_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_source_graph(&fixture, "awaiting_approval", false)?;
+    allow_legacy_graph_fixture_mutation(&fixture)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE graph_revisions \
+         SET proposal_hash = NULL, proposal_json = NULL, \
+             validation_json = '{\"errors\":[\"cycle\"]}', validation_hash = ?2 \
+         WHERE revision_id = ?1",
+        params![graph.revision_id.to_string(), "e".repeat(64)],
+    )?;
+    restore_legacy_graph_fixture_triggers(&fixture)?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let target_before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
+        .err()
+        .ok_or("unsealed graph with row authority was accepted")?;
+
+    assert!(error.to_string().contains("persisted record is invalid"));
+    assert_eq!(target_before, target_mutation_counts(&fixture)?);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
+}
+
+#[test]
+fn unsealed_graph_approval_is_refused_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    migrate_source_to_v13(&fixture)?;
+    let graph = seed_source_graph(&fixture, "awaiting_approval", false)?;
+    let now = Utc::now();
+    allow_legacy_graph_fixture_mutation(&fixture)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE graph_revisions \
+         SET proposal_hash = NULL, proposal_json = NULL, \
+             validation_json = '{\"errors\":[\"cycle\"]}' \
+         WHERE revision_id = ?1",
+        [graph.revision_id.to_string()],
+    )?;
+    Connection::open(&fixture.source.database)?.execute(
+        "INSERT INTO graph_approvals(workspace_id, revision_id, proposal_hash, approved_by, \
+            approved_at, session_id, requirement_revision_id, validation_hash, base_commit) \
+         VALUES (?1, ?2, ?3, 'fixture', ?4, ?5, NULL, NULL, NULL)",
+        params![
+            RESERVED_LEGACY_WORKSPACE,
+            graph.revision_id.to_string(),
+            "f".repeat(64),
+            now.to_rfc3339(),
+            graph.session_id.to_string(),
+        ],
+    )?;
+    restore_legacy_graph_fixture_triggers(&fixture)?;
+    let source_before = fixture.source_evidence_hashes()?;
+    let target_before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::inspect(&fixture.source, &fixture.paths)
+        .err()
+        .ok_or("unsealed graph approval was accepted")?;
+
+    assert!(error.to_string().contains("persisted record is invalid"));
+    assert_eq!(target_before, target_mutation_counts(&fixture)?);
+    assert_eq!(source_before, fixture.source_evidence_hashes()?);
+    Ok(())
+}
+
+#[test]
 fn integration_collision_rewrites_only_scratch_and_propagates_preview_hash() -> TestResult {
     let fixture = ImportFixture::new()?;
     migrate_source_to_v13(&fixture)?;
@@ -1095,6 +1246,51 @@ fn migrate_source_to_v13(fixture: &ImportFixture) -> TestResult {
 
 fn seed_approved_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
     seed_source_graph(fixture, "approved", true)
+}
+
+fn seed_invalid_source_graph(fixture: &ImportFixture) -> TestResult<GraphSeed> {
+    let graph = seed_source_graph(fixture, "invalid", false)?;
+    allow_legacy_graph_fixture_mutation(fixture)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE graph_revisions
+         SET proposal_hash = NULL,
+             proposal_json = NULL,
+             validation_json = ?1,
+             requirement_revision_id = NULL,
+             validation_hash = NULL,
+             base_commit = NULL
+         WHERE workspace_id = ?2 AND revision_id = ?3",
+        params![
+            serde_json::to_string(&json!({"errors": ["cycle"]}))?,
+            RESERVED_LEGACY_WORKSPACE,
+            graph.revision_id.to_string(),
+        ],
+    )?;
+    restore_legacy_graph_fixture_triggers(fixture)?;
+    Ok(graph)
+}
+
+fn allow_legacy_graph_fixture_mutation(fixture: &ImportFixture) -> TestResult {
+    Connection::open(&fixture.source.database)?.execute_batch(
+        "DROP TRIGGER graph_revision_authority_immutable; \
+         DROP TRIGGER graph_revisions_immutable_payload;",
+    )?;
+    Ok(())
+}
+
+fn restore_legacy_graph_fixture_triggers(fixture: &ImportFixture) -> TestResult {
+    Connection::open(&fixture.source.database)?.execute_batch(
+        "CREATE TRIGGER graph_revisions_immutable_payload \
+         BEFORE UPDATE OF workspace_id, session_id, goal_message_id, ordinal, proposal_hash, \
+                          proposal_json, validation_json, planner_provider, created_at ON graph_revisions \
+         WHEN OLD.status <> 'planning' \
+         BEGIN SELECT RAISE(ABORT, 'graph revision payload is immutable'); END; \
+         CREATE TRIGGER graph_revision_authority_immutable \
+         BEFORE UPDATE OF requirement_revision_id, validation_hash, base_commit ON graph_revisions \
+         WHEN OLD.status <> 'planning' \
+         BEGIN SELECT RAISE(ABORT, 'graph validation authority is immutable'); END;",
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]

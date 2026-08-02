@@ -1298,50 +1298,65 @@ fn validate_source_graphs(connection: &Connection) -> StateResult<()> {
             goal,
             hash,
             proposal,
-            validation,
+            validation_json,
             requirement,
             validation_hash,
             base,
         ) = row?;
-        let validation: GraphValidationSummary = serde_json::from_str(&validation)?;
-        let authority_matches = validation.authority.as_ref().map(|authority| {
-            (
-                authority.requirement_revision_id.to_string(),
-                authority.validation_hash.clone(),
-                authority.base_commit.clone(),
-            )
-        }) == requirement
-            .zip(validation_hash)
-            .zip(base)
-            .map(|((requirement, hash), base)| (requirement, hash, base));
-        let proposal_matches = match (proposal, hash) {
-            (None, None) => true,
+        let validation_value: serde_json::Value = serde_json::from_str(&validation_json)?;
+        let row_authority = match (requirement, validation_hash, base) {
+            (None, None, None) => None,
+            (Some(requirement), Some(validation_hash), Some(base)) => {
+                Some((requirement, validation_hash, base))
+            }
+            _ => {
+                return Err(StateError::InvalidRecord(format!(
+                    "legacy graph revision {revision} has incomplete validation authority"
+                )));
+            }
+        };
+        match (proposal, hash) {
+            (None, None) if row_authority.is_none() => {}
             (Some(json), Some(hash)) => {
+                let validation: GraphValidationSummary = serde_json::from_value(validation_value)?;
                 let proposal: TaskGraphProposal = serde_json::from_str(&json)?;
-                proposal.revision_id.to_string() == revision
+                let authority_matches = validation.authority.as_ref().map(|authority| {
+                    (
+                        authority.requirement_revision_id.to_string(),
+                        authority.validation_hash.clone(),
+                        authority.base_commit.clone(),
+                    )
+                }) == row_authority;
+                let proposal_matches = proposal.revision_id.to_string() == revision
                     && proposal.session_id.to_string() == session
                     && proposal.goal_message_id.to_string() == goal
                     && proposal
                         .schema_version
                         .is_supported_by(orchestrator_domain::SUPPORTED_TASK_GRAPH_SCHEMA_VERSIONS)
                     && task_graph_proposal_hash(&proposal, &validation)
-                        .is_ok_and(|observed| observed == hash)
+                        .is_ok_and(|observed| observed == hash);
+                if !authority_matches || !proposal_matches {
+                    return Err(StateError::InvalidRecord(format!(
+                        "legacy graph revision {revision} has invalid authority or proposal evidence"
+                    )));
+                }
             }
-            _ => false,
-        };
-        if !authority_matches || !proposal_matches {
-            return Err(StateError::InvalidRecord(format!(
-                "legacy graph revision {revision} has invalid authority or proposal evidence"
-            )));
+            _ => {
+                return Err(StateError::InvalidRecord(format!(
+                    "legacy graph revision {revision} has an incomplete proposal seal"
+                )));
+            }
         }
     }
     let approval_mismatches: i64 = connection.query_row(
         "SELECT count(*) FROM graph_approvals AS approval \
          JOIN graph_revisions AS revision \
            ON revision.workspace_id = approval.workspace_id \
-          AND revision.revision_id = approval.revision_id \
+         AND revision.revision_id = approval.revision_id \
          WHERE approval.workspace_id = ?1 \
-           AND approval.proposal_hash <> revision.proposal_hash",
+           AND (revision.proposal_hash IS NULL \
+                OR revision.proposal_json IS NULL \
+                OR approval.proposal_hash <> revision.proposal_hash)",
         [RESERVED_LEGACY_WORKSPACE],
         |row| row.get(0),
     )?;
