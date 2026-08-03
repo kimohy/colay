@@ -619,7 +619,7 @@ async fn doctor_state_checks(
                 Ok(None) => {
                     checks.push(legacy_import_check(
                         &legacy_import,
-                        None,
+                        LegacyImportDurableState::Unavailable,
                         &maintenance.paths,
                     ));
                     checks.push(Check::with_status_data(
@@ -644,7 +644,7 @@ async fn doctor_state_checks(
                 Err(error) => {
                     checks.push(legacy_import_check(
                         &legacy_import,
-                        None,
+                        LegacyImportDurableState::Failed,
                         &maintenance.paths,
                     ));
                     checks.push(Check::fail("state", error.to_string()));
@@ -656,7 +656,7 @@ async fn doctor_state_checks(
                 Err(error) => {
                     checks.push(legacy_import_check(
                         &legacy_import,
-                        None,
+                        LegacyImportDurableState::Failed,
                         &maintenance.paths,
                     ));
                     checks.push(Check::fail("state", error.to_string()));
@@ -666,7 +666,7 @@ async fn doctor_state_checks(
             if schema_version != orchestrator_state::STATE_SCHEMA_VERSION {
                 checks.push(legacy_import_check(
                     &legacy_import,
-                    None,
+                    LegacyImportDurableState::Unavailable,
                     &maintenance.paths,
                 ));
                 checks.push(Check::with_status_data(
@@ -696,7 +696,7 @@ async fn doctor_state_checks(
                 Err(error) => {
                     checks.push(legacy_import_check(
                         &legacy_import,
-                        None,
+                        LegacyImportDurableState::Failed,
                         &maintenance.paths,
                     ));
                     checks.push(Check::fail("state", error.to_string()));
@@ -727,7 +727,7 @@ async fn doctor_state_checks(
                 Ok(None) => {
                     checks.push(legacy_import_check(
                         &legacy_import,
-                        None,
+                        LegacyImportDurableState::Unavailable,
                         &maintenance.paths,
                     ));
                     checks.push(Check::warn(
@@ -747,7 +747,7 @@ async fn doctor_state_checks(
                 Err(error) => {
                     checks.push(legacy_import_check(
                         &legacy_import,
-                        None,
+                        LegacyImportDurableState::Failed,
                         &maintenance.paths,
                     ));
                     checks.push(Check::fail("workspace", error.to_string()));
@@ -756,7 +756,10 @@ async fn doctor_state_checks(
             };
             checks.push(legacy_import_check(
                 &legacy_import,
-                Some((&database, registration.workspace_id)),
+                LegacyImportDurableState::Registered {
+                    database: &database,
+                    workspace_id: registration.workspace_id,
+                },
                 &maintenance.paths,
             ));
             checks.push(Check::with_data("workspace", true, json!(registration)));
@@ -846,6 +849,16 @@ enum LegacyImportInspection {
     Failed(StateError),
 }
 
+#[derive(Clone, Copy)]
+enum LegacyImportDurableState<'a> {
+    Unavailable,
+    Registered {
+        database: &'a Database,
+        workspace_id: orchestrator_state::WorkspaceId,
+    },
+    Failed,
+}
+
 fn inspect_legacy_import(
     repository: &Path,
     config: &RootConfig,
@@ -865,7 +878,7 @@ fn inspect_legacy_import(
 
 fn legacy_import_check(
     inspection: &LegacyImportInspection,
-    durable_state: Option<(&Database, orchestrator_state::WorkspaceId)>,
+    durable_state: LegacyImportDurableState<'_>,
     paths: &GlobalStatePaths,
 ) -> Check {
     let (source, plan) = match inspection {
@@ -885,13 +898,17 @@ fn legacy_import_check(
         );
     };
     let imported = match durable_state {
-        Some((database, workspace_id)) => {
-            match LegacyImporter::completed_import(database, workspace_id, plan, paths) {
-                Ok(result) => result.is_some(),
-                Err(error) => return legacy_import_inspection_failure_check(&error),
-            }
+        LegacyImportDurableState::Registered {
+            database,
+            workspace_id,
+        } => match LegacyImporter::completed_import(database, workspace_id, plan, paths) {
+            Ok(result) => result.is_some(),
+            Err(error) => return legacy_import_inspection_failure_check(&error),
+        },
+        LegacyImportDurableState::Unavailable => false,
+        LegacyImportDurableState::Failed => {
+            return legacy_import_failure_check(LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
         }
-        None => false,
     };
     Check::with_data(
         "legacy_import",
