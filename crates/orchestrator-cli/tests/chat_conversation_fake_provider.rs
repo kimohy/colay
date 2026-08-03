@@ -12,7 +12,9 @@ use orchestrator_engine::{
 };
 use orchestrator_providers::AdapterRuntime;
 use orchestrator_state::RootConfig;
-use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
+use orchestrator_test_support::{
+    FakeAdapterRuntime, FakeRuntimeScenario, fake_conversation_capability,
+};
 
 use colay::conversation_orchestrator::OfficialCliConversationOrchestrator;
 
@@ -90,6 +92,64 @@ fn request(transcript: &str) -> ConversationRequest {
         repository_summary_redacted: "Git availability is not required for answers".to_owned(),
         sandbox: SandboxMode::ReadOnly,
     }
+}
+
+#[tokio::test]
+async fn all_fake_providers_preserve_the_canonical_read_only_conversation_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::Success,
+    )?);
+    let mut config = RootConfig::default();
+    for provider in [
+        config.orchestrator.providers.codex.as_mut(),
+        config.orchestrator.providers.claude.as_mut(),
+        config.orchestrator.providers.gemini.as_mut(),
+        config.orchestrator.providers.agy.as_mut(),
+    ] {
+        provider.ok_or("provider config")?.executable = executable.to_string_lossy().into_owned();
+    }
+    let providers = [
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::Agy,
+    ];
+    let capabilities = providers.map(fake_conversation_capability);
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &capabilities,
+        ModelProfile::Standard,
+    )?;
+
+    for provider in providers {
+        let mut request = request("Why does colay need Git?");
+        request.provider = provider;
+        let response = orchestrator.converse(request.clone()).await?;
+
+        assert_eq!(response.provider, provider);
+        assert_eq!(response.sandbox, SandboxMode::ReadOnly);
+        assert!(
+            response
+                .evidence_redacted
+                .contains(&format!("fake {provider} marker"))
+        );
+        assert_eq!(
+            serde_json::to_value(collect_conversation_response(&request, response)?)?,
+            serde_json::json!({
+                "outcome": "answer_complete",
+                "response_redacted": "Git is needed only after an approved writable task candidate."
+            })
+        );
+    }
+    assert!(!repository.join(".colay/worktrees").exists());
+    Ok(())
 }
 
 #[tokio::test]

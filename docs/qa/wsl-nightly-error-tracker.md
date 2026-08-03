@@ -546,10 +546,29 @@ The daemon reached `online` with the deployed nightly executable; the global imp
 foreign-key checks, and the original source hash was unchanged. This closes the startup defect.
 The post-import doctor display discrepancy is tracked separately as `WSL-021`.
 
+## Standing deployed-nightly provider QA matrix
+
+Every deployed-nightly validation must run the same bounded, read-only conversation lifecycle for
+Codex, Claude, Gemini, and Antigravity (`agy`), then preserve the redacted outcome and confirm no
+task or worktree was created. The source regression
+`all_fake_providers_preserve_the_canonical_read_only_conversation_contract` performs that exact
+four-provider contract only through `orchestrator-test-support`'s compiled fake runtime; it never
+uses a PATH-installed provider CLI.
+
+| Provider | Required deployed-nightly result | Readiness classification |
+| --- | --- | --- |
+| Codex | Canonical `answer_complete` with `response_redacted` | Product regression if the strict contract fails |
+| Claude | Same read-only lifecycle and canonical outcome when the account is ready | Quota/billing/account-unready is an external readiness state, not a product defect |
+| Gemini | Same read-only lifecycle and canonical outcome when the account is ready | Authentication/account-unready is an external readiness state, not a product defect |
+| Antigravity (`agy`) | Same read-only lifecycle and canonical outcome when the account is ready | Account/protocol-unready is an external readiness state, not a product defect |
+
+`WSL-020` and `WSL-021` remain deployment-pending until a fresh WSL nightly attaches this evidence;
+source tests and prior implementation commits alone do not close either issue.
+
 ## WSL-020: real Codex answer omits the strict conversation response field
 
 - Severity: high
-- Status: open
+- Status: fixed-in-source, deployment-pending
 - Observed nightly: `0.1.1-nightly.20260802.8f2654a`
 - Observed provider: Codex `0.146.0`
 
@@ -572,20 +591,23 @@ prompt named the internal `ConversationOutcome` type without enumerating the exa
 required field names. Fake-provider tests hard-code valid `response_redacted` fixtures and therefore
 cannot detect this prompt-to-provider contract omission.
 
-### Expected correction and verification
+### Source correction and required deployment verification
 
-- Put the exact provider-neutral outcome shapes and required field names in the conversation
-  request; use a verified provider output-schema mechanism where supported without weakening the
-  strict deserializer.
-- Add a fake or deterministic contract fixture that captures the actual prompt/schema supplied to
-  the adapter and fails when `response_redacted` is absent from that contract.
+- Source commit `190a2a1045f7cfc029081282d98906214b318dfd` puts the exact provider-neutral
+  outcome shapes and required field names in the sealed read-only conversation request without
+  weakening the strict deserializer. Its `conversation_prompt_lists_canonical_shapes` regression
+  fails if `response_redacted` is omitted from that contract.
+- The standing fake-only regression
+  `all_fake_providers_preserve_the_canonical_read_only_conversation_contract` exercises Codex,
+  Claude, Gemini, and Antigravity through the same canonical response and read-only lifecycle.
 - Re-run a bounded real Codex turn from a fresh nightly and require a successful
-  `answer_complete` attempt with no task or worktree creation.
+  `answer_complete` attempt with no task or worktree creation before changing this status to
+  `fixed`.
 
 ## WSL-021: doctor reports a completed legacy import as pending
 
 - Severity: medium
-- Status: open
+- Status: fixed-in-source, deployment-pending
 - Observed nightly: `0.1.1-nightly.20260802.8f2654a`
 
 ### Evidence and impact
@@ -602,13 +624,18 @@ still pending and may repeat maintenance steps unnecessarily. Live-daemon doctor
 that import readiness is unavailable through IPC, so neither mode currently presents a clear
 "already imported" state.
 
-### Expected correction and verification
+### Source correction and required deployment verification
 
-- Correlate source fingerprint and workspace with `legacy_imports` under the same read-only doctor
-  snapshot and report a distinct completed/already-imported state.
-- Preserve the existing pre-import pending result and source-free bounded failure diagnostics.
-- Add offline and live-daemon integration coverage for before-import, after-import, and mismatched
-  fingerprint cases.
+- Source commits `1d78d0e`, `f5e2082`, `c8e58e8`, `0482f26`, and `1326b65` validate durable import
+  completion against the freshly inspected sealed source plan. The live daemon independently
+  derives its effective configuration and re-inspects the source before returning completion
+  evidence; it does not trust a client-selected state directory or fingerprint. No persisted schema
+  version changed.
+- The focused state and IPC regressions `legacy_import_completion`, `live_doctor_`, and
+  `doctor_lookup` cover completed, pending, changed-source, and corrupt-evidence cases while
+  preserving read-only doctor behavior.
+- Attach a fresh deployed-nightly WSL run that reports completed import state after daemon startup
+  and clean shutdown before changing this status to `fixed`.
 
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
@@ -755,8 +782,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
 | `WSL-019` | high | fixed | unsealed legacy invalid graph prevents daemon startup |
-| `WSL-020` | high | open | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
-| `WSL-021` | medium | open | doctor reports an already completed legacy import as pending |
+| `WSL-020` | high | fixed-in-source, deployment-pending | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
+| `WSL-021` | medium | fixed-in-source, deployment-pending | doctor reports an already completed legacy import as pending |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
@@ -1645,10 +1672,10 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
 9. `완료`: 500ms reconnect 테스트를 condition-based wait로 바꿨다 (`WSL-007`).
 10. `완료`: config 파일이 없는 기존 DB도 기본 설정으로 migration할 수 있게 하고,
     명시적 config 누락은 계속 fail-closed로 유지한다 (`WSL-009`).
-11. `open`: 실제 provider에게 strict `ConversationOutcome` JSON shape를 전달하고 검증된
-    output-schema 기능을 연결한다 (`WSL-020`).
-12. `open`: doctor가 source fingerprint와 완료 import ledger를 대조해 pending과
-    already-imported를 구분한다 (`WSL-021`).
+11. `fixed-in-source, deployment-pending`: 실제 provider에게 strict `ConversationOutcome` JSON
+    shape를 전달하고 검증된 output-schema 기능을 연결한다 (`WSL-020`).
+12. `fixed-in-source, deployment-pending`: doctor가 source fingerprint와 완료 import ledger를
+    대조해 pending과 already-imported를 구분한다 (`WSL-021`).
 
 ## Update log
 

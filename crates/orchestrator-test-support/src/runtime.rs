@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use orchestrator_domain::{
-    AttemptId, CancelOutcome, CancelResult, ProviderId, RawEvent, RawEventChannel,
-    UntrustedWorkerClaim, WorkerHandle, WorkerRequest,
+    AttemptId, CancelOutcome, CancelResult, CapabilitySupport, ProviderCapabilities, ProviderId,
+    RawEvent, RawEventChannel, UntrustedWorkerClaim, WorkerHandle, WorkerRequest,
 };
 use orchestrator_providers::{
     AdapterRuntime, ExecutableKind, ExecutableValidationContext, PreparedInvocation, ProviderError,
@@ -29,6 +29,17 @@ pub enum FakeRuntimeScenario {
     Timeout,
     SecretOutput,
     ConversationResponseAlias,
+}
+
+/// Returns verified fake-only capability evidence for a read-only conversation provider.
+#[must_use]
+pub fn fake_conversation_capability(provider: ProviderId) -> ProviderCapabilities {
+    let mut capability = ProviderCapabilities::unsupported(provider);
+    capability.non_interactive = CapabilitySupport::Verified;
+    capability.structured_output = CapabilitySupport::Verified;
+    capability.read_only = CapabilitySupport::Verified;
+    capability.evidence = vec![format!("fake {provider} marker")];
+    capability
 }
 
 #[derive(Debug)]
