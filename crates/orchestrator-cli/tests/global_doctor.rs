@@ -6,6 +6,7 @@ use std::{
     io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -300,6 +301,32 @@ impl DoctorFixture {
             .map_err(Into::into)
     }
 
+    fn global_import_row_counts(&self) -> Result<Option<[i64; 5]>> {
+        if !self.global_database().exists() {
+            return Ok(None);
+        }
+        Connection::open(self.global_database())?
+            .query_row(
+                "SELECT (SELECT count(*) FROM workspaces), \
+                        (SELECT count(*) FROM legacy_imports), \
+                        (SELECT count(*) FROM legacy_import_id_mappings), \
+                        (SELECT count(*) FROM task_events), \
+                        (SELECT count(*) FROM artifacts)",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ])
+                },
+            )
+            .map(Some)
+            .map_err(Into::into)
+    }
+
     fn seed_future_schema_in_delete_journal_mode(&self) -> Result<Vec<u8>> {
         let database = self.global_database();
         fs::create_dir_all(database.parent().context("global database has no parent")?)?;
@@ -454,6 +481,45 @@ fn temporary_directory_entries(path: &Path) -> Result<Vec<PathBuf>> {
         .collect::<Vec<_>>();
     entries.sort();
     Ok(entries)
+}
+
+fn published_import_metadata(fixture: &DoctorFixture) -> Result<BTreeSet<(PathBuf, u64, String)>> {
+    let workspace_root = fixture.colay_home.join("data/workspaces");
+    if !workspace_root.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let mut pending = vec![workspace_root.clone()];
+    let mut published = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(&workspace_root)?.to_path_buf();
+            if relative
+                .components()
+                .any(|component| component.as_os_str() == "imports")
+            {
+                let bytes = fs::read(&path)?;
+                published.insert((
+                    relative,
+                    metadata.len(),
+                    format!("{:x}", Sha256::digest(bytes)),
+                ));
+            }
+        }
+    }
+    Ok(published)
+}
+
+fn legacy_import_doctor_guard() -> MutexGuard<'static, ()> {
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn check_named<'a>(document: &'a Value, name: &str) -> Result<&'a Value> {
@@ -809,16 +875,22 @@ fn doctor_does_not_query_future_columns_from_schema_eight_legacy_workspace() -> 
         check_named(&document, "state")?["data"]["current_schema_version"],
         Value::Null
     );
+    let legacy_check = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "pass", "{legacy_check}");
+    assert_eq!(legacy_check["data"]["pending"], false);
+    assert_eq!(legacy_check["data"]["imported"], false);
     Ok(())
 }
 
 #[test]
 fn legacy_import_doctor_reports_import_ready_invalid_graph_source() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
     let fixture = DoctorFixture::new()?;
     fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
     let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
     let source_before = Sha256::digest(fs::read(&legacy_database)?);
+    let published_before = published_import_metadata(&fixture)?;
     let global_rows_before = Connection::open(fixture.global_database())?.query_row(
         "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
         [],
@@ -839,10 +911,15 @@ fn legacy_import_doctor_reports_import_ready_invalid_graph_source() -> Result<()
         true
     );
     assert_eq!(
+        check_named(&document, "legacy_import")?["data"]["imported"],
+        false
+    );
+    assert_eq!(
         check_named(&document, "legacy_import")?["data"]["source_schema_version"],
         8
     );
     assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
     let global_rows_after = Connection::open(fixture.global_database())?.query_row(
         "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM legacy_imports)",
         [],
@@ -854,7 +931,229 @@ fn legacy_import_doctor_reports_import_ready_invalid_graph_source() -> Result<()
 }
 
 #[test]
+fn legacy_import_doctor_reports_completed_import() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    let source_before = Sha256::digest(fs::read(&legacy_database)?);
+    let global_rows_before = fixture.global_import_row_counts()?;
+    let published_before = published_import_metadata(&fixture)?;
+
+    let before_import = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        before_import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before_import.stderr)
+    );
+    let before_import: Value = serde_json::from_slice(&before_import.stdout)?;
+    let legacy_check = check_named(&before_import, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "pass", "{legacy_check}");
+    assert_eq!(legacy_check["data"]["pending"], true);
+    assert_eq!(legacy_check["data"]["imported"], false);
+    assert_eq!(fixture.global_import_row_counts()?, global_rows_before);
+    assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
+
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let stopped = fixture.colay(["daemon", "stop"])?;
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let global_rows_before = fixture.global_import_row_counts()?;
+    let published_before = published_import_metadata(&fixture)?;
+    assert!(!published_before.is_empty());
+
+    let after_import = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        after_import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after_import.stderr)
+    );
+    let after_import: Value = serde_json::from_slice(&after_import.stdout)?;
+    let legacy_check = check_named(&after_import, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "pass");
+    assert_eq!(legacy_check["data"]["pending"], false);
+    assert_eq!(legacy_check["data"]["imported"], true);
+    assert_eq!(fixture.global_import_row_counts()?, global_rows_before);
+    assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
+    Ok(())
+}
+
+#[test]
+fn legacy_import_doctor_reports_no_source() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
+    let fixture = DoctorFixture::new()?;
+    fixture.seed_current_global_workspace()?;
+    fixture.configure_fake_providers()?;
+    let global_rows_before = fixture.global_import_row_counts()?;
+    let published_before = published_import_metadata(&fixture)?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_check = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "pass");
+    assert_eq!(legacy_check["data"]["pending"], false);
+    assert_eq!(legacy_check["data"]["imported"], false);
+    assert!(legacy_check["data"].get("source_database").is_none());
+    assert!(legacy_check["data"].get("source_fingerprint").is_none());
+    assert!(legacy_check["data"].get("source_schema_version").is_none());
+    assert_eq!(fixture.global_import_row_counts()?, global_rows_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
+    Ok(())
+}
+
+#[test]
+fn legacy_import_doctor_reports_changed_source_as_pending() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let stopped = fixture.colay(["daemon", "stop"])?;
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    Connection::open(&legacy_database)?.execute(
+        "UPDATE conversation_messages SET content_redacted = 'changed legacy source'",
+        [],
+    )?;
+    let source_before = Sha256::digest(fs::read(&legacy_database)?);
+    let global_rows_before = fixture.global_import_row_counts()?;
+    let published_before = published_import_metadata(&fixture)?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_check = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "pass");
+    assert_eq!(legacy_check["data"]["pending"], true);
+    assert_eq!(legacy_check["data"]["imported"], false);
+    assert_eq!(fixture.global_import_row_counts()?, global_rows_before);
+    assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
+    Ok(())
+}
+
+#[test]
+fn legacy_import_doctor_reports_unregistered_source_as_pending() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
+    let fixture = DoctorFixture::new()?;
+    fixture.seed_current_global_workspace()?;
+    fixture.configure_fake_providers()?;
+    let unregistered = fixture.root.join("unregistered-offline");
+    fs::create_dir_all(&unregistered)?;
+    let fixture_legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    let legacy_database = unregistered.join(".colay/orchestrator.db");
+    fs::create_dir_all(
+        legacy_database
+            .parent()
+            .context("legacy database has no parent")?,
+    )?;
+    fs::copy(&fixture_legacy_database, &legacy_database)?;
+    fs::write(
+        legacy_database
+            .parent()
+            .context("legacy database has no parent")?
+            .join("config.toml"),
+        "config_version = 4\n",
+    )?;
+    let source_before = Sha256::digest(fs::read(&legacy_database)?);
+    let global_rows_before = fixture.global_import_row_counts()?;
+    let published_before = published_import_metadata(&fixture)?;
+
+    let output = fixture.colay_in(&unregistered, ["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_check = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "pass");
+    assert_eq!(legacy_check["data"]["pending"], true);
+    assert_eq!(legacy_check["data"]["imported"], false);
+    assert_eq!(check_named(&document, "workspace")?["status"], "warn");
+    assert_eq!(fixture.global_import_row_counts()?, global_rows_before);
+    assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
+    Ok(())
+}
+
+#[test]
+fn legacy_import_doctor_fails_a_corrupt_completion_ledger_without_mutation() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let stopped = fixture.colay(["daemon", "stop"])?;
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    Connection::open(fixture.global_database())?
+        .execute("UPDATE legacy_imports SET result_json = '{}'", [])?;
+    let source_before = Sha256::digest(fs::read(&legacy_database)?);
+    let global_rows_before = fixture.global_import_row_counts()?;
+    let published_before = published_import_metadata(&fixture)?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_check = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "fail");
+    assert_eq!(legacy_check["detail"], LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+    assert_eq!(document["data"]["passed"], false);
+    assert_eq!(fixture.global_import_row_counts()?, global_rows_before);
+    assert_eq!(Sha256::digest(fs::read(&legacy_database)?), source_before);
+    assert_eq!(published_import_metadata(&fixture)?, published_before);
+    Ok(())
+}
+
+#[test]
 fn legacy_import_doctor_fails_an_incomplete_proposal_seal_without_mutation() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
     let fixture = DoctorFixture::new()?;
     fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
@@ -893,6 +1192,7 @@ fn legacy_import_doctor_fails_an_incomplete_proposal_seal_without_mutation() -> 
 
 #[test]
 fn legacy_import_doctor_redacts_and_bounds_repository_controlled_graph_errors() -> Result<()> {
+    let _guard = legacy_import_doctor_guard();
     let fixture = DoctorFixture::new()?;
     fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
@@ -1004,6 +1304,7 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
     let legacy_import = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_import["status"], "pass");
     assert_eq!(legacy_import["data"]["pending"], false);
+    assert_eq!(legacy_import["data"]["imported"], false);
     assert_eq!(
         check_named(&document, "state")?["data"]["via"],
         "daemon_ipc"

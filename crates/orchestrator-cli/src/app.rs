@@ -45,7 +45,7 @@ use orchestrator_providers::{
 use orchestrator_state::{
     ArtifactStore, ConfigDocument, ConfigEnvironment, ConfigLayerKind, ConfigRequest,
     ControlAction, DaemonStatus, Database, EffectiveConfig, EventLog, GlobalStatePaths,
-    LeaseRenewal, LegacyImporter, MigratableConfigDocument, NewTaskAttemptRecord,
+    LeaseRenewal, LegacyImportPlan, LegacyImporter, MigratableConfigDocument, NewTaskAttemptRecord,
     NewWorktreeRecord, OrchestratorConfig, ProviderConfig, RepositoryStatePaths as StatePaths,
     RootConfig, RoutingAuditRecord, StateEnvironment, StateError, StoredHandover, StoredTask,
     WorkerLease, WorkerLeaseMode, WorkerLeaseRequest, WorkspaceDatabase, load_effective_config,
@@ -613,10 +613,15 @@ async fn doctor_state_checks(
     };
     match crate::daemon::acquire_maintenance() {
         Ok(maintenance) => {
-            checks.push(legacy_import_check(repository, config, &maintenance.paths));
+            let legacy_import = inspect_legacy_import(repository, config, &maintenance.paths);
             let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
                 Ok(Some(database)) => database,
                 Ok(None) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        None,
+                        &maintenance.paths,
+                    ));
                     checks.push(Check::with_status_data(
                         "state",
                         CheckStatus::Warn,
@@ -637,6 +642,11 @@ async fn doctor_state_checks(
                     return;
                 }
                 Err(error) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        None,
+                        &maintenance.paths,
+                    ));
                     checks.push(Check::fail("state", error.to_string()));
                     return;
                 }
@@ -644,11 +654,21 @@ async fn doctor_state_checks(
             let schema_version = match database.migration_status() {
                 Ok(status) => status.current_version,
                 Err(error) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        None,
+                        &maintenance.paths,
+                    ));
                     checks.push(Check::fail("state", error.to_string()));
                     return;
                 }
             };
             if schema_version != orchestrator_state::STATE_SCHEMA_VERSION {
+                checks.push(legacy_import_check(
+                    &legacy_import,
+                    None,
+                    &maintenance.paths,
+                ));
                 checks.push(Check::with_status_data(
                     "state",
                     CheckStatus::Warn,
@@ -674,6 +694,11 @@ async fn doctor_state_checks(
             let health = match database.health() {
                 Ok(health) => health,
                 Err(error) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        None,
+                        &maintenance.paths,
+                    ));
                     checks.push(Check::fail("state", error.to_string()));
                     return;
                 }
@@ -700,6 +725,11 @@ async fn doctor_state_checks(
             let registration = match database.find_repository_workspace(repository) {
                 Ok(Some(registration)) => registration,
                 Ok(None) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        None,
+                        &maintenance.paths,
+                    ));
                     checks.push(Check::warn(
                         "workspace",
                         "current repository is not registered; run a writable command to register it",
@@ -715,10 +745,20 @@ async fn doctor_state_checks(
                     return;
                 }
                 Err(error) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        None,
+                        &maintenance.paths,
+                    ));
                     checks.push(Check::fail("workspace", error.to_string()));
                     return;
                 }
             };
+            checks.push(legacy_import_check(
+                &legacy_import,
+                Some((&database, registration.workspace_id)),
+                &maintenance.paths,
+            ));
             checks.push(Check::with_data("workspace", true, json!(registration)));
             let workspace = database.workspace(registration.workspace_id);
             checks.push(match verify_workspace_audit(&workspace) {
@@ -797,28 +837,73 @@ async fn doctor_state_checks(
     }
 }
 
-fn legacy_import_check(repository: &Path, config: &RootConfig, paths: &GlobalStatePaths) -> Check {
+enum LegacyImportInspection {
+    Inspected {
+        source: StatePaths,
+        plan: Option<Box<LegacyImportPlan>>,
+    },
+    InvalidPath,
+    Failed(StateError),
+}
+
+fn inspect_legacy_import(
+    repository: &Path,
+    config: &RootConfig,
+    paths: &GlobalStatePaths,
+) -> LegacyImportInspection {
     let Ok(source) = StatePaths::from_config(repository, config) else {
-        return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
+        return LegacyImportInspection::InvalidPath;
     };
     match LegacyImporter::inspect(&source, paths) {
-        Ok(Some(plan)) => Check::with_data(
-            "legacy_import",
-            true,
-            json!({
-                "pending": true,
-                "source_schema_version": plan.source_schema_version,
-                "source_fingerprint": plan.source_fingerprint,
-                "source_database": source.database,
-            }),
-        ),
-        Ok(None) => Check::with_data(
-            "legacy_import",
-            true,
-            json!({"pending": false, "source_database": source.database}),
-        ),
-        Err(error) => legacy_import_inspection_failure_check(&error),
+        Ok(plan) => LegacyImportInspection::Inspected {
+            source,
+            plan: plan.map(Box::new),
+        },
+        Err(error) => LegacyImportInspection::Failed(error),
     }
+}
+
+fn legacy_import_check(
+    inspection: &LegacyImportInspection,
+    durable_state: Option<(&Database, orchestrator_state::WorkspaceId)>,
+    paths: &GlobalStatePaths,
+) -> Check {
+    let (source, plan) = match inspection {
+        LegacyImportInspection::InvalidPath => {
+            return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
+        }
+        LegacyImportInspection::Failed(error) => {
+            return legacy_import_inspection_failure_check(error);
+        }
+        LegacyImportInspection::Inspected { source, plan } => (source, plan),
+    };
+    let Some(plan) = plan else {
+        return Check::with_data(
+            "legacy_import",
+            true,
+            json!({"pending": false, "imported": false}),
+        );
+    };
+    let imported = match durable_state {
+        Some((database, workspace_id)) => {
+            match LegacyImporter::completed_import(database, workspace_id, plan, paths) {
+                Ok(result) => result.is_some(),
+                Err(error) => return legacy_import_inspection_failure_check(&error),
+            }
+        }
+        None => false,
+    };
+    Check::with_data(
+        "legacy_import",
+        true,
+        json!({
+            "pending": !imported,
+            "imported": imported,
+            "source_schema_version": plan.source_schema_version,
+            "source_fingerprint": plan.source_fingerprint,
+            "source_database": source.database,
+        }),
+    )
 }
 
 fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Check {
@@ -836,7 +921,7 @@ fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Ch
         Check::with_data(
             "legacy_import",
             true,
-            json!({"pending": false, "source_database": source.database}),
+            json!({"pending": false, "imported": false, "source_database": source.database}),
         )
     }
 }
