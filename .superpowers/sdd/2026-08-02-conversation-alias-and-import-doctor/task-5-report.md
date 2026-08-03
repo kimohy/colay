@@ -153,3 +153,65 @@ Full-workspace tests were not run because Task 7 owns them. The pre-existing unt
 - Tests use only local SQLite fixtures and `orchestrator-test-support` fake provider binaries.
 
 No open Task 5 concern was found in the final diff.
+
+## Fix Round 1
+
+Round 1 closed both Important review findings without changing IPC schema version 1.
+
+### Additive older-daemon negotiation
+
+The CLI now sends a repository-only `workspace.doctor.lookup` probe first. A current daemon advertises `legacy_import_evidence_supported: true`; only a registered lookup with that explicit capability and a locally inspected source receives a second evidence-bearing request. An older daemon therefore never sees fields rejected by its schema-v1 `deny_unknown_fields` request type. Once a daemon advertises support, transport, protocol, and evidence-validation failures from the second request propagate unchanged and are never downgraded.
+
+RED evidence before negotiation:
+
+```text
+older_daemon_receives_only_repository_doctor_probe
+assertion failed: the first payload contained legacy_state_dir and legacy_source_fingerprint
+
+advertised_doctor_evidence_failure_is_not_downgraded
+advertised evidence validation failure was downgraded (only one request was sent)
+```
+
+The controlled older-daemon regression uses the real lookup client and live legacy-import projector. It proves exactly one `{"repository": ...}` request, an absent capability/status decoded additively, and a CLI warning containing `pending:true, imported:false`.
+
+### Daemon-authoritative source configuration
+
+The daemon now loads effective configuration itself, resolves the configured repository-local source with `RepositoryStatePaths`, and treats `legacy_state_dir` only as a normalized, config-safe expectation. The client cannot select an alternate valid legacy database. A configured non-default repository-local directory continues to work.
+
+Clean RED evidence before the authority fix:
+
+```text
+doctor_lookup_rejects_spoofed_alternate_repository_state_dir
+Error: client-selected alternate state directory was accepted
+```
+
+The spoof regression also snapshots the alternate source database and proves rejection is read-only. The positive authority regression seeds a non-default configured directory and verifies the daemon reports the current fingerprint as `pending:true, imported:false`.
+
+### Round 1 verification
+
+```text
+cargo test -p colay --all-features older_daemon_probe_projects_pending_legacy_import_warning -- --nocapture
+test result: ok. 1 passed; 0 failed
+
+cargo test -p colay --all-features older_daemon_receives_only_repository_doctor_probe -- --nocapture
+cargo test -p colay --all-features advertised_doctor_evidence_failure_is_not_downgraded -- --nocapture
+test result: ok. 1 passed; 0 failed (each)
+
+cargo test -p orchestrator-daemon --all-features doctor_lookup -- --nocapture
+test result: ok. 6 passed; 0 failed
+
+cargo test -p colay --test global_doctor --all-features live_doctor_ -- --nocapture --test-threads=1
+test result: ok. 4 passed; 0 failed
+
+cargo test -p colay --test global_doctor --all-features legacy_import_doctor_ -- --nocapture --test-threads=1
+test result: ok. 12 passed; 0 failed
+
+cargo test -p colay --test global_doctor --all-features doctor_deep_checks_a_workspace_through_the_live_daemon -- --nocapture --test-threads=1
+test result: ok. 1 passed; 0 failed
+
+cargo fmt --all -- --check
+cargo clippy -p orchestrator-daemon -p colay --all-targets --all-features -- -D warnings
+git diff --check
+```
+
+The final static commands exited 0. The first clippy pass found only a repeated test-fixture field prefix and a 104-line acceptance test; both were refactored without lint allowances. No post-test daemon process referenced this worktree. Full-workspace tests remain owned by Task 7, and the pre-existing untracked `.task4-target/` remains untouched.

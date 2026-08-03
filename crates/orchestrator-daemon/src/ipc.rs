@@ -16,10 +16,11 @@ use orchestrator_domain::{
 #[cfg(windows)]
 use orchestrator_state::reject_symlink_components;
 use orchestrator_state::{
-    ArtifactStore, Database, DatabaseHealth, GlobalStatePaths, LegacyImporter,
-    RepositoryStatePaths, ResumeDisposition, RootConfig, SessionListFilter, StateError,
-    TaskListFilter, WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord, WorkspaceReadRequest,
-    WorkspaceRegistration, WorkspaceStatePaths, ensure_private_directory, ensure_private_file,
+    ArtifactStore, ConfigEnvironment, ConfigRequest, Database, DatabaseHealth, GlobalStatePaths,
+    LegacyImporter, RepositoryStatePaths, ResumeDisposition, RootConfig, SessionListFilter,
+    StateError, TaskListFilter, WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord,
+    WorkspaceReadRequest, WorkspaceRegistration, WorkspaceStatePaths, ensure_private_directory,
+    ensure_private_file, load_effective_config,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -110,6 +111,8 @@ pub struct WorkspaceDoctorLookup {
     pub database: DatabaseHealth,
     pub daemon: orchestrator_state::DaemonStatus,
     pub diagnostics: Option<WorkspaceDoctorDiagnostics>,
+    #[serde(default)]
+    pub legacy_import_evidence_supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_import: Option<LegacyImportDoctorStatus>,
 }
@@ -1143,6 +1146,7 @@ fn workspace_doctor_lookup(
         database: database_health,
         daemon,
         diagnostics,
+        legacy_import_evidence_supported: true,
         legacy_import,
     })
     .map_err(IpcError::from)
@@ -1156,12 +1160,7 @@ fn inspect_legacy_import_doctor_status(
     legacy_state_dir: Option<&Path>,
     expected_fingerprint: &str,
 ) -> Result<LegacyImportDoctorStatus, IpcError> {
-    let mut config = RootConfig::default();
-    if let Some(state_dir) = legacy_state_dir {
-        config.orchestrator.state_dir = state_dir.to_path_buf();
-    }
-    let source = RepositoryStatePaths::from_config(repository, &config)
-        .map_err(|_| legacy_import_doctor_validation_error())?;
+    let source = daemon_legacy_source(paths, repository, legacy_state_dir)?;
     let plan = LegacyImporter::inspect(&source, paths)
         .map_err(|_| legacy_import_doctor_validation_error())?
         .ok_or_else(legacy_import_doctor_validation_error)?;
@@ -1176,6 +1175,35 @@ fn inspect_legacy_import_doctor_status(
         pending: !imported,
         imported,
     })
+}
+
+fn daemon_legacy_source(
+    paths: &GlobalStatePaths,
+    repository: &Path,
+    expected_state_dir: Option<&Path>,
+) -> Result<RepositoryStatePaths, IpcError> {
+    let effective = load_effective_config(&ConfigRequest {
+        repository,
+        cli_config: None,
+        environment: ConfigEnvironment {
+            colay_home: Some(paths.root.clone()),
+            user_home: None,
+            colay_config: std::env::var_os("COLAY_CONFIG").map(Into::into),
+        },
+    })
+    .map_err(|_| legacy_import_doctor_validation_error())?;
+    let configured = RepositoryStatePaths::from_config(repository, effective.config())
+        .map_err(|_| legacy_import_doctor_validation_error())?;
+    if let Some(expected_state_dir) = expected_state_dir {
+        let mut expected_config = RootConfig::default();
+        expected_config.orchestrator.state_dir = expected_state_dir.to_path_buf();
+        let expected = RepositoryStatePaths::from_config(repository, &expected_config)
+            .map_err(|_| legacy_import_doctor_validation_error())?;
+        if expected.root != configured.root {
+            return Err(legacy_import_doctor_validation_error());
+        }
+    }
+    Ok(configured)
 }
 
 fn legacy_import_doctor_validation_error() -> IpcError {
@@ -2068,14 +2096,14 @@ fn request_daemon_stop(database: &Database) -> Result<Value, IpcError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
 
     #[cfg(windows)]
-    use std::{
-        ffi::OsString,
-        os::windows::ffi::OsStringExt as _,
-        path::{Path, PathBuf},
-    };
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
 
     use chrono::Utc;
     use orchestrator_domain::{
@@ -2083,6 +2111,8 @@ mod tests {
         MessageId, MessageKind, MessageRole, MessageState, SchemaVersion, SessionId, SessionState,
         TaskEnvelope, TaskEvent, TaskId, TaskState, TransitionGuards,
     };
+    use rusqlite::{Connection, params};
+    use sha2::{Digest as _, Sha256};
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::{
@@ -2099,9 +2129,112 @@ mod tests {
         windows_owner_bootstrap_guard, windows_owner_mutex_name, windows_primary_pipe_name,
     };
     use orchestrator_state::{
-        DaemonLeaseRequest, Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord,
-        StateEnvironment, WorkspaceReadRequest,
+        DaemonLeaseRequest, Database, GlobalStatePaths, LegacyImporter, NewSessionRecord,
+        NewTaskRecord, RepositoryStatePaths, RootConfig, StateEnvironment, WorkspaceReadRequest,
     };
+
+    const MIGRATIONS_THROUGH_V8: &[(u32, &str, &str)] = &[
+        (1, "core", include_str!("../../../migrations/0001_core.sql")),
+        (
+            2,
+            "execution",
+            include_str!("../../../migrations/0002_execution.sql"),
+        ),
+        (
+            3,
+            "audit_and_control",
+            include_str!("../../../migrations/0003_audit_and_control.sql"),
+        ),
+        (
+            4,
+            "durable_sessions",
+            include_str!("../../../migrations/0004_durable_sessions.sql"),
+        ),
+        (
+            5,
+            "chat_workspace_state",
+            include_str!("../../../migrations/0005_chat_workspace_state.sql"),
+        ),
+        (
+            6,
+            "approved_task_graphs",
+            include_str!("../../../migrations/0006_approved_task_graphs.sql"),
+        ),
+        (
+            7,
+            "parallel_execution",
+            include_str!("../../../migrations/0007_parallel_execution.sql"),
+        ),
+        (
+            8,
+            "result_integration",
+            include_str!("../../../migrations/0008_result_integration.sql"),
+        ),
+    ];
+
+    fn seed_legacy_source(
+        repository: &Path,
+        state_dir: &Path,
+        paths: &GlobalStatePaths,
+    ) -> Result<(RepositoryStatePaths, String), Box<dyn std::error::Error>> {
+        let mut config = RootConfig::default();
+        config.orchestrator.state_dir = state_dir.to_path_buf();
+        let source = RepositoryStatePaths::from_config(repository, &config)?;
+        std::fs::create_dir_all(&source.root)?;
+        std::fs::write(source.root.join("config.toml"), "config_version = 4\n")?;
+        let connection = Connection::open(&source.database)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        for (version, name, sql) in MIGRATIONS_THROUGH_V8 {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    version,
+                    name,
+                    format!("{:x}", Sha256::digest(sql.as_bytes())),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+        let created_at = "2026-08-02T00:00:00Z";
+        connection.execute(
+            "INSERT INTO sessions(\
+                 session_id, schema_version, revision, title, state, created_at, updated_at\
+             ) VALUES (?1, '1.0', 0, 'legacy invalid graph', 'planning', ?2, ?2)",
+            params!["01987d4e-2a54-7000-8000-000000000001", created_at],
+        )?;
+        connection.execute(
+            "INSERT INTO conversation_messages(\
+                 message_id, session_id, task_id, ordinal, role, kind, state, content_redacted, \
+                 created_at, finalized_at\
+             ) VALUES (?1, ?2, NULL, 1, 'user', 'user_message', 'final', \
+                 'legacy invalid graph', ?3, ?3)",
+            params![
+                "01987d4e-2a54-7000-8000-000000000002",
+                "01987d4e-2a54-7000-8000-000000000001",
+                created_at,
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO graph_revisions(\
+                 revision_id, session_id, goal_message_id, ordinal, status, \
+                 proposal_hash, proposal_json, validation_json, planner_provider, \
+                 created_at, completed_at\
+             ) VALUES (?1, ?2, ?3, 1, 'invalid', NULL, NULL, ?4, 'codex', ?5, ?5)",
+            params![
+                "01987d4e-2a54-7000-8000-000000000003",
+                "01987d4e-2a54-7000-8000-000000000001",
+                "01987d4e-2a54-7000-8000-000000000002",
+                serde_json::to_string(&serde_json::json!({"errors":["cycle"]}))?,
+                created_at,
+            ],
+        )?;
+        drop(connection);
+        let plan = LegacyImporter::inspect(&source, paths)?
+            .ok_or_else(|| std::io::Error::other("legacy source was not inspectable"))?;
+        Ok((source, plan.source_fingerprint))
+    }
 
     #[test]
     fn workspace_doctor_lookup_payload_preserves_schema_one_compatibility()
@@ -2154,6 +2287,7 @@ mod tests {
             },
             "daemon": {"state": "stopped"},
             "diagnostics": null,
+            "legacy_import_evidence_supported": true,
             "legacy_import": {
                 "source_fingerprint": "sealed-fingerprint",
                 "pending": false,
@@ -2162,6 +2296,7 @@ mod tests {
         }))?;
 
         assert_eq!(older.legacy_import, None);
+        assert!(!older.legacy_import_evidence_supported);
         assert_eq!(
             evidence_aware.legacy_import,
             Some(LegacyImportDoctorStatus {
@@ -2170,6 +2305,7 @@ mod tests {
                 imported: true,
             })
         );
+        assert!(evidence_aware.legacy_import_evidence_supported);
         Ok(())
     }
 
@@ -2179,8 +2315,10 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let repository = temporary.path().join("repository");
         std::fs::create_dir_all(&repository)?;
+        let home = temporary.path().join("home");
+        std::fs::create_dir_all(&home)?;
         let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
-            temporary.path().join("home"),
+            std::fs::canonicalize(home)?,
         )?)?;
         let database = Database::open(&paths.database)?;
         database.migrate_with_backup(&paths.backups)?;
@@ -2215,6 +2353,98 @@ mod tests {
             Some(registration.workspace_id)
         );
         assert!(!repository.join(".colay").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_lookup_rejects_spoofed_alternate_repository_state_dir()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        let home = temporary.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            std::fs::canonicalize(home)?,
+        )?)?;
+        let database = Database::open(&paths.database)?;
+        database.migrate_with_backup(&paths.backups)?;
+        database.resolve_repository_workspace(&repository)?;
+        std::fs::write(
+            &paths.config,
+            "config_version = 4\n[orchestrator]\nstate_dir = \".trusted-state\"\n",
+        )?;
+        let (spoofed_source, spoofed_fingerprint) =
+            seed_legacy_source(&repository, Path::new(".spoofed-state"), &paths)?;
+        let source_before = std::fs::read(&spoofed_source.database)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-spoofed-state-dir".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: serde_json::json!({
+                "repository": repository,
+                "legacy_state_dir": ".spoofed-state",
+                "legacy_source_fingerprint": spoofed_fingerprint
+            }),
+        };
+
+        let Err(error) = workspace_doctor_lookup(&database, &paths, &request) else {
+            return Err(std::io::Error::other(
+                "client-selected alternate state directory was accepted",
+            )
+            .into());
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "IPC protocol error: legacy import completion evidence could not be validated"
+        );
+        assert_eq!(std::fs::read(&spoofed_source.database)?, source_before);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_lookup_uses_daemon_derived_non_default_repository_state_dir()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        let home = temporary.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            std::fs::canonicalize(home)?,
+        )?)?;
+        let database = Database::open(&paths.database)?;
+        database.migrate_with_backup(&paths.backups)?;
+        database.resolve_repository_workspace(&repository)?;
+        std::fs::write(
+            &paths.config,
+            "config_version = 4\n[orchestrator]\nstate_dir = \".legacy-colay\"\n",
+        )?;
+        let (_source, fingerprint) =
+            seed_legacy_source(&repository, Path::new(".legacy-colay"), &paths)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-configured-state-dir".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: serde_json::json!({
+                "repository": repository,
+                "legacy_state_dir": ".legacy-colay",
+                "legacy_source_fingerprint": fingerprint
+            }),
+        };
+
+        let value = workspace_doctor_lookup(&database, &paths, &request)?;
+        let lookup = serde_json::from_value::<WorkspaceDoctorLookup>(value)?;
+        let status = lookup
+            .legacy_import
+            .ok_or_else(|| std::io::Error::other("legacy import evidence was omitted"))?;
+
+        assert_eq!(status.source_fingerprint, fingerprint);
+        assert!(status.pending);
+        assert!(!status.imported);
         Ok(())
     }
 

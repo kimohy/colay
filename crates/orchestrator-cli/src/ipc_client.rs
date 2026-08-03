@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     process::{Child, Command, Stdio},
@@ -107,24 +108,13 @@ impl DaemonClient {
         let (endpoint, _) = discover_live_endpoint(&paths, &candidates)
             .await?
             .ok_or_else(|| endpoint_refused("user daemon is not listening"))?;
-        let request = IpcRequest {
-            schema_version: IPC_SCHEMA_VERSION,
-            request_id: Uuid::now_v7().to_string(),
-            workspace_id: None,
-            action: "workspace.doctor.lookup".to_owned(),
-            payload: json!({
-                "repository": repository,
-                "legacy_state_dir": legacy_state_dir,
-                "legacy_source_fingerprint": legacy_source_fingerprint,
-            }),
-        };
-        let mut stream = open_response_stream(&paths, &endpoint, &request).await?;
-        let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
-            .await
-            .context("timed out waiting for read-only workspace doctor lookup")??
-            .ok_or_else(|| anyhow!("user daemon closed doctor IPC without replying"))?;
-        ensure_success(&response)?;
-        Ok(response)
+        doctor_lookup_with(
+            repository,
+            legacy_state_dir,
+            legacy_source_fingerprint,
+            |request| send_doctor_lookup(&paths, &endpoint, request),
+        )
+        .await
     }
 
     pub async fn request_global(action: &str, payload: Value) -> Result<IpcResponse> {
@@ -173,6 +163,69 @@ impl DaemonClient {
         )
         .await
     }
+}
+
+pub(crate) async fn doctor_lookup_with<F, Fut>(
+    repository: &Path,
+    legacy_state_dir: Option<&Path>,
+    legacy_source_fingerprint: Option<&str>,
+    mut send: F,
+) -> Result<IpcResponse>
+where
+    F: FnMut(IpcRequest) -> Fut,
+    Fut: Future<Output = Result<IpcResponse>>,
+{
+    let probe = IpcRequest {
+        schema_version: IPC_SCHEMA_VERSION,
+        request_id: Uuid::now_v7().to_string(),
+        workspace_id: None,
+        action: "workspace.doctor.lookup".to_owned(),
+        payload: json!({"repository": repository}),
+    };
+    let response = send(probe).await?;
+    ensure_success(&response)?;
+    let evidence_supported = response
+        .outcome
+        .pointer("/data/legacy_import_evidence_supported")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let registered = response
+        .outcome
+        .pointer("/data/registered")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let Some(legacy_source_fingerprint) = legacy_source_fingerprint else {
+        return Ok(response);
+    };
+    if !evidence_supported || !registered {
+        return Ok(response);
+    }
+    let evidence = IpcRequest {
+        schema_version: IPC_SCHEMA_VERSION,
+        request_id: Uuid::now_v7().to_string(),
+        workspace_id: None,
+        action: "workspace.doctor.lookup".to_owned(),
+        payload: json!({
+            "repository": repository,
+            "legacy_state_dir": legacy_state_dir,
+            "legacy_source_fingerprint": legacy_source_fingerprint,
+        }),
+    };
+    let response = send(evidence).await?;
+    ensure_success(&response)?;
+    Ok(response)
+}
+
+async fn send_doctor_lookup(
+    paths: &GlobalStatePaths,
+    endpoint: &DaemonEndpoint,
+    request: IpcRequest,
+) -> Result<IpcResponse> {
+    let mut stream = open_response_stream(paths, endpoint, &request).await?;
+    tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+        .await
+        .context("timed out waiting for read-only workspace doctor lookup")??
+        .ok_or_else(|| anyhow!("user daemon closed doctor IPC without replying"))
 }
 
 impl IpcResponseStream {
@@ -844,9 +897,10 @@ mod tests {
 
     use super::{
         LegacyDaemonIdentity, PingReadiness, ReadyChildDisposition, ReapProgress, StartupChild,
-        classify_ready_child, daemon_contenders_exited_message, inspect_child_at_startup_deadline,
-        legacy_status_identity, legacy_status_request, ping_readiness, poll_non_owner_contender,
-        resolve_ready_child, response_stream_with_legacy_identity, spawn_contender_once,
+        classify_ready_child, daemon_contenders_exited_message, doctor_lookup_with,
+        inspect_child_at_startup_deadline, legacy_status_identity, legacy_status_request,
+        ping_readiness, poll_non_owner_contender, resolve_ready_child,
+        response_stream_with_legacy_identity, spawn_contender_once,
         validate_legacy_daemon_identity,
     };
     #[cfg(windows)]
@@ -854,6 +908,106 @@ mod tests {
     use anyhow::Context as _;
     use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn older_daemon_receives_only_repository_doctor_probe() -> anyhow::Result<()> {
+        let repository = std::path::Path::new("repository");
+        let requests = std::cell::RefCell::new(Vec::new());
+
+        let response = doctor_lookup_with(
+            repository,
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.borrow_mut().push(request.clone());
+                future::ready(Ok(IpcResponse {
+                    schema_version: IPC_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    outcome: json!({
+                        "status": "ok",
+                        "data": {
+                            "registered": false,
+                            "database": {
+                                "integrity_ok": true,
+                                "foreign_key_violations": 0,
+                                "current_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                                "last_event_sequence": 0
+                            },
+                            "daemon": {"state": "stopped"},
+                            "diagnostics": null
+                        }
+                    }),
+                }))
+            },
+        )
+        .await?;
+
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(
+            requests.borrow()[0].payload,
+            json!({"repository": repository})
+        );
+        assert!(response.outcome.pointer("/data/legacy_import").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advertised_doctor_evidence_failure_is_not_downgraded() -> anyhow::Result<()> {
+        let repository = std::path::Path::new("repository");
+        let requests = std::cell::RefCell::new(Vec::new());
+
+        let result = doctor_lookup_with(
+            repository,
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.borrow_mut().push(request.clone());
+                let outcome = if requests.borrow().len() == 1 {
+                    json!({
+                        "status": "ok",
+                        "data": {
+                            "registered": true,
+                            "legacy_import_evidence_supported": true
+                        }
+                    })
+                } else {
+                    json!({
+                        "status": "error",
+                        "error": "legacy import completion evidence could not be validated"
+                    })
+                };
+                future::ready(Ok(IpcResponse {
+                    schema_version: IPC_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    outcome,
+                }))
+            },
+        )
+        .await;
+
+        let Err(error) = result else {
+            anyhow::bail!("advertised evidence validation failure was downgraded");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("legacy import completion evidence could not be validated")
+        );
+        assert_eq!(requests.borrow().len(), 2);
+        assert_eq!(
+            requests.borrow()[0].payload,
+            json!({"repository": repository})
+        );
+        assert_eq!(
+            requests.borrow()[1].payload,
+            json!({
+                "repository": repository,
+                "legacy_state_dir": ".legacy-colay",
+                "legacy_source_fingerprint": "sealed-fingerprint"
+            })
+        );
+        Ok(())
+    }
 
     #[test]
     fn contender_exit_diagnostic_points_to_doctor_without_claiming_a_cause() {
