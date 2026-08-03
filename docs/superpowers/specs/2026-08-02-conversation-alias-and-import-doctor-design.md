@@ -1,7 +1,7 @@
 # Conversation Alias and Legacy Import Doctor Design
 
-Date: 2026-08-02  
-Status: approved design, implementation pending
+Date: 2026-08-02
+Status: source implemented; deployed-nightly verification pending
 
 ## Context
 

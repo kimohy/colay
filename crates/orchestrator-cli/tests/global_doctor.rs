@@ -60,6 +60,7 @@ const MIGRATIONS_THROUGH_V8: &[(u32, &str, &str)] = &[
 const LEGACY_IMPORT_DETAIL_MAX_CHARS: usize = 256;
 const LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL: &str = "legacy import source has an incomplete proposal seal; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
 const LEGACY_IMPORT_INVALID_SOURCE_DETAIL: &str = "legacy import source failed integrity validation; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL: &str = "legacy import durable evidence failed integrity validation; restore the user-global database and published import from a trusted backup or repair them, then rerun `colay doctor`";
 
 struct DoctorFixture {
     _temp: tempfile::TempDir,
@@ -358,6 +359,24 @@ impl DoctorFixture {
             .context("repository legacy source was not inspectable")?;
         LegacyImporter::apply(&database, workspace_id, &plan, &paths)?;
         Ok(())
+    }
+
+    fn corrupt_published_legacy_database(&self) -> Result<PathBuf> {
+        let result_json: String = Connection::open(self.global_database())?.query_row(
+            "SELECT result_json FROM legacy_imports LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let result: Value = serde_json::from_str(&result_json)?;
+        let published_path: PathBuf = serde_json::from_value(
+            result
+                .get("published_path")
+                .cloned()
+                .context("legacy import result omitted its published path")?,
+        )?;
+        let published_database = published_path.join("legacy.db");
+        fs::write(&published_database, b"corrupt published legacy database")?;
+        Ok(published_database)
     }
 
     fn schema_version(&self) -> Result<u32> {
@@ -1145,7 +1164,8 @@ fn legacy_import_doctor_reports_unregistered_source_as_pending() -> Result<()> {
 }
 
 #[test]
-fn legacy_import_doctor_fails_a_corrupt_completion_ledger_without_mutation() -> Result<()> {
+fn legacy_import_doctor_directs_corrupt_completion_ledger_to_durable_recovery_without_mutation()
+-> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.configure_fake_providers()?;
     let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
@@ -1164,7 +1184,52 @@ fn legacy_import_doctor_fails_a_corrupt_completion_ledger_without_mutation() -> 
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let legacy_check = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_check["status"], "fail");
-    assert_eq!(legacy_check["detail"], LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+    assert_eq!(
+        legacy_check["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
+    assert!(
+        legacy_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.chars().count() <= LEGACY_IMPORT_DETAIL_MAX_CHARS)
+    );
+    assert_eq!(document["data"]["passed"], false);
+    assert_eq!(
+        LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_import_doctor_directs_corrupt_published_import_to_durable_recovery_without_mutation()
+-> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    fixture.import_repository_legacy()?;
+    fixture.corrupt_published_legacy_database()?;
+    let before = LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_check = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_check["status"], "fail", "{legacy_check}");
+    assert_eq!(
+        legacy_check["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
+    assert!(
+        legacy_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.chars().count() <= LEGACY_IMPORT_DETAIL_MAX_CHARS)
+    );
     assert_eq!(document["data"]["passed"], false);
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
@@ -1191,6 +1256,10 @@ fn legacy_import_doctor_fails_when_global_snapshot_is_unreadable() -> Result<()>
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let legacy_check = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_check["status"], "fail", "{legacy_check}");
+    assert_eq!(
+        legacy_check["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
     assert_eq!(document["data"]["passed"], false);
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
@@ -1225,6 +1294,10 @@ fn legacy_import_doctor_fails_when_migration_status_is_unreadable() -> Result<()
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let legacy_check = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_check["status"], "fail", "{legacy_check}");
+    assert_eq!(
+        legacy_check["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
     assert_eq!(document["data"]["passed"], false);
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
@@ -1252,6 +1325,10 @@ fn legacy_import_doctor_fails_when_global_health_is_unreadable() -> Result<()> {
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let legacy_check = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_check["status"], "fail", "{legacy_check}");
+    assert_eq!(
+        legacy_check["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
     assert_eq!(document["data"]["passed"], false);
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
@@ -1279,6 +1356,10 @@ fn legacy_import_doctor_fails_when_workspace_registry_is_unreadable() -> Result<
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let legacy_check = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_check["status"], "fail", "{legacy_check}");
+    assert_eq!(
+        legacy_check["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
     assert_eq!(document["data"]["passed"], false);
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
@@ -1318,7 +1399,8 @@ fn legacy_import_doctor_fails_an_incomplete_proposal_seal_without_mutation() -> 
 }
 
 #[test]
-fn legacy_import_doctor_redacts_and_bounds_repository_controlled_graph_errors() -> Result<()> {
+fn legacy_import_doctor_directs_source_corruption_to_repository_recovery_without_mutation()
+-> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.seed_current_global_workspace()?;
     fixture.configure_fake_providers()?;
@@ -1342,6 +1424,7 @@ fn legacy_import_doctor_redacts_and_bounds_repository_controlled_graph_errors() 
         .as_str()
         .context("legacy import detail is missing")?;
     assert_eq!(detail, LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+    assert_ne!(detail, LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL);
     assert!(!detail.contains(&sensitive_marker));
     assert!(detail.chars().count() <= LEGACY_IMPORT_DETAIL_MAX_CHARS);
     assert_eq!(
@@ -1572,7 +1655,10 @@ fn live_doctor_fails_corrupt_legacy_import_completion_without_mutation() -> Resu
     let document: Value = serde_json::from_slice(&output.stdout)?;
     let legacy_import = check_named(&document, "legacy_import")?;
     assert_eq!(legacy_import["status"], "fail", "{legacy_import}");
-    assert_eq!(legacy_import["detail"], LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+    assert_eq!(
+        legacy_import["detail"],
+        LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL
+    );
     assert_eq!(check_named(&document, "state")?["status"], "fail");
     assert_eq!(document["data"]["passed"], false);
     assert_eq!(

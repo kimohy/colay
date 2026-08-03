@@ -85,6 +85,7 @@ const RUN_COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
 const LEGACY_IMPORT_DETAIL_MAX_CHARS: usize = 256;
 const LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL: &str = "legacy import source has an incomplete proposal seal; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
 const LEGACY_IMPORT_INVALID_SOURCE_DETAIL: &str = "legacy import source failed integrity validation; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
+const LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL: &str = "legacy import durable evidence failed integrity validation; restore the user-global database and published import from a trusted backup or repair them, then rerun `colay doctor`";
 const LEGACY_IMPORT_PATH_DETAIL: &str = "legacy import readiness could not resolve the repository-local database path; review repository configuration, then rerun `colay doctor`";
 const LEGACY_IMPORT_IPC_UNAVAILABLE_DETAIL: &str =
     "import readiness is unavailable through live-daemon IPC";
@@ -613,9 +614,12 @@ async fn doctor_state_checks(
             return;
         }
     };
-    let legacy_import = inspect_legacy_import(repository, config, &paths);
-    match crate::daemon::acquire_maintenance() {
-        Ok(maintenance) => {
+    match acquire_maintenance_with_legacy_inspection(
+        crate::daemon::acquire_maintenance,
+        |maintenance| inspect_legacy_import(repository, config, &maintenance.paths),
+        || inspect_legacy_import(repository, config, &paths),
+    ) {
+        Ok((maintenance, legacy_import)) => {
             let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
                 Ok(Some(database)) => database,
                 Ok(None) => {
@@ -778,7 +782,7 @@ async fn doctor_state_checks(
                 },
             );
         }
-        Err(lock_error) => {
+        Err((lock_error, legacy_import)) => {
             let legacy_source_fingerprint = match &legacy_import {
                 LegacyImportInspection::Inspected {
                     plan: Some(plan), ..
@@ -877,6 +881,20 @@ async fn doctor_state_checks(
     }
 }
 
+fn acquire_maintenance_with_legacy_inspection<T, E, I>(
+    acquire: impl FnOnce() -> Result<T, E>,
+    inspect_offline: impl FnOnce(&T) -> I,
+    inspect_live: impl FnOnce() -> I,
+) -> Result<(T, I), (E, I)> {
+    match acquire() {
+        Ok(ownership) => {
+            let inspection = inspect_offline(&ownership);
+            Ok((ownership, inspection))
+        }
+        Err(error) => Err((error, inspect_live())),
+    }
+}
+
 enum LegacyImportInspection {
     Inspected {
         source: StatePaths,
@@ -959,14 +977,14 @@ fn legacy_import_check(
                 let imported = result.is_some();
                 (!imported, imported)
             }
-            Err(error) => return legacy_import_inspection_failure_check(&error),
+            Err(_) => return legacy_import_durable_failure_check(),
         },
         LegacyImportDurableState::Unavailable => (true, false),
         LegacyImportDurableState::Live { registered, status } => {
             return live_legacy_import_check(projection, registered, status);
         }
         LegacyImportDurableState::Failed => {
-            return legacy_import_failure_check(LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+            return legacy_import_durable_failure_check();
         }
     };
     Check::with_data(
@@ -991,7 +1009,7 @@ fn live_legacy_import_check(
         );
     };
     if source_fingerprint != projection.fingerprint || pending == imported {
-        return legacy_import_failure_check(LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+        return legacy_import_durable_failure_check();
     }
     Check::with_data(
         "legacy_import",
@@ -1024,6 +1042,10 @@ fn legacy_import_inspection_failure_check(error: &StateError) -> Check {
         _ => LEGACY_IMPORT_INVALID_SOURCE_DETAIL,
     };
     legacy_import_failure_check(detail)
+}
+
+fn legacy_import_durable_failure_check() -> Check {
+    legacy_import_failure_check(LEGACY_IMPORT_INVALID_DURABLE_EVIDENCE_DETAIL)
 }
 
 fn legacy_import_failure_check(detail: &str) -> Check {
@@ -7382,13 +7404,66 @@ mod tests {
 
     use super::{
         CheckStatus, LegacyImportProjection, ReviewOutcome, RollbackManifestStep, StatePaths,
-        acceptance_evidence, acquire_task_coordinator, acquire_worker_lease,
-        append_live_doctor_checks, block_for_unconfirmed_termination, initialize,
-        live_legacy_import_check, load_config_runtime, mixed_git_checkout_warning,
+        acceptance_evidence, acquire_maintenance_with_legacy_inspection, acquire_task_coordinator,
+        acquire_worker_lease, append_live_doctor_checks, block_for_unconfirmed_termination,
+        initialize, live_legacy_import_check, load_config_runtime, mixed_git_checkout_warning,
         next_run_command_poll_interval, provider_adapter, reset_model_profile,
         rollback_resolution_context, run_with_coordinator_renewal, run_worker, set_model_profile,
         set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
+
+    #[test]
+    fn legacy_import_inspection_follows_the_maintenance_ownership_decision() -> Result<()> {
+        let source_revision = RefCell::new("pre-lock");
+        let events = RefCell::new(Vec::new());
+
+        let (ownership, observed_revision) = acquire_maintenance_with_legacy_inspection(
+            || {
+                events.borrow_mut().push("acquire");
+                *source_revision.borrow_mut() = "owned";
+                Ok::<_, anyhow::Error>("maintenance")
+            },
+            |ownership| {
+                events.borrow_mut().push("offline-inspect");
+                assert_eq!(*ownership, "maintenance");
+                *source_revision.borrow()
+            },
+            || {
+                events.borrow_mut().push("live-inspect");
+                *source_revision.borrow()
+            },
+        )
+        .map_err(|(error, _)| error)?;
+
+        assert_eq!(ownership, "maintenance");
+        assert_eq!(observed_revision, "owned");
+        assert_eq!(*events.borrow(), ["acquire", "offline-inspect"]);
+
+        events.borrow_mut().clear();
+        *source_revision.borrow_mut() = "pre-failure";
+        let Err((error, observed_revision)) = acquire_maintenance_with_legacy_inspection(
+            || {
+                events.borrow_mut().push("acquire");
+                *source_revision.borrow_mut() = "live";
+                Err::<(), _>("already owned")
+            },
+            |()| {
+                events.borrow_mut().push("offline-inspect");
+                *source_revision.borrow()
+            },
+            || {
+                events.borrow_mut().push("live-inspect");
+                *source_revision.borrow()
+            },
+        ) else {
+            anyhow::bail!("contended ownership unexpectedly selected the offline branch");
+        };
+
+        assert_eq!(error, "already owned");
+        assert_eq!(observed_revision, "live");
+        assert_eq!(*events.borrow(), ["acquire", "live-inspect"]);
+        Ok(())
+    }
 
     #[test]
     fn run_command_polling_backs_off_and_caps_at_one_second() {

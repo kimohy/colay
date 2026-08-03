@@ -593,6 +593,9 @@ cannot detect this prompt-to-provider contract omission.
 
 ### Source correction and required deployment verification
 
+- Source commit `8305abfbde34117353451836712800c8c3d734fa` adds the bounded provider-boundary
+  `response` alias decoder and fail-closed normalization regressions while preserving
+  `response_redacted` as the only canonical domain and persisted field.
 - Source commit `190a2a1045f7cfc029081282d98906214b318dfd` puts the exact provider-neutral
   outcome shapes and required field names in the sealed read-only conversation request without
   weakening the strict deserializer. Its `conversation_prompt_lists_canonical_shapes` regression

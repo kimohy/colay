@@ -316,8 +316,10 @@ impl LegacyImporter {
         plan: &LegacyImportPlan,
         paths: &GlobalStatePaths,
     ) -> StateResult<Option<LegacyImportResult>> {
-        let connection = global.raw_lock()?;
-        let result = load_existing_result_in(&connection, target, plan)?;
+        let result = {
+            let connection = global.raw_lock()?;
+            load_existing_result_in(&connection, target, plan)?
+        };
         if let Some(result) = result.as_ref() {
             validate_published_import(result, target, paths)?;
         }
