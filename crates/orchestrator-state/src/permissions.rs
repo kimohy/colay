@@ -166,6 +166,11 @@ const BROAD_ACCESS_SIDS: [&str; 3] = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
 const WINDOWS_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(windows)]
 const MAX_WINDOWS_TOOL_OUTPUT: u64 = 64 * 1024;
+#[cfg(windows)]
+const WINDOWS_UTILITY_SPAWN_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(25),
+    std::time::Duration::from_millis(50),
+];
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +243,43 @@ fn map_windows_utility_io<T>(
     result: std::io::Result<T>,
 ) -> StateResult<T> {
     result.map_err(|source| windows_utility_io_error(path, stage, source))
+}
+
+#[cfg(windows)]
+fn is_retryable_windows_utility_io(stage: WindowsUtilityIoStage, source: &std::io::Error) -> bool {
+    stage == WindowsUtilityIoStage::Spawn
+        && source.kind() == std::io::ErrorKind::PermissionDenied
+        && source.raw_os_error() == Some(5)
+}
+
+#[cfg(windows)]
+fn spawn_windows_utility_with_retry<T, Spawn, Sleep>(
+    executable: &Path,
+    mut spawn: Spawn,
+    mut sleep: Sleep,
+) -> StateResult<T>
+where
+    Spawn: FnMut() -> std::io::Result<T>,
+    Sleep: FnMut(std::time::Duration),
+{
+    for delay in WINDOWS_UTILITY_SPAWN_RETRY_DELAYS {
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(source)
+                if is_retryable_windows_utility_io(WindowsUtilityIoStage::Spawn, &source) =>
+            {
+                sleep(delay);
+            }
+            Err(source) => {
+                return Err(windows_utility_io_error(
+                    executable,
+                    WindowsUtilityIoStage::Spawn,
+                    source,
+                ));
+            }
+        }
+    }
+    map_windows_utility_io(executable, WindowsUtilityIoStage::Spawn, spawn())
 }
 
 #[cfg(windows)]
@@ -575,16 +617,17 @@ fn run_windows_utility(
     )?;
     let system_root =
         std::env::var_os("SystemRoot").ok_or_else(|| permission_error("SystemRoot is absent"))?;
-    let spawn_result = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr))
         .env_clear()
         .env("SystemRoot", &system_root)
-        .env("WINDIR", &system_root)
-        .spawn();
-    let mut child = map_windows_utility_io(executable, WindowsUtilityIoStage::Spawn, spawn_result)?;
+        .env("WINDIR", &system_root);
+    let mut child =
+        spawn_windows_utility_with_retry(executable, || command.spawn(), thread::sleep)?;
 
     let started = Instant::now();
     let status = loop {
@@ -1095,6 +1138,154 @@ mod tests {
         let exit = windows_utility_exit_error(executable, "exit code: 5", b"Access is denied");
         assert!(matches!(exit, StateError::InvalidRecord(_)));
         assert!(!exit.to_string().contains("I/O stage"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_retry_recovers_after_two_access_denials() -> StateResult<()> {
+        use std::{cell::Cell, time::Duration};
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let attempts = Cell::new(0_u32);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+
+        let child = spawn_windows_utility_with_retry(
+            executable,
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt < 3 {
+                    Err(std::io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(42_u32)
+                }
+            },
+            |delay| sleeps.borrow_mut().push(delay),
+        )?;
+
+        assert_eq!(child, 42);
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sleeps.into_inner(),
+            [Duration::from_millis(25), Duration::from_millis(50)]
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_retry_exhaustion_retains_final_typed_error() {
+        use std::{cell::Cell, time::Duration};
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let attempts = Cell::new(0_u32);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+
+        let Err(error) = spawn_windows_utility_with_retry::<(), _, _>(
+            executable,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(5))
+            },
+            |delay| sleeps.borrow_mut().push(delay),
+        ) else {
+            panic!("exhausted Windows utility spawn retry unexpectedly succeeded");
+        };
+
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sleeps.into_inner(),
+            [Duration::from_millis(25), Duration::from_millis(50)]
+        );
+        let StateError::Io { path, source } = error else {
+            panic!("exhausted spawn retry did not return StateError::Io");
+        };
+        assert_eq!(path, executable);
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        let Some(diagnostic) = source
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<WindowsUtilityIoDiagnostic>())
+        else {
+            panic!("exhausted spawn retry lost its typed diagnostic");
+        };
+        assert_eq!(diagnostic.stage, WindowsUtilityIoStage::Spawn);
+        assert_eq!(diagnostic.source.raw_os_error(), Some(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_retry_rejects_other_error_codes_and_kinds() {
+        use std::cell::Cell;
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let cases = [
+            std::io::Error::from_raw_os_error(2),
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied without Windows error code 5",
+            ),
+        ];
+
+        for injected in cases {
+            let attempts = Cell::new(0_u32);
+            let sleeps = Cell::new(0_u32);
+            let mut injected = Some(injected);
+            let Err(_) = spawn_windows_utility_with_retry::<(), _, _>(
+                executable,
+                || {
+                    attempts.set(attempts.get() + 1);
+                    let Some(error) = injected.take() else {
+                        panic!("non-retryable spawn error was requested more than once");
+                    };
+                    Err(error)
+                },
+                |_| sleeps.set(sleeps.get() + 1),
+            ) else {
+                panic!("non-retryable Windows utility spawn unexpectedly succeeded");
+            };
+
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(sleeps.get(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_non_spawn_code_five_is_not_retryable() {
+        let access_denied = std::io::Error::from_raw_os_error(5);
+
+        assert!(is_retryable_windows_utility_io(
+            WindowsUtilityIoStage::Spawn,
+            &access_denied
+        ));
+        assert!(!is_retryable_windows_utility_io(
+            WindowsUtilityIoStage::Poll,
+            &access_denied
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_success_does_not_sleep() -> StateResult<()> {
+        use std::cell::Cell;
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let attempts = Cell::new(0_u32);
+        let sleeps = Cell::new(0_u32);
+
+        let child = spawn_windows_utility_with_retry(
+            executable,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(7_u32)
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )?;
+
+        assert_eq!(child, 7);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+        Ok(())
     }
 
     #[cfg(unix)]
