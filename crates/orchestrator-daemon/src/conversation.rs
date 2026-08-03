@@ -167,8 +167,9 @@ fn finalize_conversation_turn(
     match collected {
         Ok(collected) => {
             let outcome = apply_provider_fallback_notice(collected.outcome, provider_selection);
-            let evidence_redacted = (!collected.evidence_redacted.trim().is_empty())
-                .then_some(collected.evidence_redacted.as_str());
+            let evidence_redacted = bounded_redacted(redactor, &collected.evidence_redacted);
+            let evidence_redacted =
+                (!evidence_redacted.trim().is_empty()).then_some(evidence_redacted.as_str());
             database.finish_conversation_attempt_with_evidence(
                 request.attempt_id,
                 &outcome,

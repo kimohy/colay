@@ -89,6 +89,30 @@ fn successful_collection_returns_bounded_evidence_separate_from_canonical_outcom
 }
 
 #[test]
+fn multibyte_success_evidence_is_valid_utf8_and_strictly_byte_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = request();
+    let output = serde_json::to_vec(&json!({
+        "outcome": "answer_complete",
+        "response_redacted": "safe answer"
+    }))?;
+    let mut small = response(&request, output.clone());
+    small.evidence_redacted = "read-only command: \u{d55c}\u{ae00}".to_owned();
+    let small = collect_conversation_response_with_evidence(&request, small)?;
+    assert!(small.evidence_redacted.contains("\u{d55c}\u{ae00}"));
+    assert!(!small.evidence_redacted.ends_with("[truncated]"));
+
+    let mut oversized = response(&request, output);
+    oversized.evidence_redacted = "\u{d55c}".repeat(CONVERSATION_MAX_EVIDENCE_BYTES);
+    let oversized = collect_conversation_response_with_evidence(&request, oversized)?;
+
+    assert!(oversized.evidence_redacted.ends_with("[truncated]"));
+    assert!(oversized.evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert!(std::str::from_utf8(oversized.evidence_redacted.as_bytes()).is_ok());
+    Ok(())
+}
+
+#[test]
 fn rejects_prose_multiple_values_and_oversized_output() {
     let request = request();
     for output in [b"answer".to_vec(), b"{} {}".to_vec()] {

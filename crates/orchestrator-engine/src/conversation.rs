@@ -314,24 +314,31 @@ pub fn collect_conversation_response_with_evidence(
 fn bounded_evidence(response: &ConversationResponse) -> String {
     const TRUNCATED: &str = "[truncated]";
     let content_limit = CONVERSATION_MAX_EVIDENCE_BYTES.saturating_sub(TRUNCATED.len());
-    let mut evidence = response
-        .evidence_redacted
-        .chars()
-        .take(content_limit)
-        .collect::<String>();
-    let remaining = content_limit.saturating_sub(evidence.len());
-    if remaining > 0 {
-        let output = String::from_utf8_lossy(
-            &response.output_redacted[..response.output_redacted.len().min(remaining)],
-        );
-        evidence.extend(output.chars().take(remaining));
+    let mut evidence = String::new();
+    let mut truncated =
+        append_utf8_prefix(&mut evidence, &response.evidence_redacted, content_limit);
+    if !truncated {
+        let output = String::from_utf8_lossy(&response.output_redacted);
+        truncated = append_utf8_prefix(&mut evidence, &output, content_limit);
     }
-    if evidence.len() < response.evidence_redacted.len()
-        || response.output_redacted.len() > remaining
-    {
+    if truncated {
         evidence.push_str(TRUNCATED);
     }
     evidence
+}
+
+fn append_utf8_prefix(target: &mut String, value: &str, byte_limit: usize) -> bool {
+    let available = byte_limit.saturating_sub(target.len());
+    if value.len() <= available {
+        target.push_str(value);
+        return false;
+    }
+    let mut end = available;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    target.push_str(&value[..end]);
+    true
 }
 
 fn failure_evidence(failure: &ConversationFailure) -> String {
