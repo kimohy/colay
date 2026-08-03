@@ -215,3 +215,92 @@ git diff --check
 ```
 
 The final static commands exited 0. The first clippy pass found only a repeated test-fixture field prefix and a 104-line acceptance test; both were refactored without lint allowances. No post-test daemon process referenced this worktree. Full-workspace tests remain owned by Task 7, and the pre-existing untracked `.task4-target/` remains untouched.
+
+## Fix Round 2
+
+Round 2 restores forward compatibility for fix-base schema-v1 clients. `WorkspaceDoctorLookup` no longer carries an unconditional capability field. A repository-only lookup with no evidence request now serializes exactly the legacy lookup field set, so a local legacy reader using `deny_unknown_fields` accepts a new-daemon response.
+
+Capability discovery moved to the separate read-only `workspace.doctor.capabilities` action. With a locally inspected source and a registered lookup, the new client performs:
+
+1. legacy-shaped repository-only lookup;
+2. strict capability request with `{}` payload;
+3. evidence-bearing lookup only after an exact `legacy_import_evidence_supported: true` response.
+
+Only the exact legacy response `{"status":"error","error":"unsupported IPC action"}` returns the original lookup and warning path. Capability transport errors, any other protocol error, malformed/missing/false capability data, and evidence-validation errors all propagate without downgrade.
+
+### RED: old reader rejects the unconditional lookup field
+
+Before removing the lookup capability field:
+
+```text
+cargo test -p orchestrator-daemon --all-features repository_lookup_response_remains_readable_by_legacy_schema_one_client -- --nocapture
+
+repository_lookup_response_remains_readable_by_legacy_schema_one_client ... FAILED
+Error: unknown field `legacy_import_evidence_supported`, expected one of
+`registered`, `database`, `daemon`, `diagnostics`
+
+test result: FAILED. 0 passed; 1 failed
+```
+
+### RED: separate capability negotiation is absent
+
+Before the separate action and client sequence:
+
+```text
+cargo test -p colay --all-features capability -- --nocapture
+
+running 5 tests
+capability_protocol_failure_is_not_downgraded ... FAILED
+capability_transport_failure_is_not_downgraded ... FAILED
+malformed_capability_response_is_not_downgraded ... FAILED
+older_daemon_exact_unsupported_capability_returns_repository_lookup ... FAILED
+supported_capability_sends_evidence_lookup ... FAILED
+
+left: 1, right: 2/3
+capability transport/protocol/malformed failure was downgraded
+test result: FAILED. 0 passed; 5 failed
+```
+
+```text
+cargo test -p orchestrator-daemon --all-features workspace_doctor_capability_is_discovered_outside_legacy_lookup_response -- --nocapture
+
+workspace_doctor_capability_is_discovered_outside_legacy_lookup_response ... FAILED
+Error: capability action was not dispatched
+```
+
+The evidence-validation propagation and controlled older-daemon warning tests also failed at RED because the client returned after one request instead of performing the separate capability request.
+
+### GREEN and regression verification
+
+```text
+cargo test -p orchestrator-daemon --all-features repository_lookup_response_remains_readable_by_legacy_schema_one_client -- --nocapture
+test result: ok. 1 passed; 0 failed
+
+cargo test -p orchestrator-daemon --all-features workspace_doctor_capability_is_discovered_outside_legacy_lookup_response -- --nocapture
+test result: ok. 1 passed; 0 failed
+
+cargo test -p colay --all-features capability -- --nocapture
+test result: ok. 5 passed; 0 failed
+
+cargo test -p colay --all-features advertised_doctor_evidence_failure_is_not_downgraded -- --nocapture
+cargo test -p colay --all-features older_daemon_probe_projects_pending_legacy_import_warning -- --nocapture
+test result: ok. 1 passed; 0 failed (each)
+
+cargo test -p orchestrator-daemon --all-features doctor_ -- --nocapture
+test result: ok. 7 passed; 0 failed
+
+cargo test -p colay --test global_doctor --all-features live_doctor_ -- --nocapture --test-threads=1
+test result: ok. 4 passed; 0 failed
+
+cargo test -p colay --test global_doctor --all-features legacy_import_doctor_ -- --nocapture --test-threads=1
+test result: ok. 12 passed; 0 failed
+
+cargo test -p colay --test global_doctor --all-features doctor_deep_checks_a_workspace_through_the_live_daemon -- --nocapture --test-threads=1
+test result: ok. 1 passed; 0 failed
+
+cargo fmt --all -- --check
+cargo clippy -p orchestrator-daemon -p colay --all-targets --all-features -- -D warnings
+git diff --check
+```
+
+All final commands exited 0. The Round 1 daemon-authoritative source resolution and spoof rejection remain green. No post-test daemon process referenced this worktree. Full-workspace tests remain Task 7-owned; `.task4-target/` is still untouched. The tracked-report Minor remains deferred as directed.

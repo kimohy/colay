@@ -7470,23 +7470,33 @@ mod tests {
             Some("sealed-fingerprint"),
             |request| {
                 requests.borrow_mut().push(request.clone());
+                let outcome = if requests.borrow().len() == 1 {
+                    serde_json::json!({
+                        "status": "ok",
+                        "data": older_data.clone()
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "error",
+                        "error": "unsupported IPC action"
+                    })
+                };
                 future::ready(Ok(orchestrator_daemon::IpcResponse {
                     schema_version: orchestrator_daemon::IPC_SCHEMA_VERSION,
                     request_id: request.request_id,
-                    outcome: serde_json::json!({
-                        "status": "ok",
-                        "data": older_data.clone()
-                    }),
+                    outcome,
                 }))
             },
         )
         .await?;
 
-        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(requests.borrow().len(), 2);
         assert_eq!(
             requests.borrow()[0].payload,
             serde_json::json!({"repository": repository})
         );
+        assert_eq!(requests.borrow()[1].action, "workspace.doctor.capabilities");
+        assert_eq!(requests.borrow()[1].payload, serde_json::json!({}));
         let lookup = serde_json::from_value::<orchestrator_daemon::WorkspaceDoctorLookup>(
             response
                 .outcome
@@ -7494,7 +7504,6 @@ mod tests {
                 .cloned()
                 .context("older daemon response omitted data")?,
         )?;
-        assert!(!lookup.legacy_import_evidence_supported);
         assert!(lookup.legacy_import.is_none());
         let source_database = repository.join(".legacy-colay/orchestrator.db");
         let check = live_legacy_import_check(

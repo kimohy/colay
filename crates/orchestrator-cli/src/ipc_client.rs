@@ -10,7 +10,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 #[cfg(windows)]
 use chrono::Utc;
 use orchestrator_daemon::{
-    IPC_SCHEMA_VERSION, IpcEndpointCandidates, IpcRequest, IpcResponse, ipc_endpoint_candidates,
+    IPC_SCHEMA_VERSION, IpcEndpointCandidates, IpcRequest, IpcResponse,
+    WorkspaceDoctorCapabilities, ipc_endpoint_candidates,
 };
 use orchestrator_domain::DaemonInstanceId;
 #[cfg(windows)]
@@ -184,11 +185,6 @@ where
     };
     let response = send(probe).await?;
     ensure_success(&response)?;
-    let evidence_supported = response
-        .outcome
-        .pointer("/data/legacy_import_evidence_supported")
-        .and_then(Value::as_bool)
-        == Some(true);
     let registered = response
         .outcome
         .pointer("/data/registered")
@@ -197,8 +193,33 @@ where
     let Some(legacy_source_fingerprint) = legacy_source_fingerprint else {
         return Ok(response);
     };
-    if !evidence_supported || !registered {
+    if !registered {
         return Ok(response);
+    }
+    let capability_request = IpcRequest {
+        schema_version: IPC_SCHEMA_VERSION,
+        request_id: Uuid::now_v7().to_string(),
+        workspace_id: None,
+        action: "workspace.doctor.capabilities".to_owned(),
+        payload: json!({}),
+    };
+    let capability_response = send(capability_request).await?;
+    if capability_response.outcome == json!({"status": "error", "error": "unsupported IPC action"})
+    {
+        return Ok(response);
+    }
+    ensure_success(&capability_response)?;
+    let capabilities = capability_response
+        .outcome
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow!("user daemon doctor capability response is malformed"))
+        .and_then(|data| {
+            serde_json::from_value::<WorkspaceDoctorCapabilities>(data)
+                .context("user daemon doctor capability response is malformed")
+        })?;
+    if !capabilities.legacy_import_evidence_supported {
+        bail!("user daemon doctor capability response is malformed");
     }
     let evidence = IpcRequest {
         schema_version: IPC_SCHEMA_VERSION,
@@ -907,7 +928,61 @@ mod tests {
     use super::{RESPONSE_TIMEOUT, open_windows_pipe_with_retry};
     use anyhow::Context as _;
     use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse};
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn registered_doctor_lookup_outcome() -> Value {
+        json!({
+            "status": "ok",
+            "data": {
+                "registered": true,
+                "database": {
+                    "integrity_ok": true,
+                    "foreign_key_violations": 0,
+                    "current_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                    "last_event_sequence": 0
+                },
+                "daemon": {"state": "stopped"},
+                "diagnostics": {
+                    "schema_version": orchestrator_daemon::WORKSPACE_DOCTOR_SCHEMA_VERSION,
+                    "database": {
+                        "integrity_ok": true,
+                        "foreign_key_violations": 0,
+                        "current_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                        "last_event_sequence": 0
+                    },
+                    "daemon": {"state": "stopped"},
+                    "workspace": {
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "kind": "directory",
+                        "status": "active",
+                        "canonical_path": "repository",
+                        "git_common_dir": null,
+                        "created_at": "2026-08-03T00:00:00Z",
+                        "last_seen_at": "2026-08-03T00:00:00Z"
+                    },
+                    "audit": {
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "verified_events": 0,
+                        "last_sequence": 0,
+                        "last_hash": null
+                    },
+                    "artifacts": {
+                        "root": "artifacts",
+                        "verified_references": 0,
+                        "scope": "persisted_references"
+                    }
+                }
+            }
+        })
+    }
+
+    fn response(request: IpcRequest, outcome: Value) -> IpcResponse {
+        IpcResponse {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: request.request_id,
+            outcome,
+        }
+    }
 
     #[tokio::test]
     async fn older_daemon_receives_only_repository_doctor_probe() -> anyhow::Result<()> {
@@ -952,6 +1027,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn older_daemon_exact_unsupported_capability_returns_repository_lookup()
+    -> anyhow::Result<()> {
+        let repository = std::path::Path::new("repository");
+        let requests = std::cell::RefCell::new(Vec::new());
+
+        let response = doctor_lookup_with(
+            repository,
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.borrow_mut().push(request.clone());
+                let outcome = if requests.borrow().len() == 1 {
+                    registered_doctor_lookup_outcome()
+                } else {
+                    json!({"status": "error", "error": "unsupported IPC action"})
+                };
+                future::ready(Ok(response(request, outcome)))
+            },
+        )
+        .await?;
+
+        assert_eq!(requests.borrow().len(), 2);
+        assert_eq!(requests.borrow()[0].action, "workspace.doctor.lookup");
+        assert_eq!(
+            requests.borrow()[0].payload,
+            json!({"repository": repository})
+        );
+        assert_eq!(requests.borrow()[1].action, "workspace.doctor.capabilities");
+        assert_eq!(requests.borrow()[1].payload, json!({}));
+        assert!(response.outcome.pointer("/data/legacy_import").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supported_capability_sends_evidence_lookup() -> anyhow::Result<()> {
+        let repository = std::path::Path::new("repository");
+        let requests = std::cell::RefCell::new(Vec::new());
+
+        let response = doctor_lookup_with(
+            repository,
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.borrow_mut().push(request.clone());
+                let outcome = match requests.borrow().len() {
+                    1 => registered_doctor_lookup_outcome(),
+                    2 => json!({
+                        "status": "ok",
+                        "data": {"legacy_import_evidence_supported": true}
+                    }),
+                    _ => {
+                        let mut outcome = registered_doctor_lookup_outcome();
+                        outcome["data"]["legacy_import"] = json!({
+                            "source_fingerprint": "sealed-fingerprint",
+                            "pending": false,
+                            "imported": true
+                        });
+                        outcome
+                    }
+                };
+                future::ready(Ok(response(request, outcome)))
+            },
+        )
+        .await?;
+
+        assert_eq!(requests.borrow().len(), 3);
+        assert_eq!(requests.borrow()[1].action, "workspace.doctor.capabilities");
+        assert_eq!(
+            requests.borrow()[2].payload,
+            json!({
+                "repository": repository,
+                "legacy_state_dir": ".legacy-colay",
+                "legacy_source_fingerprint": "sealed-fingerprint"
+            })
+        );
+        assert_eq!(
+            response
+                .outcome
+                .pointer("/data/legacy_import/imported")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_transport_failure_is_not_downgraded() -> anyhow::Result<()> {
+        let requests = std::cell::Cell::new(0_u8);
+        let result = doctor_lookup_with(
+            std::path::Path::new("repository"),
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.set(requests.get() + 1);
+                let result = if requests.get() == 1 {
+                    Ok(response(request, registered_doctor_lookup_outcome()))
+                } else {
+                    Err(anyhow::anyhow!("capability transport failed"))
+                };
+                future::ready(result)
+            },
+        )
+        .await;
+
+        let Err(error) = result else {
+            anyhow::bail!("capability transport failure was downgraded");
+        };
+        assert_eq!(error.to_string(), "capability transport failed");
+        assert_eq!(requests.get(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_protocol_failure_is_not_downgraded() -> anyhow::Result<()> {
+        let requests = std::cell::Cell::new(0_u8);
+        let result = doctor_lookup_with(
+            std::path::Path::new("repository"),
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.set(requests.get() + 1);
+                let outcome = if requests.get() == 1 {
+                    registered_doctor_lookup_outcome()
+                } else {
+                    json!({"status": "error", "error": "capability lookup failed"})
+                };
+                future::ready(Ok(response(request, outcome)))
+            },
+        )
+        .await;
+
+        let Err(error) = result else {
+            anyhow::bail!("capability protocol failure was downgraded");
+        };
+        assert_eq!(error.to_string(), "capability lookup failed");
+        assert_eq!(requests.get(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_capability_response_is_not_downgraded() -> anyhow::Result<()> {
+        let requests = std::cell::Cell::new(0_u8);
+        let result = doctor_lookup_with(
+            std::path::Path::new("repository"),
+            Some(std::path::Path::new(".legacy-colay")),
+            Some("sealed-fingerprint"),
+            |request| {
+                requests.set(requests.get() + 1);
+                let outcome = if requests.get() == 1 {
+                    registered_doctor_lookup_outcome()
+                } else {
+                    json!({
+                        "status": "ok",
+                        "data": {"legacy_import_evidence_supported": "yes"}
+                    })
+                };
+                future::ready(Ok(response(request, outcome)))
+            },
+        )
+        .await;
+
+        let Err(error) = result else {
+            anyhow::bail!("malformed capability response was downgraded");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("capability response is malformed")
+        );
+        assert_eq!(requests.get(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn advertised_doctor_evidence_failure_is_not_downgraded() -> anyhow::Result<()> {
         let repository = std::path::Path::new("repository");
         let requests = std::cell::RefCell::new(Vec::new());
@@ -962,25 +1211,18 @@ mod tests {
             Some("sealed-fingerprint"),
             |request| {
                 requests.borrow_mut().push(request.clone());
-                let outcome = if requests.borrow().len() == 1 {
-                    json!({
+                let outcome = match requests.borrow().len() {
+                    1 => registered_doctor_lookup_outcome(),
+                    2 => json!({
                         "status": "ok",
-                        "data": {
-                            "registered": true,
-                            "legacy_import_evidence_supported": true
-                        }
-                    })
-                } else {
-                    json!({
+                        "data": {"legacy_import_evidence_supported": true}
+                    }),
+                    _ => json!({
                         "status": "error",
                         "error": "legacy import completion evidence could not be validated"
-                    })
+                    }),
                 };
-                future::ready(Ok(IpcResponse {
-                    schema_version: IPC_SCHEMA_VERSION,
-                    request_id: request.request_id,
-                    outcome,
-                }))
+                future::ready(Ok(response(request, outcome)))
             },
         )
         .await;
@@ -993,13 +1235,15 @@ mod tests {
                 .to_string()
                 .contains("legacy import completion evidence could not be validated")
         );
-        assert_eq!(requests.borrow().len(), 2);
+        assert_eq!(requests.borrow().len(), 3);
         assert_eq!(
             requests.borrow()[0].payload,
             json!({"repository": repository})
         );
+        assert_eq!(requests.borrow()[1].action, "workspace.doctor.capabilities");
+        assert_eq!(requests.borrow()[1].payload, json!({}));
         assert_eq!(
-            requests.borrow()[1].payload,
+            requests.borrow()[2].payload,
             json!({
                 "repository": repository,
                 "legacy_state_dir": ".legacy-colay",

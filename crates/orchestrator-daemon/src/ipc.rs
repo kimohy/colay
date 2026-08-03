@@ -111,10 +111,14 @@ pub struct WorkspaceDoctorLookup {
     pub database: DatabaseHealth,
     pub daemon: orchestrator_state::DaemonStatus,
     pub diagnostics: Option<WorkspaceDoctorDiagnostics>,
-    #[serde(default)]
-    pub legacy_import_evidence_supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_import: Option<LegacyImportDoctorStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDoctorCapabilities {
+    pub legacy_import_evidence_supported: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1063,6 +1067,7 @@ fn dispatch_read_request(
             .map(|status| json!({"status": status}))
             .map_err(IpcError::from),
         "workspace.status" => workspace_status(database, paths, request),
+        "workspace.doctor.capabilities" => workspace_doctor_capabilities(request),
         "workspace.doctor.lookup" => workspace_doctor_lookup(database, paths, request),
         "workspace.doctor" => workspace_doctor(database, paths, request),
         "workspace.task.stream" => workspace_task_stream(database, request),
@@ -1108,6 +1113,18 @@ struct WorkspaceDoctorLookupPayload {
     legacy_source_fingerprint: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceDoctorCapabilitiesPayload {}
+
+fn workspace_doctor_capabilities(request: &IpcRequest) -> Result<Value, IpcError> {
+    let _: WorkspaceDoctorCapabilitiesPayload = serde_json::from_value(request.payload.clone())?;
+    serde_json::to_value(WorkspaceDoctorCapabilities {
+        legacy_import_evidence_supported: true,
+    })
+    .map_err(IpcError::from)
+}
+
 fn workspace_doctor_lookup(
     database: &Database,
     paths: &GlobalStatePaths,
@@ -1146,7 +1163,6 @@ fn workspace_doctor_lookup(
         database: database_health,
         daemon,
         diagnostics,
-        legacy_import_evidence_supported: true,
         legacy_import,
     })
     .map_err(IpcError::from)
@@ -2118,8 +2134,8 @@ mod tests {
     use super::{
         IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, LegacyImportDoctorStatus,
         MAX_REQUEST_BYTES, TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook,
-        WorkspaceDoctorLookup, WorkspaceDoctorLookupPayload, handle_connection,
-        resume_workspace_task, workspace_conversation, workspace_doctor_lookup,
+        WorkspaceDoctorLookup, WorkspaceDoctorLookupPayload, dispatch_read_request,
+        handle_connection, resume_workspace_task, workspace_conversation, workspace_doctor_lookup,
         workspace_projection,
     };
     #[cfg(windows)]
@@ -2129,9 +2145,19 @@ mod tests {
         windows_owner_bootstrap_guard, windows_owner_mutex_name, windows_primary_pipe_name,
     };
     use orchestrator_state::{
-        DaemonLeaseRequest, Database, GlobalStatePaths, LegacyImporter, NewSessionRecord,
-        NewTaskRecord, RepositoryStatePaths, RootConfig, StateEnvironment, WorkspaceReadRequest,
+        DaemonLeaseRequest, DaemonStatus, Database, DatabaseHealth, GlobalStatePaths,
+        LegacyImporter, NewSessionRecord, NewTaskRecord, RepositoryStatePaths, RootConfig,
+        StateEnvironment, WorkspaceReadRequest,
     };
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacySchemaOneDoctorLookup {
+        registered: bool,
+        database: DatabaseHealth,
+        daemon: DaemonStatus,
+        diagnostics: Option<super::WorkspaceDoctorDiagnostics>,
+    }
 
     const MIGRATIONS_THROUGH_V8: &[(u32, &str, &str)] = &[
         (1, "core", include_str!("../../../migrations/0001_core.sql")),
@@ -2287,7 +2313,6 @@ mod tests {
             },
             "daemon": {"state": "stopped"},
             "diagnostics": null,
-            "legacy_import_evidence_supported": true,
             "legacy_import": {
                 "source_fingerprint": "sealed-fingerprint",
                 "pending": false,
@@ -2296,7 +2321,6 @@ mod tests {
         }))?;
 
         assert_eq!(older.legacy_import, None);
-        assert!(!older.legacy_import_evidence_supported);
         assert_eq!(
             evidence_aware.legacy_import,
             Some(LegacyImportDoctorStatus {
@@ -2305,7 +2329,62 @@ mod tests {
                 imported: true,
             })
         );
-        assert!(evidence_aware.legacy_import_evidence_supported);
+        Ok(())
+    }
+
+    #[test]
+    fn repository_lookup_response_remains_readable_by_legacy_schema_one_client()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = serde_json::to_value(WorkspaceDoctorLookup {
+            registered: false,
+            database: DatabaseHealth {
+                integrity_ok: true,
+                foreign_key_violations: 0,
+                current_schema_version: orchestrator_state::STATE_SCHEMA_VERSION,
+                last_event_sequence: 0,
+            },
+            daemon: DaemonStatus::Stopped,
+            diagnostics: None,
+            legacy_import: None,
+        })?;
+
+        let legacy = serde_json::from_value::<LegacySchemaOneDoctorLookup>(response)?;
+
+        assert!(!legacy.registered);
+        assert!(legacy.database.integrity_ok);
+        assert_eq!(legacy.daemon, DaemonStatus::Stopped);
+        assert!(legacy.diagnostics.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_doctor_capability_is_discovered_outside_legacy_lookup_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let home = temporary.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            std::fs::canonicalize(home)?,
+        )?)?;
+        let database = Database::open(&paths.database)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-capabilities".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.capabilities".to_owned(),
+            payload: serde_json::json!({}),
+        };
+
+        let response = dispatch_read_request(&database, &paths, &request)
+            .ok_or_else(|| std::io::Error::other("capability action was not dispatched"))?;
+
+        assert_eq!(
+            response.outcome,
+            serde_json::json!({
+                "status": "ok",
+                "data": {"legacy_import_evidence_supported": true}
+            })
+        );
         Ok(())
     }
 
