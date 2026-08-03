@@ -187,6 +187,18 @@ pub struct LegacyImportPlan {
     database_sha256: String,
     database_length: u64,
     files: Vec<ManifestFile>,
+    copied_imported_rows: u64,
+    merged_imported_rows: u64,
+}
+
+impl LegacyImportPlan {
+    fn expected_imported_rows(&self, copied_legacy_event_chain: bool) -> u64 {
+        if copied_legacy_event_chain {
+            self.copied_imported_rows
+        } else {
+            self.merged_imported_rows
+        }
+    }
 }
 
 /// Durable outcome recorded in `legacy_imports.result_json`.
@@ -267,6 +279,7 @@ impl LegacyImporter {
         validate_source_documents(&migrated)?;
         validate_jsonl_evidence(&source.root, &source.events, &migrated, &events)?;
         let event_evidence = event_evidence(&events)?;
+        let (copied_imported_rows, merged_imported_rows) = inspected_import_row_counts(&migrated)?;
         let files = collect_manifest_files(source, &migrated)?;
         let manifest_hash = manifest_hash(&database_sha256, database_length, &files);
         let logical_content_hash = logical_workspace_hash(&migrated)?;
@@ -290,6 +303,8 @@ impl LegacyImporter {
             database_sha256,
             database_length,
             files,
+            copied_imported_rows,
+            merged_imported_rows,
         }))
     }
 
@@ -298,11 +313,11 @@ impl LegacyImporter {
     pub fn completed_import(
         global: &Database,
         target: WorkspaceId,
-        source_fingerprint: &str,
+        plan: &LegacyImportPlan,
         paths: &GlobalStatePaths,
     ) -> StateResult<Option<LegacyImportResult>> {
         let connection = global.raw_lock()?;
-        let result = load_recorded_result_in(&connection, target, source_fingerprint)?;
+        let result = load_existing_result_in(&connection, target, plan)?;
         if let Some(result) = result.as_ref() {
             validate_published_import(result, target, paths)?;
         }
@@ -2216,9 +2231,11 @@ fn load_existing_result_in(
         return Ok(None);
     };
     if result.manifest_hash != plan.manifest_hash
+        || result.source_root_hash != plan.source_root_hash
         || result.legacy_event_count != plan.event_evidence.count
         || result.legacy_event_root_hash != plan.event_evidence.root_hash
         || result.legacy_event_tip_hash != plan.event_evidence.tip_hash
+        || result.imported_rows != plan.expected_imported_rows(result.copied_legacy_event_chain)
     {
         return Err(StateError::InvalidRecord(
             "legacy import ledger result does not match its sealed source plan".to_owned(),
@@ -2379,17 +2396,24 @@ fn validate_replayed_anchor(
             "legacy import audit anchor is missing or duplicated".to_owned(),
         ));
     }
-    let (event_json, stored_hash): (String, String) = connection.query_row(
-        "SELECT event_json, event_hash FROM main.task_events \
-         WHERE workspace_id = ?1 AND sequence = ?2",
-        params![
-            result.workspace_id.to_string(),
-            i64::try_from(sequence).map_err(|_| StateError::InvalidRecord(
-                "legacy import anchor sequence exceeds SQLite range".to_owned()
-            ))?
-        ],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (event_json, stored_hash): (String, String) = connection
+        .query_row(
+            "SELECT event_json, event_hash FROM main.task_events \
+             WHERE workspace_id = ?1 AND sequence = ?2",
+            params![
+                result.workspace_id.to_string(),
+                i64::try_from(sequence).map_err(|_| StateError::InvalidRecord(
+                    "legacy import anchor sequence exceeds SQLite range".to_owned()
+                ))?
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StateError::InvalidRecord(
+                "legacy import anchor sequence does not reference an audit event".to_owned(),
+            )
+        })?;
     let event: TaskEvent = serde_json::from_str(&event_json)?;
     let payload = &event.payload;
     let valid = event.event_type == EventType::CompatibilityWarning
@@ -2434,21 +2458,33 @@ fn validate_published_import(
     }
     match fs::symlink_metadata(&expected) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        Ok(_) | Err(_) => {
+        Ok(_) => {
             return Err(StateError::InvalidRecord(
                 "published legacy import directory is missing or invalid".to_owned(),
             ));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StateError::InvalidRecord(
+                "published legacy import directory is missing or invalid".to_owned(),
+            ));
+        }
+        Err(error) => return Err(StateError::io(&expected, error)),
     }
     reject_symlink_components(&expected)?;
     let database = expected.join(SOURCE_SNAPSHOT_NAME);
     match fs::symlink_metadata(&database) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-        Ok(_) | Err(_) => {
+        Ok(_) => {
             return Err(StateError::InvalidRecord(
                 "published legacy import database is missing or invalid".to_owned(),
             ));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StateError::InvalidRecord(
+                "published legacy import database is missing or invalid".to_owned(),
+            ));
+        }
+        Err(error) => return Err(StateError::io(&database, error)),
     }
     let database_sha256 = sha256_file(&database)?;
     let database_length = file_length(&database)?;
@@ -2474,6 +2510,8 @@ fn ensure_plan_unchanged(
         || expected.database_sha256 != actual.database_sha256
         || expected.database_length != actual.database_length
         || expected.files != actual.files
+        || expected.copied_imported_rows != actual.copied_imported_rows
+        || expected.merged_imported_rows != actual.merged_imported_rows
     {
         return Err(StateError::InvalidRecord(
             "legacy source changed after inspection".to_owned(),
@@ -3079,6 +3117,28 @@ fn source_identity_hash(connection: &Connection) -> StateResult<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
+fn inspected_import_row_counts(connection: &Connection) -> StateResult<(u64, u64)> {
+    let mut copied = 0_u64;
+    let mut merged = 0_u64;
+    for table in IMPORT_TABLES {
+        let sql = format!("SELECT count(*) FROM main.\"{table}\" WHERE workspace_id = ?1");
+        let count: i64 =
+            connection.query_row(&sql, [RESERVED_LEGACY_WORKSPACE], |row| row.get(0))?;
+        let count = u64::try_from(count).map_err(|_| {
+            StateError::InvalidRecord("legacy import row count is negative".to_owned())
+        })?;
+        copied = copied.checked_add(count).ok_or_else(|| {
+            StateError::InvalidRecord("legacy import row count overflow".to_owned())
+        })?;
+        if !matches!(*table, "task_events" | "event_log_state") {
+            merged = merged.checked_add(count).ok_or_else(|| {
+                StateError::InvalidRecord("legacy import row count overflow".to_owned())
+            })?;
+        }
+    }
+    Ok((copied, merged))
+}
+
 fn logical_workspace_hash(connection: &Connection) -> StateResult<String> {
     use rusqlite::types::ValueRef;
 
@@ -3205,10 +3265,11 @@ fn table_exists(connection: &Connection, name: &str) -> StateResult<bool> {
 mod final_hardening_tests {
     use std::{cell::RefCell, fs, rc::Rc};
 
+    use chrono::Utc;
     use rusqlite::Connection;
 
     use crate::{
-        Database, GlobalStatePaths, RepositoryStatePaths, RootConfig, StateEnvironment,
+        Database, GlobalStatePaths, RepositoryStatePaths, RootConfig, StateEnvironment, StateError,
         source_guard::{SourceOpenHookPhase, clear_source_open_hook, set_source_open_hook},
         sqlite_snapshot::{
             SnapshotCaptureHookPhase, clear_snapshot_capture_hook, set_snapshot_capture_hook,
@@ -3216,7 +3277,8 @@ mod final_hardening_tests {
     };
 
     use super::{
-        LegacyEventEvidence, LegacyImportPlan, LegacyImporter, backup_import_target, sha256_file,
+        LegacyEventEvidence, LegacyImportPlan, LegacyImportResult, LegacyImporter,
+        backup_import_target, sha256_file, validate_published_import,
     };
 
     #[test]
@@ -3233,6 +3295,54 @@ mod final_hardening_tests {
 
         assert!(error.to_string().contains("outside a SQLite transaction"));
         assert!(fs::read_dir(temporary.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn published_import_operational_metadata_error_remains_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let paths = GlobalStatePaths {
+            root: root.join("state"),
+            database: root.join("state.db"),
+            backups: root.join("backups"),
+            workspaces: root.join("workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+        };
+        let workspace_id = "00000000-0000-0000-0000-000000000002".parse()?;
+        let source_fingerprint = format!("{}\0", "a".repeat(63));
+        let published_path = paths
+            .for_workspace(workspace_id)
+            .root
+            .join("imports")
+            .join(&source_fingerprint);
+        let result = LegacyImportResult {
+            imported: true,
+            source_fingerprint,
+            workspace_id,
+            manifest_hash: "b".repeat(64),
+            source_root_hash: "c".repeat(64),
+            legacy_event_count: 0,
+            legacy_event_root_hash: None,
+            legacy_event_tip_hash: None,
+            copied_legacy_event_chain: true,
+            id_mapping_count: 0,
+            id_mapping_manifest_hash: "d".repeat(64),
+            imported_rows: 0,
+            anchor_sequence: None,
+            published_path: published_path.clone(),
+            imported_at: Utc::now(),
+        };
+
+        let Err(StateError::Io { path, source }) =
+            validate_published_import(&result, workspace_id, &paths)
+        else {
+            return Err("operational published metadata error was classified as corruption".into());
+        };
+        assert_eq!(path, published_path);
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
         Ok(())
     }
 
@@ -3268,6 +3378,8 @@ mod final_hardening_tests {
             database_sha256: "d".repeat(64),
             database_length: 0,
             files: Vec::new(),
+            copied_imported_rows: 0,
+            merged_imported_rows: 0,
         };
         let source_hash = sha256_file(&source.database)?;
         let target_before = target_import_counts(&global, workspace_id)?;
@@ -3496,6 +3608,8 @@ mod final_hardening_tests {
             database_sha256: "d".repeat(64),
             database_length: 0,
             files: Vec::new(),
+            copied_imported_rows: 0,
+            merged_imported_rows: 0,
         }
     }
 

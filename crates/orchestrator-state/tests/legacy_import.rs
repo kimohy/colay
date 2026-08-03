@@ -57,7 +57,7 @@ fn legacy_import_completion_preserves_durable_truth_and_accepts_a_read_only_snap
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         )?,
         None
@@ -69,15 +69,13 @@ fn legacy_import_completion_preserves_durable_truth_and_accepts_a_read_only_snap
     let snapshot = Database::open_read_only_snapshot(fixture.global.path())?
         .ok_or("global state snapshot was not created")?;
     assert_ne!(snapshot.path(), fixture.global.path());
-    let completed = LegacyImporter::completed_import(
-        &snapshot,
-        fixture.workspace_id,
-        &plan.source_fingerprint,
-        &fixture.paths,
-    )?
-    .ok_or("matching import was not discoverable")?;
+    let completed =
+        LegacyImporter::completed_import(&snapshot, fixture.workspace_id, &plan, &fixture.paths)?
+            .ok_or("matching import was not discoverable")?;
     assert!(completed.imported);
     assert_eq!(completed.source_fingerprint, plan.source_fingerprint);
+    assert_eq!(completed.anchor_sequence, None);
+    assert_eq!(completed.imported_rows, first.imported_rows);
 
     let replay =
         LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
@@ -92,14 +90,15 @@ fn legacy_import_completion_returns_none_for_a_different_sealed_fingerprint() ->
     let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
         .ok_or("legacy source was not found")?;
     LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
-    let different_fingerprint = "0".repeat(64);
-    assert_ne!(different_fingerprint, plan.source_fingerprint);
+    let mut different_plan = plan.clone();
+    different_plan.source_fingerprint = "0".repeat(64);
+    assert_ne!(different_plan.source_fingerprint, plan.source_fingerprint);
 
     assert_eq!(
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &different_fingerprint,
+            &different_plan,
             &fixture.paths,
         )?,
         None
@@ -129,7 +128,7 @@ fn legacy_import_completion_rejects_a_mismatched_indexed_workspace() -> TestResu
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "mismatched indexed workspace",
@@ -155,7 +154,7 @@ fn legacy_import_completion_rejects_a_mismatched_indexed_manifest() -> TestResul
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "mismatched indexed manifest",
@@ -178,10 +177,65 @@ fn legacy_import_completion_rejects_structurally_invalid_result_json() -> TestRe
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "structurally invalid import result JSON",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_changed_imported_row_count() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_imports SET result_json = json_set(\
+             result_json, '$.imported_rows', \
+             json_extract(result_json, '$.imported_rows') + 1\
+         ) WHERE source_fingerprint = ?1",
+        [&plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan,
+            &fixture.paths,
+        ),
+        "changed imported row count",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_changed_anchorless_source_root_hash() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    assert_eq!(imported.anchor_sequence, None);
+    let different_source_root_hash = "f".repeat(64);
+    assert_ne!(different_source_root_hash, imported.source_root_hash);
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_imports SET result_json = json_set(\
+             result_json, '$.source_root_hash', ?1\
+         ) WHERE source_fingerprint = ?2",
+        params![different_source_root_hash, plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan,
+            &fixture.paths,
+        ),
+        "changed anchorless source root hash",
     )
 }
 
@@ -206,7 +260,7 @@ fn legacy_import_completion_rejects_a_missing_id_mapping() -> TestResult {
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "missing ID mapping",
@@ -234,7 +288,7 @@ fn legacy_import_completion_rejects_a_changed_id_mapping() -> TestResult {
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "changed ID mapping",
@@ -257,7 +311,7 @@ fn legacy_import_completion_rejects_a_damaged_imported_audit_chain() -> TestResu
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "damaged imported audit chain",
@@ -291,10 +345,46 @@ fn legacy_import_completion_rejects_a_missing_import_anchor() -> TestResult {
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "missing import anchor",
+    )
+}
+
+#[test]
+fn legacy_import_completion_rejects_a_missing_referenced_anchor_sequence() -> TestResult {
+    let _guard = lock_legacy_import_completion_test();
+    let fixture = ImportFixture::new()?;
+    fixture
+        .global
+        .workspace(fixture.workspace_id)
+        .append_event(audit_event(None, "existing target evidence"))?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let imported =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let anchor_sequence = imported
+        .anchor_sequence
+        .ok_or("merged import did not record an anchor")?;
+    let missing_sequence = anchor_sequence
+        .checked_add(1_000)
+        .ok_or("anchor sequence overflow")?;
+    Connection::open(fixture.global.path())?.execute(
+        "UPDATE legacy_imports SET result_json = json_set(\
+             result_json, '$.anchor_sequence', ?1\
+         ) WHERE source_fingerprint = ?2",
+        params![i64::try_from(missing_sequence)?, plan.source_fingerprint],
+    )?;
+
+    assert_invalid_record(
+        LegacyImporter::completed_import(
+            &fixture.global,
+            fixture.workspace_id,
+            &plan,
+            &fixture.paths,
+        ),
+        "missing referenced import anchor sequence",
     )
 }
 
@@ -312,7 +402,7 @@ fn legacy_import_completion_rejects_a_missing_published_import() -> TestResult {
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "missing published import",
@@ -338,7 +428,7 @@ fn legacy_import_completion_rejects_a_mismatched_published_import() -> TestResul
         LegacyImporter::completed_import(
             &fixture.global,
             fixture.workspace_id,
-            &plan.source_fingerprint,
+            &plan,
             &fixture.paths,
         ),
         "mismatched published import",
