@@ -759,11 +759,11 @@ evidence when the requested sandbox is read-only and the provider has establishe
 
 ### Reproduction, persisted outcome, and root cause
 
-During the same isolated WSL clean-install QA, the public provider-discovery/compatibility check
-resolved no Linux-native `agy`. A Windows `agy.exe` was visible below `/mnt/c`; it is not an
-acceptable fallback and was not invoked for version, help, compatibility, or inference. The
-persisted provider result remained unavailable because no native executable was resolved, with zero
-new tasks, task attempts, worktrees, coordinator leases, and worker leases.
+During the same isolated WSL clean-install QA, the non-inference command
+`colay --json compatibility` resolved no Linux-native `agy`. A Windows `agy.exe` was visible below
+`/mnt/c`; it is not an acceptable fallback and was not invoked for version, help, compatibility, or
+inference. The persisted provider result remained unavailable because no native executable was
+resolved, with zero new tasks, task attempts, worktrees, coordinator leases, and worker leases.
 
 The resolver currently permits PATH discovery to expose a Windows executable to WSL instead of
 requiring a Linux-native binary. Discovery must reject Windows-mounted and Windows PE candidates
