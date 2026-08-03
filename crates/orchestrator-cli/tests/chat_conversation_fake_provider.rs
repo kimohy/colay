@@ -3,8 +3,8 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use orchestrator_domain::{
-    CapabilitySupport, ConversationAttemptId, ConversationOutcome, MessageId, ModelProfile,
-    ProviderCapabilities, ProviderId, SandboxMode, SessionId,
+    ConversationAttemptId, ConversationOutcome, MessageId, ModelProfile, ProviderCapabilities,
+    ProviderId, SandboxMode, SessionId,
 };
 use orchestrator_engine::{
     CONVERSATION_MAX_EVIDENCE_BYTES, ConversationExit, ConversationFailure,
@@ -12,7 +12,9 @@ use orchestrator_engine::{
 };
 use orchestrator_providers::AdapterRuntime;
 use orchestrator_state::RootConfig;
-use orchestrator_test_support::{FakeAdapterRuntime, FakeRuntimeScenario};
+use orchestrator_test_support::{
+    FakeAdapterRuntime, FakeRuntimeScenario, fake_conversation_capability,
+};
 
 use colay::conversation_orchestrator::OfficialCliConversationOrchestrator;
 
@@ -27,16 +29,7 @@ fn allowed_fake_binary(repository: &std::path::Path) -> Result<PathBuf, std::io:
 }
 
 fn capability() -> ProviderCapabilities {
-    capability_for(ProviderId::Codex)
-}
-
-fn capability_for(provider: ProviderId) -> ProviderCapabilities {
-    let mut capability = ProviderCapabilities::unsupported(provider);
-    capability.non_interactive = CapabilitySupport::Verified;
-    capability.structured_output = CapabilitySupport::Verified;
-    capability.read_only = CapabilitySupport::Verified;
-    capability.evidence = vec![format!("fake {provider} marker")];
-    capability
+    fake_conversation_capability(ProviderId::Codex)
 }
 
 #[tokio::test]
@@ -63,8 +56,8 @@ async fn requested_provider_reaches_the_claude_fake_adapter_despite_codex_priori
         &repository,
         runtime,
         &[
-            capability_for(ProviderId::Codex),
-            capability_for(ProviderId::Claude),
+            fake_conversation_capability(ProviderId::Codex),
+            fake_conversation_capability(ProviderId::Claude),
         ],
         ModelProfile::Standard,
     )?;
@@ -90,6 +83,64 @@ fn request(transcript: &str) -> ConversationRequest {
         repository_summary_redacted: "Git availability is not required for answers".to_owned(),
         sandbox: SandboxMode::ReadOnly,
     }
+}
+
+#[tokio::test]
+async fn all_fake_providers_preserve_the_canonical_read_only_conversation_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::Success,
+    )?);
+    let mut config = RootConfig::default();
+    for provider in [
+        config.orchestrator.providers.codex.as_mut(),
+        config.orchestrator.providers.claude.as_mut(),
+        config.orchestrator.providers.gemini.as_mut(),
+        config.orchestrator.providers.agy.as_mut(),
+    ] {
+        provider.ok_or("provider config")?.executable = executable.to_string_lossy().into_owned();
+    }
+    let providers = [
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::Agy,
+    ];
+    let capabilities = providers.map(fake_conversation_capability);
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &capabilities,
+        ModelProfile::Standard,
+    )?;
+
+    for provider in providers {
+        let mut request = request("Why does colay need Git?");
+        request.provider = provider;
+        let response = orchestrator.converse(request.clone()).await?;
+
+        assert_eq!(response.provider, provider);
+        assert_eq!(response.sandbox, SandboxMode::ReadOnly);
+        assert!(
+            response
+                .evidence_redacted
+                .contains(&format!("fake {provider} marker"))
+        );
+        assert_eq!(
+            serde_json::to_value(collect_conversation_response(&request, response)?)?,
+            serde_json::json!({
+                "outcome": "answer_complete",
+                "response_redacted": "Git is needed only after an approved writable task candidate."
+            })
+        );
+    }
+    assert!(!repository.join(".colay/worktrees").exists());
+    Ok(())
 }
 
 #[tokio::test]
@@ -128,6 +179,52 @@ async fn ordinary_question_uses_bounded_read_only_fake_provider_without_worktree
         ConversationOutcome::AnswerComplete { .. }
     ));
     assert!(!repository.join(".colay/worktrees").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_provider_response_alias_normalizes_to_canonical_session_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::ConversationResponseAlias,
+    )?);
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.agy = None;
+    config.orchestrator.providers.claude = None;
+    config
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+    let request = request("Compatibility response alias");
+
+    let response = orchestrator.converse(request.clone()).await?;
+    assert_eq!(response.exit, ConversationExit::Succeeded);
+    let outcome = collect_conversation_response(&request, response)?;
+    let persisted_output = serde_json::to_value(outcome)?;
+
+    assert_eq!(
+        persisted_output,
+        serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Hello! How can I help?"
+        })
+    );
+    assert!(persisted_output.get("response").is_none());
     Ok(())
 }
 
@@ -281,7 +378,7 @@ async fn noisy_provider_failure_is_deduplicated_bounded_and_safe()
         &config,
         &repository,
         adapter_runtime,
-        &[capability_for(ProviderId::Gemini)],
+        &[fake_conversation_capability(ProviderId::Gemini)],
         ModelProfile::Standard,
     )?;
     let mut request = request("bounded diagnostic noise");

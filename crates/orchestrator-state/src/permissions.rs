@@ -166,6 +166,145 @@ const BROAD_ACCESS_SIDS: [&str; 3] = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
 const WINDOWS_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(windows)]
 const MAX_WINDOWS_TOOL_OUTPUT: u64 = 64 * 1024;
+#[cfg(windows)]
+const WINDOWS_UTILITY_SPAWN_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(25),
+    std::time::Duration::from_millis(50),
+];
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsUtilityIoStage {
+    TrustedExecutableResolution,
+    StdoutCaptureCreate,
+    StderrCaptureCreate,
+    StdoutCaptureClone,
+    StderrCaptureClone,
+    Spawn,
+    Poll,
+    StdoutCaptureSeek,
+    StderrCaptureSeek,
+    StdoutCaptureMetadata,
+    StderrCaptureMetadata,
+    StdoutCaptureRead,
+    StderrCaptureRead,
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for WindowsUtilityIoStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TrustedExecutableResolution => "trusted executable resolution",
+            Self::StdoutCaptureCreate => "stdout capture temporary-file creation",
+            Self::StderrCaptureCreate => "stderr capture temporary-file creation",
+            Self::StdoutCaptureClone => "stdout capture handle cloning",
+            Self::StderrCaptureClone => "stderr capture handle cloning",
+            Self::Spawn => "process spawn",
+            Self::Poll => "process status poll",
+            Self::StdoutCaptureSeek => "stdout capture seek",
+            Self::StderrCaptureSeek => "stderr capture seek",
+            Self::StdoutCaptureMetadata => "stdout capture metadata",
+            Self::StderrCaptureMetadata => "stderr capture metadata",
+            Self::StdoutCaptureRead => "stdout capture read",
+            Self::StderrCaptureRead => "stderr capture read",
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsUtilityIoDiagnostic {
+    stage: WindowsUtilityIoStage,
+    source: std::io::Error,
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for WindowsUtilityIoDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Windows utility I/O stage `{}` failed: {}",
+            self.stage, self.source
+        )
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for WindowsUtilityIoDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(windows)]
+fn map_windows_utility_io<T>(
+    path: &Path,
+    stage: WindowsUtilityIoStage,
+    result: std::io::Result<T>,
+) -> StateResult<T> {
+    result.map_err(|source| windows_utility_io_error(path, stage, source))
+}
+
+#[cfg(windows)]
+fn is_retryable_windows_utility_io(stage: WindowsUtilityIoStage, source: &std::io::Error) -> bool {
+    stage == WindowsUtilityIoStage::Spawn
+        && source.kind() == std::io::ErrorKind::PermissionDenied
+        && source.raw_os_error() == Some(5)
+}
+
+#[cfg(windows)]
+fn spawn_windows_utility_with_retry<T, Spawn, Sleep>(
+    executable: &Path,
+    mut spawn: Spawn,
+    mut sleep: Sleep,
+) -> StateResult<T>
+where
+    Spawn: FnMut() -> std::io::Result<T>,
+    Sleep: FnMut(std::time::Duration),
+{
+    for delay in WINDOWS_UTILITY_SPAWN_RETRY_DELAYS {
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(source)
+                if is_retryable_windows_utility_io(WindowsUtilityIoStage::Spawn, &source) =>
+            {
+                sleep(delay);
+            }
+            Err(source) => {
+                return Err(windows_utility_io_error(
+                    executable,
+                    WindowsUtilityIoStage::Spawn,
+                    source,
+                ));
+            }
+        }
+    }
+    map_windows_utility_io(executable, WindowsUtilityIoStage::Spawn, spawn())
+}
+
+#[cfg(windows)]
+fn windows_utility_io_error(
+    path: &Path,
+    stage: WindowsUtilityIoStage,
+    source: std::io::Error,
+) -> StateError {
+    let kind = source.kind();
+    StateError::io(
+        path,
+        std::io::Error::new(kind, WindowsUtilityIoDiagnostic { stage, source }),
+    )
+}
+
+#[cfg(windows)]
+fn stage_windows_utility_state_io<T>(
+    stage: WindowsUtilityIoStage,
+    result: StateResult<T>,
+) -> StateResult<T> {
+    result.map_err(|error| match error {
+        StateError::Io { path, source } => windows_utility_io_error(&path, stage, source),
+        error => error,
+    })
+}
 
 #[cfg(windows)]
 struct WindowsIdentity {
@@ -276,12 +415,25 @@ fn trusted_system_utility(file_name: &str) -> StateResult<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| permission_error("SystemRoot is absent or is not absolute"))?;
-    reject_symlink_components(&root)?;
-    let root = fs::canonicalize(&root).map_err(|error| StateError::io(&root, error))?;
+    stage_windows_utility_state_io(
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        reject_symlink_components(&root),
+    )?;
+    let root = map_windows_utility_io(
+        &root,
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        fs::canonicalize(&root),
+    )?;
     let system32_input = root.join("System32");
-    reject_symlink_components(&system32_input)?;
-    let system32 = fs::canonicalize(&system32_input)
-        .map_err(|error| StateError::io(&system32_input, error))?;
+    stage_windows_utility_state_io(
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        reject_symlink_components(&system32_input),
+    )?;
+    let system32 = map_windows_utility_io(
+        &system32_input,
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        fs::canonicalize(&system32_input),
+    )?;
     if system32.parent() != Some(root.as_path()) {
         return Err(permission_error(
             "System32 escaped the canonical Windows root",
@@ -289,9 +441,15 @@ fn trusted_system_utility(file_name: &str) -> StateResult<PathBuf> {
     }
 
     let utility_input = system32.join(file_name);
-    reject_symlink_components(&utility_input)?;
-    let utility =
-        fs::canonicalize(&utility_input).map_err(|error| StateError::io(&utility_input, error))?;
+    stage_windows_utility_state_io(
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        reject_symlink_components(&utility_input),
+    )?;
+    let utility = map_windows_utility_io(
+        &utility_input,
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        fs::canonicalize(&utility_input),
+    )?;
     let has_expected_name = utility
         .file_name()
         .and_then(|name| name.to_str())
@@ -302,7 +460,11 @@ fn trusted_system_utility(file_name: &str) -> StateResult<PathBuf> {
             utility.display()
         )));
     }
-    let metadata = fs::metadata(&utility).map_err(|error| StateError::io(&utility, error))?;
+    let metadata = map_windows_utility_io(
+        &utility,
+        WindowsUtilityIoStage::TrustedExecutableResolution,
+        fs::metadata(&utility),
+    )?;
     if !metadata.is_file() {
         return Err(permission_error(format!(
             "Windows utility is not a regular file: {}",
@@ -433,33 +595,44 @@ fn run_windows_utility(
         time::Instant,
     };
 
-    let mut stdout = tempfile::tempfile().map_err(|error| StateError::io(executable, error))?;
-    let mut stderr = tempfile::tempfile().map_err(|error| StateError::io(executable, error))?;
-    let child_stdout = stdout
-        .try_clone()
-        .map_err(|error| StateError::io(executable, error))?;
-    let child_stderr = stderr
-        .try_clone()
-        .map_err(|error| StateError::io(executable, error))?;
+    let mut stdout = map_windows_utility_io(
+        executable,
+        WindowsUtilityIoStage::StdoutCaptureCreate,
+        tempfile::tempfile(),
+    )?;
+    let mut stderr = map_windows_utility_io(
+        executable,
+        WindowsUtilityIoStage::StderrCaptureCreate,
+        tempfile::tempfile(),
+    )?;
+    let child_stdout = map_windows_utility_io(
+        executable,
+        WindowsUtilityIoStage::StdoutCaptureClone,
+        stdout.try_clone(),
+    )?;
+    let child_stderr = map_windows_utility_io(
+        executable,
+        WindowsUtilityIoStage::StderrCaptureClone,
+        stderr.try_clone(),
+    )?;
     let system_root =
         std::env::var_os("SystemRoot").ok_or_else(|| permission_error("SystemRoot is absent"))?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr))
         .env_clear()
         .env("SystemRoot", &system_root)
-        .env("WINDIR", &system_root)
-        .spawn()
-        .map_err(|error| StateError::io(executable, error))?;
+        .env("WINDIR", &system_root);
+    let mut child =
+        spawn_windows_utility_with_retry(executable, || command.spawn(), thread::sleep)?;
 
     let started = Instant::now();
     let status = loop {
-        match child
-            .try_wait()
-            .map_err(|error| StateError::io(executable, error))?
-        {
+        let poll_result = child.try_wait();
+        match map_windows_utility_io(executable, WindowsUtilityIoStage::Poll, poll_result)? {
             Some(status) => break status,
             None if started.elapsed() < WINDOWS_TOOL_TIMEOUT => {
                 thread::sleep(std::time::Duration::from_millis(10));
@@ -467,32 +640,91 @@ fn run_windows_utility(
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(permission_error(format!(
-                    "Windows permission utility timed out: {}",
-                    executable.display()
-                )));
+                return Err(windows_utility_timeout_error(executable));
             }
         }
     };
 
-    stdout
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| StateError::io(executable, error))?;
-    stderr
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| StateError::io(executable, error))?;
-    let stdout = read_bounded(&mut stdout, executable)?;
-    let stderr = read_bounded(&mut stderr, executable)?;
+    let stdout_seek = stdout.seek(SeekFrom::Start(0));
+    map_windows_utility_io(
+        executable,
+        WindowsUtilityIoStage::StdoutCaptureSeek,
+        stdout_seek,
+    )?;
+    let stderr_seek = stderr.seek(SeekFrom::Start(0));
+    map_windows_utility_io(
+        executable,
+        WindowsUtilityIoStage::StderrCaptureSeek,
+        stderr_seek,
+    )?;
+    let stdout = read_windows_utility_capture(
+        &mut stdout,
+        executable,
+        WindowsUtilityIoStage::StdoutCaptureMetadata,
+        WindowsUtilityIoStage::StdoutCaptureRead,
+    )?;
+    let stderr = read_windows_utility_capture(
+        &mut stderr,
+        executable,
+        WindowsUtilityIoStage::StderrCaptureMetadata,
+        WindowsUtilityIoStage::StderrCaptureRead,
+    )?;
     if !status.success() {
         let diagnostic = if stderr.is_empty() { &stdout } else { &stderr };
-        return Err(permission_error(format!(
-            "Windows permission utility {} failed with {}: {}",
-            executable.display(),
-            status,
-            sanitize_diagnostic(diagnostic)
-        )));
+        return Err(windows_utility_exit_error(executable, status, diagnostic));
     }
     Ok(WindowsToolOutput { stdout })
+}
+
+#[cfg(windows)]
+fn windows_utility_timeout_error(executable: &Path) -> StateError {
+    permission_error(format!(
+        "Windows permission utility timed out: {}",
+        executable.display()
+    ))
+}
+
+#[cfg(windows)]
+fn windows_utility_exit_error(
+    executable: &Path,
+    status: impl std::fmt::Display,
+    diagnostic: &[u8],
+) -> StateError {
+    permission_error(format!(
+        "Windows permission utility {} failed with {}: {}",
+        executable.display(),
+        status,
+        sanitize_diagnostic(diagnostic)
+    ))
+}
+
+#[cfg(windows)]
+fn read_windows_utility_capture(
+    file: &mut fs::File,
+    executable: &Path,
+    metadata_stage: WindowsUtilityIoStage,
+    read_stage: WindowsUtilityIoStage,
+) -> StateResult<Vec<u8>> {
+    use std::io::Read as _;
+
+    let metadata_result = file.metadata();
+    let length = map_windows_utility_io(executable, metadata_stage, metadata_result)?.len();
+    if length > MAX_WINDOWS_TOOL_OUTPUT {
+        return Err(permission_error(format!(
+            "Windows permission utility output exceeded {MAX_WINDOWS_TOOL_OUTPUT} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    let read_result = file
+        .take(MAX_WINDOWS_TOOL_OUTPUT + 1)
+        .read_to_end(&mut bytes);
+    map_windows_utility_io(executable, read_stage, read_result)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_WINDOWS_TOOL_OUTPUT {
+        return Err(permission_error(format!(
+            "Windows permission utility output exceeded {MAX_WINDOWS_TOOL_OUTPUT} bytes"
+        )));
+    }
+    Ok(bytes)
 }
 
 #[cfg(windows)]
@@ -780,6 +1012,281 @@ fn permission_error(message: impl Into<String>) -> StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_io_stages_preserve_path_source_and_raw_code() {
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let cases = [
+            (
+                WindowsUtilityIoStage::TrustedExecutableResolution,
+                "trusted executable resolution",
+            ),
+            (
+                WindowsUtilityIoStage::StdoutCaptureCreate,
+                "stdout capture temporary-file creation",
+            ),
+            (
+                WindowsUtilityIoStage::StderrCaptureCreate,
+                "stderr capture temporary-file creation",
+            ),
+            (
+                WindowsUtilityIoStage::StdoutCaptureClone,
+                "stdout capture handle cloning",
+            ),
+            (
+                WindowsUtilityIoStage::StderrCaptureClone,
+                "stderr capture handle cloning",
+            ),
+            (WindowsUtilityIoStage::Spawn, "process spawn"),
+            (WindowsUtilityIoStage::Poll, "process status poll"),
+            (
+                WindowsUtilityIoStage::StdoutCaptureSeek,
+                "stdout capture seek",
+            ),
+            (
+                WindowsUtilityIoStage::StderrCaptureSeek,
+                "stderr capture seek",
+            ),
+            (
+                WindowsUtilityIoStage::StdoutCaptureMetadata,
+                "stdout capture metadata",
+            ),
+            (
+                WindowsUtilityIoStage::StderrCaptureMetadata,
+                "stderr capture metadata",
+            ),
+            (
+                WindowsUtilityIoStage::StdoutCaptureRead,
+                "stdout capture read",
+            ),
+            (
+                WindowsUtilityIoStage::StderrCaptureRead,
+                "stderr capture read",
+            ),
+        ];
+
+        for (stage, expected_label) in cases {
+            let Err(error) = map_windows_utility_io::<()>(
+                executable,
+                stage,
+                Err(std::io::Error::from_raw_os_error(5)),
+            ) else {
+                panic!("injected utility I/O error unexpectedly succeeded");
+            };
+            let rendered = error.to_string();
+
+            let StateError::Io { path, source } = error else {
+                panic!("utility I/O error was not retained as StateError::Io");
+            };
+            assert_eq!(path, executable);
+            assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            let Some(diagnostic) = source
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<WindowsUtilityIoDiagnostic>())
+            else {
+                panic!("utility I/O source did not retain the typed stage diagnostic");
+            };
+            assert_eq!(diagnostic.stage, stage);
+            assert_eq!(
+                diagnostic.source.kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(diagnostic.source.raw_os_error(), Some(5));
+            assert!(rendered.contains(expected_label), "{rendered}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_resolution_stages_only_io_failures() {
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let Err(io_error) = stage_windows_utility_state_io::<()>(
+            WindowsUtilityIoStage::TrustedExecutableResolution,
+            Err(StateError::io(
+                executable,
+                std::io::Error::from_raw_os_error(5),
+            )),
+        ) else {
+            panic!("injected trusted-path I/O error unexpectedly succeeded");
+        };
+        assert!(
+            io_error
+                .to_string()
+                .contains("trusted executable resolution")
+        );
+
+        let unsafe_path = PathBuf::from(r"C:\redirected\icacls.exe");
+        let Err(trust_error) = stage_windows_utility_state_io::<()>(
+            WindowsUtilityIoStage::TrustedExecutableResolution,
+            Err(StateError::SymlinkEscape(unsafe_path.clone())),
+        ) else {
+            panic!("injected trusted-path rejection unexpectedly succeeded");
+        };
+        assert!(matches!(trust_error, StateError::SymlinkEscape(path) if path == unsafe_path));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_timeout_and_exit_remain_non_io_failures() {
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+
+        let timeout = windows_utility_timeout_error(executable);
+        assert!(matches!(timeout, StateError::InvalidRecord(_)));
+        assert!(!timeout.to_string().contains("I/O stage"));
+
+        let exit = windows_utility_exit_error(executable, "exit code: 5", b"Access is denied");
+        assert!(matches!(exit, StateError::InvalidRecord(_)));
+        assert!(!exit.to_string().contains("I/O stage"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_retry_recovers_after_two_access_denials() -> StateResult<()> {
+        use std::{cell::Cell, time::Duration};
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let attempts = Cell::new(0_u32);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+
+        let child = spawn_windows_utility_with_retry(
+            executable,
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt < 3 {
+                    Err(std::io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(42_u32)
+                }
+            },
+            |delay| sleeps.borrow_mut().push(delay),
+        )?;
+
+        assert_eq!(child, 42);
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sleeps.into_inner(),
+            [Duration::from_millis(25), Duration::from_millis(50)]
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_retry_exhaustion_retains_final_typed_error() {
+        use std::{cell::Cell, time::Duration};
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let attempts = Cell::new(0_u32);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+
+        let Err(error) = spawn_windows_utility_with_retry::<(), _, _>(
+            executable,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(5))
+            },
+            |delay| sleeps.borrow_mut().push(delay),
+        ) else {
+            panic!("exhausted Windows utility spawn retry unexpectedly succeeded");
+        };
+
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sleeps.into_inner(),
+            [Duration::from_millis(25), Duration::from_millis(50)]
+        );
+        let StateError::Io { path, source } = error else {
+            panic!("exhausted spawn retry did not return StateError::Io");
+        };
+        assert_eq!(path, executable);
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        let Some(diagnostic) = source
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<WindowsUtilityIoDiagnostic>())
+        else {
+            panic!("exhausted spawn retry lost its typed diagnostic");
+        };
+        assert_eq!(diagnostic.stage, WindowsUtilityIoStage::Spawn);
+        assert_eq!(diagnostic.source.raw_os_error(), Some(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_retry_rejects_other_error_codes_and_kinds() {
+        use std::cell::Cell;
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let cases = [
+            std::io::Error::from_raw_os_error(2),
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied without Windows error code 5",
+            ),
+        ];
+
+        for injected in cases {
+            let attempts = Cell::new(0_u32);
+            let sleeps = Cell::new(0_u32);
+            let mut injected = Some(injected);
+            let Err(_) = spawn_windows_utility_with_retry::<(), _, _>(
+                executable,
+                || {
+                    attempts.set(attempts.get() + 1);
+                    let Some(error) = injected.take() else {
+                        panic!("non-retryable spawn error was requested more than once");
+                    };
+                    Err(error)
+                },
+                |_| sleeps.set(sleeps.get() + 1),
+            ) else {
+                panic!("non-retryable Windows utility spawn unexpectedly succeeded");
+            };
+
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(sleeps.get(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_non_spawn_code_five_is_not_retryable() {
+        let access_denied = std::io::Error::from_raw_os_error(5);
+
+        assert!(is_retryable_windows_utility_io(
+            WindowsUtilityIoStage::Spawn,
+            &access_denied
+        ));
+        assert!(!is_retryable_windows_utility_io(
+            WindowsUtilityIoStage::Poll,
+            &access_denied
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_utility_spawn_success_does_not_sleep() -> StateResult<()> {
+        use std::cell::Cell;
+
+        let executable = Path::new(r"C:\Windows\System32\icacls.exe");
+        let attempts = Cell::new(0_u32);
+        let sleeps = Cell::new(0_u32);
+
+        let child = spawn_windows_utility_with_retry(
+            executable,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(7_u32)
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+        )?;
+
+        assert_eq!(child, 7);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

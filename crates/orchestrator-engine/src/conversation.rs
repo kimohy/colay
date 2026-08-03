@@ -43,6 +43,61 @@ pub struct ConversationResponse {
     pub evidence_redacted: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", deny_unknown_fields)]
+enum ProviderConversationOutcome {
+    AnswerComplete {
+        #[serde(alias = "response")]
+        response_redacted: String,
+    },
+    MoreInformationNeeded {
+        #[serde(alias = "response")]
+        response_redacted: String,
+        requirements: orchestrator_domain::RequirementSnapshot,
+    },
+    WorktreeTaskCandidate {
+        #[serde(alias = "response")]
+        response_redacted: String,
+        requirements: orchestrator_domain::RequirementSnapshot,
+    },
+    NeedsAttention {
+        #[serde(alias = "response")]
+        response_redacted: String,
+        evidence_redacted: String,
+    },
+}
+
+impl From<ProviderConversationOutcome> for ConversationOutcome {
+    fn from(outcome: ProviderConversationOutcome) -> Self {
+        match outcome {
+            ProviderConversationOutcome::AnswerComplete { response_redacted } => {
+                Self::AnswerComplete { response_redacted }
+            }
+            ProviderConversationOutcome::MoreInformationNeeded {
+                response_redacted,
+                requirements,
+            } => Self::MoreInformationNeeded {
+                response_redacted,
+                requirements,
+            },
+            ProviderConversationOutcome::WorktreeTaskCandidate {
+                response_redacted,
+                requirements,
+            } => Self::WorktreeTaskCandidate {
+                response_redacted,
+                requirements,
+            },
+            ProviderConversationOutcome::NeedsAttention {
+                response_redacted,
+                evidence_redacted,
+            } => Self::NeedsAttention {
+                response_redacted,
+                evidence_redacted,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ConversationFailure {
     #[error("conversation invocation failed: {reason}")]
@@ -224,13 +279,12 @@ pub fn collect_conversation_response(
             evidence_redacted,
         });
     }
-    let outcome: ConversationOutcome =
-        serde_json::from_slice(&response.output_redacted).map_err(|error| {
-            ConversationFailure::MalformedOutput {
-                reason: error.to_string(),
-                evidence_redacted: evidence_redacted.clone(),
-            }
+    let outcome: ProviderConversationOutcome = serde_json::from_slice(&response.output_redacted)
+        .map_err(|error| ConversationFailure::MalformedOutput {
+            reason: error.to_string(),
+            evidence_redacted: evidence_redacted.clone(),
         })?;
+    let outcome = ConversationOutcome::from(outcome);
     outcome
         .validate()
         .map_err(|source| ConversationFailure::Validation {
@@ -358,4 +412,159 @@ fn bound_redacted_text(value: &str) -> String {
         end = end.saturating_sub(1);
     }
     format!("{}{TRUNCATED}", &value[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request() -> ConversationRequest {
+        ConversationRequest {
+            attempt_id: ConversationAttemptId::new(),
+            session_id: SessionId::new(),
+            source_message_id: MessageId::new(),
+            provider: ProviderId::Codex,
+            transcript_redacted: "user: help".to_owned(),
+            repository_summary_redacted: "repository availability is unknown".to_owned(),
+            sandbox: SandboxMode::ReadOnly,
+        }
+    }
+
+    fn successful_response(
+        request: &ConversationRequest,
+        output_redacted: Vec<u8>,
+    ) -> ConversationResponse {
+        ConversationResponse {
+            schema_version: SchemaVersion::v1(),
+            attempt_id: request.attempt_id,
+            session_id: request.session_id,
+            source_message_id: request.source_message_id,
+            provider: request.provider,
+            sandbox: SandboxMode::ReadOnly,
+            exit: ConversationExit::Succeeded,
+            output_redacted,
+            evidence_redacted: "fake provider exited 0".to_owned(),
+        }
+    }
+
+    fn requirements(open_questions: &[&str]) -> serde_json::Value {
+        json!({
+            "objective": "answer the question",
+            "in_scope": ["requested answer"],
+            "out_of_scope": [],
+            "constraints": [],
+            "acceptance_criteria": ["is useful"],
+            "verification_plan": [{"executable": "cargo", "args": ["test"]}],
+            "risks": [],
+            "open_questions": open_questions,
+        })
+    }
+
+    #[test]
+    fn conversation_response_alias_normalizes_to_canonical_outcomes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request();
+        let output = json!({
+            "outcome": "answer_complete",
+            "response": "Hello! How can I help?",
+        });
+        let outcome = collect_conversation_response(
+            &request,
+            successful_response(&request, serde_json::to_vec(&output)?),
+        )?;
+        assert_eq!(
+            outcome,
+            ConversationOutcome::AnswerComplete {
+                response_redacted: "Hello! How can I help?".to_owned(),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(outcome)?,
+            json!({
+                "outcome": "answer_complete",
+                "response_redacted": "Hello! How can I help?",
+            })
+        );
+        let cases = [
+            (
+                json!({
+                    "outcome": "more_information_needed",
+                    "response": "Which crate should change?",
+                    "requirements": requirements(&["Which crate?"]),
+                }),
+                json!({
+                    "outcome": "more_information_needed",
+                    "response_redacted": "Which crate should change?",
+                    "requirements": requirements(&["Which crate?"]),
+                }),
+            ),
+            (
+                json!({
+                    "outcome": "worktree_task_candidate",
+                    "response": "Ready to implement.",
+                    "requirements": requirements(&[]),
+                }),
+                json!({
+                    "outcome": "worktree_task_candidate",
+                    "response_redacted": "Ready to implement.",
+                    "requirements": requirements(&[]),
+                }),
+            ),
+            (
+                json!({
+                    "outcome": "needs_attention",
+                    "response": "Approval is required.",
+                    "evidence_redacted": "mutable operation requested",
+                }),
+                json!({
+                    "outcome": "needs_attention",
+                    "response_redacted": "Approval is required.",
+                    "evidence_redacted": "mutable operation requested",
+                }),
+            ),
+        ];
+
+        for (output, expected) in cases {
+            let outcome = collect_conversation_response(
+                &request,
+                successful_response(&request, serde_json::to_vec(&output)?),
+            )?;
+            assert_eq!(serde_json::to_value(outcome)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_response_alias_remains_strict() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request();
+        let malformed = [
+            json!({
+                "outcome": "answer_complete",
+                "response": "alias",
+                "response_redacted": "canonical",
+            }),
+            json!({
+                "outcome": "answer_complete",
+                "response": "answer",
+                "unexpected": "field",
+            }),
+            json!({
+                "outcome": "answer_complete",
+                "response": 1,
+            }),
+            json!({"outcome": "answer_complete"}),
+        ];
+
+        for output in malformed {
+            assert!(matches!(
+                collect_conversation_response(
+                    &request,
+                    successful_response(&request, serde_json::to_vec(&output)?),
+                ),
+                Err(ConversationFailure::MalformedOutput { .. })
+            ));
+        }
+        Ok(())
+    }
 }

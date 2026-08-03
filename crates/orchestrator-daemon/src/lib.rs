@@ -29,9 +29,10 @@ pub use ipc::ipc_endpoint;
 pub use ipc::windows_named_pipe_security_descriptor;
 pub use ipc::{
     DaemonOwnerLock, IPC_SCHEMA_VERSION, IpcEndpointCandidates, IpcError, IpcRequest, IpcResponse,
-    IpcServer, WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceActivation, WorkspaceArtifactDiagnostics,
-    WorkspaceArtifactScope, WorkspaceAuditDiagnostics, WorkspaceDoctorDiagnostics,
-    WorkspaceDoctorLookup, ipc_endpoint_candidates,
+    IpcServer, LegacyImportDoctorStatus, WORKSPACE_DOCTOR_SCHEMA_VERSION, WorkspaceActivation,
+    WorkspaceArtifactDiagnostics, WorkspaceArtifactScope, WorkspaceAuditDiagnostics,
+    WorkspaceDoctorCapabilities, WorkspaceDoctorDiagnostics, WorkspaceDoctorLookup,
+    ipc_endpoint_candidates,
 };
 pub use planning::{PlanningServices, process_next_orchestration_command};
 

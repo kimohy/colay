@@ -69,6 +69,7 @@ pub use leases::{
     CoordinatorLease, CoordinatorLeaseRequest, LeaseRenewal, ResumeDisposition, WorkerLease,
     WorkerLeaseMode, WorkerLeaseRequest,
 };
+/// Legacy repository import inspection, application, and completion-query types.
 pub use legacy_import::{LegacyImportPlan, LegacyImportResult, LegacyImporter};
 pub use migrations::{
     AppliedMigration, MigrationManager, MigrationPlan, MigrationStatus,

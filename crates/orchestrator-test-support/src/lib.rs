@@ -5,7 +5,7 @@
 
 mod runtime;
 
-pub use runtime::{FakeAdapterRuntime, FakeRuntimeScenario};
+pub use runtime::{FakeAdapterRuntime, FakeRuntimeScenario, fake_conversation_capability};
 
 /// Entry point shared by the fixture binary and subprocess integration tests.
 pub fn fake_cli_main<I>(args: I)
