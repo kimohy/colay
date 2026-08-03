@@ -830,13 +830,14 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-08-02
+- 마지막 갱신: 2026-08-03
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
   `0.1.1-nightly.20260726.b086448`, `0.1.1-nightly.20260726.20b7654`,
   `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`,
-  `0.1.1-nightly.20260801.3f4e2f7`, `0.1.1-nightly.20260802.8f2654a`
+  `0.1.1-nightly.20260801.3f4e2f7`, `0.1.1-nightly.20260802.8f2654a`,
+  `0.1.1-nightly.20260803.95cf4d3`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 자동화 테스트와 CI는 fake provider만 사용한다. 실제 provider inference는 사용자가
   명시적으로 승인한 격리 수동 QA에서만 제한적으로 호출한다.
@@ -850,8 +851,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
 | `WSL-019` | high | fixed | unsealed legacy invalid graph prevents daemon startup |
-| `WSL-020` | high | fixed-in-source, deployment-pending | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
-| `WSL-021` | medium | fixed-in-source, deployment-pending | doctor reports an already completed legacy import as pending |
+| `WSL-020` | high | fixed | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
+| `WSL-021` | medium | fixed | doctor reports an already completed legacy import as pending |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
@@ -1740,10 +1741,12 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
 9. `완료`: 500ms reconnect 테스트를 condition-based wait로 바꿨다 (`WSL-007`).
 10. `완료`: config 파일이 없는 기존 DB도 기본 설정으로 migration할 수 있게 하고,
     명시적 config 누락은 계속 fail-closed로 유지한다 (`WSL-009`).
-11. `fixed-in-source, deployment-pending`: 실제 provider에게 strict `ConversationOutcome` JSON
-    shape를 전달하고 검증된 output-schema 기능을 연결한다 (`WSL-020`).
-12. `fixed-in-source, deployment-pending`: doctor가 source fingerprint와 완료 import ledger를
-    대조해 pending과 already-imported를 구분한다 (`WSL-021`).
+11. `완료 (fixed)`: 실제 provider에게 strict `ConversationOutcome` JSON shape를 전달하고
+    검증된 output-schema 기능을 연결했다 (`WSL-020`; deployed nightly
+    `0.1.1-nightly.20260803.95cf4d3`).
+12. `완료 (fixed)`: doctor가 source fingerprint와 완료 import ledger를 대조해 pending과
+    already-imported를 구분한다 (`WSL-021`; deployed nightly
+    `0.1.1-nightly.20260803.95cf4d3`).
 
 ## Update log
 
