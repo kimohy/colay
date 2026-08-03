@@ -727,7 +727,7 @@ that import readiness is unavailable through IPC, so neither mode currently pres
 ## WSL-022: plan-only rejects an established read-only provider command
 
 - Severity: high
-- Status: fix-in-progress
+- Status: fix-in-progress (source checks passed; published-nightly verification pending)
 - Observed nightly: `0.1.1-nightly.20260803.28d0d5f`
 - Observed provider: Codex
 
@@ -745,6 +745,21 @@ coordinator leases, and worker leases. The failure is caused by treating every n
 `CommandStarted` event as a terminal lifecycle violation instead of retaining bounded, redacted
 evidence when the requested sandbox is read-only and the provider has established that capability.
 
+### Source fix and focused verification
+
+- Commit `bad265f` applies the same capability-gated command policy to Codex, Claude, Gemini, and
+  Agy and persists successful evidence separately under schema 17. Commit `3710cf9` additionally
+  applies daemon redaction before persistence and makes multibyte truncation UTF-8-safe within the
+  16 KiB aggregate bound.
+- Focused source checks passed: the conversation orchestrator unit suite (8 tests), fake chat suite
+  (9 tests), global plan-first suite (5 tests), conversation collector suite (9 tests), daemon
+  conversation-flow suite (16 tests), state conversation suite (6 tests), schema migration contract
+  suite (7 tests), and fake-provider support targets. The successful regression persists status
+  `succeeded`, canonical `answer_complete`, separate redacted evidence, and zero writable task state;
+  the file-change regression still fails closed.
+- These checks use fake providers only. Published-nightly WSL verification remains pending, so the
+  issue is not yet `fixed`.
+
 ### Completion conditions
 
 - Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
@@ -753,7 +768,7 @@ evidence when the requested sandbox is read-only and the provider has establishe
 ## WSL-023: WSL provider discovery can expose a Windows executable
 
 - Severity: high
-- Status: fix-in-progress
+- Status: fix-in-progress (source checks passed; published-nightly verification pending)
 - Observed nightly: `0.1.1-nightly.20260803.28d0d5f`
 - Observed provider: Antigravity (`agy`)
 
@@ -768,6 +783,17 @@ resolved, with zero new tasks, task attempts, worktrees, coordinator leases, and
 The resolver currently permits PATH discovery to expose a Windows executable to WSL instead of
 requiring a Linux-native binary. Discovery must reject Windows-mounted and Windows PE candidates
 before any probe, uniformly for Codex, Claude, Gemini, and Agy.
+
+### Source fix and focused verification
+
+- Commit `f8fac9e` centralizes the provider-only WSL native-executable policy before public probes
+  and worker starts. Commit `32d9225` closes the 9p `aname=drvfs;...` mount-option bypass without
+  changing general subprocess resolution.
+- Focused source checks passed: all 18 executable resolver tests, all 39 `orchestrator-process` unit
+  tests, and all 6 provider process-runtime tests. Local inert mount, PE, symlink, and script fixtures
+  were classified without invoking a real provider.
+- Published-nightly WSL validation of native identity and pre-probe rejection remains pending, so
+  the issue is not yet `fixed`.
 
 ### Completion conditions
 
@@ -1820,6 +1846,14 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
     `0.1.1-nightly.20260803.95cf4d3`).
 
 ## Update log
+
+### 2026-08-04
+
+- `WSL-022` source fixes landed in `bad265f` and `3710cf9`. Focused fake-provider, persistence,
+  redaction, and UTF-8 byte-bound regressions pass; published-nightly WSL verification is pending.
+- `WSL-023` source fixes landed in `f8fac9e` and `32d9225`. Focused resolver and shared provider
+  runtime checks pass with inert fixtures; published-nightly WSL verification is pending.
+- Both issue-index states remain `fix-in-progress`; neither issue is closed by source checks alone.
 
 ### 2026-08-02
 

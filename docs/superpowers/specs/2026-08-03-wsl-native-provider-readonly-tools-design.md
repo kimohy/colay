@@ -59,8 +59,9 @@ only `orchestrator-test-support` fake binaries.
 - No real provider invocation from unit tests, integration tests, or CI.
 - No credential inspection, identity rotation, quota bypass, usage scraping,
   unofficial endpoints, or external telemetry.
-- No SQLite schema migration. The design uses existing conversation evidence
-  and compatibility structures.
+- No rewrite of migration 0016 or embedding successful evidence in canonical
+  outcome JSON. The explicitly approved append-only migration 0017 adds only a
+  nullable, bounded, redacted successful-attempt evidence column.
 
 ## Selected Architecture
 
@@ -160,8 +161,12 @@ candidate and does not search Windows application state for credentials.
 Accepted command events are auditable conversation evidence, not health or
 account-readiness claims. Evidence remains local, redacted, append-only, and
 bounded by the existing conversation evidence limits. Successful completion
-stores the canonical outcome and evidence through existing state APIs; no new
-provider wire type enters `orchestrator-domain` and no database column is added.
+stores the canonical outcome unchanged and stores evidence separately in the
+nullable `conversation_attempts.evidence_redacted` column added by append-only
+migration 0017. Migration 0016 remains unchanged, historical rows receive
+`NULL`, and running, failed, and cancelled attempts require this new column to
+remain `NULL`. Failure outcomes and `error_redacted` retain their schema-16
+semantics. No new provider wire type enters `orchestrator-domain`.
 
 Rejected WSL candidates appear in compatibility and doctor diagnostics with the
 resolved redacted path class, native-runtime requirement, and remediation. A
@@ -250,7 +255,7 @@ and macOS checks before merge.
 
 After the merge produces a new nightly, install it into a new timestamped npm
 prefix and `COLAY_HOME` inside WSL. Confirm package version, registry integrity,
-Linux ELF identity, schema migration, doctor/compatibility output, SQLite
+Linux ELF identity, migration through schema 17, doctor/compatibility output, SQLite
 integrity, and daemon start/status/stop cleanup. Verify all four provider public
 probes with Linux-native binaries where installed and verify that a Windows
 candidate is rejected without execution.
@@ -270,8 +275,9 @@ artifacts.
 2. All four providers share one capability-gated plan-only command policy.
 3. A read-only command event can coexist with a successful canonical answer
    when read-only capability is advertised or verified.
-4. Command evidence is redacted, deterministic, and bounded by existing
-   conversation limits.
+4. Command evidence is redacted, deterministic, bounded by existing
+   conversation limits, and persisted separately from the canonical outcome by
+   append-only schema 17.
 5. File changes, write-capable requests, missing read-only capability, lifecycle
    errors, and nonzero exits remain fail-closed.
 6. Plan-only success and failure create no task, task attempt, worktree, or

@@ -6,7 +6,7 @@ Tests and CI must never invoke real Codex, Claude, Gemini, or Agy inference. Pro
 
 CI clears common provider API-key variables and sets `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` at job scope. Compatibility workflows may build an exact official Codex source revision and run only the explicit version/help/schema probe allowlist; they never pass a prompt.
 
-Configuration, resolver, and rollback tests also use local fixtures and fake binaries only. They do not invoke provider inference: Windows and Unix executable-resolution cases exercise fixture files, and rollback cases validate persisted execution evidence without resolving a live provider binary from the current `PATH`.
+Configuration, resolver, and rollback tests also use local fixtures and fake binaries only. They do not invoke provider inference: Windows and Unix executable-resolution cases exercise fixture files, and rollback cases validate persisted execution evidence without resolving a live provider binary from the current `PATH`. WSL resolver tests simulate `drvfs`, 9p `aname=drvfs`, lexical Windows-drive mounts, and PE signatures with local inert fixture files; the candidates are classified without being invoked.
 
 Daemon tests are also inference-free. State tests race independent SQLite
 connections for command claims and lease acquisition, while runtime tests use
@@ -110,6 +110,19 @@ owned by the same user as `COLAY_HOME`, a non-Git home plan, idempotent import,
 Unix symlink redirect rejection, and the same 32-client stress contract. Windows
 and WSL evidence is valid only when their resolved databases are under separate
 native temporary roots; a WSL database under `/mnt/<drive>` is a test failure.
+
+After a nightly is published, repeat WSL QA from an isolated npm prefix and
+`COLAY_HOME`. For Codex, Claude, Gemini, and Agy, record the resolved native path
+and verify an ELF binary or Linux-native script identity as appropriate before
+allowing any public version/help probe. A Windows-backed or PE candidate must be
+rejected before that probe and must never be invoked. For every bounded
+plan-only turn, verify the requested provider identity, canonical outcome,
+schema-17 bounded/redacted successful evidence, and zero rows in `tasks`,
+`task_attempts`, `worktrees`, `coordinator_leases`, and `worker_leases`. Finish
+with SQLite `integrity_check`, foreign-key checks, daemon stop, socket removal,
+and confirmation that no QA Colay process remains. Automated tests and CI remain
+fake-only; authorized real-provider turns belong only to this post-release
+operator QA.
 
 ## Required local verification
 

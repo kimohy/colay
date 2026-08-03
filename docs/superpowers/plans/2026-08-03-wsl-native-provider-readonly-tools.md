@@ -19,7 +19,7 @@
 - `FileChanged`, write-capable sandbox selection, protocol lifecycle errors, nonzero exits, and process cleanup uncertainty remain failures.
 - WSL never launches a provider executable from a Windows-backed mount or a Windows PE image and never falls back to a Windows executable.
 - Normal Linux, macOS, and Windows native discovery remains unchanged.
-- Preserve schema version 16, append-only audit semantics, redaction, and explicit approval gates; add no migration.
+- Preserve migration 0016 unchanged, append-only audit semantics, redaction, and explicit approval gates. The user-approved migration 0017 adds nullable, bounded/redacted evidence only for succeeded conversation attempts; historical rows and running/failed/cancelled attempts keep this column `NULL`.
 - Writable implementation work remains in the existing isolated `codex/wsl-provider-readonly-policy` worktree; do not delete any worktree.
 - Required verification is `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace --all-features`.
 
@@ -401,6 +401,15 @@ git commit -m "fix: require native provider executables in WSL"
 ### Task 3: Accept Capability-Gated Read-Only Command Events
 
 **Files:**
+- Add: `migrations/0017_conversation_success_evidence.sql`
+- Modify: `crates/orchestrator-state/src/migrations.rs`
+- Modify: `crates/orchestrator-state/src/conversations.rs`
+- Modify: `crates/orchestrator-state/tests/conversations.rs`
+- Modify: `crates/orchestrator-state/tests/migration_contract.rs`
+- Modify: `crates/orchestrator-engine/src/conversation.rs`
+- Modify: `crates/orchestrator-engine/src/lib.rs`
+- Modify: `crates/orchestrator-engine/tests/conversation_collector.rs`
+- Modify: `crates/orchestrator-daemon/src/conversation.rs`
 - Modify: `crates/orchestrator-cli/src/conversation_orchestrator.rs:1-25`
 - Modify: `crates/orchestrator-cli/src/conversation_orchestrator.rs:268-393`
 - Modify: `crates/orchestrator-cli/src/conversation_orchestrator.rs:439-525`
@@ -409,11 +418,13 @@ git commit -m "fix: require native provider executables in WSL"
 - Modify: `crates/orchestrator-test-support/src/runtime.rs:735-751`
 - Modify: `crates/orchestrator-cli/tests/chat_conversation_fake_provider.rs:88-145`
 - Modify: `crates/orchestrator-cli/tests/global_plan_first.rs:125-253`
+- Modify: `scripts/release/test/stage.test.mjs`
 
 **Interfaces:**
 - Consumes: `WorkerEvent::CommandStarted`, the request sandbox, and the selected provider's `ProviderCapabilities::read_only` value.
 - Produces: `observe_read_only_command(provider: ProviderId, sandbox: SandboxMode, support: CapabilitySupport, executable: &str, args: &[String], evidence: &mut ConversationEvidence) -> Option<String>`; `None` means bounded evidence was accepted, while `Some(reason)` is a lifecycle violation.
 - Produces: fake scenarios `ReadOnlyCommand` and `ReadOnlyCommandWithFileChange` used only by test support.
+- Produces: append-only schema 17 and a vendor-neutral collected-response wrapper that preserve the canonical outcome while persisting nullable, bounded/redacted evidence separately for succeeded attempts.
 
 - [ ] **Step 1: Write the four-provider command policy tests**
 
@@ -507,7 +518,7 @@ serde_json::json!({
 
 Make `emit_conversation_fixture` select the scenarios when the redacted transcript contains `scenario:read-only-command` or `scenario:read-only-command-file-change`. Keep normal fake conversations unchanged.
 
-Extend `global_plan_first.rs` with one success and one failure test. The success test must query `conversation_attempts` and assert `status = 'completed'`, canonical `answer_complete`, and evidence containing `read-only provider command started`. Both tests must execute this zero-state loop:
+Extend `global_plan_first.rs` with one success and one failure test. The success test must query `conversation_attempts` and assert `status = 'succeeded'`, canonical `answer_complete`, and separate `evidence_redacted` containing `read-only provider command started`. Both tests must execute this zero-state loop:
 
 ```rust
 for table in [
@@ -592,6 +603,16 @@ Ok(WorkerEvent::CommandStarted {
 
 Do not change the `FileChanged` arm. Do not use `CapabilitySupport::usable()`, because that would incorrectly admit `Degraded`.
 
+Add migration 0017 without modifying migration 0016. The new nullable
+`conversation_attempts.evidence_redacted` column accepts only trimmed, nonblank,
+at-most-16-KiB evidence for `succeeded` attempts. Historical rows migrate with
+`NULL`; running, failed, and cancelled attempts require `NULL`; the append-once
+completion trigger covers the new column. Keep the canonical outcome JSON and
+existing failure outcome/error contracts unchanged. Thread a vendor-neutral
+collected response containing outcome plus evidence through the daemon, apply
+redaction and a UTF-8-safe byte bound before persistence, and retain compatibility
+wrappers where existing callers need outcome-only behavior.
+
 - [ ] **Step 5: Run conversation unit, integration, and persistence tests and confirm GREEN**
 
 Run:
@@ -601,14 +622,19 @@ cargo test -p colay --lib conversation_orchestrator --all-features
 cargo test -p colay --test chat_conversation_fake_provider --all-features
 cargo test -p colay --test global_plan_first --all-features
 cargo test -p orchestrator-test-support --all-features
+cargo test -p orchestrator-state --test conversations --all-features
+cargo test -p orchestrator-state --test migration_contract --all-features
+cargo test -p orchestrator-engine --test conversation_collector --all-features
+cargo test -p orchestrator-daemon --test conversation_flow --all-features
+node --test scripts/release/test/stage.test.mjs
 ```
 
-Expected: all four provider identities pass the shared policy matrix; the Codex-like fake end-to-end command turn completes; the file-change turn fails; all writable-state tables remain empty.
+Expected: all four provider identities pass the shared policy matrix; the Codex-like fake end-to-end command turn completes with status `succeeded`, canonical outcome JSON, and separate schema-17 evidence; the file-change turn fails with the existing failure semantics and new evidence column `NULL`; all writable-state tables remain empty.
 
 - [ ] **Step 6: Commit the conversation policy and fake regressions**
 
 ```powershell
-git add -- crates/orchestrator-cli/src/conversation_orchestrator.rs crates/orchestrator-test-support/src/runtime.rs crates/orchestrator-cli/tests/chat_conversation_fake_provider.rs crates/orchestrator-cli/tests/global_plan_first.rs
+git add -- migrations/0017_conversation_success_evidence.sql crates/orchestrator-state crates/orchestrator-engine crates/orchestrator-daemon/src/conversation.rs crates/orchestrator-cli/src/conversation_orchestrator.rs crates/orchestrator-test-support/src/runtime.rs crates/orchestrator-cli/tests/chat_conversation_fake_provider.rs crates/orchestrator-cli/tests/global_plan_first.rs scripts/release/test/stage.test.mjs
 git commit -m "fix: accept verified read-only provider commands"
 ```
 
@@ -737,7 +763,7 @@ git diff --stat origin/main...HEAD
 git diff origin/main...HEAD -- crates/orchestrator-process/src/executable.rs crates/orchestrator-cli/src/conversation_orchestrator.rs
 ```
 
-Confirm no provider-specific permission exception, schema migration, shell interpolation, real-provider test, worktree deletion, or tracker premature closure was introduced. Address valid findings and repeat all affected focused tests plus the required gates.
+Confirm no provider-specific permission exception, migration-0016 rewrite, schema change beyond the approved append-only migration 0017, shell interpolation, real-provider test, worktree deletion, or tracker premature closure was introduced. Verify that schema 17 stores only nullable, bounded/redacted successful evidence separately, historical rows receive `NULL`, running/failed/cancelled rows keep `NULL`, and canonical outcome plus failure semantics remain unchanged. Address valid findings and repeat all affected focused tests plus the required gates.
 
 - [ ] **Step 6: Push and open the pull request**
 
@@ -800,7 +826,7 @@ colay --json daemon status
 colay --json daemon stop
 ```
 
-Expected: schema 16, SQLite `integrity_check = ok`, zero foreign-key violations, exact nightly daemon binary identity, final stopped state, no Unix socket, and no remaining QA Colay process.
+Expected: schema 17, SQLite `integrity_check = ok`, zero foreign-key violations, exact nightly daemon binary identity, final stopped state, no Unix socket, and no remaining QA Colay process.
 
 - [ ] **Step 3: Validate WSL-native discovery for all four providers**
 
@@ -825,7 +851,7 @@ If Agy or another provider is not account-ready, record `unverified` or the reda
 
 - [ ] **Step 5: Audit final persistence and cleanup**
 
-Stop the daemon and inspect the isolated database read-only. Confirm schema 16, `integrity_check = ok`, zero foreign-key violations, bounded conversation evidence, no credential values, zero writable task state, and no active lease. Confirm the QA PID and socket are absent. Preserve the timestamped QA root and record its path; do not delete a worktree.
+Stop the daemon and inspect the isolated database read-only. Confirm schema 17, `integrity_check = ok`, zero foreign-key violations, bounded/redacted successful evidence in the separate nullable column, unchanged canonical outcomes and failure semantics, no credential values, zero writable task state, and no active lease. Confirm the QA PID and socket are absent. Preserve the timestamped QA root and record its path; do not delete a worktree.
 
 - [ ] **Step 6: Mark both defects fixed only after all release checks pass**
 

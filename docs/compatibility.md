@@ -14,6 +14,12 @@ The probe allowlist contains only `--version`, public `--help` surfaces, and `ap
 
 Unknown optional item/event payloads are retained as opaque values. Unknown `thread.*` or `turn.*` lifecycle events, missing/changed required fields, and malformed JSON fail closed. Quota errors are normalized without treating a transient rate limit as confirmed quota exhaustion.
 
+Plan-only conversations always request a read-only sandbox. A normalized command-start event is retained as bounded, redacted evidence only when the selected provider advertises or verifies read-only capability. A file-change event, degraded or missing read-only capability, write-capable sandbox, lifecycle error, or nonzero provider exit still fails closed. This policy is identical for Codex, Claude, Gemini, and Agy and does not use a command-name allowlist. Schema 17 stores successful command evidence in the separate nullable `conversation_attempts.evidence_redacted` column; the canonical successful outcome and all existing failure semantics remain unchanged.
+
+## WSL-native provider discovery
+
+Under WSL, every provider must resolve to a Linux-native executable installed inside the current distribution. Colay rejects provider candidates on Windows-backed mounts and files with a Windows PE signature before version, help, or inference execution. Install the provider inside WSL and place its Linux binary on `PATH` before Windows-mounted entries; Colay does not fall back to `.exe` candidates. This boundary is applied uniformly to Codex, Claude, Gemini, and Agy.
+
 ## Supported Codex releases
 
 Exact fixture-backed compatibility is limited to Codex `0.144.6` and `0.144.5`; `0.144.6` is the recommended release and `0.144.5` is the minimum supported version. The committed registry pins the recommended release to revision `5d1fbf26c43abc65a203928b2e31561cb039e06d`. The version registry and generated matrix are the authoritative records for exact compatibility: [`compatibility/codex-version.toml`](../compatibility/codex-version.toml) and [`compatibility/codex-matrix.json`](../compatibility/codex-matrix.json). A newer or otherwise unknown version is not treated as exact compatibility, but can remain eligible through the minimum-version or observed-capability policy with degraded health and explicit evidence.
