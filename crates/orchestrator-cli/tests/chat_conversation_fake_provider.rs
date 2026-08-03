@@ -3,8 +3,8 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use orchestrator_domain::{
-    CapabilitySupport, ConversationAttemptId, ConversationOutcome, MessageId, ModelProfile,
-    ProviderCapabilities, ProviderId, SandboxMode, SessionId,
+    ConversationAttemptId, ConversationOutcome, MessageId, ModelProfile, ProviderCapabilities,
+    ProviderId, SandboxMode, SessionId,
 };
 use orchestrator_engine::{
     CONVERSATION_MAX_EVIDENCE_BYTES, ConversationExit, ConversationFailure,
@@ -29,16 +29,7 @@ fn allowed_fake_binary(repository: &std::path::Path) -> Result<PathBuf, std::io:
 }
 
 fn capability() -> ProviderCapabilities {
-    capability_for(ProviderId::Codex)
-}
-
-fn capability_for(provider: ProviderId) -> ProviderCapabilities {
-    let mut capability = ProviderCapabilities::unsupported(provider);
-    capability.non_interactive = CapabilitySupport::Verified;
-    capability.structured_output = CapabilitySupport::Verified;
-    capability.read_only = CapabilitySupport::Verified;
-    capability.evidence = vec![format!("fake {provider} marker")];
-    capability
+    fake_conversation_capability(ProviderId::Codex)
 }
 
 #[tokio::test]
@@ -65,8 +56,8 @@ async fn requested_provider_reaches_the_claude_fake_adapter_despite_codex_priori
         &repository,
         runtime,
         &[
-            capability_for(ProviderId::Codex),
-            capability_for(ProviderId::Claude),
+            fake_conversation_capability(ProviderId::Codex),
+            fake_conversation_capability(ProviderId::Claude),
         ],
         ModelProfile::Standard,
     )?;
@@ -387,7 +378,7 @@ async fn noisy_provider_failure_is_deduplicated_bounded_and_safe()
         &config,
         &repository,
         adapter_runtime,
-        &[capability_for(ProviderId::Gemini)],
+        &[fake_conversation_capability(ProviderId::Gemini)],
         ModelProfile::Standard,
     )?;
     let mut request = request("bounded diagnostic noise");
