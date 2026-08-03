@@ -1477,6 +1477,112 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
 }
 
 #[test]
+fn live_doctor_reports_completed_legacy_import() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    fixture.import_repository_legacy()?;
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let before = LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_import = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_import["status"], "pass", "{legacy_import}");
+    assert_eq!(legacy_import["data"]["pending"], false);
+    assert_eq!(legacy_import["data"]["imported"], true);
+    assert_eq!(
+        LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn live_doctor_reports_changed_legacy_import_as_pending() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    fixture.import_repository_legacy()?;
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    Connection::open(&legacy_database)?.execute(
+        "UPDATE conversation_messages SET content_redacted = 'changed live legacy source'",
+        [],
+    )?;
+    let before = LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_import = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_import["status"], "pass", "{legacy_import}");
+    assert_eq!(legacy_import["data"]["pending"], true);
+    assert_eq!(legacy_import["data"]["imported"], false);
+    assert_eq!(
+        LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn live_doctor_fails_corrupt_legacy_import_completion_without_mutation() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    fixture.import_repository_legacy()?;
+    let started = fixture.colay(["daemon", "start"])?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    Connection::open(fixture.global_database())?
+        .execute("UPDATE legacy_imports SET result_json = '{}'", [])?;
+    let before = LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?;
+
+    let output = fixture.colay(["--json", "doctor"])?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout)?;
+    let legacy_import = check_named(&document, "legacy_import")?;
+    assert_eq!(legacy_import["status"], "fail", "{legacy_import}");
+    assert_eq!(legacy_import["detail"], LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+    assert_eq!(check_named(&document, "state")?["status"], "fail");
+    assert_eq!(document["data"]["passed"], false);
+    assert_eq!(
+        LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
 fn live_doctor_in_unregistered_legacy_workspace_is_read_only() -> Result<()> {
     let fixture = DoctorFixture::new()?;
     fixture.configure_fake_providers()?;
@@ -1512,8 +1618,8 @@ fn live_doctor_in_unregistered_legacy_workspace_is_read_only() -> Result<()> {
     let selected_state = unregistered.join("chosen-state");
     fs::create_dir_all(&selected_state)?;
     let legacy_database = selected_state.join("orchestrator.db");
-    let legacy_bytes = b"not a SQLite database";
-    fs::write(&legacy_database, legacy_bytes)?;
+    let registered_legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    fs::copy(registered_legacy_database, &legacy_database)?;
     let before = LegacyDoctorMutationSnapshot::capture(&fixture, Some(&legacy_database))?;
     let workspace_root = fixture.colay_home.join("data/workspaces");
     fs::create_dir_all(&workspace_root)?;
@@ -1546,6 +1652,8 @@ fn live_doctor_in_unregistered_legacy_workspace_is_read_only() -> Result<()> {
         legacy_import["detail"],
         "import readiness is unavailable through live-daemon IPC"
     );
+    assert_eq!(legacy_import["data"]["pending"], true);
+    assert_eq!(legacy_import["data"]["imported"], false);
     assert_eq!(
         legacy_import["data"]["source_database"],
         json!(&legacy_database)

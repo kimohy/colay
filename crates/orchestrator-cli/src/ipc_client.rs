@@ -97,7 +97,11 @@ impl DaemonClient {
         })
     }
 
-    pub async fn doctor_lookup(repository: &Path) -> Result<IpcResponse> {
+    pub async fn doctor_lookup(
+        repository: &Path,
+        legacy_state_dir: Option<&Path>,
+        legacy_source_fingerprint: Option<&str>,
+    ) -> Result<IpcResponse> {
         let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
         let candidates = ipc_endpoint_candidates(&paths)?;
         let (endpoint, _) = discover_live_endpoint(&paths, &candidates)
@@ -108,7 +112,11 @@ impl DaemonClient {
             request_id: Uuid::now_v7().to_string(),
             workspace_id: None,
             action: "workspace.doctor.lookup".to_owned(),
-            payload: json!({"repository": repository}),
+            payload: json!({
+                "repository": repository,
+                "legacy_state_dir": legacy_state_dir,
+                "legacy_source_fingerprint": legacy_source_fingerprint,
+            }),
         };
         let mut stream = open_response_stream(&paths, &endpoint, &request).await?;
         let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())

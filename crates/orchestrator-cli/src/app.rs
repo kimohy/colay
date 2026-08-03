@@ -86,6 +86,8 @@ const LEGACY_IMPORT_DETAIL_MAX_CHARS: usize = 256;
 const LEGACY_IMPORT_INCOMPLETE_PROPOSAL_DETAIL: &str = "legacy import source has an incomplete proposal seal; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
 const LEGACY_IMPORT_INVALID_SOURCE_DETAIL: &str = "legacy import source failed integrity validation; restore the repository-local database from a trusted backup or repair it, then rerun `colay doctor`";
 const LEGACY_IMPORT_PATH_DETAIL: &str = "legacy import readiness could not resolve the repository-local database path; review repository configuration, then rerun `colay doctor`";
+const LEGACY_IMPORT_IPC_UNAVAILABLE_DETAIL: &str =
+    "import readiness is unavailable through live-daemon IPC";
 
 struct ConfigRuntime {
     effective: EffectiveConfig,
@@ -611,9 +613,9 @@ async fn doctor_state_checks(
             return;
         }
     };
+    let legacy_import = inspect_legacy_import(repository, config, &paths);
     match crate::daemon::acquire_maintenance() {
         Ok(maintenance) => {
-            let legacy_import = inspect_legacy_import(repository, config, &maintenance.paths);
             let database = match Database::open_read_only_snapshot(&maintenance.paths.database) {
                 Ok(Some(database)) => database,
                 Ok(None) => {
@@ -777,10 +779,26 @@ async fn doctor_state_checks(
             );
         }
         Err(lock_error) => {
-            checks.push(live_daemon_legacy_import_check(repository, config));
-            let response = match crate::ipc_client::DaemonClient::doctor_lookup(repository).await {
+            let legacy_source_fingerprint = match &legacy_import {
+                LegacyImportInspection::Inspected {
+                    plan: Some(plan), ..
+                } => Some(plan.source_fingerprint.as_str()),
+                _ => None,
+            };
+            let response = match crate::ipc_client::DaemonClient::doctor_lookup(
+                repository,
+                Some(&config.orchestrator.state_dir),
+                legacy_source_fingerprint,
+            )
+            .await
+            {
                 Ok(response) => response,
                 Err(ipc_error) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        LegacyImportDurableState::Failed,
+                        &paths,
+                    ));
                     checks.push(Check::fail(
                         "state",
                         format!(
@@ -801,11 +819,30 @@ async fn doctor_state_checks(
                 }) {
                 Ok(lookup) => lookup,
                 Err(error) => {
+                    checks.push(legacy_import_check(
+                        &legacy_import,
+                        LegacyImportDurableState::Failed,
+                        &paths,
+                    ));
                     checks.push(Check::fail("state", error.to_string()));
                     return;
                 }
             };
-            let Some(diagnostics) = lookup.diagnostics else {
+            checks.push(legacy_import_check(
+                &legacy_import,
+                LegacyImportDurableState::Live {
+                    registered: lookup.registered && lookup.diagnostics.is_some(),
+                    status: lookup.legacy_import.as_ref().map(|status| {
+                        (
+                            status.source_fingerprint.as_str(),
+                            status.pending,
+                            status.imported,
+                        )
+                    }),
+                },
+                &paths,
+            ));
+            let Some(diagnostics) = lookup.diagnostics.as_ref() else {
                 let healthy = lookup.database.integrity_ok
                     && lookup.database.foreign_key_violations == 0
                     && lookup.database.current_schema_version
@@ -830,7 +867,7 @@ async fn doctor_state_checks(
             };
             append_live_doctor_diagnostics(
                 checks,
-                &diagnostics,
+                diagnostics,
                 &paths,
                 diagnostics.workspace.workspace_id,
                 repository,
@@ -855,6 +892,10 @@ enum LegacyImportDurableState<'a> {
     Registered {
         database: &'a Database,
         workspace_id: orchestrator_state::WorkspaceId,
+    },
+    Live {
+        registered: bool,
+        status: Option<(&'a str, bool, bool)>,
     },
     Failed,
 }
@@ -897,15 +938,34 @@ fn legacy_import_check(
             json!({"pending": false, "imported": false}),
         );
     };
-    let imported = match durable_state {
+    let (pending, imported) = match durable_state {
         LegacyImportDurableState::Registered {
             database,
             workspace_id,
         } => match LegacyImporter::completed_import(database, workspace_id, plan, paths) {
-            Ok(result) => result.is_some(),
+            Ok(result) => {
+                let imported = result.is_some();
+                (!imported, imported)
+            }
             Err(error) => return legacy_import_inspection_failure_check(&error),
         },
-        LegacyImportDurableState::Unavailable => false,
+        LegacyImportDurableState::Unavailable => (true, false),
+        LegacyImportDurableState::Live { registered, status } => {
+            let Some((source_fingerprint, pending, imported)) =
+                registered.then_some(status).flatten()
+            else {
+                return Check::with_status_data(
+                    "legacy_import",
+                    CheckStatus::Warn,
+                    LEGACY_IMPORT_IPC_UNAVAILABLE_DETAIL,
+                    legacy_import_data(source, plan, true, false),
+                );
+            };
+            if source_fingerprint != plan.source_fingerprint || pending == imported {
+                return legacy_import_failure_check(LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
+            }
+            (pending, imported)
+        }
         LegacyImportDurableState::Failed => {
             return legacy_import_failure_check(LEGACY_IMPORT_INVALID_SOURCE_DETAIL);
         }
@@ -913,34 +973,23 @@ fn legacy_import_check(
     Check::with_data(
         "legacy_import",
         true,
-        json!({
-            "pending": !imported,
-            "imported": imported,
-            "source_schema_version": plan.source_schema_version,
-            "source_fingerprint": plan.source_fingerprint,
-            "source_database": source.database,
-        }),
+        legacy_import_data(source, plan, pending, imported),
     )
 }
 
-fn live_daemon_legacy_import_check(repository: &Path, config: &RootConfig) -> Check {
-    let Ok(source) = StatePaths::from_config(repository, config) else {
-        return legacy_import_failure_check(LEGACY_IMPORT_PATH_DETAIL);
-    };
-    if source.database.exists() {
-        Check::with_status_data(
-            "legacy_import",
-            CheckStatus::Warn,
-            "import readiness is unavailable through live-daemon IPC",
-            json!({"source_database": source.database}),
-        )
-    } else {
-        Check::with_data(
-            "legacy_import",
-            true,
-            json!({"pending": false, "imported": false, "source_database": source.database}),
-        )
-    }
+fn legacy_import_data(
+    source: &StatePaths,
+    plan: &LegacyImportPlan,
+    pending: bool,
+    imported: bool,
+) -> Value {
+    json!({
+        "pending": pending,
+        "imported": imported,
+        "source_schema_version": plan.source_schema_version,
+        "source_fingerprint": plan.source_fingerprint,
+        "source_database": source.database,
+    })
 }
 
 fn legacy_import_inspection_failure_check(error: &StateError) -> Check {

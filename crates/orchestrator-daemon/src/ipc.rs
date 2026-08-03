@@ -110,6 +110,16 @@ pub struct WorkspaceDoctorLookup {
     pub database: DatabaseHealth,
     pub daemon: orchestrator_state::DaemonStatus,
     pub diagnostics: Option<WorkspaceDoctorDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_import: Option<LegacyImportDoctorStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyImportDoctorStatus {
+    pub source_fingerprint: String,
+    pub pending: bool,
+    pub imported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1089,6 +1099,10 @@ fn workspace_doctor(
 #[serde(deny_unknown_fields)]
 struct WorkspaceDoctorLookupPayload {
     repository: PathBuf,
+    #[serde(default)]
+    legacy_state_dir: Option<PathBuf>,
+    #[serde(default)]
+    legacy_source_fingerprint: Option<String>,
 }
 
 fn workspace_doctor_lookup(
@@ -1104,8 +1118,24 @@ fn workspace_doctor_lookup(
     let payload = serde_json::from_value::<WorkspaceDoctorLookupPayload>(request.payload.clone())?;
     let database_health = database.health()?;
     let daemon = database.daemon_status(Utc::now())?;
-    let diagnostics = database
-        .find_repository_workspace(&payload.repository)?
+    let registration = database.find_repository_workspace(&payload.repository)?;
+    let legacy_import = match (
+        registration.as_ref(),
+        payload.legacy_source_fingerprint.as_deref(),
+    ) {
+        (Some(registration), Some(expected_fingerprint)) => {
+            Some(inspect_legacy_import_doctor_status(
+                database,
+                paths,
+                registration.workspace_id,
+                &payload.repository,
+                payload.legacy_state_dir.as_deref(),
+                expected_fingerprint,
+            )?)
+        }
+        _ => None,
+    };
+    let diagnostics = registration
         .map(|registration| workspace_doctor_diagnostics(database, paths, registration))
         .transpose()?;
     serde_json::to_value(WorkspaceDoctorLookup {
@@ -1113,8 +1143,43 @@ fn workspace_doctor_lookup(
         database: database_health,
         daemon,
         diagnostics,
+        legacy_import,
     })
     .map_err(IpcError::from)
+}
+
+fn inspect_legacy_import_doctor_status(
+    database: &Database,
+    paths: &GlobalStatePaths,
+    workspace_id: WorkspaceId,
+    repository: &Path,
+    legacy_state_dir: Option<&Path>,
+    expected_fingerprint: &str,
+) -> Result<LegacyImportDoctorStatus, IpcError> {
+    let mut config = RootConfig::default();
+    if let Some(state_dir) = legacy_state_dir {
+        config.orchestrator.state_dir = state_dir.to_path_buf();
+    }
+    let source = RepositoryStatePaths::from_config(repository, &config)
+        .map_err(|_| legacy_import_doctor_validation_error())?;
+    let plan = LegacyImporter::inspect(&source, paths)
+        .map_err(|_| legacy_import_doctor_validation_error())?
+        .ok_or_else(legacy_import_doctor_validation_error)?;
+    if plan.source_fingerprint != expected_fingerprint {
+        return Err(legacy_import_doctor_validation_error());
+    }
+    let imported = LegacyImporter::completed_import(database, workspace_id, &plan, paths)
+        .map_err(|_| legacy_import_doctor_validation_error())?
+        .is_some();
+    Ok(LegacyImportDoctorStatus {
+        source_fingerprint: plan.source_fingerprint,
+        pending: !imported,
+        imported,
+    })
+}
+
+fn legacy_import_doctor_validation_error() -> IpcError {
+    IpcError::Protocol("legacy import completion evidence could not be validated".to_owned())
 }
 
 fn workspace_doctor_diagnostics(
@@ -2021,9 +2086,11 @@ mod tests {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     use super::{
-        IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, MAX_REQUEST_BYTES,
-        TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook, handle_connection,
-        resume_workspace_task, workspace_conversation, workspace_projection,
+        IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, LegacyImportDoctorStatus,
+        MAX_REQUEST_BYTES, TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook,
+        WorkspaceDoctorLookup, WorkspaceDoctorLookupPayload, handle_connection,
+        resume_workspace_task, workspace_conversation, workspace_doctor_lookup,
+        workspace_projection,
     };
     #[cfg(windows)]
     use super::{
@@ -2033,8 +2100,157 @@ mod tests {
     };
     use orchestrator_state::{
         DaemonLeaseRequest, Database, GlobalStatePaths, NewSessionRecord, NewTaskRecord,
-        WorkspaceReadRequest,
+        StateEnvironment, WorkspaceReadRequest,
     };
+
+    #[test]
+    fn workspace_doctor_lookup_payload_preserves_schema_one_compatibility()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let older = serde_json::from_value::<WorkspaceDoctorLookupPayload>(serde_json::json!({
+            "repository": "repository"
+        }))?;
+        let evidence_aware =
+            serde_json::from_value::<WorkspaceDoctorLookupPayload>(serde_json::json!({
+                "repository": "repository",
+                "legacy_state_dir": ".legacy-colay",
+                "legacy_source_fingerprint": "sealed-fingerprint"
+            }))?;
+
+        assert_eq!(older.legacy_state_dir, None);
+        assert_eq!(older.legacy_source_fingerprint, None);
+        assert_eq!(
+            evidence_aware.legacy_state_dir,
+            Some(std::path::PathBuf::from(".legacy-colay"))
+        );
+        assert_eq!(
+            evidence_aware.legacy_source_fingerprint.as_deref(),
+            Some("sealed-fingerprint")
+        );
+        assert_eq!(IPC_SCHEMA_VERSION, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_doctor_lookup_response_preserves_schema_one_compatibility()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let older = serde_json::from_value::<WorkspaceDoctorLookup>(serde_json::json!({
+            "registered": false,
+            "database": {
+                "integrity_ok": true,
+                "foreign_key_violations": 0,
+                "current_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                "last_event_sequence": 0
+            },
+            "daemon": {"state": "stopped"},
+            "diagnostics": null
+        }))?;
+        let evidence_aware = serde_json::from_value::<WorkspaceDoctorLookup>(serde_json::json!({
+            "registered": false,
+            "database": {
+                "integrity_ok": true,
+                "foreign_key_violations": 0,
+                "current_schema_version": orchestrator_state::STATE_SCHEMA_VERSION,
+                "last_event_sequence": 0
+            },
+            "daemon": {"state": "stopped"},
+            "diagnostics": null,
+            "legacy_import": {
+                "source_fingerprint": "sealed-fingerprint",
+                "pending": false,
+                "imported": true
+            }
+        }))?;
+
+        assert_eq!(older.legacy_import, None);
+        assert_eq!(
+            evidence_aware.legacy_import,
+            Some(LegacyImportDoctorStatus {
+                source_fingerprint: "sealed-fingerprint".to_owned(),
+                pending: false,
+                imported: true,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_lookup_never_trusts_a_client_fingerprint_without_current_source_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            temporary.path().join("home"),
+        )?)?;
+        let database = Database::open(&paths.database)?;
+        database.migrate_with_backup(&paths.backups)?;
+        let registration = database.resolve_repository_workspace(&repository)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-missing-source".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: serde_json::json!({
+                "repository": repository,
+                "legacy_state_dir": ".colay",
+                "legacy_source_fingerprint": "client-only-fingerprint"
+            }),
+        };
+
+        let Err(error) = workspace_doctor_lookup(&database, &paths, &request) else {
+            return Err(std::io::Error::other(
+                "client-only evidence must not imply a completed import",
+            )
+            .into());
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "IPC protocol error: legacy import completion evidence could not be validated"
+        );
+        assert_eq!(
+            database
+                .find_repository_workspace(&repository)?
+                .map(|workspace| workspace.workspace_id),
+            Some(registration.workspace_id)
+        );
+        assert!(!repository.join(".colay").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_lookup_unregistered_repository_remains_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            temporary.path().join("home"),
+        )?)?;
+        let database = Database::open(&paths.database)?;
+        database.migrate_with_backup(&paths.backups)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-unregistered".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: serde_json::json!({
+                "repository": repository,
+                "legacy_state_dir": "chosen-state",
+                "legacy_source_fingerprint": "unregistered-fingerprint"
+            }),
+        };
+
+        let value = workspace_doctor_lookup(&database, &paths, &request)?;
+        let lookup = serde_json::from_value::<WorkspaceDoctorLookup>(value)?;
+
+        assert!(!lookup.registered);
+        assert!(lookup.diagnostics.is_none());
+        assert!(lookup.legacy_import.is_none());
+        assert!(database.find_repository_workspace(&repository)?.is_none());
+        assert!(!repository.join("chosen-state").exists());
+        Ok(())
+    }
 
     #[cfg(windows)]
     #[test]
