@@ -43,6 +43,12 @@ pub struct ConversationResponse {
     pub evidence_redacted: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectedConversationResponse {
+    pub outcome: ConversationOutcome,
+    pub evidence_redacted: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome", deny_unknown_fields)]
 enum ProviderConversationOutcome {
@@ -234,6 +240,14 @@ pub fn collect_conversation_response(
     request: &ConversationRequest,
     response: ConversationResponse,
 ) -> Result<ConversationOutcome, ConversationFailure> {
+    collect_conversation_response_with_evidence(request, response)
+        .map(|collected| collected.outcome)
+}
+
+pub fn collect_conversation_response_with_evidence(
+    request: &ConversationRequest,
+    response: ConversationResponse,
+) -> Result<CollectedConversationResponse, ConversationFailure> {
     let evidence_redacted = bounded_evidence(&response);
     if request.sandbox != SandboxMode::ReadOnly || response.sandbox != SandboxMode::ReadOnly {
         return Err(ConversationFailure::NotReadOnly);
@@ -289,9 +303,12 @@ pub fn collect_conversation_response(
         .validate()
         .map_err(|source| ConversationFailure::Validation {
             source,
-            evidence_redacted,
+            evidence_redacted: evidence_redacted.clone(),
         })?;
-    Ok(outcome)
+    Ok(CollectedConversationResponse {
+        outcome,
+        evidence_redacted,
+    })
 }
 
 fn bounded_evidence(response: &ConversationResponse) -> String {

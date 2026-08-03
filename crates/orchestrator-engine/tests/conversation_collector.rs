@@ -5,7 +5,8 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
     ConversationFailure, ConversationFailureKind, ConversationRequest, ConversationResponse,
-    collect_conversation_response, diagnose_conversation_failure,
+    collect_conversation_response, collect_conversation_response_with_evidence,
+    diagnose_conversation_failure,
 };
 use serde_json::json;
 
@@ -47,6 +48,43 @@ fn accepts_one_strict_provider_neutral_outcome() -> Result<(), Box<dyn std::erro
         outcome,
         ConversationOutcome::AnswerComplete { .. }
     ));
+    Ok(())
+}
+
+#[test]
+fn successful_collection_returns_bounded_evidence_separate_from_canonical_outcome()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = request();
+    let output = serde_json::to_vec(&json!({
+        "outcome": "answer_complete",
+        "response_redacted": "Git is required only when writable work is approved."
+    }))?;
+    let mut response = response(&request, output);
+    response.evidence_redacted = format!(
+        "read-only provider command started\n{}",
+        "x".repeat(CONVERSATION_MAX_EVIDENCE_BYTES * 2)
+    );
+
+    let collected = collect_conversation_response_with_evidence(&request, response)?;
+
+    assert!(matches!(
+        collected.outcome,
+        ConversationOutcome::AnswerComplete { .. }
+    ));
+    assert!(
+        collected
+            .evidence_redacted
+            .starts_with("read-only provider command started")
+    );
+    assert!(collected.evidence_redacted.ends_with("[truncated]"));
+    assert!(collected.evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert_eq!(
+        serde_json::to_value(&collected.outcome)?,
+        json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Git is required only when writable work is approved."
+        })
+    );
     Ok(())
 }
 

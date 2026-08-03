@@ -42,6 +42,97 @@ fn database() -> Result<(Database, WorkspaceId), Box<dyn std::error::Error>> {
     fresh_database()
 }
 
+#[test]
+fn successful_conversation_evidence_is_validated_idempotent_and_immutable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id) = database()?;
+    let database_path = database.path().to_path_buf();
+    let database = database.workspace(workspace_id);
+    let (session_id, message_id) = seed_session_message(&database_path, &database)?;
+    let outcome = ConversationOutcome::AnswerComplete {
+        response_redacted: "done".to_owned(),
+    };
+
+    for invalid in ["   ".to_owned(), "x".repeat(16 * 1024 + 1)] {
+        let attempt_id = ConversationAttemptId::new();
+        database.begin_conversation_attempt(&NewConversationAttempt {
+            attempt_id,
+            session_id,
+            source_message_id: message_id,
+            provider: ProviderId::Codex,
+            started_at: Utc::now(),
+        })?;
+        assert!(
+            database
+                .finish_conversation_attempt_with_evidence(
+                    attempt_id,
+                    &outcome,
+                    Some(&invalid),
+                    Utc::now(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            database
+                .load_conversation_attempt(attempt_id)?
+                .ok_or("missing running attempt")?
+                .status,
+            ConversationAttemptStatus::Running
+        );
+    }
+
+    let attempt_id = ConversationAttemptId::new();
+    let completed_at = Utc::now();
+    database.begin_conversation_attempt(&NewConversationAttempt {
+        attempt_id,
+        session_id,
+        source_message_id: message_id,
+        provider: ProviderId::Codex,
+        started_at: Utc::now(),
+    })?;
+    let completed = database.finish_conversation_attempt_with_evidence(
+        attempt_id,
+        &outcome,
+        Some("  read-only provider command started  "),
+        completed_at,
+    )?;
+    assert_eq!(
+        completed.evidence_redacted.as_deref(),
+        Some("read-only provider command started")
+    );
+    assert_eq!(
+        database.finish_conversation_attempt_with_evidence(
+            attempt_id,
+            &outcome,
+            Some("read-only provider command started"),
+            completed_at,
+        )?,
+        completed
+    );
+    assert!(
+        database
+            .finish_conversation_attempt_with_evidence(
+                attempt_id,
+                &outcome,
+                Some("different evidence"),
+                completed_at,
+            )
+            .is_err()
+    );
+    with_workspace_connection(&database_path, &database, |connection| {
+        assert!(
+            connection
+                .execute(
+                    "UPDATE conversation_attempts SET evidence_redacted = 'changed' WHERE attempt_id = ?1",
+                    [attempt_id.to_string()],
+                )
+                .is_err()
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
 fn ready_snapshot() -> RequirementSnapshot {
     RequirementSnapshot {
         objective: "fix the conversation flow".to_owned(),

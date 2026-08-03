@@ -210,6 +210,86 @@ fn plan_only_session_cannot_be_promoted_by_same_command() -> Result<()> {
 }
 
 #[test]
+fn read_only_provider_command_completes_with_durable_evidence_and_zero_writable_state() -> Result<()>
+{
+    let fixture = PlanFixture::non_git()?;
+    let output = fixture.colay(["run", "--plan-only", "scenario:read-only-command"])?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let database = fixture.database()?;
+    let (status, outcome_json, evidence_redacted): (String, String, String) = database.query_row(
+        "SELECT status, outcome_json, evidence_redacted FROM conversation_attempts LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(status, "succeeded");
+    let outcome: serde_json::Value = serde_json::from_str(&outcome_json)?;
+    assert_eq!(outcome["outcome"], "answer_complete");
+    assert!(outcome.get("evidence_redacted").is_none());
+    assert!(evidence_redacted.contains("read-only provider command started"));
+    for table in [
+        "tasks",
+        "task_attempts",
+        "worktrees",
+        "coordinator_leases",
+        "worker_leases",
+    ] {
+        assert_eq!(fixture.count(table)?, 0, "unexpected row in {table}");
+    }
+    Ok(())
+}
+
+#[test]
+fn file_change_after_read_only_command_fails_without_writable_state() -> Result<()> {
+    let fixture = PlanFixture::non_git()?;
+    let output = fixture.colay([
+        "run",
+        "--plan-only",
+        "scenario:read-only-command-file-change",
+    ])?;
+    assert!(
+        !output.status.success(),
+        "file-change conversation unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let database = fixture.database()?;
+    let (status, outcome_json, error_redacted, evidence_redacted): (
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = database.query_row(
+        "SELECT status, outcome_json, error_redacted, evidence_redacted
+         FROM conversation_attempts LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(status, "failed");
+    let outcome: serde_json::Value = serde_json::from_str(&outcome_json)?;
+    assert_eq!(outcome["outcome"], "needs_attention");
+    assert!(error_redacted.contains("process failed"));
+    assert!(
+        outcome["evidence_redacted"].as_str().is_some_and(
+            |evidence| evidence.contains("read-only conversation reported a file change")
+        )
+    );
+    assert_eq!(evidence_redacted, None);
+    for table in [
+        "tasks",
+        "task_attempts",
+        "worktrees",
+        "coordinator_leases",
+        "worker_leases",
+    ] {
+        assert_eq!(fixture.count(table)?, 0, "unexpected row in {table}");
+    }
+    Ok(())
+}
+
+#[test]
 fn provider_failure_exits_nonzero_with_actionable_redacted_outcome() -> Result<()> {
     let fixture = PlanFixture::non_git()?;
     let output = fixture.colay(["run", "--plan-only", "scenario:crash"])?;

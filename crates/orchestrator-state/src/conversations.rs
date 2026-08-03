@@ -39,6 +39,7 @@ pub struct StoredConversationAttempt {
     pub status: ConversationAttemptStatus,
     pub outcome: Option<ConversationOutcome>,
     pub error_redacted: Option<String>,
+    pub evidence_redacted: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -94,16 +95,39 @@ impl $database {
         outcome: &ConversationOutcome,
         completed_at: DateTime<Utc>,
     ) -> StateResult<StoredConversationAttempt> {
+        self.finish_conversation_attempt_with_evidence(attempt_id, outcome, None, completed_at)
+    }
+
+    pub fn finish_conversation_attempt_with_evidence(
+        &self,
+        attempt_id: ConversationAttemptId,
+        outcome: &ConversationOutcome,
+        evidence_redacted: Option<&str>,
+        completed_at: DateTime<Utc>,
+    ) -> StateResult<StoredConversationAttempt> {
         outcome
             .validate()
             .map_err(|error| StateError::InvalidRecord(error.to_string()))?;
+        let evidence_redacted = evidence_redacted.map(str::trim);
+        if evidence_redacted.is_some_and(str::is_empty) {
+            return Err(StateError::InvalidRecord(
+                "conversation success evidence must not be blank".to_owned(),
+            ));
+        }
+        if evidence_redacted.is_some_and(|evidence| evidence.len() > CONVERSATION_MAX_ERROR_BYTES) {
+            return Err(StateError::InvalidRecord(format!(
+                "conversation success evidence exceeds {CONVERSATION_MAX_ERROR_BYTES} bytes"
+            )));
+        }
         let outcome_json = serde_json::to_string(outcome)?;
         self.with_transaction(|transaction| {
             let existing = load_attempt(transaction, attempt_id)?.ok_or_else(|| {
                 StateError::InvalidRecord("conversation attempt does not exist".to_owned())
             })?;
             if existing.status == ConversationAttemptStatus::Succeeded {
-                if existing.outcome.as_ref() == Some(outcome) {
+                if existing.outcome.as_ref() == Some(outcome)
+                    && existing.evidence_redacted.as_deref() == evidence_redacted
+                {
                     return Ok(existing);
                 }
                 return Err(StateError::InvalidRecord(
@@ -117,10 +141,12 @@ impl $database {
             }
             let changed = transaction.execute(
                 "UPDATE main.conversation_attempts
-                 SET status = 'succeeded', outcome_json = ?1, completed_at = ?2
-                 WHERE workspace_id = current_workspace() AND attempt_id = ?3 AND status = 'running'",
+                 SET status = 'succeeded', outcome_json = ?1, evidence_redacted = ?2,
+                     completed_at = ?3
+                 WHERE workspace_id = current_workspace() AND attempt_id = ?4 AND status = 'running'",
                 params![
                     outcome_json,
+                    evidence_redacted,
                     completed_at.to_rfc3339(),
                     attempt_id.to_string()
                 ],
@@ -383,7 +409,7 @@ fn load_attempt(
     connection
         .query_row(
             "SELECT attempt_id, session_id, source_message_id, provider_id, status,
-                    outcome_json, error_redacted, started_at, completed_at
+                    outcome_json, error_redacted, evidence_redacted, started_at, completed_at
              FROM conversation_attempts WHERE attempt_id = ?1",
             [attempt_id.to_string()],
             map_attempt,
@@ -404,9 +430,10 @@ fn map_attempt(row: &Row<'_>) -> rusqlite::Result<StoredConversationAttempt> {
             .map(|value| serde_json::from_str(&value).map_err(to_sql_error))
             .transpose()?,
         error_redacted: row.get(6)?,
-        started_at: parse_timestamp(&row.get::<_, String>(7)?)?,
+        evidence_redacted: row.get(7)?,
+        started_at: parse_timestamp(&row.get::<_, String>(8)?)?,
         completed_at: row
-            .get::<_, Option<String>>(8)?
+            .get::<_, Option<String>>(9)?
             .map(|value| parse_timestamp(&value))
             .transpose()?,
     })

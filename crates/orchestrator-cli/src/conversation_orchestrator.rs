@@ -6,8 +6,8 @@ use std::{
 
 use async_trait::async_trait;
 use orchestrator_domain::{
-    AttemptId, ModelProfile, ProviderCapabilities, ProviderId, SandboxMode, SchemaVersion, TaskId,
-    WorkerEvent, WorkerRequest,
+    AttemptId, CapabilitySupport, ModelProfile, ProviderCapabilities, ProviderId, SandboxMode,
+    SchemaVersion, TaskId, WorkerEvent, WorkerRequest,
 };
 use orchestrator_engine::{
     CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
@@ -99,6 +99,32 @@ impl ConversationEvidence {
         }
         truncate_evidence_text(&self.lines.join("\n"))
     }
+}
+
+fn observe_read_only_command(
+    provider: ProviderId,
+    sandbox: SandboxMode,
+    support: CapabilitySupport,
+    executable: &str,
+    args: &[String],
+    evidence: &mut ConversationEvidence,
+) -> Option<String> {
+    if sandbox != SandboxMode::ReadOnly
+        || !matches!(
+            support,
+            CapabilitySupport::Advertised | CapabilitySupport::Verified
+        )
+    {
+        return Some(format!(
+            "provider command execution lacks an established read-only capability: {executable}"
+        ));
+    }
+    let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_owned());
+    evidence.push_provider_text(
+        provider,
+        &format!("read-only provider command started: executable={executable}; args={args}"),
+    );
+    None
 }
 
 fn truncate_evidence_line(line: &str) -> String {
@@ -295,6 +321,7 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
         let mut guard = ActiveConversationGuard::new(Arc::clone(&adapter), handle.clone());
         let mut messages = Vec::new();
         let mut evidence = ConversationEvidence::default();
+        let read_only_support = self.planner.capabilities[&provider].read_only;
         for capability_evidence in &self.planner.capabilities[&provider].evidence {
             evidence.push_provider_text(provider, capability_evidence);
         }
@@ -332,10 +359,19 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
                         "read-only conversation reported a file change: {path}"
                     ));
                 }
-                Ok(WorkerEvent::CommandStarted { executable, .. }) => {
-                    lifecycle_error = Some(format!(
-                        "read-only conversation reported command execution: {executable}"
-                    ));
+                Ok(WorkerEvent::CommandStarted {
+                    executable, args, ..
+                }) => {
+                    if let Some(error) = observe_read_only_command(
+                        provider,
+                        request.sandbox,
+                        read_only_support,
+                        &executable,
+                        &args,
+                        &mut evidence,
+                    ) {
+                        lifecycle_error = Some(error);
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => lifecycle_error = Some(error.to_string()),
@@ -439,6 +475,110 @@ fn map_planner_failure(error: orchestrator_engine::PlannerFailure) -> Conversati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_providers_accept_commands_only_with_established_read_only_capability() {
+        for provider in [
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Gemini,
+            ProviderId::Agy,
+        ] {
+            for support in [CapabilitySupport::Advertised, CapabilitySupport::Verified] {
+                let mut evidence = ConversationEvidence::default();
+                let violation = observe_read_only_command(
+                    provider,
+                    SandboxMode::ReadOnly,
+                    support,
+                    "/bin/sh",
+                    &["-c".to_owned(), "pwd".to_owned()],
+                    &mut evidence,
+                );
+                assert!(violation.is_none(), "{provider} {support:?}");
+                let evidence = evidence.finish();
+                assert!(evidence.contains("read-only provider command started"));
+                assert!(evidence.contains("pwd"));
+            }
+        }
+    }
+
+    #[test]
+    fn command_policy_rejects_degraded_unsupported_and_writable_contexts() {
+        for support in [CapabilitySupport::Unsupported, CapabilitySupport::Degraded] {
+            let mut evidence = ConversationEvidence::default();
+            assert!(
+                observe_read_only_command(
+                    ProviderId::Codex,
+                    SandboxMode::ReadOnly,
+                    support,
+                    "pwd",
+                    &[],
+                    &mut evidence,
+                )
+                .is_some()
+            );
+        }
+        let mut evidence = ConversationEvidence::default();
+        assert!(
+            observe_read_only_command(
+                ProviderId::Codex,
+                SandboxMode::WorkspaceWrite,
+                CapabilitySupport::Verified,
+                "pwd",
+                &[],
+                &mut evidence,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn command_evidence_is_bounded_and_deduplicated_in_first_seen_order() {
+        let mut evidence = ConversationEvidence::default();
+        let repeated_args = vec!["-lc".to_owned(), "pwd".to_owned()];
+        for _ in 0..2 {
+            assert!(
+                observe_read_only_command(
+                    ProviderId::Codex,
+                    SandboxMode::ReadOnly,
+                    CapabilitySupport::Verified,
+                    "/bin/sh",
+                    &repeated_args,
+                    &mut evidence,
+                )
+                .is_none()
+            );
+        }
+        for index in 0..100 {
+            assert!(
+                observe_read_only_command(
+                    ProviderId::Codex,
+                    SandboxMode::ReadOnly,
+                    CapabilitySupport::Verified,
+                    &format!("command-{index}"),
+                    &["x".repeat(3_000)],
+                    &mut evidence,
+                )
+                .is_none()
+            );
+        }
+
+        let evidence = evidence.finish();
+
+        assert_eq!(
+            evidence
+                .matches("read-only provider command started: executable=/bin/sh")
+                .count(),
+            1
+        );
+        assert!(evidence.lines().count() <= CONVERSATION_MAX_EVIDENCE_LINES);
+        assert!(
+            evidence
+                .lines()
+                .all(|line| line.len() <= CONVERSATION_MAX_EVIDENCE_LINE_BYTES)
+        );
+        assert!(evidence.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    }
 
     #[test]
     fn evidence_deduplicates_unknown_events_with_occurrence_count() {

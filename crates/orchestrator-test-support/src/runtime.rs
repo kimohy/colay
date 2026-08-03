@@ -29,6 +29,8 @@ pub enum FakeRuntimeScenario {
     Timeout,
     SecretOutput,
     ConversationResponseAlias,
+    ReadOnlyCommand,
+    ReadOnlyCommandWithFileChange,
 }
 
 /// Returns verified fake-only capability evidence for a read-only conversation provider.
@@ -154,7 +156,10 @@ impl AdapterRuntime for FakeAdapterRuntime {
         let lines = if request.objective == "Conduct a read-only conversation turn"
             && matches!(
                 self.scenario,
-                FakeRuntimeScenario::Success | FakeRuntimeScenario::ConversationResponseAlias
+                FakeRuntimeScenario::Success
+                    | FakeRuntimeScenario::ConversationResponseAlias
+                    | FakeRuntimeScenario::ReadOnlyCommand
+                    | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
             ) {
             conversation_lines(provider, &request.prompt, self.scenario)
         } else {
@@ -434,13 +439,52 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
             FakeRuntimeScenario::ProcessCrash
             | FakeRuntimeScenario::DiagnosticNoise
             | FakeRuntimeScenario::Timeout
-            | FakeRuntimeScenario::ConversationResponseAlias,
+            | FakeRuntimeScenario::ConversationResponseAlias
+            | FakeRuntimeScenario::ReadOnlyCommand
+            | FakeRuntimeScenario::ReadOnlyCommandWithFileChange,
         ) => Vec::new(),
     };
     lines
         .into_iter()
         .map(|line| line.as_bytes().to_vec())
         .collect()
+}
+
+fn codex_conversation_lines(text: &str, scenario: FakeRuntimeScenario) -> Vec<serde_json::Value> {
+    let mut lines = vec![
+        serde_json::json!({"type":"thread.started","thread_id":"fake-conversation"}),
+        serde_json::json!({"type":"turn.started"}),
+    ];
+    if matches!(
+        scenario,
+        FakeRuntimeScenario::ReadOnlyCommand | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
+    ) {
+        lines.push(serde_json::json!({
+            "type": "item.started",
+            "item": {
+                "id": "read-only-command",
+                "type": "command_execution",
+                "command": "/bin/sh -lc pwd",
+                "status": "in_progress"
+            }
+        }));
+    }
+    if scenario == FakeRuntimeScenario::ReadOnlyCommandWithFileChange {
+        lines.push(serde_json::json!({
+            "type": "item.started",
+            "item": {
+                "id": "unexpected-write",
+                "type": "file_change",
+                "path": "README.md",
+                "status": "in_progress"
+            }
+        }));
+    }
+    lines.extend([
+        serde_json::json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":text}}),
+        serde_json::json!({"type":"turn.completed","usage":{}}),
+    ]);
+    lines
 }
 
 fn conversation_lines(
@@ -505,12 +549,7 @@ fn conversation_lines(
     };
     let text = serde_json::to_string(&outcome).unwrap_or_default();
     let lines = match provider {
-        ProviderId::Codex => vec![
-            serde_json::json!({"type":"thread.started","thread_id":"fake-conversation"}),
-            serde_json::json!({"type":"turn.started"}),
-            serde_json::json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":text}}),
-            serde_json::json!({"type":"turn.completed","usage":{}}),
-        ],
+        ProviderId::Codex => codex_conversation_lines(&text, scenario),
         ProviderId::Claude => vec![
             serde_json::json!({"type":"system","subtype":"init","session_id":"fake-conversation"}),
             serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
@@ -745,7 +784,14 @@ fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
         eprintln!("fake conversation provider crash");
         std::process::exit(17);
     }
-    for line in conversation_lines(provider, &prompt, FakeRuntimeScenario::Success) {
+    let scenario = if prompt.contains("scenario:read-only-command-file-change") {
+        FakeRuntimeScenario::ReadOnlyCommandWithFileChange
+    } else if prompt.contains("scenario:read-only-command") {
+        FakeRuntimeScenario::ReadOnlyCommand
+    } else {
+        FakeRuntimeScenario::Success
+    };
+    for line in conversation_lines(provider, &prompt, scenario) {
         println!("{}", String::from_utf8_lossy(&line));
     }
     true
