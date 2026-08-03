@@ -1,7 +1,7 @@
 # WSL-Native Provider and Read-Only Conversation Tools Design
 
 Date: 2026-08-03
-Status: Proposed; approved design awaiting document review
+Status: Approved for implementation
 
 ## Context
 
