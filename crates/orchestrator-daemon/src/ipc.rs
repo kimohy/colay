@@ -2112,14 +2112,10 @@ fn request_daemon_stop(database: &Database) -> Result<Value, IpcError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::Duration,
-    };
+    use std::{path::Path, sync::Arc, time::Duration};
 
     #[cfg(windows)]
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, path::PathBuf};
 
     use chrono::Utc;
     use orchestrator_domain::{
