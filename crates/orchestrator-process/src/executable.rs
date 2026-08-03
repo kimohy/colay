@@ -520,7 +520,7 @@ fn windows_mounts_from_mountinfo(mountinfo: &str) -> Vec<PathBuf> {
                     .iter()
                     .chain(fields[separator + 3..].iter())
                     .flat_map(|field| field.split(','))
-                    .any(|option| option == "aname=drvfs");
+                    .any(|option| option == "aname=drvfs" || option.starts_with("aname=drvfs;"));
             if filesystem == "drvfs" || source == "drvfs" || has_drvfs_9p_option {
                 Some(PathBuf::from(decode_mountinfo_field(fields[4])))
             } else {
@@ -900,6 +900,31 @@ mod tests {
 
         assert!(mounts.contains(&PathBuf::from("/mnt/c")));
         assert!(mounts.contains(&PathBuf::from("/windows")));
+    }
+
+    #[test]
+    fn wsl_rejects_custom_9p_drvfs_mount_with_semicolon_suboptions() {
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("custom/bin/provider", b"#!/bin/sh\nexit 0\n");
+        fixture.make_executable("custom/bin/provider");
+        let custom_mount = fixture.path("custom");
+        let lookalike_mount = fixture.path("lookalike");
+        let mountinfo = format!(
+            "36 25 0:32 / {} rw - 9p unrelated rw,aname=drvfs;path=/custom-root\n\
+             37 25 0:33 / {} rw - 9p unrelated rw,aname=drvfsx;path=/not-drvfs",
+            custom_mount.display(),
+            lookalike_mount.display(),
+        );
+        let mounts = windows_mounts_from_mountinfo(&mountinfo);
+
+        assert!(mounts.contains(&custom_mount));
+        assert!(!mounts.contains(&lookalike_mount));
+        let search = fixture.wsl_search(["custom/bin"], mounts);
+
+        assert!(matches!(
+            resolve_executable(Path::new("provider"), &search),
+            Err(ExecutableResolutionError::WslNonNativeCandidate { .. })
+        ));
     }
 
     #[test]
