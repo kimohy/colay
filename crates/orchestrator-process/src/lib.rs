@@ -9,9 +9,9 @@ mod redaction;
 mod runner;
 
 pub use executable::{
-    ExecutableKind, ExecutablePlatform, ExecutableResolutionError, ExecutableSearch,
-    ExecutableValidationContext, ResolvedExecutable, resolve_executable,
-    validate_resolution_evidence,
+    ExecutableHostContext, ExecutableKind, ExecutablePlatform, ExecutablePolicy,
+    ExecutableResolutionError, ExecutableSearch, ExecutableValidationContext, ResolvedExecutable,
+    resolve_executable, validate_resolution_evidence,
 };
 pub use git::{GitCommandBuilder, GitSafetyError, resolve_repo_path};
 pub use jsonl::{JsonLines, MalformedJsonLine, parse_json_lines};

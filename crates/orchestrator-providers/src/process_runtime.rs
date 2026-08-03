@@ -105,11 +105,7 @@ impl AdapterRuntime for ProcessAdapterRuntime {
         args: &[OsString],
     ) -> Result<RuntimeOutput, ProviderError> {
         validate_safe_probe(args)?;
-        let mut spec = CommandSpec::new(executable).args(args.iter().cloned());
-        spec.timeout = Duration::from_secs(30);
-        spec.stdout_limit = 4 * 1024 * 1024;
-        spec.stderr_limit = 1024 * 1024;
-        spec.redaction = self.redaction.clone();
+        let spec = probe_command_spec(executable, args, &self.redaction);
         self.run_bounded(spec).await
     }
 
@@ -603,8 +599,24 @@ fn next_sequence(job: &ProcessJob) -> u64 {
     job.event_sequence.fetch_add(1, Ordering::Relaxed)
 }
 
+fn probe_command_spec(
+    executable: &Path,
+    args: &[OsString],
+    redaction: &RedactionConfig,
+) -> CommandSpec {
+    let mut spec = CommandSpec::new(executable)
+        .require_native_provider()
+        .args(args.iter().cloned());
+    spec.timeout = Duration::from_secs(30);
+    spec.stdout_limit = 4 * 1024 * 1024;
+    spec.stderr_limit = 1024 * 1024;
+    spec.redaction = redaction.clone();
+    spec
+}
+
 fn command_spec(invocation: &PreparedInvocation, redaction: &RedactionConfig) -> CommandSpec {
     let mut spec = CommandSpec::new(&invocation.executable)
+        .require_native_provider()
         .args(invocation.args.iter().cloned())
         .current_dir(&invocation.working_directory)
         .with_stdin(invocation.stdin.clone());
@@ -730,6 +742,41 @@ fn validate_fake_provider_executable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_probe_requires_a_native_provider_executable() {
+        let spec = probe_command_spec(
+            Path::new("fake-provider-cli"),
+            &[OsString::from("--version")],
+            &RedactionConfig::default(),
+        );
+
+        assert_eq!(
+            spec.executable_policy,
+            orchestrator_process::ExecutablePolicy::Provider
+        );
+    }
+
+    #[test]
+    fn worker_requires_a_native_provider_executable() {
+        let invocation = PreparedInvocation {
+            executable: "fake-provider-cli".into(),
+            args: vec![OsString::from("--version")],
+            stdin: Vec::new(),
+            working_directory: ".".into(),
+            timeout_seconds: 30,
+            stdout_limit: 1024,
+            stderr_limit: 1024,
+            output: StructuredOutput::AgyText,
+            codex_app_server: None,
+            fallback: None,
+        };
+
+        assert_eq!(
+            command_spec(&invocation, &RedactionConfig::default()).executable_policy,
+            orchestrator_process::ExecutablePolicy::Provider
+        );
+    }
 
     fn process_result_with_uncertain_tree(
         termination: orchestrator_process::TerminationReason,
