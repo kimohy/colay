@@ -1148,7 +1148,7 @@ fn workspace_doctor_lookup(
                 database,
                 paths,
                 registration.workspace_id,
-                &payload.repository,
+                &registration.canonical_path,
                 payload.legacy_state_dir.as_deref(),
                 expected_fingerprint,
             )?)
@@ -2523,14 +2523,94 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_lookup_uses_registered_canonical_repository_for_aliased_client_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temporary.path())?;
+        let repository = root.join("repository");
+        let other_repository = root.join("other-repository");
+        std::fs::create_dir_all(&repository)?;
+        std::fs::create_dir_all(&other_repository)?;
+        let repository_alias = root.join("repository-alias");
+        std::os::unix::fs::symlink(&repository, &repository_alias)?;
+        let home = root.join("home");
+        std::fs::create_dir_all(&home)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            std::fs::canonicalize(home)?,
+        )?)?;
+        let database = Database::open(&paths.database)?;
+        database.migrate_with_backup(&paths.backups)?;
+        let registration = database.resolve_repository_workspace(&repository)?;
+        std::fs::write(
+            &paths.config,
+            "config_version = 4\n[orchestrator]\nstate_dir = \".legacy-colay\"\n",
+        )?;
+        let (_source, fingerprint) =
+            seed_legacy_source(&repository, Path::new(".legacy-colay"), &paths)?;
+        let request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-aliased-repository".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: serde_json::json!({
+                "repository": repository_alias,
+                "legacy_state_dir": ".legacy-colay",
+                "legacy_source_fingerprint": fingerprint
+            }),
+        };
+
+        let value = workspace_doctor_lookup(&database, &paths, &request)?;
+        let lookup = serde_json::from_value::<WorkspaceDoctorLookup>(value)?;
+        let status = lookup
+            .legacy_import
+            .ok_or_else(|| std::io::Error::other("legacy import evidence was omitted"))?;
+
+        assert!(lookup.registered);
+        assert_eq!(status.source_fingerprint, fingerprint);
+        assert!(status.pending);
+        assert!(!status.imported);
+        assert_eq!(
+            database
+                .find_repository_workspace(&repository_alias)?
+                .map(|workspace| workspace.workspace_id),
+            Some(registration.workspace_id)
+        );
+
+        let other_request = IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "doctor-different-repository".to_owned(),
+            workspace_id: None,
+            action: "workspace.doctor.lookup".to_owned(),
+            payload: serde_json::json!({
+                "repository": other_repository,
+                "legacy_state_dir": ".legacy-colay",
+                "legacy_source_fingerprint": fingerprint
+            }),
+        };
+        let other_value = workspace_doctor_lookup(&database, &paths, &other_request)?;
+        let other_lookup = serde_json::from_value::<WorkspaceDoctorLookup>(other_value)?;
+        assert!(!other_lookup.registered);
+        assert!(other_lookup.legacy_import.is_none());
+        assert!(
+            database
+                .find_repository_workspace(&other_repository)?
+                .is_none()
+        );
+        Ok(())
+    }
+
     #[test]
     fn doctor_lookup_unregistered_repository_remains_read_only()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
         let repository = temporary.path().join("repository");
         std::fs::create_dir_all(&repository)?;
+        let home = temporary.path().join("home");
+        std::fs::create_dir_all(&home)?;
         let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
-            temporary.path().join("home"),
+            std::fs::canonicalize(home)?,
         )?)?;
         let database = Database::open(&paths.database)?;
         database.migrate_with_backup(&paths.backups)?;
