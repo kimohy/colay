@@ -1,5 +1,24 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## 2026-08-03 clean-install nightly provider-boundary QA
+
+- WSL 2 clean-install QA of `0.1.1-nightly.20260803.28d0d5f` used an isolated
+  npm prefix, `COLAY_HOME`, and WSL-native repository. Package provenance,
+  schema migration, daemon lifecycle, SQLite integrity, and public compatibility
+  probes completed before the bounded provider checks described below.
+- The single bounded Codex command was `colay --json run --plan-only --provider codex
+  <fixed-token-read-only-prompt>`. It returned `CLEAN_OK` and exited zero, but
+  Colay persisted the conversation as failed with the redacted diagnostic
+  `read-only conversation reported command execution`. The provider had used a
+  read-only command to inspect a required local skill file while Colay's
+  read-only sandbox and Codex read-only capability were established. Read-only
+  inspection after the turn found zero new tasks, task attempts, worktrees,
+  coordinator leases, and worker leases; no file change was observed.
+- WSL provider discovery resolved no Linux-native `agy`. A Windows `agy.exe`
+  candidate was visible below `/mnt/c`, but it is not an acceptable fallback and
+  was not used for a version, help, compatibility, or inference command. These
+  two provider-boundary defects are tracked as `WSL-022` and `WSL-023`.
+
 ## 2026-08-03 PR #17 deployed-nightly verification
 
 - PR #17 merged as `95cf4d37fef4ede3fab59fc93854a8ec80eb3891` after its six push/pull-request
@@ -705,6 +724,56 @@ that import readiness is unavailable through IPC, so neither mode currently pres
   through live daemon IPC and after clean shutdown, and reported a changed sealed fingerprint as
   pending in both modes. The deployment gate is satisfied.
 
+## WSL-022: plan-only rejects an established read-only provider command
+
+- Severity: high
+- Status: fix-in-progress
+- Observed nightly: `0.1.1-nightly.20260803.28d0d5f`
+- Observed provider: Codex
+
+### Reproduction, persisted outcome, and root cause
+
+In isolated WSL clean-install QA, the bounded command
+`colay --json run --plan-only --provider codex <fixed-token-read-only-prompt>` ran with the
+read-only sandbox and established Codex read-only capability. The provider used a read-only command
+to inspect a required local skill file, returned canonical `CLEAN_OK`, and exited zero. Colay
+nevertheless persisted the conversation as failed with the redacted outcome
+`read-only conversation reported command execution`.
+
+Read-only inspection found no file change and zero new tasks, task attempts, worktrees,
+coordinator leases, and worker leases. The failure is caused by treating every normalized
+`CommandStarted` event as a terminal lifecycle violation instead of retaining bounded, redacted
+evidence when the requested sandbox is read-only and the provider has established that capability.
+
+### Completion conditions
+
+- Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
+- Release completion: a newly published nightly passes isolated WSL clean-install QA and the issue status changes to `fixed`.
+
+## WSL-023: WSL provider discovery can expose a Windows executable
+
+- Severity: high
+- Status: fix-in-progress
+- Observed nightly: `0.1.1-nightly.20260803.28d0d5f`
+- Observed provider: Antigravity (`agy`)
+
+### Reproduction, persisted outcome, and root cause
+
+During the same isolated WSL clean-install QA, the public provider-discovery/compatibility check
+resolved no Linux-native `agy`. A Windows `agy.exe` was visible below `/mnt/c`; it is not an
+acceptable fallback and was not invoked for version, help, compatibility, or inference. The
+persisted provider result remained unavailable because no native executable was resolved, with zero
+new tasks, task attempts, worktrees, coordinator leases, and worker leases.
+
+The resolver currently permits PATH discovery to expose a Windows executable to WSL instead of
+requiring a Linux-native binary. Discovery must reject Windows-mounted and Windows PE candidates
+before any probe, uniformly for Codex, Claude, Gemini, and Agy.
+
+### Completion conditions
+
+- Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
+- Release completion: a newly published nightly passes isolated WSL clean-install QA and the issue status changes to `fixed`.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
@@ -853,6 +922,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-019` | high | fixed | unsealed legacy invalid graph prevents daemon startup |
 | `WSL-020` | high | fixed | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
 | `WSL-021` | medium | fixed | doctor reports an already completed legacy import as pending |
+| `WSL-022` | high | fix-in-progress | plan-only rejects a provider command even when the read-only sandbox and capability are established |
+| `WSL-023` | high | fix-in-progress | WSL provider discovery can expose a Windows executable instead of requiring a Linux-native binary |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
