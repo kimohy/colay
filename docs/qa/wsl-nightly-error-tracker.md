@@ -967,6 +967,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
+| `WIN-005` | high | fix-in-progress | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1754,6 +1755,34 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Windows 실제 source binary에서 `provider_updated { provider: agy, enabled: false }`가
   반환되고 effective provider report에도 `enabled=false`가 반영됨을 확인했다.
 - 변경 후 workspace 전체 target/feature Clippy `-D warnings`와 전체 Rust suite가 통과했다.
+
+## WIN-005: fresh daemon의 중복 legacy 검사로 `workspace.register` 응답 timeout
+
+### 관찰 및 영향
+
+- Merge-triggered Release run `30866284840`은 성공했지만 main CI run `30866284842`의
+  Windows job `91858756051`에서 `global_doctor` 31개 중 다음 두 테스트가 실패했다.
+  - `live_doctor_fails_corrupt_legacy_import_completion_without_mutation`
+  - `live_doctor_reports_changed_legacy_import_as_pending`
+- 두 실패 모두 daemon에 `workspace.register` 요청을 기록한 뒤 기존 10초 응답 제한 안에
+  완료 응답을 받지 못해 `timed out registering the workspace with the user daemon: deadline has
+  elapsed`를 반환했다. 같은 변경의 pull-request Windows 실행과 로컬 전체 suite는 통과해
+  병렬 Windows 부하에 민감한 경로로 확인됐다.
+
+### 근본 원인과 수정 방향
+
+- fresh daemon은 IPC를 bind하기 전에 startup workspace의 legacy source를 inspect하고 sealed
+  plan을 `apply`하면서 다시 inspect한다. 준비 완료 뒤 daemon을 시작한 클라이언트가 같은
+  workspace를 IPC `workspace.register`로 무조건 등록해 동일 source를 세 번째로 inspect한다.
+- legacy inspect는 SQLite family capture, snapshot migration, event/document 검증, 파일 hash를
+  수행한다. Windows의 scratch/private-path 보장은 이 과정에서 `whoami.exe`와 `icacls.exe`
+  utility process를 반복 생성하므로 병렬 CI 부하에서 중복 비용이 증폭된다.
+- 일반 IPC 응답 제한을 30초로 늘리는 timeout-only 수정은 중복 작업과 writer 점유를 그대로
+  정상화하므로 거부했다. exact spawned daemon owner가 bootstrap 등록 영수증을 제공한 경우에만
+  중복 `workspace.register`를 생략하고, incumbent daemon과 새 workspace 등록 경로는 유지한다.
+- 상태: `fix-in-progress`. test-fixtures 전용 content-free inspect marker로 현행 cold start의
+  3회 검사를 고정 재현했으며, 승인된 완료 계약은 plan inspect와 sealed-plan apply reinspection
+  합계 2회다. source hash와 import ledger/workspace cardinality는 유지해야 한다.
 
 ## WSL-009: config 없는 기존 DB의 migration 진입 실패 (WSL/Windows 공통)
 

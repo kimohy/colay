@@ -296,13 +296,31 @@ impl DoctorFixture {
     }
 
     fn colay_in<const N: usize>(&self, repository: &Path, args: [&str; N]) -> Result<Output> {
+        self.colay_in_with_legacy_inspect_marker(repository, args, None)
+    }
+
+    fn colay_with_legacy_inspect_marker<const N: usize>(
+        &self,
+        args: [&str; N],
+        marker: &Path,
+    ) -> Result<Output> {
+        self.colay_in_with_legacy_inspect_marker(&self.repository, args, Some(marker))
+    }
+
+    fn colay_in_with_legacy_inspect_marker<const N: usize>(
+        &self,
+        repository: &Path,
+        args: [&str; N],
+        marker: Option<&Path>,
+    ) -> Result<Output> {
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
         #[cfg(windows)]
         let system_root = env::var_os("SystemRoot").context("SystemRoot is not set")?;
         #[cfg(not(windows))]
         let system_root = "/";
-        let status = Command::new(env!("CARGO_BIN_EXE_colay"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_colay"));
+        command
             .args(args)
             .current_dir(repository)
             .env_clear()
@@ -319,9 +337,11 @@ impl DoctorFixture {
             .env("TEMP", &self.root)
             .env("TMP", &self.root)
             .stdout(Stdio::from(stdout.try_clone()?))
-            .stderr(Stdio::from(stderr.try_clone()?))
-            .status()
-            .context("failed to invoke colay")?;
+            .stderr(Stdio::from(stderr.try_clone()?));
+        if let Some(marker) = marker {
+            command.env("COLAY_TEST_LEGACY_INSPECT_MARKER", marker);
+        }
+        let status = command.status().context("failed to invoke colay")?;
         stdout.seek(SeekFrom::Start(0))?;
         stderr.seek(SeekFrom::Start(0))?;
         let mut stdout_bytes = Vec::new();
@@ -1555,6 +1575,56 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, None)?,
         before
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_legacy_daemon_start_inspects_the_source_exactly_twice() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    let copied_schema_fixture = fixture.root.join("legacy-schema-v8-fixture.db");
+    fs::copy(&legacy_database, &copied_schema_fixture)?;
+    fs::remove_file(&legacy_database)?;
+    fs::copy(&copied_schema_fixture, &legacy_database)?;
+    let source_before = file_content_snapshot(&legacy_database)?;
+    let marker = fixture.root.join("legacy-inspections.log");
+
+    let started = fixture.colay_with_legacy_inspect_marker(["daemon", "start"], &marker)?;
+
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(file_content_snapshot(&legacy_database)?, source_before);
+    let connection = Connection::open_with_flags(
+        fixture.global_database(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM legacy_imports", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM workspaces", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM workspace_paths", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    let inspections = fs::read_to_string(marker)?
+        .lines()
+        .filter(|line| *line == "legacy-inspect")
+        .count();
+    assert_eq!(
+        inspections, 2,
+        "cold daemon bootstrap must inspect once for planning and once for sealed-plan apply"
     );
     Ok(())
 }

@@ -235,6 +235,8 @@ impl LegacyImporter {
         if !source.database.exists() {
             return Ok(None);
         }
+        #[cfg(feature = "test-fixtures")]
+        record_legacy_inspection_marker()?;
         let family = GuardedSqliteFamily::open(&source.root, &source.database)?;
         let canonical_root = family.canonical_root().to_path_buf();
         let scratch_fingerprint =
@@ -3261,6 +3263,97 @@ fn table_exists(connection: &Connection, name: &str) -> StateResult<bool> {
             |row| row.get(0),
         )
         .map_err(StateError::from)
+}
+
+#[cfg(feature = "test-fixtures")]
+fn record_legacy_inspection_marker() -> StateResult<()> {
+    let Some(marker) = std::env::var_os("COLAY_TEST_LEGACY_INSPECT_MARKER") else {
+        return Ok(());
+    };
+    let temporary_root = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .ok_or_else(|| {
+            StateError::InvalidRecord(
+                "legacy inspection test marker requires a temporary root".to_owned(),
+            )
+        })?;
+    append_legacy_inspection_marker(&PathBuf::from(marker), &PathBuf::from(temporary_root))
+}
+
+#[cfg(feature = "test-fixtures")]
+fn append_legacy_inspection_marker(marker: &Path, temporary_root: &Path) -> StateResult<()> {
+    if !marker.is_absolute() {
+        return Err(StateError::InvalidRecord(
+            "legacy inspection test marker path must be absolute".to_owned(),
+        ));
+    }
+    let canonical_root =
+        fs::canonicalize(temporary_root).map_err(|error| StateError::io(temporary_root, error))?;
+    let parent = marker.parent().ok_or_else(|| {
+        StateError::InvalidRecord("legacy inspection test marker has no parent".to_owned())
+    })?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| StateError::io(parent, error))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(StateError::InvalidRecord(
+            "legacy inspection test marker is outside the temporary root".to_owned(),
+        ));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(marker)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy inspection test marker must be a regular file".to_owned(),
+        ));
+    }
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+        .map_err(|error| StateError::io(marker, error))?;
+    std::io::Write::write_all(&mut output, b"legacy-inspect\n")
+        .map_err(|error| StateError::io(marker, error))
+}
+
+#[cfg(all(test, feature = "test-fixtures"))]
+mod legacy_inspection_marker_tests {
+    use std::fs;
+
+    use super::append_legacy_inspection_marker;
+
+    #[test]
+    fn legacy_inspection_marker_appends_only_the_fixed_token_below_temp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let marker = root.join("legacy-inspections.log");
+
+        append_legacy_inspection_marker(&marker, &root)?;
+        append_legacy_inspection_marker(&marker, &root)?;
+
+        assert_eq!(
+            fs::read_to_string(marker)?,
+            "legacy-inspect\nlegacy-inspect\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_inspection_marker_rejects_paths_outside_temp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let allowed = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let allowed_root = fs::canonicalize(allowed.path())?;
+        let marker = fs::canonicalize(outside.path())?.join("legacy-inspections.log");
+
+        let Err(error) = append_legacy_inspection_marker(&marker, &allowed_root) else {
+            return Err("marker outside the bounded temporary root was accepted".into());
+        };
+
+        assert!(error.to_string().contains("outside the temporary root"));
+        assert!(!marker.exists());
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-fixtures = []
+
 [dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true
