@@ -6,7 +6,7 @@ Tests and CI must never invoke real Codex, Claude, Gemini, or Agy inference. Pro
 
 CI clears common provider API-key variables and sets `COLAY_TEST_FAKE_PROVIDERS_ONLY=1` at job scope. Compatibility workflows may build an exact official Codex source revision and run only the explicit version/help/schema probe allowlist; they never pass a prompt.
 
-Configuration, resolver, and rollback tests also use local fixtures and fake binaries only. They do not invoke provider inference: Windows and Unix executable-resolution cases exercise fixture files, and rollback cases validate persisted execution evidence without resolving a live provider binary from the current `PATH`.
+Configuration, resolver, and rollback tests also use local fixtures and fake binaries only. They do not invoke provider inference: Windows and Unix executable-resolution cases exercise fixture files, and rollback cases validate persisted execution evidence without resolving a live provider binary from the current `PATH`. WSL resolver tests simulate `drvfs`, 9p `aname=drvfs`, lexical Windows-drive mounts, and PE signatures with local inert fixture files; the candidates are classified without being invoked.
 
 Daemon tests are also inference-free. State tests race independent SQLite
 connections for command claims and lease acquisition, while runtime tests use
@@ -111,6 +111,19 @@ Unix symlink redirect rejection, and the same 32-client stress contract. Windows
 and WSL evidence is valid only when their resolved databases are under separate
 native temporary roots; a WSL database under `/mnt/<drive>` is a test failure.
 
+After a nightly is published, repeat WSL QA from an isolated npm prefix and
+`COLAY_HOME`. For Codex, Claude, Gemini, and Agy, record the resolved native path
+and verify an ELF binary or Linux-native script identity as appropriate before
+allowing any public version/help probe. A Windows-backed or PE candidate must be
+rejected before that probe and must never be invoked. For every bounded
+plan-only turn, verify the requested provider identity, canonical outcome,
+schema-17 bounded/redacted successful evidence, and zero rows in `tasks`,
+`task_attempts`, `worktrees`, `coordinator_leases`, and `worker_leases`. Finish
+with SQLite `integrity_check`, foreign-key checks, daemon stop, socket removal,
+and confirmation that no QA Colay process remains. Automated tests and CI remain
+fake-only; authorized real-provider turns belong only to this post-release
+operator QA.
+
 ## Required local verification
 
 ```text
@@ -150,7 +163,7 @@ No provider credentials are needed. If an integration test asks for a provider l
 - `orchestrator-test-support/tests/provider_e2e.rs` runs each adapter through fake structured streams or Agy's bounded plain-text bridge, malformed/error/quota paths, cancellation, redaction, bounded process execution, and executable/argv usage probes.
 - `orchestrator-test-support/tests/multi_provider_handover_e2e.rs` drives the vendor-neutral lifecycle from a fake Gemini daily quota event through a sealed checkpoint, Codex implementation, a monthly-headroom warning carried into the Claude handover, Claude read-only review, and the independent completion gate.
 - `orchestrator-cli/tests/fake_cli_handover_e2e.rs` launches the compiled `colay` and gated `colay-e2e-fake-provider` binaries. It proves a Codex quota failure preserves a partial Git diff, Claude exactly acknowledges the sealed bundle before writing, local fmt/clippy/check/test evidence reaches `Completed`, the original branch remains untouched, and no merge/push/cleanup occurs. A second scenario exercises sealed, explicitly approved SQLite restore, recovery backup retention, and the post-restore JSONL hash chain.
-- `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential plan through v15 and historical event hashes, rebuilds constrained command tables without losing rows, proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.
+- `orchestrator-state/tests/migration_contract.rs` starts at SQLite schema v1, verifies the sequential plan through v17 and historical event hashes, and rebuilds constrained tables without losing rows. It checks the v16 failure-outcome constraints and the v17 successful-evidence constraints: v16 and other historical succeeded rows migrate with `evidence_redacted = NULL`, while running, failed, and cancelled evidence remains `NULL`. It also proves dry-run non-mutation, inspects backups, and rejects checksum/future-schema tampering. `orchestrator-state/tests/config_migration.rs` separately verifies config v1 -> v2 -> v3 -> v4, legacy state-path materialization, explicit-path preservation, and the `.colay` v4 default.
 - `orchestrator-cli/tests/daemon_lifecycle.rs` proves public help, hidden internal serve, absent-state status, single-instance start, idempotent start, restart ownership transfer, graceful stop, and child cleanup.
 - `orchestrator-cli/tests/chat_tui_reconnect.rs` proves chat help/docs, durable daemon command processing, redacted persistence, a second SQLite connection restoring the session, and daemon survival/cleanup.
 - `orchestrator-cli/tests/chat_plan_approval.rs` proves the full goal -> read-only fake planner -> validated revision -> exact typed approval path through a real daemon process, with no pre-approval writable artifact and no real provider.

@@ -5,7 +5,8 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
     ConversationFailure, ConversationFailureKind, ConversationRequest, ConversationResponse,
-    collect_conversation_response, diagnose_conversation_failure,
+    collect_conversation_response, collect_conversation_response_with_evidence,
+    diagnose_conversation_failure,
 };
 use serde_json::json;
 
@@ -47,6 +48,67 @@ fn accepts_one_strict_provider_neutral_outcome() -> Result<(), Box<dyn std::erro
         outcome,
         ConversationOutcome::AnswerComplete { .. }
     ));
+    Ok(())
+}
+
+#[test]
+fn successful_collection_returns_bounded_evidence_separate_from_canonical_outcome()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = request();
+    let output = serde_json::to_vec(&json!({
+        "outcome": "answer_complete",
+        "response_redacted": "Git is required only when writable work is approved."
+    }))?;
+    let mut response = response(&request, output);
+    response.evidence_redacted = format!(
+        "read-only provider command started\n{}",
+        "x".repeat(CONVERSATION_MAX_EVIDENCE_BYTES * 2)
+    );
+
+    let collected = collect_conversation_response_with_evidence(&request, response)?;
+
+    assert!(matches!(
+        collected.outcome,
+        ConversationOutcome::AnswerComplete { .. }
+    ));
+    assert!(
+        collected
+            .evidence_redacted
+            .starts_with("read-only provider command started")
+    );
+    assert!(collected.evidence_redacted.ends_with("[truncated]"));
+    assert!(collected.evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert_eq!(
+        serde_json::to_value(&collected.outcome)?,
+        json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Git is required only when writable work is approved."
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn multibyte_success_evidence_is_valid_utf8_and_strictly_byte_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = request();
+    let output = serde_json::to_vec(&json!({
+        "outcome": "answer_complete",
+        "response_redacted": "safe answer"
+    }))?;
+    let mut small = response(&request, output.clone());
+    small.evidence_redacted = "read-only command: \u{d55c}\u{ae00}".to_owned();
+    let small = collect_conversation_response_with_evidence(&request, small)?;
+    assert!(small.evidence_redacted.contains("\u{d55c}\u{ae00}"));
+    assert!(!small.evidence_redacted.ends_with("[truncated]"));
+
+    let mut oversized = response(&request, output);
+    oversized.evidence_redacted = "\u{d55c}".repeat(CONVERSATION_MAX_EVIDENCE_BYTES);
+    let oversized = collect_conversation_response_with_evidence(&request, oversized)?;
+
+    assert!(oversized.evidence_redacted.ends_with("[truncated]"));
+    assert!(oversized.evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert!(std::str::from_utf8(oversized.evidence_redacted.as_bytes()).is_ok());
     Ok(())
 }
 

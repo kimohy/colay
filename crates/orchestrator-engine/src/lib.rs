@@ -16,10 +16,11 @@ mod worktree;
 
 pub use checkpoint::{CheckpointInput, CheckpointManager, GitCheckpointEvidence};
 pub use conversation::{
-    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
-    ConversationFailure, ConversationFailureDiagnostic, ConversationFailureKind,
+    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, CollectedConversationResponse,
+    ConversationExit, ConversationFailure, ConversationFailureDiagnostic, ConversationFailureKind,
     ConversationOrchestrator, ConversationRequest, ConversationResponse,
-    collect_conversation_response, diagnose_conversation_failure,
+    collect_conversation_response, collect_conversation_response_with_evidence,
+    diagnose_conversation_failure,
 };
 pub use coordinator::TaskLifecycle;
 pub use error::{EngineError, EngineResult};

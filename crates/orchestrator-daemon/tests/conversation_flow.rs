@@ -54,6 +54,8 @@ struct FakeConversation {
     outcome: ConversationOutcome,
 }
 
+struct SecretCommandEvidenceConversation;
+
 #[derive(Clone)]
 enum FailureFixture {
     Error(ConversationFailure),
@@ -249,6 +251,32 @@ impl ConversationOrchestrator for FakeConversation {
             exit: ConversationExit::Succeeded,
             output_redacted: serde_json::to_vec(&self.outcome).unwrap_or_default(),
             evidence_redacted: "fake conversation".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl ConversationOrchestrator for SecretCommandEvidenceConversation {
+    async fn converse(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        Ok(ConversationResponse {
+            schema_version: orchestrator_domain::SchemaVersion::v1(),
+            attempt_id: request.attempt_id,
+            session_id: request.session_id,
+            source_message_id: request.source_message_id,
+            provider: request.provider,
+            sandbox: SandboxMode::ReadOnly,
+            exit: ConversationExit::Succeeded,
+            output_redacted: serde_json::to_vec(&ConversationOutcome::AnswerComplete {
+                response_redacted: "safe answer".to_owned(),
+            })
+            .unwrap_or_default(),
+            evidence_redacted: format!(
+                "read-only provider command started: executable=/bin/sh; args={}",
+                "secret-token".repeat(CONVERSATION_MAX_EVIDENCE_BYTES)
+            ),
         })
     }
 }
@@ -872,6 +900,45 @@ async fn provider_failures_are_terminal_actionable_and_preserve_the_session()
         assert_terminal_provider_failure(&run, &case)?;
         assert_terminal_provider_failure_replay(&mut run, &case).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_command_evidence_is_redacted_and_bounded_before_persistence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    let append = append_command(session_id, "inspect safely");
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    workspace.submit_client_command(&append)?;
+    process_next_client_command(&workspace, &SecretRedactor, Utc::now())?;
+    let services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(SecretCommandEvidenceConversation),
+    );
+
+    process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now()).await?;
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    let attempt = workspace
+        .load_conversation_attempt(attempt_id)?
+        .ok_or("conversation attempt is missing")?;
+    let evidence = attempt
+        .evidence_redacted
+        .ok_or("successful command evidence is missing")?;
+    assert!(evidence.contains("read-only provider command started"));
+    assert!(evidence.contains("[REDACTED]"));
+    assert!(!evidence.contains("secret-token"));
+    assert!(evidence.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
+    assert_eq!(
+        attempt.outcome,
+        Some(ConversationOutcome::AnswerComplete {
+            response_redacted: "safe answer".to_owned(),
+        })
+    );
+    assert_zero_writable_rows(&database_path, &workspace)?;
     Ok(())
 }
 

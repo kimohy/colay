@@ -7,9 +7,9 @@ use orchestrator_domain::{
     SchemaVersion, SessionId, TaskEvent,
 };
 use orchestrator_engine::{
-    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationFailure, ConversationFailureKind,
-    ConversationOrchestrator, ConversationRequest, collect_conversation_response,
-    diagnose_conversation_failure,
+    CONVERSATION_MAX_EVIDENCE_BYTES, CollectedConversationResponse, ConversationFailure,
+    ConversationFailureKind, ConversationOrchestrator, ConversationRequest,
+    collect_conversation_response_with_evidence, diagnose_conversation_failure,
 };
 use orchestrator_state::{
     ConversationAttemptStatus, NewConversationAttempt, StateError, WorkspaceDatabase,
@@ -141,7 +141,7 @@ pub(crate) async fn request_conversation_turn(
         sandbox: SandboxMode::ReadOnly,
     };
     let collected = match orchestrator.converse(request.clone()).await {
-        Ok(response) => collect_conversation_response(&request, response),
+        Ok(response) => collect_conversation_response_with_evidence(&request, response),
         Err(error) => Err(error),
     };
     finalize_conversation_turn(
@@ -161,13 +161,21 @@ fn finalize_conversation_turn(
     command: &ClientCommand,
     request: &ConversationRequest,
     provider_selection: ConversationProviderSelection,
-    collected: Result<ConversationOutcome, ConversationFailure>,
+    collected: Result<CollectedConversationResponse, ConversationFailure>,
     now: DateTime<Utc>,
 ) -> Result<String, ConversationCommandError> {
     match collected {
-        Ok(outcome) => {
-            let outcome = apply_provider_fallback_notice(outcome, provider_selection);
-            database.finish_conversation_attempt(request.attempt_id, &outcome, now)?;
+        Ok(collected) => {
+            let outcome = apply_provider_fallback_notice(collected.outcome, provider_selection);
+            let evidence_redacted = bounded_redacted(redactor, &collected.evidence_redacted);
+            let evidence_redacted =
+                (!evidence_redacted.trim().is_empty()).then_some(evidence_redacted.as_str());
+            database.finish_conversation_attempt_with_evidence(
+                request.attempt_id,
+                &outcome,
+                evidence_redacted,
+                now,
+            )?;
             reconcile_outcome(
                 database,
                 command,

@@ -9,6 +9,7 @@ use orchestrator_domain::{
 use orchestrator_engine::{
     CONVERSATION_MAX_EVIDENCE_BYTES, ConversationExit, ConversationFailure,
     ConversationOrchestrator, ConversationRequest, collect_conversation_response,
+    collect_conversation_response_with_evidence,
 };
 use orchestrator_providers::AdapterRuntime;
 use orchestrator_state::RootConfig;
@@ -30,6 +31,80 @@ fn allowed_fake_binary(repository: &std::path::Path) -> Result<PathBuf, std::io:
 
 fn capability() -> ProviderCapabilities {
     fake_conversation_capability(ProviderId::Codex)
+}
+
+fn codex_only_config(executable: &std::path::Path) -> Result<RootConfig, &'static str> {
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.agy = None;
+    config.orchestrator.providers.claude = None;
+    config
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .executable = executable.to_string_lossy().into_owned();
+    Ok(config)
+}
+
+#[tokio::test]
+async fn verified_read_only_command_is_evidence_but_file_change_remains_terminal()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::ReadOnlyCommand,
+    )?);
+    let config = codex_only_config(&executable)?;
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+    let success_request = request("scenario:read-only-command");
+    let collected = collect_conversation_response_with_evidence(
+        &success_request,
+        orchestrator.converse(success_request.clone()).await?,
+    )?;
+    assert!(matches!(
+        collected.outcome,
+        ConversationOutcome::AnswerComplete { .. }
+    ));
+    assert!(
+        collected
+            .evidence_redacted
+            .contains("read-only provider command started")
+    );
+
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::ReadOnlyCommandWithFileChange,
+    )?);
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+    let failure_request = request("scenario:read-only-command-file-change");
+    let response = orchestrator.converse(failure_request.clone()).await?;
+    assert!(
+        response
+            .evidence_redacted
+            .contains("read-only conversation reported a file change")
+    );
+    assert!(matches!(
+        collect_conversation_response(&failure_request, response),
+        Err(ConversationFailure::Lifecycle { .. })
+    ));
+    Ok(())
 }
 
 #[tokio::test]

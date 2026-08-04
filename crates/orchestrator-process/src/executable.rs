@@ -1,6 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs,
+    io::Read as _,
     path::{Component, Path, PathBuf},
 };
 
@@ -33,9 +34,45 @@ pub enum ExecutableKind {
 #[derive(Clone, Debug)]
 pub struct ExecutableSearch {
     pub platform: ExecutablePlatform,
+    pub host: ExecutableHostContext,
+    pub policy: ExecutablePolicy,
     pub path: Vec<PathBuf>,
     pub pathext: Vec<OsString>,
     pub working_directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutableHostContext {
+    pub is_wsl: bool,
+    pub windows_mounts: Vec<PathBuf>,
+}
+
+impl ExecutableHostContext {
+    pub(crate) fn current() -> Self {
+        let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::env::var_os("WSL_INTEROP").is_some()
+            || fs::read_to_string("/proc/sys/kernel/osrelease")
+                .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"));
+        let windows_mounts = if is_wsl {
+            fs::read_to_string("/proc/self/mountinfo").map_or_else(
+                |_| Vec::new(),
+                |value| windows_mounts_from_mountinfo(&value),
+            )
+        } else {
+            Vec::new()
+        };
+        Self {
+            is_wsl,
+            windows_mounts,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutablePolicy {
+    #[default]
+    General,
+    Provider,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +123,14 @@ pub enum ExecutableResolutionError {
         candidate: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error(
+        "WSL requires a Linux-native provider executable; rejected configured executable `{configured}` candidate `{candidate}`: {reason}. Install the provider inside this WSL distribution and ensure its Linux binary appears on PATH before any Windows-mounted path"
+    )]
+    WslNonNativeCandidate {
+        configured: PathBuf,
+        candidate: PathBuf,
+        reason: String,
     },
     #[error("configured executable `{configured}` was not found on the effective PATH")]
     NotFound {
@@ -285,6 +330,7 @@ fn resolve_explicit(
             reason: "regular file is not executable".to_owned(),
         });
     }
+    validate_wsl_native_candidate(configured, &resolved, search)?;
     let kind = executable_kind(&resolved, search.platform);
     Ok(ResolvedExecutable {
         configured: configured.to_path_buf(),
@@ -394,6 +440,7 @@ fn resolved_bare(
     path: PathBuf,
     search: &ExecutableSearch,
 ) -> Result<ResolvedExecutable, ExecutableResolutionError> {
+    validate_wsl_native_candidate(configured, &path, search)?;
     let search_directory = path.parent().map(Path::to_path_buf).ok_or_else(|| {
         ExecutableResolutionError::ExplicitNotFile {
             configured: configured.to_path_buf(),
@@ -409,6 +456,129 @@ fn resolved_bare(
             search_directory: Some(search_directory),
         },
     })
+}
+
+fn validate_wsl_native_candidate(
+    configured: &Path,
+    candidate: &Path,
+    search: &ExecutableSearch,
+) -> Result<(), ExecutableResolutionError> {
+    if search.policy == ExecutablePolicy::General || !search.host.is_wsl {
+        return Ok(());
+    }
+
+    let canonical = fs::canonicalize(candidate)
+        .map_err(|error| candidate_io_failure(configured, candidate.to_path_buf(), error))?;
+    let mut windows_mounts = search.host.windows_mounts.clone();
+    windows_mounts.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let windows_backed = [candidate, canonical.as_path()].into_iter().any(|path| {
+        is_lexical_windows_drive_mount(path)
+            || windows_mounts.iter().any(|root| path.starts_with(root))
+    });
+    if windows_backed {
+        return Err(ExecutableResolutionError::WslNonNativeCandidate {
+            configured: configured.to_path_buf(),
+            candidate: candidate.to_path_buf(),
+            reason: "candidate is located on a Windows-backed mount".to_owned(),
+        });
+    }
+
+    let mut file = fs::File::open(&canonical)
+        .map_err(|error| candidate_io_failure(configured, candidate.to_path_buf(), error))?;
+    let mut magic = [0_u8; 2];
+    file.read_exact(&mut magic)
+        .map_err(|error| candidate_io_failure(configured, candidate.to_path_buf(), error))?;
+    if magic == *b"MZ" {
+        return Err(ExecutableResolutionError::WslNonNativeCandidate {
+            configured: configured.to_path_buf(),
+            candidate: candidate.to_path_buf(),
+            reason: "candidate has a Windows PE header".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn windows_mounts_from_mountinfo(mountinfo: &str) -> Vec<PathBuf> {
+    let mut mounts = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let separator = fields.iter().position(|field| *field == "-")?;
+            if separator < 6 || fields.len() <= separator + 3 {
+                return None;
+            }
+            let filesystem = fields[separator + 1];
+            let source = fields[separator + 2];
+            let has_drvfs_9p_option = filesystem == "9p"
+                && fields[5..separator]
+                    .iter()
+                    .chain(fields[separator + 3..].iter())
+                    .flat_map(|field| field.split(','))
+                    .any(|option| option == "aname=drvfs" || option.starts_with("aname=drvfs;"));
+            if filesystem == "drvfs" || source == "drvfs" || has_drvfs_9p_option {
+                Some(PathBuf::from(decode_mountinfo_field(fields[4])))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    mounts.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    mounts.dedup();
+    mounts
+}
+
+fn decode_mountinfo_field(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 3 < bytes.len() && bytes[index] == b'\\' {
+            let replacement = match &bytes[index + 1..index + 4] {
+                b"040" => Some(b' '),
+                b"011" => Some(b'\t'),
+                b"012" => Some(b'\n'),
+                b"134" => Some(b'\\'),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                decoded.push(replacement);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_owned())
+}
+
+fn is_lexical_windows_drive_mount(path: &Path) -> bool {
+    if !path.has_root() {
+        return false;
+    }
+    let mut normal = path.components().filter_map(|component| match component {
+        Component::Normal(value) => value.to_str(),
+        _ => None,
+    });
+    let Some(mnt) = normal.next() else {
+        return false;
+    };
+    let Some(drive) = normal.next() else {
+        return false;
+    };
+    mnt.eq_ignore_ascii_case("mnt") && drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic()
 }
 
 fn canonicalize_resolution_path(path: PathBuf) -> Result<PathBuf, ExecutableResolutionError> {
@@ -571,9 +741,41 @@ mod tests {
         ) -> ExecutableSearch {
             ExecutableSearch {
                 platform,
+                host: ExecutableHostContext::default(),
+                policy: ExecutablePolicy::General,
                 path: directories.map(|directory| self.path(directory)).into(),
                 pathext: pathext.split(';').map(OsString::from).collect(),
                 working_directory: self.root.path().to_path_buf(),
+            }
+        }
+
+        fn wsl_search<const N: usize>(
+            &self,
+            directories: [&str; N],
+            windows_mounts: Vec<PathBuf>,
+        ) -> ExecutableSearch {
+            let mut search = self.search(ExecutablePlatform::Unix, "", directories);
+            search.host = ExecutableHostContext {
+                is_wsl: true,
+                windows_mounts,
+            };
+            search.policy = ExecutablePolicy::Provider;
+            search
+        }
+
+        #[cfg_attr(not(unix), allow(clippy::unused_self))]
+        fn make_executable(&self, relative: impl AsRef<Path>) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let path = self.path(relative);
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .unwrap_or_else(|error| panic!("set fixture executable permission: {error}"));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = relative;
             }
         }
 
@@ -597,6 +799,157 @@ mod tests {
             .unwrap_or_else(|error| panic!("resolve codex: {error}"));
         assert_eq!(resolved.path, fixture.path("second/codex.cmd"));
         assert_eq!(resolved.kind, ExecutableKind::CommandScript);
+    }
+
+    #[test]
+    fn wsl_accepts_a_native_linux_provider_candidate() {
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("linux/bin/provider", b"#!/bin/sh\nexit 0\n");
+        fixture.make_executable("linux/bin/provider");
+        let search = fixture.wsl_search(["linux/bin"], Vec::new());
+
+        let resolved = resolve_executable(Path::new("provider"), &search)
+            .unwrap_or_else(|error| panic!("resolve native WSL provider: {error}"));
+
+        assert_eq!(resolved.path, fixture.path("linux/bin/provider"));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn wsl_rejects_a_provider_on_a_windows_backed_mount() {
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("windows/bin/provider", b"#!/bin/sh\nexit 0\n");
+        fixture.make_executable("windows/bin/provider");
+        let mount = fixture.path("windows");
+        let search = fixture.wsl_search(["windows/bin"], vec![mount]);
+
+        let error = resolve_executable(Path::new("provider"), &search)
+            .expect_err("Windows-backed WSL provider unexpectedly resolved");
+
+        assert!(matches!(
+            error,
+            ExecutableResolutionError::WslNonNativeCandidate { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("Install the provider inside this WSL distribution")
+        );
+    }
+
+    #[test]
+    fn wsl_rejects_a_renamed_pe_candidate() {
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("linux/bin/provider", b"MZ\x90\0fake-pe");
+        fixture.make_executable("linux/bin/provider");
+        let search = fixture.wsl_search(["linux/bin"], Vec::new());
+
+        assert!(matches!(
+            resolve_executable(Path::new("provider"), &search),
+            Err(ExecutableResolutionError::WslNonNativeCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn wsl_general_process_resolution_is_not_reclassified_as_a_provider() {
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("windows/bin/git", b"MZ\x90\0fixture");
+        fixture.make_executable("windows/bin/git");
+        let mut search = fixture.wsl_search(["windows/bin"], vec![fixture.path("windows")]);
+        search.policy = ExecutablePolicy::General;
+
+        let resolved = resolve_executable(Path::new("git"), &search)
+            .unwrap_or_else(|error| panic!("general command policy changed: {error}"));
+
+        assert_eq!(resolved.path, fixture.path("windows/bin/git"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wsl_rejects_a_symlink_to_a_pe_candidate() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("payload/provider.exe", b"MZ\x90\0fake-pe");
+        fs::set_permissions(
+            fixture.path("payload/provider.exe"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap_or_else(|error| panic!("set PE fixture permission: {error}"));
+        fs::create_dir_all(fixture.path("linux/bin"))
+            .unwrap_or_else(|error| panic!("create symlink parent: {error}"));
+        symlink(
+            fixture.path("payload/provider.exe"),
+            fixture.path("linux/bin/provider"),
+        )
+        .unwrap_or_else(|error| panic!("create provider symlink: {error}"));
+        let search = fixture.wsl_search(["linux/bin"], Vec::new());
+
+        assert!(matches!(
+            resolve_executable(Path::new("provider"), &search),
+            Err(ExecutableResolutionError::WslNonNativeCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn mountinfo_parser_recognizes_drvfs_and_drvfs_backed_9p() {
+        let mounts = windows_mounts_from_mountinfo(
+            "36 25 0:32 / /mnt/c rw - drvfs C: rw\n\
+             37 25 0:33 / /windows rw - 9p drvfs rw,aname=drvfs",
+        );
+
+        assert!(mounts.contains(&PathBuf::from("/mnt/c")));
+        assert!(mounts.contains(&PathBuf::from("/windows")));
+    }
+
+    #[test]
+    fn wsl_rejects_custom_9p_drvfs_mount_with_semicolon_suboptions() {
+        let fixture = SearchFixture::new();
+        fixture.write_bytes("custom/bin/provider", b"#!/bin/sh\nexit 0\n");
+        fixture.make_executable("custom/bin/provider");
+        let custom_mount = fixture.path("custom");
+        let lookalike_mount = fixture.path("lookalike");
+        let mountinfo = format!(
+            "36 25 0:32 / {} rw - 9p unrelated rw,aname=drvfs;path=/custom-root\n\
+             37 25 0:33 / {} rw - 9p unrelated rw,aname=drvfsx;path=/not-drvfs",
+            custom_mount.display(),
+            lookalike_mount.display(),
+        );
+        let mounts = windows_mounts_from_mountinfo(&mountinfo);
+
+        assert!(mounts.contains(&custom_mount));
+        assert!(!mounts.contains(&lookalike_mount));
+        let search = fixture.wsl_search(["custom/bin"], mounts);
+
+        assert!(matches!(
+            resolve_executable(Path::new("provider"), &search),
+            Err(ExecutableResolutionError::WslNonNativeCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn mountinfo_parser_decodes_escaped_mount_points() {
+        let mounts = windows_mounts_from_mountinfo(
+            "36 25 0:32 / /mnt/space\\040tab\\011line\\012slash\\134name rw - drvfs C: rw",
+        );
+
+        assert_eq!(
+            mounts,
+            vec![PathBuf::from("/mnt/space tab\tline\nslash\\name")]
+        );
+    }
+
+    #[test]
+    fn lexical_windows_drive_mount_is_detected_without_mountinfo() {
+        assert!(is_lexical_windows_drive_mount(Path::new(
+            "/mnt/c/tools/agy.exe"
+        )));
+        assert!(!is_lexical_windows_drive_mount(Path::new(
+            "/opt/agy/bin/agy"
+        )));
+        assert!(!is_lexical_windows_drive_mount(Path::new(
+            "mnt/c/tools/agy.exe"
+        )));
     }
 
     #[test]

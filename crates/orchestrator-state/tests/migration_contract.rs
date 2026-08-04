@@ -51,7 +51,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(initial.current_version, 1);
     assert_eq!(
         initial.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
 
     let dry_run = database.dry_run_migrations()?;
@@ -120,7 +120,7 @@ fn v1_to_current_dry_run_is_non_mutating_and_apply_keeps_a_readable_backup()
     assert_eq!(backup_status.current_version, 1);
     assert_eq!(
         backup_status.pending_versions,
-        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     Ok(())
 }
@@ -682,7 +682,7 @@ fn assert_v16_conversation_attempt_integrity(
 }
 
 #[test]
-fn v15_conversation_attempts_gain_durable_failure_outcomes_without_losing_rows()
+fn v15_conversation_attempts_gain_failure_outcomes_and_v17_success_evidence_without_losing_rows()
 -> Result<(), Box<dyn std::error::Error>> {
     let V15ConversationFixture {
         _directory,
@@ -700,7 +700,7 @@ fn v15_conversation_attempts_gain_durable_failure_outcomes_without_losing_rows()
     let migrated = MigrationManager::apply(&mut connection)?;
     drop(connection);
     let database = Database::open(&database_path)?;
-    assert_eq!(migrated.current_version, 16);
+    assert_eq!(migrated.current_version, 17);
     with_database_connection(&database, |connection| {
         assert_v15_preserved_attempts(connection, &data)?;
 
@@ -713,8 +713,86 @@ fn v15_conversation_attempts_gain_durable_failure_outcomes_without_losing_rows()
         assert_v16_rejects_invalid_failure_outcomes(connection, &data);
         assert_v16_rejects_invalid_failure_errors(connection, &data);
         assert_v16_conversation_attempt_integrity(connection, &data)?;
+        assert_v17_success_evidence_contract(connection, &data)?;
         Ok(())
     })?;
+    Ok(())
+}
+
+fn assert_v17_success_evidence_contract(
+    connection: &Connection,
+    data: &V15ConversationData,
+) -> Result<(), StateError> {
+    for attempt_id in [
+        &data.running_id,
+        &data.succeeded_id,
+        &data.failed_id,
+        &data.blank_error_id,
+    ] {
+        let evidence: Option<String> = connection.query_row(
+            "SELECT evidence_redacted FROM conversation_attempts
+             WHERE workspace_id = ?1 AND attempt_id = ?2",
+            params![data.workspace_id.to_string(), attempt_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(evidence, None, "historical evidence for {attempt_id}");
+    }
+
+    let valid_id = uuid::Uuid::now_v7().to_string();
+    connection.execute(
+        "INSERT INTO conversation_attempts(
+            workspace_id, attempt_id, session_id, source_message_id, provider_id,
+            status, outcome_json, evidence_redacted, started_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, 'codex', 'succeeded', ?5, ?6, ?7, ?7)",
+        params![
+            data.workspace_id.to_string(),
+            valid_id,
+            data.session_id,
+            data.message_id,
+            r#"{"outcome":"answer_complete","response_redacted":"done"}"#,
+            "read-only provider command started",
+            data.now,
+        ],
+    )?;
+    for evidence in [" ".to_owned(), "x".repeat(16 * 1024 + 1)] {
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO conversation_attempts(
+                        workspace_id, attempt_id, session_id, source_message_id, provider_id,
+                        status, outcome_json, evidence_redacted, started_at, completed_at)
+                     VALUES (?1, ?2, ?3, ?4, 'codex', 'succeeded', ?5, ?6, ?7, ?7)",
+                    params![
+                        data.workspace_id.to_string(),
+                        uuid::Uuid::now_v7().to_string(),
+                        data.session_id,
+                        data.message_id,
+                        r#"{"outcome":"answer_complete","response_redacted":"done"}"#,
+                        evidence,
+                        data.now,
+                    ],
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        connection
+            .execute(
+                "UPDATE conversation_attempts SET evidence_redacted = 'changed'
+                 WHERE workspace_id = ?1 AND attempt_id = ?2",
+                params![data.workspace_id.to_string(), valid_id],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE conversation_attempts SET status = 'failed', evidence_redacted = 'bad'
+                 WHERE workspace_id = ?1 AND attempt_id = ?2",
+                params![data.workspace_id.to_string(), data.running_id],
+            )
+            .is_err()
+    );
     Ok(())
 }
 
@@ -748,8 +826,12 @@ fn restore_v15_conversation_attempts_schema(connection: &Connection) -> rusqlite
                  OR (status IN ('failed', 'cancelled') AND outcome_json IS NULL AND error_redacted IS NOT NULL AND completed_at IS NOT NULL)
              )
          ) STRICT;
-         INSERT INTO conversation_attempts
-         SELECT * FROM conversation_attempts_after_v15;
+         INSERT INTO conversation_attempts(
+             workspace_id, attempt_id, session_id, source_message_id, provider_id,
+             status, outcome_json, error_redacted, started_at, completed_at)
+         SELECT workspace_id, attempt_id, session_id, source_message_id, provider_id,
+                status, outcome_json, error_redacted, started_at, completed_at
+         FROM conversation_attempts_after_v15;
          DROP TABLE conversation_attempts_after_v15;
          CREATE INDEX conversation_attempts_session_time
              ON conversation_attempts(workspace_id, session_id, started_at DESC);
@@ -764,7 +846,7 @@ fn restore_v15_conversation_attempts_schema(connection: &Connection) -> rusqlite
          BEGIN SELECT RAISE(ABORT, 'conversation attempt completion is append-once'); END;
          CREATE TRIGGER conversation_attempts_no_delete BEFORE DELETE ON conversation_attempts
          BEGIN SELECT RAISE(ABORT, 'conversation attempts are append-only'); END;
-         DELETE FROM schema_migrations WHERE version = 16;
+         DELETE FROM schema_migrations WHERE version IN (16, 17);
          PRAGMA user_version = 15;",
     )?;
     Ok(())

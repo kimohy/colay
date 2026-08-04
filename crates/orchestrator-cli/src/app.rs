@@ -558,7 +558,7 @@ async fn doctor(
         );
         let resolution = provider_config(&effective.config().orchestrator, report.provider).map(
             |config| async {
-                diagnostic_command(
+                provider_diagnostic_command(
                     &config.executable,
                     ["--version"],
                     repository,
@@ -6240,7 +6240,7 @@ async fn collect_usage(
                 bail!("only JSON usage probes are supported");
             }
             let working_directory = current_repository()?;
-            let result = run_bounded_command(
+            let result = run_bounded_provider_command(
                 executable,
                 args.iter().map(String::as_str),
                 &working_directory,
@@ -6460,11 +6460,13 @@ async fn probe_provider(
 
     let repository = current_repository()?;
     let version =
-        diagnostic_command(&config.executable, ["--version"], &repository, redaction).await?;
+        provider_diagnostic_command(&config.executable, ["--version"], &repository, redaction)
+            .await?;
     if !version.success() {
         bail!("{} --version failed", provider.as_str());
     }
-    let help = diagnostic_command(&config.executable, ["--help"], &repository, redaction).await?;
+    let help =
+        provider_diagnostic_command(&config.executable, ["--help"], &repository, redaction).await?;
     let help_text = format!(
         "{}\n{}",
         help.stdout.redacted_text, help.stderr.redacted_text
@@ -6550,13 +6552,13 @@ impl CapabilitySource for ProcessCapabilitySource {
     type Error = ProcessError;
 
     fn run(&mut self, command: &ProbeCommand) -> Result<ProbeOutput, Self::Error> {
-        let mut spec = CommandSpec::new(&self.executable)
-            .args(command.args.clone())
-            .current_dir(&self.working_directory);
-        spec.timeout = Duration::from_secs(20);
-        spec.stdout_limit = 4 * 1024 * 1024;
-        spec.stderr_limit = 2 * 1024 * 1024;
-        spec.redaction = self.redaction.clone();
+        let spec = provider_command_spec(
+            &self.executable,
+            command.args.clone(),
+            &self.working_directory,
+            20,
+            &self.redaction,
+        );
         let result = self
             .handle
             .block_on(ProcessRunner.run(spec, CancellationToken::new()))?;
@@ -6568,16 +6570,16 @@ impl CapabilitySource for ProcessCapabilitySource {
     }
 }
 
-async fn diagnostic_command<const N: usize>(
+async fn provider_diagnostic_command<const N: usize>(
     executable: &str,
     args: [&str; N],
     working_directory: &Path,
     redaction: &RedactionConfig,
 ) -> Result<orchestrator_process::ProcessResult> {
-    run_bounded_command(executable, args, working_directory, 20, redaction).await
+    run_bounded_provider_command(executable, args, working_directory, 20, redaction).await
 }
 
-async fn run_bounded_command<I, S>(
+async fn run_bounded_provider_command<I, S>(
     executable: &str,
     args: I,
     working_directory: &Path,
@@ -6588,17 +6590,39 @@ where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
 {
+    let spec = provider_command_spec(
+        Path::new(executable),
+        args,
+        working_directory,
+        timeout_seconds,
+        redaction,
+    );
+    ProcessRunner
+        .run(spec, CancellationToken::new())
+        .await
+        .map_err(Into::into)
+}
+
+fn provider_command_spec<I, S>(
+    executable: &Path,
+    args: I,
+    working_directory: &Path,
+    timeout_seconds: u64,
+    redaction: &RedactionConfig,
+) -> CommandSpec
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
     let mut spec = CommandSpec::new(executable)
+        .require_native_provider()
         .args(args)
         .current_dir(working_directory);
     spec.timeout = Duration::from_secs(timeout_seconds);
     spec.stdout_limit = 4 * 1024 * 1024;
     spec.stderr_limit = 2 * 1024 * 1024;
     spec.redaction = redaction.clone();
-    ProcessRunner
-        .run(spec, CancellationToken::new())
-        .await
-        .map_err(Into::into)
+    spec
 }
 
 fn transition_task(
@@ -7393,7 +7417,10 @@ mod tests {
         TaskEnvelope, TaskEvent, TaskId, TaskState, TestEvidence, TestStatus, VerificationStatus,
         WorkerOutcome, WorkerRequest, WorkerResult,
     };
-    use orchestrator_process::{EnvironmentPolicy, RedactionConfig, Redactor, resolve_executable};
+    use orchestrator_process::{
+        EnvironmentPolicy, ExecutableHostContext, ExecutablePlatform, ExecutablePolicy,
+        ExecutableResolutionError, ExecutableSearch, RedactionConfig, Redactor, resolve_executable,
+    };
     use orchestrator_state::{
         ConfigEnvironment, DaemonStatus, Database, DatabaseHealth, GlobalStatePaths, NewTaskRecord,
         RootConfig, WorkspaceDatabase, WorkspaceId, WorkspaceKind, WorkspaceRegistration,
@@ -7407,10 +7434,72 @@ mod tests {
         acceptance_evidence, acquire_maintenance_with_legacy_inspection, acquire_task_coordinator,
         acquire_worker_lease, append_live_doctor_checks, block_for_unconfirmed_termination,
         initialize, live_legacy_import_check, load_config_runtime, mixed_git_checkout_warning,
-        next_run_command_poll_interval, provider_adapter, reset_model_profile,
-        rollback_resolution_context, run_with_coordinator_renewal, run_worker, set_model_profile,
-        set_provider_enabled, trusted_rollback_steps, worker_started_payload,
+        next_run_command_poll_interval, provider_adapter, provider_command_spec,
+        reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
+        set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
     };
+
+    #[test]
+    fn cli_provider_command_spec_requires_a_native_provider() {
+        let spec = provider_command_spec(
+            Path::new("fake-provider-cli"),
+            ["--version"],
+            Path::new("."),
+            20,
+            &RedactionConfig::default(),
+        );
+
+        assert_eq!(spec.executable_policy, ExecutablePolicy::Provider);
+    }
+
+    #[test]
+    fn cli_provider_probe_rejects_windows_mount_before_invocation() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let windows_mount = root.join("windows");
+        fs::create_dir_all(&windows_mount)?;
+        let marker = root.join("provider-invoked.marker");
+        let provider = windows_mount.join(if cfg!(windows) {
+            "fake-provider-cli.exe"
+        } else {
+            "fake-provider-cli"
+        });
+        fs::write(
+            &provider,
+            format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))?;
+        }
+        let spec = provider_command_spec(
+            &provider,
+            ["--version"],
+            &root,
+            20,
+            &RedactionConfig::default(),
+        );
+        let search = ExecutableSearch {
+            platform: ExecutablePlatform::Unix,
+            host: ExecutableHostContext {
+                is_wsl: true,
+                windows_mounts: vec![windows_mount],
+            },
+            policy: spec.executable_policy,
+            path: Vec::new(),
+            pathext: Vec::new(),
+            working_directory: root,
+        };
+
+        assert!(matches!(
+            resolve_executable(&spec.executable, &search),
+            Err(ExecutableResolutionError::WslNonNativeCandidate { .. })
+        ));
+        assert!(!marker.exists());
+        Ok(())
+    }
 
     #[test]
     fn legacy_import_inspection_follows_the_maintenance_ownership_decision() -> Result<()> {

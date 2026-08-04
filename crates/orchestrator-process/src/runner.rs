@@ -23,8 +23,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ExecutablePlatform, ExecutableResolutionError, ExecutableSearch, RedactionConfig,
-    RedactionError, Redactor, ResolvedExecutable, resolve_executable,
+    ExecutableHostContext, ExecutablePlatform, ExecutablePolicy, ExecutableResolutionError,
+    ExecutableSearch, RedactionConfig, RedactionError, Redactor, ResolvedExecutable,
+    resolve_executable,
 };
 
 const DEFAULT_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
@@ -33,6 +34,7 @@ const DEFAULT_STDERR_LIMIT: usize = 8 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub executable: PathBuf,
+    pub executable_policy: ExecutablePolicy,
     pub args: Vec<OsString>,
     pub working_dir: Option<PathBuf>,
     pub stdin: Vec<u8>,
@@ -54,6 +56,7 @@ impl CommandSpec {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            executable_policy: ExecutablePolicy::General,
             args: Vec::new(),
             working_dir: None,
             stdin: Vec::new(),
@@ -76,6 +79,12 @@ impl CommandSpec {
     #[must_use]
     pub fn args(mut self, arguments: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
         self.args.extend(arguments.into_iter().map(Into::into));
+        self
+    }
+
+    #[must_use]
+    pub const fn require_native_provider(mut self) -> Self {
+        self.executable_policy = ExecutablePolicy::Provider;
         self
     }
 
@@ -167,6 +176,8 @@ impl EnvironmentPolicy {
             .unwrap_or_default();
         ExecutableSearch {
             platform,
+            host: ExecutableHostContext::current(),
+            policy: ExecutablePolicy::General,
             path,
             pathext,
             working_directory,
@@ -514,9 +525,10 @@ impl ProcessSupervisor {
         validate_spec(&spec)?;
         let redactor = Redactor::new(&spec.redaction)?;
         let working_directory = absolute_working_directory(spec.working_dir.as_deref())?;
-        let search = spec
+        let mut search = spec
             .environment
             .executable_search(working_directory.clone());
+        search.policy = spec.executable_policy;
         let resolved_executable = resolve_executable(&spec.executable, &search)?;
         let mut command = Command::new(&resolved_executable.path);
         command
