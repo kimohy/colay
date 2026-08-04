@@ -528,6 +528,7 @@ pub struct IpcServer {
     pipe_owner_sid: String,
     database: Arc<Database>,
     paths: GlobalStatePaths,
+    startup_workspace_id: Option<WorkspaceId>,
     workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
 }
 
@@ -564,6 +565,7 @@ impl IpcServer {
                 listener,
                 database,
                 paths: paths.clone(),
+                startup_workspace_id: None,
                 workspace_activations: None,
             })
         }
@@ -586,6 +588,7 @@ impl IpcServer {
                 pipe_owner_sid: orchestrator_state::current_windows_user_sid()?,
                 database,
                 paths: paths.clone(),
+                startup_workspace_id: None,
                 workspace_activations: None,
             })
         }
@@ -596,6 +599,12 @@ impl IpcServer {
                 "local IPC is unsupported on this platform".to_owned(),
             ))
         }
+    }
+
+    #[must_use]
+    pub fn with_startup_workspace_id(mut self, startup_workspace_id: WorkspaceId) -> Self {
+        self.startup_workspace_id = Some(startup_workspace_id);
+        self
     }
 
     #[must_use]
@@ -646,12 +655,14 @@ impl IpcServer {
                     let connection_writer = writer.clone();
                     let connection_database = Arc::clone(&self.database);
                     let connection_paths = self.paths.clone();
+                    let startup_workspace_id = self.startup_workspace_id;
                     connections.spawn(async move {
                         handle_connection(
                             stream,
                             connection_database,
                             connection_paths,
                             connection_writer,
+                            startup_workspace_id,
                         ).await
                     });
                 }
@@ -686,6 +697,7 @@ impl IpcServer {
             let database = Arc::clone(&self.database);
             let paths = self.paths.clone();
             let writer = writer.clone();
+            let startup_workspace_id = self.startup_workspace_id;
             let cancellation = listener_cancellation.clone();
             listeners.spawn(async move {
                 accept_windows_pipe_loop(
@@ -694,6 +706,7 @@ impl IpcServer {
                     database,
                     paths,
                     writer,
+                    startup_workspace_id,
                     cancellation,
                 )
                 .await
@@ -730,6 +743,7 @@ async fn accept_windows_pipe_loop(
     database: Arc<Database>,
     paths: GlobalStatePaths,
     writer: mpsc::Sender<WriterRequest>,
+    startup_workspace_id: Option<WorkspaceId>,
     cancellation: CancellationToken,
 ) -> Result<(), IpcError> {
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -767,6 +781,7 @@ async fn accept_windows_pipe_loop(
                         connection_database,
                         connection_paths,
                         connection_writer,
+                        startup_workspace_id,
                     ).await
                 });
             }
@@ -803,6 +818,7 @@ async fn handle_connection<S>(
     database: Arc<Database>,
     paths: GlobalStatePaths,
     writer: mpsc::Sender<WriterRequest>,
+    startup_workspace_id: Option<WorkspaceId>,
 ) -> Result<(), IpcError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -834,7 +850,10 @@ where
                     stream_task_status(&mut output, &database, &request).await?;
                     return Ok(());
                 }
-                Ok(request) => dispatch_request(request, &database, &paths, &writer).await,
+                Ok(request) => {
+                    dispatch_request(request, &database, &paths, &writer, startup_workspace_id)
+                        .await
+                }
                 Err(_) => IpcResponse::failure(String::new(), "IPC request is not valid JSON"),
             }
         };
@@ -1017,6 +1036,7 @@ async fn dispatch_request(
     database: &Database,
     paths: &GlobalStatePaths,
     writer: &mpsc::Sender<WriterRequest>,
+    startup_workspace_id: Option<WorkspaceId>,
 ) -> IpcResponse {
     if request.schema_version != IPC_SCHEMA_VERSION {
         return IpcResponse::failure(
@@ -1027,7 +1047,7 @@ async fn dispatch_request(
             ),
         );
     }
-    if let Some(response) = dispatch_read_request(database, paths, &request) {
+    if let Some(response) = dispatch_read_request(database, paths, &request, startup_workspace_id) {
         return response;
     }
     if !matches!(
@@ -1059,9 +1079,16 @@ fn dispatch_read_request(
     database: &Database,
     paths: &GlobalStatePaths,
     request: &IpcRequest,
+    startup_workspace_id: Option<WorkspaceId>,
 ) -> Option<IpcResponse> {
     let result = match request.action.as_str() {
-        "daemon.ping" => Ok(json!({"ready": true, "owner_pid": std::process::id()})),
+        "daemon.ping" => {
+            let mut data = json!({"ready": true, "owner_pid": std::process::id()});
+            if let Some(workspace_id) = startup_workspace_id {
+                data["startup_workspace_id"] = json!(workspace_id);
+            }
+            Ok(data)
+        }
         "daemon.status" => database
             .daemon_status(Utc::now())
             .map(|status| json!({"status": status}))
@@ -2131,8 +2158,8 @@ mod tests {
         IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, LegacyImportDoctorStatus,
         MAX_REQUEST_BYTES, TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook,
         WorkspaceDoctorLookup, WorkspaceDoctorLookupPayload, dispatch_read_request,
-        handle_connection, resume_workspace_task, workspace_conversation, workspace_doctor_lookup,
-        workspace_projection,
+        dispatch_request, handle_connection, process_writer_request, resume_workspace_task,
+        workspace_conversation, workspace_doctor_lookup, workspace_projection,
     };
     #[cfg(windows)]
     use super::{
@@ -2143,7 +2170,7 @@ mod tests {
     use orchestrator_state::{
         DaemonLeaseRequest, DaemonStatus, Database, DatabaseHealth, GlobalStatePaths,
         LegacyImporter, NewSessionRecord, NewTaskRecord, RepositoryStatePaths, RootConfig,
-        StateEnvironment, WorkspaceReadRequest,
+        StateEnvironment, WorkspaceId, WorkspaceReadRequest,
     };
 
     #[derive(serde::Deserialize)]
@@ -2193,6 +2220,129 @@ mod tests {
             include_str!("../../../migrations/0008_result_integration.sql"),
         ),
     ];
+
+    #[test]
+    fn daemon_ping_omits_startup_workspace_receipt_when_unset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(Path::new("unused"))?;
+        let paths = test_global_paths();
+        let request = daemon_request("ping-unset", "daemon.ping");
+
+        let response = dispatch_read_request(&database, &paths, &request, None)
+            .ok_or_else(|| std::io::Error::other("daemon.ping was not dispatched"))?;
+
+        assert_eq!(response.schema_version, 1);
+        assert_eq!(
+            response.outcome,
+            serde_json::json!({
+                "status": "ok",
+                "data": {"ready": true, "owner_pid": std::process::id()}
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_ping_exposes_only_the_exact_startup_workspace_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(Path::new("unused"))?;
+        let paths = test_global_paths();
+        let workspace_id = "018f68d2-00f0-7000-8000-000000000001".parse::<WorkspaceId>()?;
+        let request = daemon_request("ping-set", "daemon.ping");
+
+        let response = dispatch_read_request(&database, &paths, &request, Some(workspace_id))
+            .ok_or_else(|| std::io::Error::other("daemon.ping was not dispatched"))?;
+
+        assert_eq!(response.schema_version, 1);
+        assert_eq!(
+            response.outcome,
+            serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "ready": true,
+                    "owner_pid": std::process::id(),
+                    "startup_workspace_id": "018f68d2-00f0-7000-8000-000000000001"
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_workspace_receipt_is_absent_from_other_read_and_write_responses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let database = Database::open_in_memory()?;
+        database.migrate_with_backup(Path::new("unused"))?;
+        let paths = test_global_paths();
+        let workspace_id = "018f68d2-00f0-7000-8000-000000000001".parse::<WorkspaceId>()?;
+        let (writer, mut receiver) = tokio::sync::mpsc::channel(1);
+
+        let read = dispatch_request(
+            daemon_request("status", "daemon.status"),
+            &database,
+            &paths,
+            &writer,
+            Some(workspace_id),
+        )
+        .await;
+        let write_request = dispatch_request(
+            daemon_request("stop", "daemon.stop"),
+            &database,
+            &paths,
+            &writer,
+            Some(workspace_id),
+        );
+        let process_write = async {
+            let command = receiver
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::other("writer request was not dispatched"))?;
+            let response = process_writer_request(&database, &paths, command.request);
+            command
+                .response
+                .send(response)
+                .map_err(|_| std::io::Error::other("writer response receiver closed"))?;
+            Ok::<(), std::io::Error>(())
+        };
+        let (write, processed) = tokio::join!(write_request, process_write);
+        processed?;
+
+        assert_eq!(read.schema_version, 1);
+        assert_eq!(write.schema_version, 1);
+        for response in [read, write] {
+            assert!(!serde_json::to_string(&response)?.contains(&workspace_id.to_string()));
+            assert!(
+                response.outcome["data"]
+                    .get("startup_workspace_id")
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    fn daemon_request(request_id: &str, action: &str) -> IpcRequest {
+        IpcRequest {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: request_id.to_owned(),
+            workspace_id: None,
+            action: action.to_owned(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn test_global_paths() -> GlobalStatePaths {
+        let root = std::path::PathBuf::from("unused");
+        GlobalStatePaths {
+            database: root.join("state.db"),
+            backups: root.join("backups"),
+            workspaces: root.join("workspaces"),
+            runtime: root.join("runtime"),
+            config: root.join("config.toml"),
+            root,
+        }
+    }
 
     fn seed_legacy_source(
         repository: &Path,
@@ -2371,7 +2521,7 @@ mod tests {
             payload: serde_json::json!({}),
         };
 
-        let response = dispatch_read_request(&database, &paths, &request)
+        let response = dispatch_read_request(&database, &paths, &request, None)
             .ok_or_else(|| std::io::Error::other("capability action was not dispatched"))?;
 
         assert_eq!(
@@ -2812,7 +2962,7 @@ mod tests {
         };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
         let (mut client, server) = tokio::io::duplex(MAX_REQUEST_BYTES.saturating_add(2));
-        let server_task = tokio::spawn(handle_connection(server, database, paths, writer));
+        let server_task = tokio::spawn(handle_connection(server, database, paths, writer, None));
 
         client
             .write_all(&vec![b'x'; MAX_REQUEST_BYTES.saturating_add(1)])
@@ -2922,6 +3072,7 @@ mod tests {
             Arc::clone(&database),
             paths,
             writer,
+            None,
         ));
         let (reader, mut output) = tokio::io::split(client);
         let mut reader = BufReader::new(reader);
@@ -3028,6 +3179,7 @@ mod tests {
             Arc::clone(&database),
             paths,
             writer,
+            None,
         ));
         let (reader, mut output) = tokio::io::split(client);
         let mut reader = BufReader::new(reader);
@@ -3141,7 +3293,7 @@ mod tests {
         };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(handle_connection(server, database, paths, writer));
+        let server_task = tokio::spawn(handle_connection(server, database, paths, writer, None));
         let (reader, mut output) = tokio::io::split(client);
         let mut reader = BufReader::new(reader);
         let request = IpcRequest {

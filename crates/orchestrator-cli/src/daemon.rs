@@ -247,6 +247,7 @@ async fn serve_foreground(
     });
     let (activation_sender, activation_receiver) = tokio::sync::mpsc::unbounded_channel();
     let ipc_server = IpcServer::bind(&paths, Arc::clone(&database))?
+        .with_startup_workspace_id(workspace_id)
         .with_workspace_activations(activation_sender);
     let ipc_cancellation = cancellation.clone();
     let ipc_task = tokio::spawn(async move { ipc_server.serve(ipc_cancellation).await });
