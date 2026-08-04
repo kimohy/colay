@@ -2,6 +2,10 @@
 #![cfg(windows)]
 #![allow(clippy::missing_errors_doc)]
 
+mod process_identity;
+
+pub use process_identity::current_process_user_sid;
+
 use std::{
     ffi::{OsStr, OsString, c_void},
     io, iter,
