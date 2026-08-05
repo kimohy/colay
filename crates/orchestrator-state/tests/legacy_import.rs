@@ -19,9 +19,9 @@ use orchestrator_domain::{
     WorkerResult, task_graph_proposal_hash,
 };
 use orchestrator_state::{
-    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, PreparedLegacyImport,
-    PreparedLegacyInspection, RepositoryStatePaths, RootConfig, StateEnvironment, StateError,
-    StoredArtifact, TaskListFilter,
+    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, MigrationManager,
+    PreparedLegacyImport, PreparedLegacyInspection, RepositoryStatePaths, RootConfig,
+    STATE_SCHEMA_VERSION, StateEnvironment, StateError, StoredArtifact, TaskListFilter,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -99,6 +99,11 @@ fn prepared_inspection_is_consumed_by_one_preparation() -> TestResult {
         published_database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
+    assert_eq!(MigrationManager::status(&published)?.current_version, 3);
+    assert_eq!(
+        fixture.global.migration_status()?.current_version,
+        STATE_SCHEMA_VERSION
+    );
     assert_eq!(
         published.query_row("SELECT count(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
         1
@@ -203,6 +208,33 @@ fn prepared_inspection_rejects_added_monitored_file_before_target_mutation() -> 
     Ok(())
 }
 
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn prepared_inspection_rejects_file_added_after_initial_manifest_enumeration() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let added = fixture.source.tasks.join("added-after-enumeration.txt");
+    let added_for_hook = added.clone();
+    LegacyImporter::set_manifest_enumeration_hook_for_test(move || {
+        fs::write(&added_for_hook, b"late addition")
+    });
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("file added after initial manifest enumeration escaped the sealed path set")?;
+
+    assert!(added.is_file());
+    assert!(error.to_string().contains("file set"));
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
 #[test]
 fn prepared_inspection_rejects_changed_monitored_file_before_target_mutation() -> TestResult {
     let fixture = ImportFixture::new()?;
@@ -280,6 +312,35 @@ fn prepared_inspection_rejects_monitored_tree_link_substitution() -> TestResult 
     )
     .err()
     .ok_or("monitored tree link substitution was accepted")?;
+
+    assert!(matches!(
+        error,
+        StateError::SymlinkEscape(_) | StateError::InvalidRecord(_)
+    ));
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_dangling_link_on_absent_monitored_directory() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    assert!(!fixture.source.checkpoints.exists());
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let target = fixture.root.path().join("removed-checkpoint-target");
+    fs::create_dir(&target)?;
+    create_directory_link(&target, &fixture.source.checkpoints)?;
+    fs::remove_dir(&target)?;
+    assert!(!fixture.source.checkpoints.exists());
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("dangling monitored-directory link was treated as absent")?;
 
     assert!(matches!(
         error,

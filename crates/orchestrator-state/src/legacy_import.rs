@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -17,6 +18,7 @@ use orchestrator_domain::{
     canonical_sha256, task_graph_proposal_hash,
 };
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension as _, Transaction, params};
+use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -37,6 +39,15 @@ thread_local! {
     static TEST_INSPECTION_COUNTS: std::cell::Cell<(u32, u32)> = const {
         std::cell::Cell::new((0, 0))
     };
+}
+
+#[cfg(feature = "test-fixtures")]
+type ManifestEnumerationHook = Box<dyn FnOnce() -> std::io::Result<()> + 'static>;
+
+#[cfg(feature = "test-fixtures")]
+thread_local! {
+    static MANIFEST_ENUMERATION_HOOK: std::cell::RefCell<Option<ManifestEnumerationHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 const REWRITE_TRIGGERS: &[(&str, &str)] = &[
@@ -178,6 +189,24 @@ struct ManifestFile {
 struct GuardedManifestFile {
     relative_path: PathBuf,
     guard: SourceOpenGuard,
+}
+
+struct GuardedManifestDirectory {
+    path: PathBuf,
+    handle: Handle,
+}
+
+struct GuardedManifestSource {
+    directories: Vec<GuardedManifestDirectory>,
+    directory_paths: BTreeSet<PathBuf>,
+    absent_paths: BTreeSet<PathBuf>,
+    artifact_paths: BTreeSet<PathBuf>,
+    file_paths: BTreeSet<PathBuf>,
+}
+
+struct GuardedManifestFiles {
+    source: GuardedManifestSource,
+    files: Vec<GuardedManifestFile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,6 +365,15 @@ impl LegacyImporter {
         TEST_INSPECTION_COUNTS.with(std::cell::Cell::get)
     }
 
+    /// Installs a one-shot hook immediately after the initial pass-2 manifest enumeration.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn set_manifest_enumeration_hook_for_test(
+        hook: impl FnOnce() -> std::io::Result<()> + 'static,
+    ) {
+        MANIFEST_ENUMERATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
     /// Inspects only the explicitly supplied repository-local state store. The source connection
     /// is read-only; migration and validation operate against online-backup copies.
     pub fn inspect(
@@ -351,8 +389,10 @@ impl LegacyImporter {
         source: &RepositoryStatePaths,
         paths: &GlobalStatePaths,
     ) -> StateResult<Option<PreparedLegacyInspection>> {
-        if !source.database.exists() {
-            return Ok(None);
+        match fs::symlink_metadata(&source.database) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StateError::io(&source.database, error)),
         }
         #[cfg(feature = "test-fixtures")]
         record_legacy_inspection_marker()?;
@@ -696,7 +736,8 @@ fn stage_guarded_source_files(
     validate_source_documents(&migrated)?;
     let guarded_files = guard_manifest_files(&plan.source, &migrated, &plan.files)?;
     drop(migrated);
-    for (guarded, file) in guarded_files.into_iter().zip(&plan.files) {
+    verify_manifest_source_unchanged(&plan.source, &guarded_files.source)?;
+    for (guarded, file) in guarded_files.files.iter().zip(&plan.files) {
         let bytes = guarded.guard.read_all()?;
         staging.stage_verified_bytes(
             &guarded.relative_path,
@@ -705,6 +746,7 @@ fn stage_guarded_source_files(
             file.byte_length,
         )?;
     }
+    verify_manifest_source_unchanged(&plan.source, &guarded_files.source)?;
     let staged_files = manifest_files_below(staging.root(), Some(SOURCE_SNAPSHOT_NAME))?;
     let staged_manifest = manifest_hash(&plan.database_sha256, plan.database_length, &staged_files);
     if staged_manifest != plan.manifest_hash {
@@ -3270,12 +3312,18 @@ fn collect_manifest_files(
 ) -> StateResult<Vec<ManifestFile>> {
     let mut relative_paths = BTreeSet::new();
     for directory in [&source.tasks, &source.checkpoints, &source.handovers] {
-        if directory.exists() {
-            collect_relative_files(&source.root, directory, &mut relative_paths)?;
+        match fs::symlink_metadata(directory) {
+            Ok(_) => collect_relative_files(&source.root, directory, &mut relative_paths)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(StateError::io(directory, error)),
         }
     }
-    if source.events.exists() {
-        relative_paths.insert(relative_from_root(&source.root, &source.events)?);
+    match fs::symlink_metadata(&source.events) {
+        Ok(_) => {
+            relative_paths.insert(relative_from_root(&source.root, &source.events)?);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(StateError::io(&source.events, error)),
     }
     let mut statement = migrated.prepare(
         "SELECT relative_path, sha256, byte_length FROM artifacts \
@@ -3322,16 +3370,8 @@ fn guard_manifest_files(
     source: &RepositoryStatePaths,
     migrated: &Connection,
     expected: &[ManifestFile],
-) -> StateResult<Vec<GuardedManifestFile>> {
-    let mut relative_paths = BTreeSet::new();
-    for directory in [&source.tasks, &source.checkpoints, &source.handovers] {
-        if directory.exists() {
-            collect_relative_files(&source.root, directory, &mut relative_paths)?;
-        }
-    }
-    if source.events.exists() {
-        relative_paths.insert(relative_from_root(&source.root, &source.events)?);
-    }
+) -> StateResult<GuardedManifestFiles> {
+    let mut guarded_source = GuardedManifestSource::enumerate(source)?;
     let mut statement = migrated.prepare(
         "SELECT relative_path, sha256, byte_length FROM artifacts \
          WHERE workspace_id = ?1 ORDER BY relative_path",
@@ -3366,9 +3406,13 @@ fn guard_manifest_files(
                 "legacy artifact metadata changed after inspection: {path}"
             )));
         }
-        relative_paths.insert(relative_path);
+        guarded_source.artifact_paths.insert(relative_path.clone());
+        guarded_source.file_paths.insert(relative_path);
     }
-    if relative_paths.contains(Path::new(SOURCE_SNAPSHOT_NAME)) {
+    if guarded_source
+        .file_paths
+        .contains(Path::new(SOURCE_SNAPSHOT_NAME))
+    {
         return Err(StateError::InvalidRecord(
             "legacy artifact path collides with reserved import snapshot name".to_owned(),
         ));
@@ -3377,21 +3421,230 @@ fn guard_manifest_files(
         .iter()
         .map(|file| file.relative_path.clone())
         .collect::<BTreeSet<_>>();
-    if relative_paths != expected_paths || expected_paths.len() != expected.len() {
+    if guarded_source.file_paths != expected_paths || expected_paths.len() != expected.len() {
         return Err(StateError::InvalidRecord(
             "legacy source file set changed after inspection".to_owned(),
         ));
     }
-    relative_paths
-        .into_iter()
+    #[cfg(feature = "test-fixtures")]
+    run_manifest_enumeration_hook(&source.root)?;
+    let files = expected
+        .iter()
         .map(|relative_path| {
+            let relative_path = relative_path.relative_path.clone();
             let guard = SourceOpenGuard::open(&source.root, &source.root.join(&relative_path))?;
             Ok(GuardedManifestFile {
                 relative_path,
                 guard,
             })
         })
-        .collect()
+        .collect::<StateResult<Vec<_>>>()?;
+    verify_manifest_source_unchanged(source, &guarded_source)?;
+    Ok(GuardedManifestFiles {
+        source: guarded_source,
+        files,
+    })
+}
+
+impl GuardedManifestDirectory {
+    fn open(path: &Path) -> StateResult<Self> {
+        validate_manifest_directory(path)?;
+        let before = manifest_directory_identity(path)?;
+        let handle = manifest_directory_identity(path)?;
+        validate_manifest_directory(path)?;
+        let after = manifest_directory_identity(path)?;
+        if before != handle || handle != after {
+            return Err(StateError::SymlinkEscape(path.to_path_buf()));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            handle,
+        })
+    }
+
+    fn revalidate(&self) -> StateResult<()> {
+        validate_manifest_directory(&self.path)?;
+        if manifest_directory_identity(&self.path)? != self.handle {
+            return Err(StateError::SymlinkEscape(self.path.clone()));
+        }
+        Ok(())
+    }
+}
+
+impl GuardedManifestSource {
+    fn enumerate(source: &RepositoryStatePaths) -> StateResult<Self> {
+        let mut guarded = Self {
+            directories: Vec::new(),
+            directory_paths: BTreeSet::new(),
+            absent_paths: BTreeSet::new(),
+            artifact_paths: BTreeSet::new(),
+            file_paths: BTreeSet::new(),
+        };
+        guarded.guard_directory(&source.root)?;
+        for directory in [&source.tasks, &source.checkpoints, &source.handovers] {
+            guarded.enumerate_optional_directory(&source.root, directory)?;
+        }
+        guarded.enumerate_optional_file(&source.root, &source.events)?;
+        guarded.revalidate()?;
+        Ok(guarded)
+    }
+
+    fn enumerate_optional_directory(&mut self, root: &Path, path: &Path) -> StateResult<()> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => self.collect_directory(root, path),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.absent_paths.insert(path.to_path_buf());
+                Ok(())
+            }
+            Err(error) => Err(StateError::io(path, error)),
+        }
+    }
+
+    fn enumerate_optional_file(&mut self, root: &Path, path: &Path) -> StateResult<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                reject_symlink_components(path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(StateError::InvalidRecord(format!(
+                        "legacy monitored source has an unexpected file type: {}",
+                        path.display()
+                    )));
+                }
+                self.file_paths.insert(relative_from_root(root, path)?);
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.absent_paths.insert(path.to_path_buf());
+                Ok(())
+            }
+            Err(error) => Err(StateError::io(path, error)),
+        }
+    }
+
+    fn collect_directory(&mut self, root: &Path, directory: &Path) -> StateResult<()> {
+        self.guard_directory(directory)?;
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| StateError::io(directory, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StateError::io(directory, error))?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            reject_symlink_components(&path)?;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| StateError::io(&path, error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(StateError::SymlinkEscape(path));
+            }
+            if metadata.is_dir() {
+                self.collect_directory(root, &path)?;
+            } else if metadata.is_file() {
+                self.file_paths.insert(relative_from_root(root, &path)?);
+            } else {
+                return Err(StateError::InvalidRecord(format!(
+                    "legacy import encountered a non-regular file: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn guard_directory(&mut self, path: &Path) -> StateResult<()> {
+        self.directories.push(GuardedManifestDirectory::open(path)?);
+        self.directory_paths.insert(path.to_path_buf());
+        Ok(())
+    }
+
+    fn revalidate(&self) -> StateResult<()> {
+        for directory in &self.directories {
+            directory.revalidate()?;
+        }
+        for path in &self.absent_paths {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Ok(_) => {
+                    reject_symlink_components(path)?;
+                    return Err(StateError::InvalidRecord(format!(
+                        "legacy monitored source path appeared after inspection: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) => return Err(StateError::io(path, error)),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn verify_manifest_source_unchanged(
+    source: &RepositoryStatePaths,
+    guarded: &GuardedManifestSource,
+) -> StateResult<()> {
+    guarded.revalidate()?;
+    let mut observed = GuardedManifestSource::enumerate(source)?;
+    observed.artifact_paths.clone_from(&guarded.artifact_paths);
+    observed
+        .file_paths
+        .extend(observed.artifact_paths.iter().cloned());
+    if observed.directory_paths != guarded.directory_paths
+        || observed.absent_paths != guarded.absent_paths
+        || observed.file_paths != guarded.file_paths
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source file set changed after inspection".to_owned(),
+        ));
+    }
+    observed.revalidate()?;
+    guarded.revalidate()
+}
+
+fn validate_manifest_directory(path: &Path) -> StateResult<()> {
+    reject_symlink_components(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| StateError::io(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StateError::InvalidRecord(format!(
+            "legacy monitored source is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn manifest_directory_identity(path: &Path) -> StateResult<Handle> {
+    let file = open_manifest_directory(path).map_err(|error| StateError::io(path, error))?;
+    Handle::from_file(file).map_err(|error| StateError::io(path, error))
+}
+
+#[cfg(not(windows))]
+fn open_manifest_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(windows)]
+fn open_manifest_directory(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options.open(path)
+}
+
+#[cfg(feature = "test-fixtures")]
+fn run_manifest_enumeration_hook(path: &Path) -> StateResult<()> {
+    MANIFEST_ENUMERATION_HOOK.with(|slot| {
+        let Some(hook) = slot.borrow_mut().take() else {
+            return Ok(());
+        };
+        hook().map_err(|error| StateError::io(path, error))
+    })
 }
 
 fn collect_relative_files(
