@@ -72,6 +72,7 @@ pub use leases::{
 /// Legacy repository import inspection, application, and completion-query types.
 pub use legacy_import::{
     LegacyImportPlan, LegacyImportResult, LegacyImporter, PreparedLegacyImport,
+    PreparedLegacyInspection,
 };
 pub use migrations::{
     AppliedMigration, MigrationManager, MigrationPlan, MigrationStatus,

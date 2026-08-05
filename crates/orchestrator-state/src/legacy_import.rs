@@ -32,6 +32,13 @@ const LAST_LEGACY_SCHEMA_VERSION: u32 = 13;
 const RESERVED_LEGACY_WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
 const SOURCE_SNAPSHOT_NAME: &str = "legacy.db";
 
+#[cfg(feature = "test-fixtures")]
+thread_local! {
+    static TEST_INSPECTION_COUNTS: std::cell::Cell<(u32, u32)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
 const REWRITE_TRIGGERS: &[(&str, &str)] = &[
     (
         "graph_revisions_immutable_payload",
@@ -168,6 +175,11 @@ struct ManifestFile {
     byte_length: u64,
 }
 
+struct GuardedManifestFile {
+    relative_path: PathBuf,
+    guard: SourceOpenGuard,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LegacyEventEvidence {
     count: u64,
@@ -222,6 +234,26 @@ pub struct LegacyImportResult {
     pub imported_at: DateTime<Utc>,
 }
 
+/// Owns one fully validated legacy inspection and its sealed private snapshots.
+///
+/// The value is intentionally opaque, non-cloneable, and non-serializable. It must be consumed by
+/// [`LegacyImporter::prepare_inspection`] or dropped, which releases only its owned inspection
+/// attempt.
+#[must_use = "a prepared legacy inspection must be prepared or explicitly dropped"]
+pub struct PreparedLegacyInspection {
+    plan: LegacyImportPlan,
+    expected_paths: GlobalStatePaths,
+    scratch_fingerprint: String,
+    scratch: LegacyImportScratch,
+    canonical_root: PathBuf,
+    canonical_database: PathBuf,
+    source_identity_hash: String,
+    validated_path: PathBuf,
+    migrated_path: PathBuf,
+    migrated_sha256: String,
+    migrated_length: u64,
+}
+
 /// Owns a sealed legacy import's private scratch and staging until authoritative commit or drop.
 ///
 /// The value is intentionally opaque and non-cloneable. It contains no live `SQLite` connection;
@@ -260,7 +292,7 @@ enum PreparedLegacyImportState {
 }
 
 struct PendingLegacyImport {
-    _scratch: LegacyImportScratch,
+    _scratch: PreparedLegacyScratch,
     staging: LegacyImportStaging,
     rewrite_path: PathBuf,
     published_path: PathBuf,
@@ -268,16 +300,57 @@ struct PendingLegacyImport {
     fail_after_publish_before_commit: bool,
 }
 
+enum PreparedLegacyScratch {
+    Shared(LegacyImportScratch),
+    Distinct {
+        _inspection: LegacyImportScratch,
+        preparation: LegacyImportScratch,
+    },
+}
+
+impl PreparedLegacyScratch {
+    fn preparation_path(&self) -> &Path {
+        match self {
+            Self::Shared(scratch) => scratch.path(),
+            Self::Distinct { preparation, .. } => preparation.path(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LegacyImporter;
 
 impl LegacyImporter {
+    /// Resets the current thread's inspection/migration counters.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn reset_inspection_counts_for_test() {
+        TEST_INSPECTION_COUNTS.with(|counts| counts.set((0, 0)));
+    }
+
+    /// Returns `(genuine inspections, full migrations)` for the current thread.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inspection_counts_for_test() -> (u32, u32) {
+        TEST_INSPECTION_COUNTS.with(std::cell::Cell::get)
+    }
+
     /// Inspects only the explicitly supplied repository-local state store. The source connection
     /// is read-only; migration and validation operate against online-backup copies.
     pub fn inspect(
         source: &RepositoryStatePaths,
         paths: &GlobalStatePaths,
     ) -> StateResult<Option<LegacyImportPlan>> {
+        Ok(Self::inspect_for_prepare(source, paths)?.map(|inspection| inspection.plan.clone()))
+    }
+
+    /// Performs one full semantic inspection and retains its sealed private snapshots for
+    /// [`Self::prepare_inspection`].
+    pub fn inspect_for_prepare(
+        source: &RepositoryStatePaths,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<Option<PreparedLegacyInspection>> {
         if !source.database.exists() {
             return Ok(None);
         }
@@ -285,6 +358,7 @@ impl LegacyImporter {
         record_legacy_inspection_marker()?;
         let family = GuardedSqliteFamily::open(&source.root, &source.database)?;
         let canonical_root = family.canonical_root().to_path_buf();
+        let canonical_database = family.canonical_database().to_path_buf();
         let scratch_fingerprint =
             inspection_scratch_fingerprint(family.canonical_root(), family.canonical_database());
         let scratch = LegacyImportScratch::acquire(paths, &scratch_fingerprint)?;
@@ -341,7 +415,10 @@ impl LegacyImporter {
             &logical_content_hash,
             &files,
         );
-        Ok(Some(LegacyImportPlan {
+        drop(migrated);
+        let migrated_sha256 = sha256_file(&migrated_path)?;
+        let migrated_length = file_length(&migrated_path)?;
+        let plan = LegacyImportPlan {
             source: source.clone(),
             source_schema_version: status.current_version,
             source_fingerprint,
@@ -353,6 +430,19 @@ impl LegacyImporter {
             files,
             copied_imported_rows,
             merged_imported_rows,
+        };
+        Ok(Some(PreparedLegacyInspection {
+            plan,
+            expected_paths: paths.clone(),
+            scratch_fingerprint,
+            scratch,
+            canonical_root,
+            canonical_database,
+            source_identity_hash,
+            validated_path: validated_snapshot,
+            migrated_path,
+            migrated_sha256,
+            migrated_length,
         }))
     }
 
@@ -400,60 +490,99 @@ impl LegacyImporter {
                 state: PreparedLegacyImportState::Replay,
             });
         }
-        let inspected = Self::inspect(&plan.source, paths)?.ok_or_else(|| {
+        let inspection = Self::inspect_for_prepare(&plan.source, paths)?.ok_or_else(|| {
             StateError::InvalidRecord("legacy source disappeared before import".to_owned())
         })?;
-        ensure_plan_unchanged(plan, &inspected)?;
-        let scratch = LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?;
+        ensure_plan_unchanged(plan, &inspection.plan)?;
+        Self::prepare_inspection(global, target, inspection, paths)
+    }
+
+    /// Consumes a retained semantic inspection, performs a fresh byte-exact source inspection,
+    /// and prepares private rewrite and publication staging for authoritative commit.
+    pub fn prepare_inspection(
+        global: &Database,
+        target: WorkspaceId,
+        inspection: PreparedLegacyInspection,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<PreparedLegacyImport> {
+        if global.path() != paths.database || inspection.expected_paths != *paths {
+            return Err(StateError::InvalidRecord(
+                "legacy import global state paths do not match the inspected durability context"
+                    .to_owned(),
+            ));
+        }
+        ensure_target_database(global, target)?;
+        if let Some(existing) = load_existing_result(global, target, &inspection.plan)? {
+            validate_published_import(&existing, target, paths)?;
+            return Ok(PreparedLegacyImport {
+                target,
+                plan: inspection.plan.clone(),
+                expected_paths: paths.clone(),
+                state: PreparedLegacyImportState::Replay,
+            });
+        }
+
+        let PreparedLegacyInspection {
+            plan,
+            expected_paths: _,
+            scratch_fingerprint,
+            scratch: inspection_scratch,
+            canonical_root,
+            canonical_database,
+            source_identity_hash,
+            validated_path,
+            migrated_path,
+            migrated_sha256,
+            migrated_length,
+        } = inspection;
+        verify_file(&validated_path, &plan.database_sha256, plan.database_length)?;
+        verify_file(&migrated_path, &migrated_sha256, migrated_length)?;
+        let scratch = if scratch_fingerprint == plan.source_fingerprint {
+            PreparedLegacyScratch::Shared(inspection_scratch)
+        } else {
+            PreparedLegacyScratch::Distinct {
+                _inspection: inspection_scratch,
+                preparation: LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?,
+            }
+        };
 
         let workspace_paths = paths.for_workspace(target);
         let staging =
             LegacyImportStaging::acquire(&workspace_paths.root, &plan.source_fingerprint)?;
-        if let Some(existing) = load_existing_result(global, target, plan)? {
+        if let Some(existing) = load_existing_result(global, target, &plan)? {
             validate_published_import(&existing, target, paths)?;
             return Ok(PreparedLegacyImport {
                 target,
-                plan: plan.clone(),
+                plan,
                 expected_paths: paths.clone(),
                 state: PreparedLegacyImportState::Replay,
             });
         }
         staging.prepare()?;
-        let staged_database = capture_staged_database(plan, &scratch, &staging)?;
-        for file in &plan.files {
-            let source_file = SourceOpenGuard::open(
-                &plan.source.root,
-                &plan.source.root.join(&file.relative_path),
-            )?;
-            let bytes = source_file.read_all()?;
-            staging.stage_verified_bytes(
-                &file.relative_path,
-                &bytes,
-                &file.sha256,
-                file.byte_length,
-            )?;
-        }
-        let staged_files = manifest_files_below(staging.root(), Some(SOURCE_SNAPSHOT_NAME))?;
-        let staged_manifest =
-            manifest_hash(&plan.database_sha256, plan.database_length, &staged_files);
-        if staged_manifest != plan.manifest_hash {
-            return Err(StateError::InvalidRecord(
-                "legacy import staging manifest differs from inspected source".to_owned(),
-            ));
-        }
+        capture_staged_database(
+            &plan,
+            scratch.preparation_path(),
+            &staging,
+            &canonical_root,
+            &canonical_database,
+            &source_identity_hash,
+        )?;
+        verify_file(&migrated_path, &migrated_sha256, migrated_length)?;
+        stage_guarded_source_files(&plan, &migrated_path, &staging)?;
 
-        let migrated_path = scratch.path().join("migrated.db");
-        let migrated = migrate_snapshot(&staged_database, &migrated_path)?;
-        validate_event_chain(&migrated)?;
-        validate_source_documents(&migrated)?;
-        drop(migrated);
-        let rewrite_path = scratch.path().join("rewrite.db");
-        prepare_rewrite_scratch(&migrated_path, &rewrite_path)?;
+        verify_file(&migrated_path, &migrated_sha256, migrated_length)?;
+        let rewrite_path = scratch.preparation_path().join("rewrite.db");
+        prepare_rewrite_scratch(
+            &migrated_path,
+            &rewrite_path,
+            &migrated_sha256,
+            migrated_length,
+        )?;
         let published_path = staging.published_path().to_path_buf();
 
         Ok(PreparedLegacyImport {
             target,
-            plan: plan.clone(),
+            plan,
             expected_paths: paths.clone(),
             state: PreparedLegacyImportState::Pending(Box::new(PendingLegacyImport {
                 _scratch: scratch,
@@ -549,6 +678,41 @@ impl LegacyImporter {
         let prepared = Self::prepare(global, target, plan, paths)?;
         Self::commit(global, prepared, paths)
     }
+}
+
+fn stage_guarded_source_files(
+    plan: &LegacyImportPlan,
+    migrated_path: &Path,
+    staging: &LegacyImportStaging,
+) -> StateResult<()> {
+    let migrated = open_snapshot_read_only(migrated_path)?;
+    validate_integrity(&migrated, "retained migrated legacy snapshot")?;
+    let events = validate_event_chain(&migrated)?;
+    if event_evidence(&events)? != plan.event_evidence {
+        return Err(StateError::InvalidRecord(
+            "retained migrated legacy event evidence differs from its inspection seal".to_owned(),
+        ));
+    }
+    validate_source_documents(&migrated)?;
+    let guarded_files = guard_manifest_files(&plan.source, &migrated, &plan.files)?;
+    drop(migrated);
+    for (guarded, file) in guarded_files.into_iter().zip(&plan.files) {
+        let bytes = guarded.guard.read_all()?;
+        staging.stage_verified_bytes(
+            &guarded.relative_path,
+            &bytes,
+            &file.sha256,
+            file.byte_length,
+        )?;
+    }
+    let staged_files = manifest_files_below(staging.root(), Some(SOURCE_SNAPSHOT_NAME))?;
+    let staged_manifest = manifest_hash(&plan.database_sha256, plan.database_length, &staged_files);
+    if staged_manifest != plan.manifest_hash {
+        return Err(StateError::InvalidRecord(
+            "legacy import staging manifest differs from inspected source".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn backup_import_target(
@@ -2663,11 +2827,30 @@ fn ensure_plan_unchanged(
 
 fn capture_staged_database(
     plan: &LegacyImportPlan,
-    scratch: &LegacyImportScratch,
+    scratch: &Path,
     staging: &LegacyImportStaging,
+    expected_canonical_root: &Path,
+    expected_canonical_database: &Path,
+    expected_source_identity_hash: &str,
 ) -> StateResult<PathBuf> {
     let family = GuardedSqliteFamily::open(&plan.source.root, &plan.source.database)?;
-    let captured_source = scratch.path().join("source.db");
+    let canonical_root = family.canonical_root().to_path_buf();
+    let canonical_database = family.canonical_database().to_path_buf();
+    let source_root_hash = hash_domain(
+        b"colay/legacy-source-root/v1\0",
+        canonical_root.to_string_lossy().as_bytes(),
+    );
+    if canonical_root != expected_canonical_root
+        || canonical_database != expected_canonical_database
+        || source_root_hash != plan.source_root_hash
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source canonical context changed after inspection".to_owned(),
+        ));
+    }
+    #[cfg(feature = "test-fixtures")]
+    record_legacy_inspection_marker()?;
+    let captured_source = scratch.join("fresh-source.db");
     family.capture(&captured_source)?;
     drop(family);
 
@@ -2686,7 +2869,13 @@ fn capture_staged_database(
     }
     validate_integrity(&source, "legacy source")?;
     reject_live_legacy_daemon(&source, status.current_version)?;
-    let _ = source_identity_hash(&source)?;
+    if status.current_version != plan.source_schema_version
+        || source_identity_hash(&source)? != expected_source_identity_hash
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source identity changed after inspection".to_owned(),
+        ));
+    }
 
     let staged_database = staging.root().join(SOURCE_SNAPSHOT_NAME);
     backup_stable_source(&source, &staged_database)?;
@@ -2773,6 +2962,11 @@ fn backup_stable_source(source: &Connection, destination: &Path) -> StateResult<
 }
 
 fn migrate_snapshot(source: &Path, destination: &Path) -> StateResult<Connection> {
+    #[cfg(feature = "test-fixtures")]
+    TEST_INSPECTION_COUNTS.with(|counts| {
+        let (inspections, migrations) = counts.get();
+        counts.set((inspections, migrations.saturating_add(1)));
+    });
     fs::copy(source, destination).map_err(|error| StateError::io(destination, error))?;
     ensure_private_file(destination)?;
     let mut connection = Connection::open(destination)?;
@@ -2783,12 +2977,18 @@ fn migrate_snapshot(source: &Path, destination: &Path) -> StateResult<Connection
     Ok(connection)
 }
 
-fn prepare_rewrite_scratch(validated: &Path, scratch: &Path) -> StateResult<()> {
+fn prepare_rewrite_scratch(
+    validated: &Path,
+    scratch: &Path,
+    expected_sha256: &str,
+    expected_length: u64,
+) -> StateResult<()> {
     if scratch.exists() {
         return Err(StateError::ArtifactConflict(scratch.to_path_buf()));
     }
     fs::copy(validated, scratch).map_err(|error| StateError::io(scratch, error))?;
     ensure_private_file(scratch)?;
+    verify_file(scratch, expected_sha256, expected_length)?;
     let connection = Connection::open(scratch)?;
     connection.execute_batch("PRAGMA journal_mode = DELETE;")?;
     validate_integrity(&connection, "legacy rewrite scratch before trigger removal")?;
@@ -3118,6 +3318,82 @@ fn collect_manifest_files(
         .collect()
 }
 
+fn guard_manifest_files(
+    source: &RepositoryStatePaths,
+    migrated: &Connection,
+    expected: &[ManifestFile],
+) -> StateResult<Vec<GuardedManifestFile>> {
+    let mut relative_paths = BTreeSet::new();
+    for directory in [&source.tasks, &source.checkpoints, &source.handovers] {
+        if directory.exists() {
+            collect_relative_files(&source.root, directory, &mut relative_paths)?;
+        }
+    }
+    if source.events.exists() {
+        relative_paths.insert(relative_from_root(&source.root, &source.events)?);
+    }
+    let mut statement = migrated.prepare(
+        "SELECT relative_path, sha256, byte_length FROM artifacts \
+         WHERE workspace_id = ?1 ORDER BY relative_path",
+    )?;
+    let rows = statement.query_map([RESERVED_LEGACY_WORKSPACE], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let expected_by_path = expected
+        .iter()
+        .map(|file| (file.relative_path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    for row in rows {
+        let (path, stored_sha256, stored_length) = row?;
+        let path = RepoPath::try_from(path).map_err(|error| {
+            StateError::InvalidRecord(format!("legacy artifact path is unsafe: {error}"))
+        })?;
+        let relative_path = PathBuf::from(path.to_string());
+        let stored_length = u64::try_from(stored_length).map_err(|_| {
+            StateError::InvalidRecord(format!(
+                "legacy artifact metadata has a negative byte length: {path}"
+            ))
+        })?;
+        let expected_file = expected_by_path.get(&relative_path).ok_or_else(|| {
+            StateError::InvalidRecord("legacy source file set changed after inspection".to_owned())
+        })?;
+        if expected_file.sha256 != stored_sha256 || expected_file.byte_length != stored_length {
+            return Err(StateError::InvalidRecord(format!(
+                "legacy artifact metadata changed after inspection: {path}"
+            )));
+        }
+        relative_paths.insert(relative_path);
+    }
+    if relative_paths.contains(Path::new(SOURCE_SNAPSHOT_NAME)) {
+        return Err(StateError::InvalidRecord(
+            "legacy artifact path collides with reserved import snapshot name".to_owned(),
+        ));
+    }
+    let expected_paths = expected
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    if relative_paths != expected_paths || expected_paths.len() != expected.len() {
+        return Err(StateError::InvalidRecord(
+            "legacy source file set changed after inspection".to_owned(),
+        ));
+    }
+    relative_paths
+        .into_iter()
+        .map(|relative_path| {
+            let guard = SourceOpenGuard::open(&source.root, &source.root.join(&relative_path))?;
+            Ok(GuardedManifestFile {
+                relative_path,
+                guard,
+            })
+        })
+        .collect()
+}
+
 fn collect_relative_files(
     root: &Path,
     directory: &Path,
@@ -3404,6 +3680,10 @@ fn table_exists(connection: &Connection, name: &str) -> StateResult<bool> {
 
 #[cfg(feature = "test-fixtures")]
 fn record_legacy_inspection_marker() -> StateResult<()> {
+    TEST_INSPECTION_COUNTS.with(|counts| {
+        let (inspections, migrations) = counts.get();
+        counts.set((inspections.saturating_add(1), migrations));
+    });
     let Some(marker) = std::env::var_os("COLAY_TEST_LEGACY_INSPECT_MARKER") else {
         return Ok(());
     };
