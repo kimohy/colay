@@ -34,7 +34,7 @@ use tokio::{
         AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _,
         BufReader,
     },
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -45,6 +45,9 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TASK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BLOCKING_LEGACY_PREPARATIONS: usize = 4;
+const WRITER_INGRESS_CAPACITY: usize = 64;
+const WRITER_CONTROL_CAPACITY: usize = 1;
+const MAX_PENDING_WRITER_ADMISSIONS: usize = 64;
 
 #[cfg(test)]
 struct TaskStreamInterleaveHook {
@@ -620,30 +623,21 @@ impl IpcServer {
     }
 
     pub async fn serve(self, cancellation: CancellationToken) -> Result<(), IpcError> {
-        let (writer, receiver) = mpsc::channel(64);
-        let writer_database = Arc::clone(&self.database);
-        let writer_paths = self.paths.clone();
-        let workspace_activations = self.workspace_activations.clone();
-        let writer_task = tokio::spawn(async move {
-            writer_loop(
-                writer_database,
-                writer_paths,
-                receiver,
-                workspace_activations,
-            )
-            .await;
-        });
+        let (writer, writer_thread) = spawn_writer_thread(
+            Arc::clone(&self.database),
+            self.paths.clone(),
+            self.workspace_activations.clone(),
+        )
+        .await?;
         let result = self.accept_loop(writer, cancellation).await;
-        writer_task.await.map_err(|error| {
-            IpcError::Protocol(format!("daemon writer supervisor failed: {error}"))
-        })?;
+        writer_thread.join().await?;
         result
     }
 
     #[cfg(unix)]
     async fn accept_loop(
         self,
-        writer: mpsc::Sender<WriterRequest>,
+        writer: WriterIngress,
         cancellation: CancellationToken,
     ) -> Result<(), IpcError> {
         let endpoint = ipc_endpoint(&self.paths);
@@ -691,7 +685,7 @@ impl IpcServer {
     #[cfg(windows)]
     async fn accept_loop(
         self,
-        writer: mpsc::Sender<WriterRequest>,
+        writer: WriterIngress,
         cancellation: CancellationToken,
     ) -> Result<(), IpcError> {
         let listener_cancellation = cancellation.child_token();
@@ -746,7 +740,7 @@ async fn accept_windows_pipe_loop(
     pipe_owner_sid: String,
     database: Arc<Database>,
     paths: GlobalStatePaths,
-    writer: mpsc::Sender<WriterRequest>,
+    writer: WriterIngress,
     startup_workspace_id: Option<WorkspaceId>,
     cancellation: CancellationToken,
 ) -> Result<(), IpcError> {
@@ -821,7 +815,7 @@ async fn handle_connection<S>(
     stream: S,
     database: Arc<Database>,
     paths: GlobalStatePaths,
-    writer: mpsc::Sender<WriterRequest>,
+    writer: WriterIngress,
     startup_workspace_id: Option<WorkspaceId>,
 ) -> Result<(), IpcError>
 where
@@ -1039,7 +1033,7 @@ async fn dispatch_request(
     request: IpcRequest,
     database: &Database,
     paths: &GlobalStatePaths,
-    writer: &mpsc::Sender<WriterRequest>,
+    writer: &WriterIngress,
     startup_workspace_id: Option<WorkspaceId>,
 ) -> IpcResponse {
     if request.schema_version != IPC_SCHEMA_VERSION {
@@ -1457,6 +1451,72 @@ struct WriterRequest {
     response: oneshot::Sender<IpcResponse>,
 }
 
+#[derive(Clone)]
+struct WriterIngress {
+    data: mpsc::Sender<WriterRequest>,
+    control: mpsc::Sender<WriterRequest>,
+    stop_claimed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl WriterIngress {
+    async fn send(
+        &self,
+        command: WriterRequest,
+    ) -> Result<(), mpsc::error::SendError<WriterRequest>> {
+        if command.request.action == "daemon.stop" {
+            if self
+                .stop_claimed
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(mpsc::error::SendError(command));
+            }
+            self.control.send(command).await
+        } else {
+            self.data.send(command).await
+        }
+    }
+
+    #[cfg(test)]
+    fn single_channel(data: mpsc::Sender<WriterRequest>) -> Self {
+        Self {
+            control: data.clone(),
+            data,
+            stop_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+struct WriterThread {
+    completion: oneshot::Receiver<Result<(), String>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WriterThread {
+    async fn join(mut self) -> Result<(), IpcError> {
+        let completion = self.completion.await.map_err(|_| {
+            IpcError::Protocol(
+                "daemon writer thread exited without reporting completion".to_owned(),
+            )
+        });
+        let handle = self.handle.take().ok_or_else(|| {
+            IpcError::Protocol("daemon writer thread handle is missing".to_owned())
+        })?;
+        tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .map_err(|error| {
+                IpcError::Protocol(format!("daemon writer join task failed: {error}"))
+            })?
+            .map_err(|_| IpcError::Protocol("daemon writer thread panicked".to_owned()))?;
+        completion?.map_err(|error| IpcError::Protocol(format!("daemon writer failed: {error}")))
+    }
+}
+
 struct RegistrationPreparationInput {
     database: Arc<Database>,
     paths: GlobalStatePaths,
@@ -1479,12 +1539,52 @@ trait RegistrationCommit: Send {
 }
 
 trait WriterBackend: Send + Sync + 'static {
+    fn resolve_registration(
+        &self,
+        database: &Arc<Database>,
+        paths: &GlobalStatePaths,
+        request: &IpcRequest,
+    ) -> Result<(RegistrationPreparationInput, RegistrationSemantics), IpcError> {
+        resolve_registration_admission(database, paths, request)
+    }
+
+    fn resolve_evidence(
+        &self,
+        database: &Arc<Database>,
+        paths: &GlobalStatePaths,
+        request: &IpcRequest,
+    ) -> Result<Option<(WorkspaceId, EvidenceInspectionInput)>, IpcError> {
+        resolve_evidence_admission(database, paths, request)
+    }
+
     fn prepare_registration(
         &self,
         input: RegistrationPreparationInput,
     ) -> Result<Box<dyn RegistrationCommit>, IpcError>;
 
     fn inspect_evidence(&self, input: EvidenceInspectionInput) -> Result<Value, IpcError>;
+
+    fn process_ordinary(
+        &self,
+        database: &Database,
+        paths: &GlobalStatePaths,
+        request: IpcRequest,
+    ) -> IpcResponse {
+        process_writer_request(database, paths, request)
+    }
+
+    fn publish_activation(
+        &self,
+        database: &Database,
+        request: &IpcRequest,
+        response: &IpcResponse,
+        sender: &mpsc::UnboundedSender<WorkspaceActivation>,
+    ) -> Result<(), IpcError> {
+        let activation = workspace_activation(database, request, response)?;
+        sender
+            .send(activation)
+            .map_err(|_| IpcError::WriterUnavailable)
+    }
 }
 
 struct StateWriterBackend;
@@ -1617,8 +1717,8 @@ struct WriterScheduler {
     admissions: VecDeque<SequencedWriterAdmission>,
     lanes: HashMap<WorkspaceId, WorkspacePreparationLane>,
     generations: HashMap<u64, RegistrationGeneration>,
+    ready_generations: VecDeque<u64>,
     jobs: JoinSet<(u64, Result<LaneJobOutput, String>)>,
-    permits: Arc<Semaphore>,
     backend: Arc<dyn WriterBackend>,
 }
 
@@ -1631,10 +1731,14 @@ impl WriterScheduler {
             admissions: VecDeque::new(),
             lanes: HashMap::new(),
             generations: HashMap::new(),
+            ready_generations: VecDeque::new(),
             jobs: JoinSet::new(),
-            permits: Arc::new(Semaphore::new(MAX_BLOCKING_LEGACY_PREPARATIONS)),
             backend,
         }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.admissions.len() < MAX_PENDING_WRITER_ADMISSIONS
     }
 
     fn admit(
@@ -1643,9 +1747,20 @@ impl WriterScheduler {
         paths: &GlobalStatePaths,
         command: WriterRequest,
     ) -> bool {
+        if !self.has_capacity() {
+            let response = IpcResponse::failure(
+                command.request.request_id,
+                "daemon writer admission capacity is full",
+            );
+            let _ = command.response.send(response);
+            return false;
+        }
         if command.request.action == "workspace.doctor.lookup" {
             let request_id = command.request.request_id.clone();
-            match resolve_evidence_admission(database, paths, &command.request) {
+            match self
+                .backend
+                .resolve_evidence(database, paths, &command.request)
+            {
                 Ok(Some((workspace_id, input))) => {
                     let generation =
                         self.create_generation(workspace_id, None, LaneJobInput::Evidence(input));
@@ -1679,7 +1794,10 @@ impl WriterScheduler {
             return stops_admission;
         }
         let request_id = command.request.request_id.clone();
-        match resolve_registration_admission(database, paths, &command.request) {
+        match self
+            .backend
+            .resolve_registration(database, paths, &command.request)
+        {
             Ok((input, semantics)) => {
                 let workspace_id = input.workspace_id;
                 let generation = self.join_or_create_generation(workspace_id, semantics, input);
@@ -1763,11 +1881,29 @@ impl WriterScheduler {
         let lane = self.lanes.entry(workspace_id).or_default();
         if lane.active.is_none() {
             lane.active = Some(generation);
-            self.start_generation(generation);
+            self.ready_generations.push_back(generation);
+            self.start_available_generations();
         } else {
             lane.queued.push_back(generation);
         }
         generation
+    }
+
+    fn start_available_generations(&mut self) {
+        while self.jobs.len() < MAX_BLOCKING_LEGACY_PREPARATIONS {
+            let Some(generation) = self.ready_generations.pop_front() else {
+                break;
+            };
+            let is_active = self
+                .generations
+                .get(&generation)
+                .and_then(|entry| self.lanes.get(&entry.workspace_id))
+                .is_some_and(|lane| lane.active == Some(generation));
+            if !is_active {
+                continue;
+            }
+            self.start_generation(generation);
+        }
     }
 
     fn start_generation(&mut self, generation: u64) {
@@ -1779,31 +1915,19 @@ impl WriterScheduler {
         else {
             return;
         };
-        let permits = Arc::clone(&self.permits);
         let backend = Arc::clone(&self.backend);
         self.jobs.spawn(async move {
-            let permit = permits
-                .acquire_owned()
-                .await
-                .map_err(|error| format!("legacy preparation capacity closed: {error}"));
-            let result = match permit {
-                Ok(permit) => {
-                    let prepared = tokio::task::spawn_blocking(move || match *input {
-                        LaneJobInput::Registration(input) => backend
-                            .prepare_registration(input)
-                            .map(LaneJobOutput::Registration),
-                        LaneJobInput::Evidence(input) => {
-                            backend.inspect_evidence(input).map(LaneJobOutput::Evidence)
-                        }
-                    })
-                    .await
-                    .map_err(|error| format!("legacy preparation job failed: {error}"))
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-                    drop(permit);
-                    prepared
+            let result = tokio::task::spawn_blocking(move || match *input {
+                LaneJobInput::Registration(input) => backend
+                    .prepare_registration(input)
+                    .map(LaneJobOutput::Registration),
+                LaneJobInput::Evidence(input) => {
+                    backend.inspect_evidence(input).map(LaneJobOutput::Evidence)
                 }
-                Err(error) => Err(error),
-            };
+            })
+            .await
+            .map_err(|error| format!("legacy preparation job failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
             (generation, result)
         });
     }
@@ -1812,6 +1936,7 @@ impl WriterScheduler {
         if let Some(entry) = self.generations.get_mut(&generation) {
             entry.state = RegistrationGenerationState::Ready(result);
         }
+        self.start_available_generations();
     }
 
     fn head_ready(&self) -> bool {
@@ -1832,7 +1957,7 @@ impl WriterScheduler {
     }
 
     fn is_idle(&self) -> bool {
-        self.admissions.is_empty() && self.jobs.is_empty()
+        self.admissions.is_empty() && self.ready_generations.is_empty() && self.jobs.is_empty()
     }
 
     fn drain_one(
@@ -1855,7 +1980,9 @@ impl WriterScheduler {
                 let _ = response.send(value);
             }
             WriterAdmission::Ordinary(command) => {
-                let response = process_writer_request(database, paths, command.request);
+                let response = self
+                    .backend
+                    .process_ordinary(database, paths, command.request);
                 let _ = command.response.send(response);
             }
             WriterAdmission::Registration {
@@ -1949,13 +2076,10 @@ impl WriterScheduler {
         if response.outcome.get("status").and_then(Value::as_str) == Some("ok")
             && let Some(sender) = workspace_activations
         {
-            match workspace_activation(database, &command.request, &response).and_then(
-                |activation| {
-                    sender
-                        .send(activation)
-                        .map_err(|_| IpcError::WriterUnavailable)
-                },
-            ) {
+            match self
+                .backend
+                .publish_activation(database, &command.request, &response, sender)
+            {
                 Ok(()) => {}
                 Err(error) => {
                     response = IpcResponse::failure(response.request_id, error.to_string());
@@ -2038,7 +2162,8 @@ impl WriterScheduler {
             lane.active
         };
         if let Some(next) = next {
-            self.start_generation(next);
+            self.ready_generations.push_back(next);
+            self.start_available_generations();
         } else {
             self.lanes.remove(&workspace_id);
         }
@@ -2097,48 +2222,190 @@ fn resolve_evidence_admission(
     )))
 }
 
-async fn writer_loop(
+async fn spawn_writer_thread(
+    database: Arc<Database>,
+    paths: GlobalStatePaths,
+    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
+) -> Result<(WriterIngress, WriterThread), IpcError> {
+    spawn_writer_thread_with_backend(
+        database,
+        paths,
+        workspace_activations,
+        Arc::new(StateWriterBackend),
+    )
+    .await
+}
+
+async fn spawn_writer_thread_with_backend(
+    database: Arc<Database>,
+    paths: GlobalStatePaths,
+    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
+    backend: Arc<dyn WriterBackend>,
+) -> Result<(WriterIngress, WriterThread), IpcError> {
+    let (data, data_receiver) = mpsc::channel(WRITER_INGRESS_CAPACITY);
+    let (control, control_receiver) = mpsc::channel(WRITER_CONTROL_CAPACITY);
+    let ingress = WriterIngress {
+        data,
+        control,
+        stop_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let (startup, startup_receiver) = oneshot::channel();
+    let (completion, completion_receiver) = oneshot::channel();
+    let handle = std::thread::Builder::new()
+        .name("orchestrator-state-writer".to_owned())
+        .spawn(move || {
+            let runtime = build_writer_runtime();
+            let outcome = match runtime {
+                Ok(runtime) => {
+                    let _ = startup.send(Ok(()));
+                    runtime.block_on(writer_loop_with_channels(
+                        database,
+                        paths,
+                        data_receiver,
+                        control_receiver,
+                        workspace_activations,
+                        backend,
+                    ));
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = startup.send(Err(error.clone()));
+                    Err(error)
+                }
+            };
+            let _ = completion.send(outcome);
+        })
+        .map_err(|error| {
+            IpcError::Protocol(format!("could not spawn daemon writer thread: {error}"))
+        })?;
+    let thread = WriterThread {
+        completion: completion_receiver,
+        handle: Some(handle),
+    };
+    match startup_receiver.await {
+        Ok(Ok(())) => Ok((ingress, thread)),
+        Ok(Err(error)) => {
+            let _ = thread.join().await;
+            Err(IpcError::Protocol(error))
+        }
+        Err(_) => {
+            let joined = thread.join().await;
+            Err(joined.err().unwrap_or_else(|| {
+                IpcError::Protocol(
+                    "daemon writer thread exited before reporting startup".to_owned(),
+                )
+            }))
+        }
+    }
+}
+
+fn build_writer_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_LEGACY_PREPARATIONS)
+        .build()
+        .map_err(|error| format!("could not create writer runtime: {error}"))
+}
+
+#[cfg(test)]
+async fn writer_loop_with_backend(
     database: Arc<Database>,
     paths: GlobalStatePaths,
     receiver: mpsc::Receiver<WriterRequest>,
     workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
+    backend: Arc<dyn WriterBackend>,
 ) {
-    writer_loop_with_backend(
+    let (control, control_receiver) = mpsc::channel(WRITER_CONTROL_CAPACITY);
+    drop(control);
+    writer_loop_with_channels(
         database,
         paths,
         receiver,
+        control_receiver,
         workspace_activations,
-        Arc::new(StateWriterBackend),
+        backend,
     )
     .await;
 }
 
-async fn writer_loop_with_backend(
+async fn writer_loop_with_channels(
     database: Arc<Database>,
     paths: GlobalStatePaths,
     mut receiver: mpsc::Receiver<WriterRequest>,
+    mut control_receiver: mpsc::Receiver<WriterRequest>,
     workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
     backend: Arc<dyn WriterBackend>,
 ) {
     let mut scheduler = WriterScheduler::new(backend);
     let mut receiver_open = true;
+    let mut control_open = true;
+    let mut stopping = false;
+    let mut pending_stop = None;
     loop {
+        if !stopping {
+            match control_receiver.try_recv() {
+                Ok(command) => {
+                    begin_writer_stop(
+                        command,
+                        &mut receiver,
+                        &mut control_receiver,
+                        &mut receiver_open,
+                        &mut control_open,
+                        &mut stopping,
+                        &mut pending_stop,
+                    );
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        if pending_stop.is_some()
+            && scheduler.has_capacity()
+            && let Some(command) = pending_stop.take()
+        {
+            let _stops_admission = scheduler.admit(&database, &paths, command);
+        }
         if scheduler.head_ready() {
             scheduler.drain_one(&database, &paths, workspace_activations.as_ref());
             tokio::task::yield_now().await;
             continue;
         }
-        if !receiver_open && scheduler.is_idle() {
+        if !receiver_open && !control_open && pending_stop.is_none() && scheduler.is_idle() {
             break;
         }
         tokio::select! {
-            command = receiver.recv(), if receiver_open => {
+            biased;
+            command = control_receiver.recv(), if control_open && !stopping => {
                 match command {
                     Some(command) => {
-                        if scheduler.admit(&database, &paths, command) {
-                            receiver.close();
-                            receiver_open = false;
-                        }
+                        begin_writer_stop(
+                            command,
+                            &mut receiver,
+                            &mut control_receiver,
+                            &mut receiver_open,
+                            &mut control_open,
+                            &mut stopping,
+                            &mut pending_stop,
+                        );
+                    }
+                    None => control_open = false,
+                }
+            }
+            command = receiver.recv(), if receiver_open && scheduler.has_capacity() && !stopping => {
+                match command {
+                    Some(command) if command.request.action == "daemon.stop" => {
+                        begin_writer_stop(
+                            command,
+                            &mut receiver,
+                            &mut control_receiver,
+                            &mut receiver_open,
+                            &mut control_open,
+                            &mut stopping,
+                            &mut pending_stop,
+                        );
+                    }
+                    Some(command) => {
+                        let _stops_admission = scheduler.admit(&database, &paths, command);
                     }
                     None => receiver_open = false,
                 }
@@ -2159,6 +2426,35 @@ async fn writer_loop_with_backend(
                 }
             }
         }
+    }
+}
+
+fn begin_writer_stop(
+    command: WriterRequest,
+    receiver: &mut mpsc::Receiver<WriterRequest>,
+    control_receiver: &mut mpsc::Receiver<WriterRequest>,
+    receiver_open: &mut bool,
+    control_open: &mut bool,
+    stopping: &mut bool,
+    pending_stop: &mut Option<WriterRequest>,
+) {
+    *stopping = true;
+    receiver.close();
+    control_receiver.close();
+    *receiver_open = false;
+    *control_open = false;
+    reject_buffered_writer_requests(receiver);
+    reject_buffered_writer_requests(control_receiver);
+    *pending_stop = Some(command);
+}
+
+fn reject_buffered_writer_requests(receiver: &mut mpsc::Receiver<WriterRequest>) {
+    while let Ok(command) = receiver.try_recv() {
+        let response = IpcResponse::failure(
+            command.request.request_id,
+            "daemon writer stopped before admitting request",
+        );
+        let _ = command.response.send(response);
     }
 }
 
@@ -2844,9 +3140,9 @@ mod tests {
         IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, LegacyImportDoctorStatus,
         MAX_REQUEST_BYTES, RegistrationPreparationInput, StateWriterBackend,
         TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook, WorkspaceDoctorLookup,
-        WorkspaceDoctorLookupPayload, WriterBackend, dispatch_read_request, dispatch_request,
-        handle_connection, process_writer_request, resume_workspace_task, workspace_conversation,
-        workspace_doctor_lookup, workspace_projection,
+        WorkspaceDoctorLookupPayload, WriterBackend, WriterIngress, dispatch_read_request,
+        dispatch_request, handle_connection, process_writer_request, resume_workspace_task,
+        workspace_conversation, workspace_doctor_lookup, workspace_projection,
     };
     #[cfg(windows)]
     use super::{
@@ -3021,6 +3317,7 @@ mod tests {
         let paths = test_global_paths();
         let workspace_id = "018f68d2-00f0-7000-8000-000000000001".parse::<WorkspaceId>()?;
         let (writer, mut receiver) = tokio::sync::mpsc::channel(1);
+        let writer = WriterIngress::single_channel(writer);
 
         let read = dispatch_request(
             daemon_request("status", "daemon.status"),
@@ -3704,6 +4001,7 @@ mod tests {
             root,
         };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let writer = WriterIngress::single_channel(writer);
         let (mut client, server) = tokio::io::duplex(MAX_REQUEST_BYTES.saturating_add(2));
         let server_task = tokio::spawn(handle_connection(server, database, paths, writer, None));
 
@@ -3809,6 +4107,7 @@ mod tests {
             root,
         };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let writer = WriterIngress::single_channel(writer);
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(handle_connection(
             server,
@@ -3916,6 +4215,7 @@ mod tests {
             root,
         };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let writer = WriterIngress::single_channel(writer);
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(handle_connection(
             server,
@@ -4035,6 +4335,7 @@ mod tests {
             root,
         };
         let (writer, _receiver) = tokio::sync::mpsc::channel(1);
+        let writer = WriterIngress::single_channel(writer);
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(handle_connection(server, database, paths, writer, None));
         let (reader, mut output) = tokio::io::split(client);
