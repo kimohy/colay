@@ -4135,12 +4135,19 @@ fn append_attributed_legacy_inspection_marker(
             "attributed legacy inspection test marker directory must be absolute".to_owned(),
         ));
     }
-    reject_marker_link_components(temporary_root)?;
-    reject_marker_link_components(marker)?;
     let canonical_root =
         fs::canonicalize(temporary_root).map_err(|error| StateError::io(temporary_root, error))?;
-    let canonical_marker =
-        fs::canonicalize(marker).map_err(|error| StateError::io(marker, error))?;
+    let marker_suffix = marker.strip_prefix(temporary_root).map_err(|_| {
+        StateError::InvalidRecord(
+            "attributed legacy inspection test marker directory is outside the temporary root"
+                .to_owned(),
+        )
+    })?;
+    validate_marker_descendant(marker_suffix)?;
+    let rebased_marker = canonical_root.join(marker_suffix);
+    reject_marker_descendant_links(&canonical_root, &rebased_marker)?;
+    let canonical_marker = fs::canonicalize(&rebased_marker)
+        .map_err(|error| StateError::io(&rebased_marker, error))?;
     if canonical_marker == canonical_root || !canonical_marker.starts_with(&canonical_root) {
         return Err(StateError::InvalidRecord(
             "attributed legacy inspection test marker directory is outside the temporary root"
@@ -4157,13 +4164,13 @@ fn append_attributed_legacy_inspection_marker(
     }
 
     let source_directory = canonical_marker.join(source_root_hash);
-    reject_marker_link_components(&source_directory)?;
+    reject_marker_descendant_links(&canonical_root, &source_directory)?;
     match fs::create_dir(&source_directory) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(error) => return Err(StateError::io(&source_directory, error)),
     }
-    reject_marker_link_components(&source_directory)?;
+    reject_marker_descendant_links(&canonical_root, &source_directory)?;
     if !fs::metadata(&source_directory)
         .map_err(|error| StateError::io(&source_directory, error))?
         .is_dir()
@@ -4184,7 +4191,7 @@ fn append_attributed_legacy_inspection_marker(
         let sequence =
             TEST_INSPECTION_EVENT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let event = canonical_source.join(format!("event-{}-{sequence}", std::process::id()));
-        reject_marker_link_components(&event)?;
+        reject_marker_descendant_links(&canonical_root, &event)?;
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -4198,14 +4205,62 @@ fn append_attributed_legacy_inspection_marker(
 }
 
 #[cfg(feature = "test-fixtures")]
-fn reject_marker_link_components(path: &Path) -> StateResult<()> {
-    match reject_symlink_components(path) {
-        Err(StateError::SymlinkEscape(_)) => Err(StateError::InvalidRecord(
-            "attributed legacy inspection test marker contains a symbolic link or reparse point"
-                .to_owned(),
-        )),
-        result => result,
+fn validate_marker_descendant(path: &Path) -> StateResult<()> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection test marker has an unsafe relative path".to_owned(),
+        ));
     }
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+fn reject_marker_descendant_links(canonical_root: &Path, path: &Path) -> StateResult<()> {
+    let relative = path.strip_prefix(canonical_root).map_err(|_| {
+        StateError::InvalidRecord(
+            "attributed legacy inspection test marker escaped the temporary root".to_owned(),
+        )
+    })?;
+    validate_marker_descendant(relative)?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(StateError::InvalidRecord(
+                "attributed legacy inspection test marker has an unsafe relative path".to_owned(),
+            ));
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if marker_metadata_is_link_like(&metadata) => {
+                return Err(StateError::InvalidRecord(
+                    "attributed legacy inspection test marker contains a symbolic link or reparse point"
+                        .to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(StateError::io(&current, error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "test-fixtures", not(windows)))]
+fn marker_metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(all(feature = "test-fixtures", windows))]
+fn marker_metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(all(test, feature = "test-fixtures"))]
@@ -4316,6 +4371,30 @@ mod legacy_inspection_marker_tests {
         Ok(())
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn attributed_marker_accepts_symlink_aliased_temporary_root_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let container = tempfile::tempdir()?;
+        let actual_parent = container.path().join("actual-parent");
+        let actual_root = actual_parent.join("temporary-root");
+        let aliased_parent = container.path().join("aliased-parent");
+        fs::create_dir_all(&actual_root)?;
+        create_directory_link(&actual_parent, &aliased_parent)?;
+        let aliased_root = aliased_parent.join("temporary-root");
+        let marker = aliased_root.join("attributed-markers");
+        fs::create_dir(&marker)?;
+        let source = "f".repeat(64);
+
+        append_attributed_legacy_inspection_marker(Some(&marker), &aliased_root, &source)?;
+
+        let events = fs::read_dir(actual_root.join("attributed-markers").join(source))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(fs::metadata(events[0].path())?.len(), 0);
+        Ok(())
+    }
+
     #[test]
     fn attributed_markers_group_concurrent_empty_events_by_opaque_source()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4364,8 +4443,9 @@ mod legacy_inspection_marker_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let allowed = tempfile::tempdir()?;
         let outside = tempfile::tempdir()?;
-        let allowed_root = fs::canonicalize(allowed.path())?;
-        let outside_marker = fs::canonicalize(outside.path())?;
+        let allowed_root = allowed.path().to_path_buf();
+        let outside_marker = outside.path().to_path_buf();
+        let traversing_marker = allowed_root.join("nested").join("..").join("marker");
 
         let Err(traversal) = append_attributed_legacy_inspection_marker(
             Some(&allowed_root),
@@ -4381,9 +4461,24 @@ mod legacy_inspection_marker_tests {
         ) else {
             return Err("attributed marker outside the bounded temporary root was accepted".into());
         };
+        let Err(marker_traversal) = append_attributed_legacy_inspection_marker(
+            Some(&traversing_marker),
+            &allowed_root,
+            &"d".repeat(64),
+        ) else {
+            return Err(
+                "attributed marker accepted parent traversal below the temporary root".into(),
+            );
+        };
 
         assert!(traversal.to_string().contains("opaque SHA-256"));
         assert!(outside.to_string().contains("outside the temporary root"));
+        assert!(
+            marker_traversal
+                .to_string()
+                .contains("unsafe relative path"),
+            "unexpected marker traversal error: {marker_traversal}"
+        );
         assert!(fs::read_dir(allowed_root)?.next().is_none());
         assert!(fs::read_dir(outside_marker)?.next().is_none());
         Ok(())
