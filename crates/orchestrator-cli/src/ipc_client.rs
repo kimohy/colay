@@ -27,6 +27,8 @@ use uuid::Uuid;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "test-fixtures")]
+const MAX_TEST_SPAWN_BARRIER_PARTICIPANTS: usize = 64;
 
 type ResponseReader = Pin<Box<dyn AsyncBufRead + Send>>;
 
@@ -626,6 +628,22 @@ async fn wait_until_ready(
 }
 
 #[cfg(feature = "test-fixtures")]
+fn parse_test_spawn_barrier_count(value: &std::ffi::OsStr) -> Result<usize> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("daemon spawn barrier count is not valid UTF-8"))?;
+    let count = value
+        .parse::<usize>()
+        .context("daemon spawn barrier count is not a positive integer")?;
+    if !(1..=MAX_TEST_SPAWN_BARRIER_PARTICIPANTS).contains(&count) {
+        bail!(
+            "daemon spawn barrier count must be between 1 and {MAX_TEST_SPAWN_BARRIER_PARTICIPANTS}"
+        );
+    }
+    Ok(count)
+}
+
+#[cfg(feature = "test-fixtures")]
 async fn wait_for_test_spawn_barrier() -> Result<()> {
     let (barrier, expected) = match (
         std::env::var_os("COLAY_TEST_DAEMON_SPAWN_BARRIER"),
@@ -642,14 +660,7 @@ async fn wait_for_test_spawn_barrier() -> Result<()> {
             barrier.display()
         );
     }
-    let expected = expected
-        .to_str()
-        .ok_or_else(|| anyhow!("daemon spawn barrier count is not valid UTF-8"))?
-        .parse::<usize>()
-        .context("daemon spawn barrier count is not a positive integer")?;
-    if expected == 0 {
-        bail!("daemon spawn barrier count must be greater than zero");
-    }
+    let expected = parse_test_spawn_barrier_count(&expected)?;
 
     let marker = barrier.join(format!("{}.ready", std::process::id()));
     let mut marker_file = std::fs::OpenOptions::new()
@@ -1081,6 +1092,8 @@ mod tests {
 
     #[cfg(windows)]
     use super::open_windows_pipe_with_retry;
+    #[cfg(feature = "test-fixtures")]
+    use super::parse_test_spawn_barrier_count;
     use super::{
         CONNECT_TIMEOUT, LegacyDaemonIdentity, PingReadiness, RESPONSE_TIMEOUT,
         ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
@@ -1504,6 +1517,24 @@ mod tests {
         };
         assert_eq!(ping_readiness(&legacy)?, PingReadiness::Legacy);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn test_spawn_barrier_count_accepts_only_bounded_participants() -> anyhow::Result<()> {
+        for (raw, expected) in [("1", 1), ("4", 4), ("64", 64)] {
+            assert_eq!(
+                parse_test_spawn_barrier_count(std::ffi::OsStr::new(raw))?,
+                expected
+            );
+        }
+        for invalid in ["0", "65", "not-a-number"] {
+            assert!(
+                parse_test_spawn_barrier_count(std::ffi::OsStr::new(invalid)).is_err(),
+                "accepted invalid spawn barrier count {invalid:?}"
+            );
+        }
         Ok(())
     }
 
