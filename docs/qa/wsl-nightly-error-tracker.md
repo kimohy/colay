@@ -967,7 +967,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
-| `WIN-005` | high | fix-in-progress | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-005` | high | fix-in-progress (source checks passed; published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1780,9 +1780,43 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - 일반 IPC 응답 제한을 30초로 늘리는 timeout-only 수정은 중복 작업과 writer 점유를 그대로
   정상화하므로 거부했다. exact spawned daemon owner가 bootstrap 등록 영수증을 제공한 경우에만
   중복 `workspace.register`를 생략하고, incumbent daemon과 새 workspace 등록 경로는 유지한다.
-- 상태: `fix-in-progress`. test-fixtures 전용 content-free inspect marker로 현행 cold start의
-  3회 검사를 고정 재현했으며, 승인된 완료 계약은 plan inspect와 sealed-plan apply reinspection
-  합계 2회다. source hash와 import ledger/workspace cardinality는 유지해야 한다.
+- 상태: `fix-in-progress (source checks passed; published CI/nightly verification pending)`.
+  test-fixtures 전용 content-free inspect marker의 승인된 완료 계약은 plan inspect와
+  sealed-plan apply reinspection 합계 2회다. source hash와 import ledger/workspace cardinality는
+  유지해야 한다. `WIN-005`, `WSL-022`, `WSL-023`은 published verification 전에는 닫지 않는다.
+
+### 2026-08-05 source-fixed Windows evidence
+
+- Source `a52945d`에는 native ACL commits `c83200d`, `83181f0`, `ab5617e`, `361391a`,
+  `4e5e408`, `d1efe8e`, `3b6b8ec`와 receipt/concurrency commits through `c841b75`,
+  `77936e9`, `a52945d`가 포함된다. `cargo build -p colay --bins --features test-fixtures`는
+  통과했다. exact debug binary SHA-256은 `colay.exe`
+  `2197cef5b4120ce60072b9d657ba42f19f32d2933d9dfc899fc1efcf50724196`, fake-only
+  `colay-e2e-fake-provider.exe`
+  `9b146633d2914023021f695837572c4a5d9c013e887b0c2b1990b67787ddbba3`이다.
+- Native run `20260805T093708005Z`는 distinct non-empty schema-v8 source 5개의 incumbent
+  등록을 `[4273, 4261, 1336, 1343, 1420]` ms에 완료했고 nearest-rank p95는 `4273` ms
+  (`<=5000`)였다. 4개 동시 등록은 `[5844, 5750, 5653, 5579]` ms, 최대 `5844` ms
+  (`<=8000`)였다. source `RESPONSE_TIMEOUT`은 `10000` ms로 유지됐다.
+- Inspect marker는 9개 import에 정확히 18개였다. durable
+  workspace/path/import/session cardinality는 `10/10/9/9`, SQLite integrity는 `ok`, foreign-key
+  violation은 0, tasks/task attempts/worktrees/coordinator leases/worker leases는 모두 0이었다.
+  source SQLite SHA-256은
+  `5ef31365ff98b5ad813874a844f6d58dfe3cfe66f831664d0c978b494744a6fe`,
+  `61c89c13eaaedae9bc97ff26931675ecfd543a1ca2f23e6ece90dcfcb0ca3861`,
+  `460a5a36f40ba61a07350267e1c44c0dd523aa38934a570fd5277007636e46ee`,
+  `48e8c07fdbde2d07f0743dfecd30daf060fdee7ded54409b53bb82802ce95892`,
+  `2d52603dc8d97280c5b02534ad55f140798e8ee5240a04d0e86a1b10b025c75f`,
+  `d05fa9fe8351a01ed0048bc20f2c73df8063ffd966f62418013c105058ba2af8`,
+  `307d8b9e8871c7cda832305d3fc0c81aec5f439712713a36f73bca766f86b200`,
+  `05fa6d8b15123f9a5bb04e16ad23993e6fc7dca1e915ba77fddb6619d08b9f87`,
+  `b1d706bdff8411b89e7c4183e05fc7c7fd36a1a0981d82d91121e3a9cb69951a`로 import 전후
+  동일했다. attributable `whoami.exe`/`icacls.exe` launch와 stop 후 endpoint/live
+  lease/Colay/fake/utility residue는 모두 0이었다.
+- Original failures는 각각 exact serial 10/10 통과했다. `live_doctor_`는 serial 4/4
+  (`42.147s`), default 4/4 (`19.478s`), full `global_doctor`는 serial 33/33
+  (`156.932s`), default 33/33 (`45.997s`) 통과했다. 모든 run은 실제 nonzero test count를
+  보고했고 registration timeout은 없었다.
 
 ## WSL-009: config 없는 기존 DB의 migration 진입 실패 (WSL/Windows 공통)
 

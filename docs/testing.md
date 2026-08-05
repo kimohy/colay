@@ -91,6 +91,73 @@ registration, the current-SID-only named-pipe DACL, singleton ownership,
 non-Git plan-first behavior, all four fake provider doctor fixtures, idempotent
 legacy import, junction redirect rejection, and the 32-client cold-start fan-in.
 
+### Native Windows state ACL registration stress
+
+Run the native acceptance harness from PowerShell 7.2 or newer after building
+the exact test-fixtures binaries. The host must provide Python with SQLite
+3.37 or newer so the harness can create schema-v8 sources and inspect
+schema-17 `STRICT` tables without invoking a SQLite command shell. The harness
+accepts only `colay-e2e-fake-provider.exe`, clears provider credential variables
+from every child, and passes every process argument with
+`ProcessStartInfo.ArgumentList.Add`.
+
+```powershell
+cargo build -p colay --bins --features test-fixtures
+New-Item -ItemType Directory -Force artifacts\qa\windows-state-acl | Out-Null
+& scripts\qa\windows-state-acl-stress.ps1 `
+  -ColayExe (Resolve-Path target\debug\colay.exe) `
+  -FakeProviderExe (Resolve-Path target\debug\colay-e2e-fake-provider.exe) `
+  -EvidenceRoot (Resolve-Path artifacts\qa\windows-state-acl)
+```
+
+The run is a failure unless five sequential incumbent registrations have
+nearest-rank p95 at or below 5,000 ms, four simultaneous registrations each
+finish within 8,000 ms, and the source still declares the unchanged 10,000 ms
+IPC response timeout. Each source is a distinct non-empty schema-v8 database.
+The harness compares every source SQLite-family hash before and after import,
+requires exactly two content-free inspection markers per imported source,
+validates workspace/path/import/session and publication-ledger cardinality,
+runs SQLite integrity and foreign-key checks, and requires zero tasks, task
+attempts, worktrees, coordinator leases, and worker leases. `Win32_Process`
+ancestry observation must find zero attributable `whoami.exe` or `icacls.exe`
+launches. After daemon stop, the endpoint status, live lease count, and all
+attributable Colay, fake-provider, `whoami.exe`, and `icacls.exe` processes must
+be absent. The harness writes timestamped JSON plus `summary.json`, including
+failure evidence when safe.
+
+Source-fixed Windows evidence at `a52945d` (native ACL commits
+`c83200d`, `83181f0`, `ab5617e`, `361391a`, `4e5e408`, `d1efe8e`, and
+`3b6b8ec`; receipt/concurrency commits through `c841b75`, `77936e9`, and
+`a52945d`) used run `20260805T093708005Z`. The five sequential times were
+`[4273, 4261, 1336, 1343, 1420]` ms, with nearest-rank p95 `4273` ms. The four
+concurrent times were `[5844, 5750, 5653, 5579]` ms, with maximum `5844` ms.
+The run recorded exactly 18 inspections, durable cardinality
+workspaces/paths/imports/sessions `10/10/9/9`, SQLite `integrity_check = ok`,
+zero foreign-key violations, zero writable rows, zero utility launches, and
+zero post-stop process/live-lease/endpoint residue. The nine unchanged source
+database SHA-256 values were
+`5ef31365ff98b5ad813874a844f6d58dfe3cfe66f831664d0c978b494744a6fe`,
+`61c89c13eaaedae9bc97ff26931675ecfd543a1ca2f23e6ece90dcfcb0ca3861`,
+`460a5a36f40ba61a07350267e1c44c0dd523aa38934a570fd5277007636e46ee`,
+`48e8c07fdbde2d07f0743dfecd30daf060fdee7ded54409b53bb82802ce95892`,
+`2d52603dc8d97280c5b02534ad55f140798e8ee5240a04d0e86a1b10b025c75f`,
+`d05fa9fe8351a01ed0048bc20f2c73df8063ffd966f62418013c105058ba2af8`,
+`307d8b9e8871c7cda832305d3fc0c81aec5f439712713a36f73bca766f86b200`,
+`05fa6d8b15123f9a5bb04e16ad23993e6fc7dca1e915ba77fddb6619d08b9f87`,
+and `b1d706bdff8411b89e7c4183e05fc7c7fd36a1a0981d82d91121e3a9cb69951a`.
+The exact debug binaries were SHA-256
+`2197cef5b4120ce60072b9d657ba42f19f32d2933d9dfc899fc1efcf50724196`
+(`colay.exe`) and
+`9b146633d2914023021f695837572c4a5d9c013e887b0c2b1990b67787ddbba3`
+(`colay-e2e-fake-provider.exe`).
+
+The original failures each passed 10/10 exact serial repetitions. The
+`live_doctor_` group passed 4/4 serial in 42.147 seconds and 4/4 with default
+threads in 19.478 seconds. Full `global_doctor` passed 33/33 serial in 156.932
+seconds and 33/33 with default threads in 45.997 seconds. Published Windows CI
+and nightly verification remain required; these source checks do not close
+`WIN-005`, `WSL-022`, or `WSL-023`.
+
 Run the Linux commands inside WSL with Cargo build output on the Linux-native
 filesystem, not under `/mnt/<drive>`. A native checkout is preferred; when the
 source checkout is mounted read-only or used only as source, set
