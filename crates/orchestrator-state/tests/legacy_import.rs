@@ -90,6 +90,39 @@ fn dropping_prepared_import_cleans_owned_scratch_and_staging_without_target_muta
 }
 
 #[test]
+fn prepared_commit_rejects_a_different_durability_context_before_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let before = target_mutation_counts(&fixture)?;
+    let alternate_root = fixture.root.path().join("alternate-global-context");
+    let alternate_paths = GlobalStatePaths {
+        root: alternate_root.clone(),
+        database: fixture.paths.database.clone(),
+        backups: alternate_root.join("backups"),
+        workspaces: alternate_root.join("workspaces"),
+        runtime: alternate_root.join("runtime"),
+        config: alternate_root.join("config.toml"),
+    };
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &alternate_paths)
+        .err()
+        .ok_or("prepared import committed under a different durability context")?;
+
+    assert!(error.to_string().contains("prepared durability context"));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(regular_file_count(&alternate_paths.backups)?, 0);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn preparation_rejects_source_mutation_after_inspection_without_target_mutation() -> TestResult {
     let fixture = ImportFixture::new()?;
     let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
@@ -173,6 +206,42 @@ fn prepared_publish_failure_rolls_back_rows_and_cleans_owned_staging() -> TestRe
     assert_eq!(
         scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
         0
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn prepared_post_publish_precommit_failure_rolls_back_and_cleans_publication() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let mut prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    prepared.inject_post_publish_precommit_failure_for_test()?;
+    let before = target_mutation_counts(&fixture)?;
+    let imports = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports");
+    let sentinel = imports.join("unrelated-external-sentinel");
+    fs::write(&sentinel, b"must survive prepared import rollback")?;
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)
+        .err()
+        .ok_or("injected post-publish/pre-commit failure did not fire")?;
+
+    assert!(error.to_string().contains("post-publish/pre-commit"));
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    assert_eq!(
+        fs::read(&sentinel)?,
+        b"must survive prepared import rollback"
     );
     Ok(())
 }

@@ -231,8 +231,27 @@ pub struct LegacyImportResult {
 pub struct PreparedLegacyImport {
     target: WorkspaceId,
     plan: LegacyImportPlan,
-    expected_database: PathBuf,
+    expected_paths: GlobalStatePaths,
     state: PreparedLegacyImportState,
+}
+
+impl PreparedLegacyImport {
+    /// Injects a deterministic failure after atomic publication and before `SQLite` commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this value represents only a completed-import replay.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn inject_post_publish_precommit_failure_for_test(&mut self) -> StateResult<()> {
+        let PreparedLegacyImportState::Pending(pending) = &mut self.state else {
+            return Err(StateError::InvalidRecord(
+                "cannot inject a commit failure into a replayed legacy import".to_owned(),
+            ));
+        };
+        pending.fail_after_publish_before_commit = true;
+        Ok(())
+    }
 }
 
 enum PreparedLegacyImportState {
@@ -245,6 +264,8 @@ struct PendingLegacyImport {
     staging: LegacyImportStaging,
     rewrite_path: PathBuf,
     published_path: PathBuf,
+    #[cfg(feature = "test-fixtures")]
+    fail_after_publish_before_commit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -375,7 +396,7 @@ impl LegacyImporter {
             return Ok(PreparedLegacyImport {
                 target,
                 plan: plan.clone(),
-                expected_database: paths.database.clone(),
+                expected_paths: paths.clone(),
                 state: PreparedLegacyImportState::Replay,
             });
         }
@@ -393,7 +414,7 @@ impl LegacyImporter {
             return Ok(PreparedLegacyImport {
                 target,
                 plan: plan.clone(),
-                expected_database: paths.database.clone(),
+                expected_paths: paths.clone(),
                 state: PreparedLegacyImportState::Replay,
             });
         }
@@ -433,12 +454,14 @@ impl LegacyImporter {
         Ok(PreparedLegacyImport {
             target,
             plan: plan.clone(),
-            expected_database: paths.database.clone(),
+            expected_paths: paths.clone(),
             state: PreparedLegacyImportState::Pending(Box::new(PendingLegacyImport {
                 _scratch: scratch,
                 staging,
                 rewrite_path,
                 published_path,
+                #[cfg(feature = "test-fixtures")]
+                fail_after_publish_before_commit: false,
             })),
         })
     }
@@ -455,12 +478,13 @@ impl LegacyImporter {
         let PreparedLegacyImport {
             target,
             plan,
-            expected_database,
+            expected_paths,
             state,
         } = prepared;
-        if global.path() != paths.database || expected_database != paths.database {
+        if global.path() != paths.database || expected_paths != *paths {
             return Err(StateError::InvalidRecord(
-                "legacy import database does not match the prepared global state paths".to_owned(),
+                "legacy import global state paths do not match the prepared durability context"
+                    .to_owned(),
             ));
         }
         ensure_target_database(global, target)?;
@@ -478,7 +502,11 @@ impl LegacyImporter {
             mut staging,
             rewrite_path,
             published_path,
+            #[cfg(feature = "test-fixtures")]
+            fail_after_publish_before_commit,
         } = *pending;
+        #[cfg(not(feature = "test-fixtures"))]
+        let fail_after_publish_before_commit = false;
 
         let imported_at = Utc::now();
         let mut connection = global.raw_lock()?;
@@ -499,6 +527,7 @@ impl LegacyImporter {
             &published_path,
             imported_at,
             &mut staging,
+            fail_after_publish_before_commit,
         );
         let detach_result = connection.execute_batch("DETACH DATABASE legacy_import_source;");
         let result = transaction_result?;
@@ -547,7 +576,10 @@ fn apply_transaction(
     published_path: &Path,
     imported_at: DateTime<Utc>,
     staging: &mut LegacyImportStaging,
+    fail_after_publish_before_commit: bool,
 ) -> StateResult<LegacyImportResult> {
+    #[cfg(not(feature = "test-fixtures"))]
+    let _ = fail_after_publish_before_commit;
     let transaction = connection.transaction()?;
     if let Some(existing) = load_existing_result_in(&transaction, target, plan)? {
         return Ok(replayed_apply_result(existing));
@@ -601,6 +633,12 @@ fn apply_transaction(
     };
     record_import_ledger(&transaction, target, plan, &result, id_mappings)?;
     staging.publish()?;
+    #[cfg(feature = "test-fixtures")]
+    if fail_after_publish_before_commit {
+        return Err(StateError::RollbackGuard(
+            "injected legacy import post-publish/pre-commit failure".to_owned(),
+        ));
+    }
     transaction.commit()?;
     Ok(result)
 }
