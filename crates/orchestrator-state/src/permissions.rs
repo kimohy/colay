@@ -299,16 +299,66 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_read_only_verification_does_not_repair_inherited_dacl() -> StateResult<()> {
+    fn windows_public_file_api_repairs_permissive_dacl() -> StateResult<()> {
         let temporary = crate::CanonicalTempDir::new("tempdir")?;
-        let directory = temporary.path().join("state");
-        ensure_private_directory(&directory)?;
-        let file = directory.join("inherited.json");
+        let file = temporary.path().join("permissive.json");
         fs::write(&file, b"{}\r\n").map_err(|error| StateError::io(&file, error))?;
+        orchestrator_windows_ipc::test_support::install_permissive_state_artifact_dacl(
+            &file,
+            StateArtifactKind::File,
+        )
+        .map_err(|error| StateError::io(&file, error))?;
 
         assert!(verify_private_file(&file).is_err());
+        ensure_private_file(&file)?;
+        verify_private_file(&file)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_public_file_api_repairs_deny_containing_dacl() -> StateResult<()> {
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
+        let file = temporary.path().join("deny.json");
+        fs::write(&file, b"{}\r\n").map_err(|error| StateError::io(&file, error))?;
+        orchestrator_windows_ipc::test_support::install_deny_containing_state_artifact_dacl(
+            &file,
+            StateArtifactKind::File,
+        )
+        .map_err(|error| StateError::io(&file, error))?;
+
         assert!(verify_private_file(&file).is_err());
         ensure_private_file(&file)?;
+        verify_private_file(&file)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_public_file_api_preserves_native_access_denied_error() -> StateResult<()> {
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
+        let file = temporary.path().join("access-denied.json");
+        fs::write(&file, b"{}\r\n").map_err(|error| StateError::io(&file, error))?;
+        ensure_private_file(&file)?;
+        let canonical = fs::canonicalize(&file).map_err(|error| StateError::io(&file, error))?;
+        let mut denied = orchestrator_windows_ipc::test_support::deny_state_artifact_acl_access(
+            &file,
+            StateArtifactKind::File,
+        )
+        .map_err(|error| StateError::io(&file, error))?;
+
+        let Err(error) = ensure_private_file(&file) else {
+            panic!("state hardening unexpectedly opened an ACL-denied artifact");
+        };
+        let StateError::Io { path, source } = error else {
+            panic!("native access denial did not remain a path-aware I/O error");
+        };
+        assert_eq!(path, canonical);
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(source.to_string().contains("target open"), "{source}");
+        assert!(source.to_string().contains("os error 5"), "{source}");
+
+        denied
+            .restore()
+            .map_err(|error| StateError::io(&file, error))?;
         verify_private_file(&file)
     }
 }

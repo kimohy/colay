@@ -27,6 +27,11 @@ use windows_sys::Win32::{
 
 use crate::process_identity::current_process_user;
 
+#[cfg(any(test, feature = "test-support"))]
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+
 const MAX_SECURITY_DESCRIPTOR_BYTES: usize = 128 * 1024;
 static STATE_ARTIFACT_REPAIR: Mutex<()> = Mutex::new(());
 
@@ -843,6 +848,171 @@ fn stage_invalid_data(stage: &'static str, detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{stage}: {detail}"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn install_fixture_dacl(
+    path: &Path,
+    kind: StateArtifactKind,
+    sddl: &str,
+    protected: bool,
+) -> io::Result<()> {
+    let encoded = sddl.encode_utf16().chain([0]).collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: The SDDL is live and NUL-terminated; the output receives LocalAlloc memory.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            encoded.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 || descriptor.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let _descriptor = LocalDescriptor(descriptor);
+    let mut present = 0;
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: The converted descriptor is live and all outputs are writable.
+    let loaded = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut dacl,
+            &raw mut defaulted,
+        )
+    };
+    if loaded == 0 || present == 0 || dacl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "test fixture did not produce a non-null DACL",
+        ));
+    }
+    let handle = open_target(path, kind, true)?;
+    let protection = if protected {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: The retained handle and converted non-null DACL are live. Owner, group, and SACL
+    // are intentionally unchanged.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(status).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use std::{io, path::Path};
+
+    use super::{
+        OwnedAcl, OwnedHandle, StateArtifactKind, expected_principals, install_acl,
+        install_fixture_dacl, open_target,
+    };
+
+    /// Restores exact state-artifact access after an intentional test-only access denial.
+    pub struct StateArtifactAclAccessDeniedGuard {
+        handle: OwnedHandle,
+        exact_acl: Option<OwnedAcl>,
+    }
+
+    impl StateArtifactAclAccessDeniedGuard {
+        /// Restores the exact native state DACL through the handle retained before denial.
+        pub fn restore(&mut self) -> io::Result<()> {
+            let Some(acl) = self.exact_acl.as_ref() else {
+                return Ok(());
+            };
+            install_acl(self.handle.0, acl)?;
+            self.exact_acl = None;
+            Ok(())
+        }
+    }
+
+    impl Drop for StateArtifactAclAccessDeniedGuard {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    /// Installs a fixed protected DACL granting Everyone full access on a temporary artifact.
+    pub fn install_permissive_state_artifact_dacl(
+        path: &Path,
+        kind: StateArtifactKind,
+    ) -> io::Result<()> {
+        let target = validate_temporary_fixture_target(path)?;
+        let flags = inheritance_flags(kind);
+        install_fixture_dacl(&target, kind, &format!("D:P(A;{flags};GA;;;WD)"), true)
+    }
+
+    /// Installs a fixed protected DACL containing a Builtin Users deny ACE.
+    pub fn install_deny_containing_state_artifact_dacl(
+        path: &Path,
+        kind: StateArtifactKind,
+    ) -> io::Result<()> {
+        let target = validate_temporary_fixture_target(path)?;
+        let user = crate::current_process_user_sid()?;
+        let flags = inheritance_flags(kind);
+        let sddl = format!(
+            "D:P(D;{flags};0x00000001;;;BU)(A;{flags};GA;;;{user})(A;{flags};GA;;;SY)(A;{flags};GA;;;BA)"
+        );
+        install_fixture_dacl(&target, kind, &sddl, true)
+    }
+
+    /// Denies the owner `READ_CONTROL|WRITE_DAC` while retaining a handle that can restore access.
+    pub fn deny_state_artifact_acl_access(
+        path: &Path,
+        kind: StateArtifactKind,
+    ) -> io::Result<StateArtifactAclAccessDeniedGuard> {
+        let target = validate_temporary_fixture_target(path)?;
+        let principals = expected_principals()?;
+        let exact_acl = OwnedAcl::build(kind, &principals)?;
+        let handle = open_target(&target, kind, true)?;
+        let user = crate::current_process_user_sid()?;
+        let flags = inheritance_flags(kind);
+        let denied = format!(
+            "D:P(D;{flags};RCWD;;;OW)(A;{flags};GA;;;{user})(A;{flags};GA;;;SY)(A;{flags};GA;;;BA)"
+        );
+        install_fixture_dacl(&target, kind, &denied, true)?;
+        Ok(StateArtifactAclAccessDeniedGuard {
+            handle,
+            exact_acl: Some(exact_acl),
+        })
+    }
+
+    fn inheritance_flags(kind: StateArtifactKind) -> &'static str {
+        match kind {
+            StateArtifactKind::File => "",
+            StateArtifactKind::Directory => "OICI",
+        }
+    }
+
+    fn validate_temporary_fixture_target(path: &Path) -> io::Result<std::path::PathBuf> {
+        let target = std::fs::canonicalize(path)?;
+        let temporary = std::fs::canonicalize(std::env::temp_dir())?;
+        if target == temporary || !target.starts_with(&temporary) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state ACL test fixture target is outside the system temporary directory",
+            ));
+        }
+        Ok(target)
+    }
+}
+
 #[cfg(test)]
 fn reset_set_security_info_calls_for_test() {
     SET_SECURITY_INFO_CALLS.store(0, Ordering::SeqCst);
@@ -890,33 +1060,15 @@ fn read_owner_sid_for_test(path: &Path, kind: StateArtifactKind) -> io::Result<B
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        ffi::c_void,
-        fs, io,
-        mem::size_of,
-        os::windows::{ffi::OsStrExt as _, fs::symlink_file},
-        path::Path,
-        ptr,
-        sync::Mutex,
-    };
+    use std::{fs, io, mem::size_of, os::windows::fs::symlink_file, path::Path, ptr, sync::Mutex};
 
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
         Security::{
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-            Authorization::{
-                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-                SE_FILE_OBJECT, SetSecurityInfo,
-            },
-            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAclInformation,
-            GetSecurityDescriptorDacl, INHERITED_ACE, IsValidAcl, OBJECT_INHERIT_ACE,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-            UNPROTECTED_DACL_SECURITY_INFORMATION,
+            CONTAINER_INHERIT_ACE, GetAclInformation, INHERITED_ACE, IsValidAcl,
+            OBJECT_INHERIT_ACE,
         },
-        Storage::FileSystem::{
-            CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
-        },
+        Storage::FileSystem::FILE_ALL_ACCESS,
         System::SystemServices::{
             ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
             ACCESS_ALLOWED_OBJECT_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SYSTEM_AUDIT_ACE_TYPE,
@@ -937,30 +1089,6 @@ mod tests {
     const ADMIN_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
     const EVERYONE_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
     static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct TestHandle(HANDLE);
-
-    impl Drop for TestHandle {
-        fn drop(&mut self) {
-            // SAFETY: This test guard owns a successful `CreateFileW` result.
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-
-    struct TestLocalAllocation(*mut c_void);
-
-    impl Drop for TestLocalAllocation {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: This guard owns a successful LocalAlloc-family API result.
-                unsafe {
-                    let _ = LocalFree(self.0);
-                }
-            }
-        }
-    }
 
     #[derive(Clone)]
     struct TestAce {
@@ -1049,106 +1177,13 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn encode_path(path: &Path) -> io::Result<Vec<u16>> {
-        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if encoded.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "test path contains an interior NUL",
-            ));
-        }
-        encoded.push(0);
-        Ok(encoded)
-    }
-
-    fn open_test_target(path: &Path, kind: StateArtifactKind) -> io::Result<TestHandle> {
-        let encoded = encode_path(path)?;
-        let flags = FILE_FLAG_OPEN_REPARSE_POINT
-            | match kind {
-                StateArtifactKind::File => 0,
-                StateArtifactKind::Directory => FILE_FLAG_BACKUP_SEMANTICS,
-            };
-        // SAFETY: The encoded path is live and NUL-terminated. The returned handle is owned.
-        let handle = unsafe {
-            CreateFileW(
-                encoded.as_ptr(),
-                READ_CONTROL | WRITE_DAC,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null(),
-                OPEN_EXISTING,
-                flags,
-                ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(TestHandle(handle))
-    }
-
     fn set_test_dacl(
         path: &Path,
         kind: StateArtifactKind,
         sddl: &str,
         protected: bool,
     ) -> io::Result<()> {
-        let encoded = sddl.encode_utf16().chain([0]).collect::<Vec<_>>();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        // SAFETY: The SDDL is live and NUL-terminated; the output receives LocalAlloc memory.
-        let converted = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                encoded.as_ptr(),
-                SDDL_REVISION_1,
-                &raw mut descriptor,
-                ptr::null_mut(),
-            )
-        };
-        if converted == 0 || descriptor.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let _descriptor = TestLocalAllocation(descriptor.cast());
-        let mut present = 0;
-        let mut dacl: *mut ACL = ptr::null_mut();
-        let mut defaulted = 0;
-        // SAFETY: The converted descriptor is live and all outputs are writable.
-        let loaded = unsafe {
-            GetSecurityDescriptorDacl(
-                descriptor,
-                &raw mut present,
-                &raw mut dacl,
-                &raw mut defaulted,
-            )
-        };
-        if loaded == 0 || present == 0 || dacl.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "test SDDL did not produce a non-null DACL",
-            ));
-        }
-        let handle = open_test_target(path, kind)?;
-        let protection = if protected {
-            PROTECTED_DACL_SECURITY_INFORMATION
-        } else {
-            UNPROTECTED_DACL_SECURITY_INFORMATION
-        };
-        // SAFETY: The handle and non-null DACL are live; owner/group/SACL are intentionally null.
-        let status = unsafe {
-            SetSecurityInfo(
-                handle.0,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | protection,
-                ptr::null_mut::<c_void>() as PSID,
-                ptr::null_mut::<c_void>() as PSID,
-                dacl,
-                ptr::null(),
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(
-                i32::try_from(status).unwrap_or(i32::MAX),
-            ));
-        }
-        Ok(())
+        super::install_fixture_dacl(path, kind, sddl, protected)
     }
 
     fn aligned_bytes_mut(storage: &mut AlignedBuffer) -> &mut [u8] {

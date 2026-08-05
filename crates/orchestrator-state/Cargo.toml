@@ -33,5 +33,8 @@ orchestrator-windows-ipc = { path = "../orchestrator-windows-ipc" }
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+orchestrator-windows-ipc = { path = "../orchestrator-windows-ipc", features = ["test-support"] }
+
 [lints]
 workspace = true

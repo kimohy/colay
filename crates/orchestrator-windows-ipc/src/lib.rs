@@ -6,6 +6,8 @@ mod process_identity;
 mod state_artifact;
 
 pub use process_identity::current_process_user_sid;
+#[cfg(feature = "test-support")]
+pub use state_artifact::test_support;
 pub use state_artifact::{
     StateArtifactKind, ensure_private_state_artifact, verify_private_state_artifact,
 };
