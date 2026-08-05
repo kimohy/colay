@@ -16,6 +16,13 @@ internal static class WindowsProcessAuditHelper
 
     private static int Main(string[] args)
     {
+#if PROCESS_AUDIT_TESTING
+        if (args.Length == 1 && args[0] == "--test-run-internal-unit-tests")
+        {
+            return AuditRunner.RunInternalUnitTests();
+        }
+#endif
+
         Options options;
         try
         {
@@ -76,6 +83,9 @@ internal static class WindowsProcessAuditHelper
         };
         internal string Executable;
         internal readonly List<string> ChildArguments = new List<string>();
+#if PROCESS_AUDIT_TESTING
+        internal bool TestFailBeforeJobAssignment;
+#endif
 
         internal static Options Parse(string[] args)
         {
@@ -137,22 +147,13 @@ internal static class WindowsProcessAuditHelper
                         break;
                     case "--child-argument-base64":
                         string encodedArgument = RequireValue(args, ref index, argument);
-                        try
-                        {
-                            byte[] argumentBytes = Convert.FromBase64String(encodedArgument);
-                            if (argumentBytes.Length == 0 || argumentBytes[0] != 0)
-                            {
-                                throw new FormatException("missing zero-byte framing prefix");
-                            }
-
-                            options.ChildArguments.Add(new UTF8Encoding(false, true).GetString(argumentBytes, 1, argumentBytes.Length - 1));
-                        }
-                        catch (Exception error)
-                        {
-                            throw new ArgumentException("--child-argument-base64 requires canonical UTF-8 base64", error);
-                        }
-
+                        options.ChildArguments.Add(DecodeChildArgument(encodedArgument));
                         break;
+#if PROCESS_AUDIT_TESTING
+                    case "--test-fail-before-job-assignment":
+                        options.TestFailBeforeJobAssignment = true;
+                        break;
+#endif
                     default:
                         throw new ArgumentException("unknown option before --: " + argument);
                 }
@@ -218,6 +219,41 @@ internal static class WindowsProcessAuditHelper
                 throw new ArgumentException("environment names must be nonempty and cannot contain '=' or NUL");
             }
         }
+
+        internal static string DecodeChildArgument(string encodedArgument)
+        {
+            byte[] argumentBytes;
+            try
+            {
+                argumentBytes = Convert.FromBase64String(encodedArgument);
+            }
+            catch (FormatException error)
+            {
+                throw new ArgumentException("--child-argument-base64 requires framed UTF-8 base64", error);
+            }
+
+            if (argumentBytes.Length == 0 || argumentBytes[0] != 0)
+            {
+                throw new ArgumentException("--child-argument-base64 is missing its zero-byte framing prefix");
+            }
+
+            string decoded;
+            try
+            {
+                decoded = new UTF8Encoding(false, true).GetString(argumentBytes, 1, argumentBytes.Length - 1);
+            }
+            catch (DecoderFallbackException error)
+            {
+                throw new ArgumentException("--child-argument-base64 contains invalid UTF-8", error);
+            }
+
+            if (decoded.IndexOf('\0') >= 0)
+            {
+                throw new ArgumentException("decoded child arguments cannot contain NUL");
+            }
+
+            return decoded;
+        }
     }
 
     private sealed class AuditRunner
@@ -231,10 +267,15 @@ internal static class WindowsProcessAuditHelper
         private const uint DbgContinue = 0x00010002;
         private const uint DbgExceptionNotHandled = 0x80010001;
         private const uint ExceptionBreakpoint = 0x80000003;
-        private const uint CreateProcessDebugEvent = 3;
-        private const uint ExitProcessDebugEvent = 5;
-        private const uint LoadDllDebugEvent = 6;
-        private const uint ExceptionDebugEvent = 1;
+        private const uint EXCEPTION_DEBUG_EVENT = 1;
+        private const uint CREATE_THREAD_DEBUG_EVENT = 2;
+        private const uint CREATE_PROCESS_DEBUG_EVENT = 3;
+        private const uint EXIT_THREAD_DEBUG_EVENT = 4;
+        private const uint EXIT_PROCESS_DEBUG_EVENT = 5;
+        private const uint LOAD_DLL_DEBUG_EVENT = 6;
+        private const uint UNLOAD_DLL_DEBUG_EVENT = 7;
+        private const uint OUTPUT_DEBUG_STRING_EVENT = 8;
+        private const uint RIP_EVENT = 9;
         private const uint ErrorSemTimeout = 121;
         private const uint ErrorInsufficientBuffer = 122;
         private const uint HandleFlagInherit = 0x00000001;
@@ -246,6 +287,18 @@ internal static class WindowsProcessAuditHelper
         private const uint JobObjectLimitKillOnJobClose = 0x00002000;
         private const int JobObjectExtendedLimitInformation = 9;
         private const uint InfiniteStillActive = 259;
+
+        private enum DebugEventKind
+        {
+            Exception,
+            CreateThread,
+            CreateProcess,
+            ExitThread,
+            ExitProcess,
+            LoadDll,
+            UnloadDll,
+            OutputDebugString
+        }
 
         private readonly Options options;
         private readonly AuditEvidence evidence;
@@ -267,6 +320,138 @@ internal static class WindowsProcessAuditHelper
             this.options = options;
             this.evidence = evidence;
         }
+
+#if PROCESS_AUDIT_TESTING
+        internal static int RunInternalUnitTests()
+        {
+            try
+            {
+                uint[] codes =
+                {
+                    EXCEPTION_DEBUG_EVENT,
+                    CREATE_THREAD_DEBUG_EVENT,
+                    CREATE_PROCESS_DEBUG_EVENT,
+                    EXIT_THREAD_DEBUG_EVENT,
+                    EXIT_PROCESS_DEBUG_EVENT,
+                    LOAD_DLL_DEBUG_EVENT,
+                    UNLOAD_DLL_DEBUG_EVENT,
+                    OUTPUT_DEBUG_STRING_EVENT
+                };
+                DebugEventKind[] expected =
+                {
+                    DebugEventKind.Exception,
+                    DebugEventKind.CreateThread,
+                    DebugEventKind.CreateProcess,
+                    DebugEventKind.ExitThread,
+                    DebugEventKind.ExitProcess,
+                    DebugEventKind.LoadDll,
+                    DebugEventKind.UnloadDll,
+                    DebugEventKind.OutputDebugString
+                };
+                for (int index = 0; index < codes.Length; index++)
+                {
+                    DebugEvent known = new DebugEvent();
+                    known.Code = codes[index];
+                    DebugEventKind actual = ClassifyDebugEvent(ref known);
+                    if (actual != expected[index])
+                    {
+                        throw new InvalidOperationException(
+                            "debug event " + codes[index] + " classified as " + actual +
+                            " instead of " + expected[index]);
+                    }
+                }
+
+                DebugEvent rip = new DebugEvent();
+                rip.Code = RIP_EVENT;
+                rip.Data.Rip.Error = 17;
+                rip.Data.Rip.Type = 23;
+                bool ripRejected = false;
+                try
+                {
+                    ClassifyDebugEvent(ref rip);
+                }
+                catch (InvalidOperationException error)
+                {
+                    ripRejected = error.Message.Contains("RIP_EVENT") &&
+                        error.Message.Contains("error=17") &&
+                        error.Message.Contains("type=23");
+                }
+
+                if (!ripRejected)
+                {
+                    throw new InvalidOperationException("RIP_EVENT was not rejected with its RIP_INFO payload");
+                }
+
+                DebugEvent unknown = new DebugEvent();
+                unknown.Code = 42;
+                bool unknownRejected = false;
+                try
+                {
+                    ClassifyDebugEvent(ref unknown);
+                }
+                catch (InvalidOperationException error)
+                {
+                    unknownRejected = error.Message.Contains("unknown debug event code: 42");
+                }
+
+                if (!unknownRejected)
+                {
+                    throw new InvalidOperationException("unknown debug event code was not rejected");
+                }
+
+                byte[] nulArgument = { 0, (byte)'a', 0, (byte)'b' };
+                bool nulRejected = false;
+                try
+                {
+                    Options.DecodeChildArgument(Convert.ToBase64String(nulArgument));
+                }
+                catch (ArgumentException error)
+                {
+                    nulRejected = error.Message.Contains("cannot contain NUL");
+                }
+
+                if (!nulRejected)
+                {
+                    throw new InvalidOperationException("decoded NUL child argument was not rejected");
+                }
+
+                string executable = "C:\\x.exe";
+                int largestArgumentLength = 32766 - executable.Length - 1;
+                List<string> largestArguments = new List<string>();
+                largestArguments.Add(new string('a', largestArgumentLength));
+                string largest = BuildCommandLine(executable, largestArguments);
+                if (largest.Length + 1 != 32767)
+                {
+                    throw new InvalidOperationException("maximum command line did not include exactly one terminating NUL");
+                }
+
+                bool oversizedRejected = false;
+                try
+                {
+                    List<string> oversizedArguments = new List<string>();
+                    oversizedArguments.Add(new string('a', largestArgumentLength + 1));
+                    BuildCommandLine(executable, oversizedArguments);
+                }
+                catch (ArgumentException error)
+                {
+                    oversizedRejected = error.Message.Contains("terminating NUL");
+                }
+
+                if (!oversizedRejected)
+                {
+                    throw new InvalidOperationException("command line with 32768 code units including NUL was not rejected");
+                }
+
+                Console.WriteLine("windows process audit helper internal unit tests passed");
+                return 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine("windows process audit helper internal unit test failure: " + error);
+                return ObserverFailureExitCode;
+            }
+        }
+#endif
 
         internal int Run()
         {
@@ -344,6 +529,30 @@ internal static class WindowsProcessAuditHelper
                 {
                     throw LastError("DebugSetProcessKillOnExit");
                 }
+
+#if PROCESS_AUDIT_TESTING
+                if (options.TestFailBeforeJobAssignment)
+                {
+                    DebugEvent initialEvent;
+                    if (!Native.WaitForDebugEvent(out initialEvent, 5000))
+                    {
+                        throw LastError("WaitForDebugEvent(test pre-job create)");
+                    }
+
+                    bool expectedRootCreate =
+                        initialEvent.Code == CREATE_PROCESS_DEBUG_EVENT &&
+                        initialEvent.ProcessId == rootProcessId;
+                    ProcessAndContinueEvent(ref initialEvent, true);
+                    if (!expectedRootCreate)
+                    {
+                        throw new InvalidOperationException(
+                            "test pre-job injection received unexpected debug event code=" + initialEvent.Code +
+                            " pid=" + initialEvent.ProcessId);
+                    }
+
+                    throw new InvalidOperationException("injected pre-job-assignment failure");
+                }
+#endif
 
                 if (!Native.AssignProcessToJobObject(job, rootProcess))
                 {
@@ -439,7 +648,7 @@ internal static class WindowsProcessAuditHelper
 
         private void ProcessAndContinueEvent(ref DebugEvent debugEvent, bool enforceForbidden)
         {
-            uint continueStatus = debugEvent.Code == ExceptionDebugEvent ? DbgExceptionNotHandled : DbgContinue;
+            uint continueStatus = debugEvent.Code == EXCEPTION_DEBUG_EVENT ? DbgExceptionNotHandled : DbgContinue;
             Exception handlerError = null;
             try
             {
@@ -489,26 +698,60 @@ internal static class WindowsProcessAuditHelper
 
         private uint HandleEvent(ref DebugEvent debugEvent, bool enforceForbidden)
         {
-            switch (debugEvent.Code)
+            switch (ClassifyDebugEvent(ref debugEvent))
             {
-                case CreateProcessDebugEvent:
+                case DebugEventKind.CreateProcess:
                     HandleCreate(ref debugEvent, enforceForbidden);
                     return DbgContinue;
-                case ExitProcessDebugEvent:
+                case DebugEventKind.ExitProcess:
                     HandleExit(ref debugEvent);
                     return DbgContinue;
-                case LoadDllDebugEvent:
+                case DebugEventKind.LoadDll:
                     CloseDebugFile(debugEvent.Data.LoadDll.File, "LOAD_DLL_DEBUG_EVENT hFile");
                     return DbgContinue;
-                case ExceptionDebugEvent:
+                case DebugEventKind.Exception:
                     if (debugEvent.Data.ExceptionCode == ExceptionBreakpoint && initialBreakpoints.Add(debugEvent.ProcessId))
                     {
                         return DbgContinue;
                     }
 
                     return DbgExceptionNotHandled;
-                default:
+                case DebugEventKind.CreateThread:
+                case DebugEventKind.ExitThread:
+                case DebugEventKind.UnloadDll:
+                case DebugEventKind.OutputDebugString:
                     return DbgContinue;
+                default:
+                    throw new InvalidOperationException("unhandled classified debug event kind: " + debugEvent.Code);
+            }
+        }
+
+        private static DebugEventKind ClassifyDebugEvent(ref DebugEvent debugEvent)
+        {
+            switch (debugEvent.Code)
+            {
+                case EXCEPTION_DEBUG_EVENT:
+                    return DebugEventKind.Exception;
+                case CREATE_THREAD_DEBUG_EVENT:
+                    return DebugEventKind.CreateThread;
+                case CREATE_PROCESS_DEBUG_EVENT:
+                    return DebugEventKind.CreateProcess;
+                case EXIT_THREAD_DEBUG_EVENT:
+                    return DebugEventKind.ExitThread;
+                case EXIT_PROCESS_DEBUG_EVENT:
+                    return DebugEventKind.ExitProcess;
+                case LOAD_DLL_DEBUG_EVENT:
+                    return DebugEventKind.LoadDll;
+                case UNLOAD_DLL_DEBUG_EVENT:
+                    return DebugEventKind.UnloadDll;
+                case OUTPUT_DEBUG_STRING_EVENT:
+                    return DebugEventKind.OutputDebugString;
+                case RIP_EVENT:
+                    throw new InvalidOperationException(
+                        "RIP_EVENT reported error=" + debugEvent.Data.Rip.Error +
+                        " type=" + debugEvent.Data.Rip.Type);
+                default:
+                    throw new InvalidOperationException("unknown debug event code: " + debugEvent.Code);
             }
         }
 
@@ -693,9 +936,9 @@ internal static class WindowsProcessAuditHelper
                 AppendQuotedArgument(commandLine, arguments[index]);
             }
 
-            if (commandLine.Length > 32767)
+            if (commandLine.Length >= 32767)
             {
-                throw new ArgumentException("child command line exceeds 32767 UTF-16 code units");
+                throw new ArgumentException("child command line including its terminating NUL exceeds 32767 UTF-16 code units");
             }
 
             return commandLine.ToString();
@@ -1384,6 +1627,13 @@ internal static class WindowsProcessAuditHelper
         internal uint ExitCode;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RipInfo
+    {
+        internal uint Error;
+        internal uint Type;
+    }
+
     [StructLayout(LayoutKind.Explicit, Size = 160)]
     private struct DebugEventData
     {
@@ -1395,6 +1645,9 @@ internal static class WindowsProcessAuditHelper
 
         [FieldOffset(0)]
         internal ExitProcessDebugInfo ExitProcess;
+
+        [FieldOffset(0)]
+        internal RipInfo Rip;
 
         [FieldOffset(0)]
         internal uint ExceptionCode;

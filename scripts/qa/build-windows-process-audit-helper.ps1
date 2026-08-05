@@ -42,7 +42,8 @@ New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
 function Invoke-CSharpCompiler {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Output
+        [Parameter(Mandatory = $true)][string]$Output,
+        [string[]]$AdditionalCompilerArguments = @()
     )
 
     $compilerArguments = @(
@@ -55,6 +56,7 @@ function Invoke-CSharpCompiler {
         "/out:$Output",
         $Source
     )
+    $compilerArguments += $AdditionalCompilerArguments
     & $compiler @compilerArguments
     if ($LASTEXITCODE -ne 0) {
         throw "C# compiler failed with exit code $LASTEXITCODE for $Source"
@@ -71,6 +73,11 @@ if ($IncludeTestChild) {
     if (-not (Test-Path -LiteralPath $testChildSource -PathType Leaf)) {
         throw "required test source file is missing: $testChildSource"
     }
+    $testHelperOutput = Join-Path $resolvedOutput 'windows-process-audit-helper-test.exe'
+    Invoke-CSharpCompiler `
+        -Source $helperSource `
+        -Output $testHelperOutput `
+        -AdditionalCompilerArguments @('/define:PROCESS_AUDIT_TESTING')
     $testChildOutput = Join-Path $resolvedOutput 'windows-process-audit-test-child.exe'
     Invoke-CSharpCompiler -Source $testChildSource -Output $testChildOutput
 }

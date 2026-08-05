@@ -9,7 +9,8 @@ $ErrorActionPreference = 'Stop'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildScript = Join-Path $scriptRoot 'build-windows-process-audit-helper.ps1'
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("colay-process-audit-test-" + [guid]::NewGuid().ToString('N'))
-$helper = Join-Path $tempRoot 'windows-process-audit-helper.exe'
+$productionHelper = Join-Path $tempRoot 'windows-process-audit-helper.exe'
+$helper = Join-Path $tempRoot 'windows-process-audit-helper-test.exe'
 $testChild = Join-Path $tempRoot 'windows-process-audit-test-child.exe'
 
 function Assert-Equal {
@@ -50,6 +51,15 @@ function Assert-NoRecordedResidue {
         ([string]$_.ExecutablePath).StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)
     })
     Assert-Equal 0 $tempResidual.Count "$Label temp-root residual process count"
+}
+
+function Assert-RecordedPidAccounting {
+    param($Evidence, [string]$Label)
+    $startIds = @($Evidence.process_starts | ForEach-Object { [uint32]$_.process_id } | Sort-Object)
+    $exitIds = @($Evidence.process_exits | ForEach-Object { [uint32]$_.process_id } | Sort-Object)
+    Assert-True ($startIds.Count -gt 0) "$Label must record at least one process start"
+    Assert-Equal ($startIds -join ',') ($exitIds -join ',') "$Label start/exit PID multiset"
+    Assert-Equal 0 @($Evidence.active_process_ids_at_finish).Count "$Label final active set"
 }
 
 function Invoke-Audit {
@@ -105,8 +115,36 @@ function Invoke-Audit {
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 try {
     & $buildScript -OutputDirectory $tempRoot -IncludeTestChild
-    Assert-True (Test-Path -LiteralPath $helper -PathType Leaf) 'helper build did not produce an executable'
+    Assert-True (Test-Path -LiteralPath $productionHelper -PathType Leaf) 'production helper build did not produce an executable'
+    Assert-True (Test-Path -LiteralPath $helper -PathType Leaf) 'test helper build did not produce an executable'
     Assert-True (Test-Path -LiteralPath $testChild -PathType Leaf) 'test-child build did not produce an executable'
+
+    $unitStdout = Join-Path $tempRoot 'internal-unit.stdout'
+    $unitStderr = Join-Path $tempRoot 'internal-unit.stderr'
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $helper '--test-run-internal-unit-tests' 1> $unitStdout 2> $unitStderr
+        $unitExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    Assert-Equal 0 $unitExit 'test-only internal unit checks exit code'
+    Assert-True ((Get-Content -Raw -LiteralPath $unitStdout) -match 'internal unit tests passed') 'test-only internal unit checks output'
+
+    $productionStdout = Join-Path $tempRoot 'production-hook.stdout'
+    $productionStderr = Join-Path $tempRoot 'production-hook.stderr'
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $productionHelper '--test-run-internal-unit-tests' 1> $productionStdout 2> $productionStderr
+        $productionHookExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    Assert-Equal 125 $productionHookExit 'production helper must reject test-only hook'
 
     $contractArguments = @('', 'plain', 'with spaces', 'quote"tail', 'slash\', 'slashes\\"quote')
     $contract = Invoke-Audit `
@@ -154,7 +192,21 @@ try {
     Assert-Equal 125 $timedOut.ExitCode 'timeout must use observer-failure exit code'
     Assert-Equal 'failed' $timedOut.Evidence.status 'timeout evidence status'
     Assert-True ([string]$timedOut.Evidence.observer_error -match 'timeout') 'timeout evidence reason'
+    $timeoutNames = @($timedOut.Evidence.process_starts | ForEach-Object { [System.IO.Path]::GetFileName([string]$_.path).ToLowerInvariant() })
+    Assert-True ($timeoutNames -contains 'windows-process-audit-test-child.exe') 'timeout must record the root process start'
+    Assert-RecordedPidAccounting $timedOut.Evidence 'timed-out audit'
     Assert-NoRecordedResidue $timedOut.Evidence 'timed-out audit'
+
+    $preJobFailure = Invoke-Audit `
+        -ChildArguments @('exit', '0') `
+        -AdditionalAuditArguments @('--test-fail-before-job-assignment')
+    Assert-Equal 125 $preJobFailure.ExitCode 'pre-job injected failure exit code'
+    Assert-Equal 'failed' $preJobFailure.Evidence.status 'pre-job injected failure status'
+    Assert-True ([string]$preJobFailure.Evidence.observer_error -match 'injected pre-job-assignment failure') 'pre-job injected failure reason'
+    $preJobNames = @($preJobFailure.Evidence.process_starts | ForEach-Object { [System.IO.Path]::GetFileName([string]$_.path).ToLowerInvariant() })
+    Assert-True ($preJobNames -contains 'windows-process-audit-test-child.exe') 'pre-job failure must record the suspended root'
+    Assert-RecordedPidAccounting $preJobFailure.Evidence 'pre-job injected failure'
+    Assert-NoRecordedResidue $preJobFailure.Evidence 'pre-job injected failure'
 
     $flood = Invoke-Audit -ChildArguments @('flood', '1048576')
     Assert-Equal 0 $flood.ExitCode 'stdout/stderr flood audit exit code'
@@ -172,6 +224,29 @@ try {
     Assert-True ($source.Contains('DeleteProcThreadAttributeList')) 'helper must delete the attribute list'
     Assert-True ($source.Contains('initialBreakpoints.Remove(debugEvent.ProcessId)')) 'helper must forget exited PIDs before PID reuse'
     Assert-True ($source.Contains('TerminateProcess(rootProcess')) 'helper must terminate an unassigned suspended root directly'
+    foreach ($knownCode in @(
+        'EXCEPTION_DEBUG_EVENT',
+        'CREATE_THREAD_DEBUG_EVENT',
+        'CREATE_PROCESS_DEBUG_EVENT',
+        'EXIT_THREAD_DEBUG_EVENT',
+        'EXIT_PROCESS_DEBUG_EVENT',
+        'LOAD_DLL_DEBUG_EVENT',
+        'UNLOAD_DLL_DEBUG_EVENT',
+        'OUTPUT_DEBUG_STRING_EVENT',
+        'RIP_EVENT'
+    )) {
+        Assert-True ($source.Contains("case ${knownCode}:")) "helper must explicitly classify $knownCode"
+    }
+    Assert-True ($source.Contains('RipInfo')) 'helper must define RIP_INFO payload'
+    Assert-True ($source.Contains('unknown debug event code')) 'helper must reject unknown debug event codes'
+    $continueMethodStart = $source.IndexOf('private void ProcessAndContinueEvent', [System.StringComparison]::Ordinal)
+    $continueMethodEnd = $source.IndexOf('private void ThrowIfObserverUnhealthy', $continueMethodStart, [System.StringComparison]::Ordinal)
+    Assert-True ($continueMethodStart -ge 0 -and $continueMethodEnd -gt $continueMethodStart) 'unable to isolate ProcessAndContinueEvent source'
+    $continueMethod = $source.Substring($continueMethodStart, $continueMethodEnd - $continueMethodStart)
+    Assert-Equal 1 ([regex]::Matches($continueMethod, 'Native\.ContinueDebugEvent\(').Count) 'pending debug event must be continued exactly once'
+    $continueCall = $continueMethod.IndexOf('Native.ContinueDebugEvent(', [System.StringComparison]::Ordinal)
+    $surfaceHandlerError = $continueMethod.LastIndexOf('if (handlerError != null)', [System.StringComparison]::Ordinal)
+    Assert-True ($continueCall -ge 0 -and $surfaceHandlerError -gt $continueCall) 'handler errors must surface only after ContinueDebugEvent'
 
     Write-Output 'windows process audit helper tests passed'
 }
