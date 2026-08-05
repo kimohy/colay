@@ -355,6 +355,24 @@ mod tests {
         assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(source.to_string().contains("target open"), "{source}");
         assert!(source.to_string().contains("os error 5"), "{source}");
+        let mut error: &(dyn std::error::Error + 'static) = &source;
+        let native_code_is_preserved = loop {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(5)
+            {
+                break true;
+            }
+            let Some(next) = error.source() else {
+                break false;
+            };
+            error = next;
+        };
+        assert!(
+            native_code_is_preserved,
+            "native access-denied code was absent from the structured error chain"
+        );
 
         denied
             .restore()

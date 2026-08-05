@@ -15,6 +15,8 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
+use crate::stage_error;
+
 const MAX_TOKEN_USER_BYTES: u32 = 64 * 1024;
 const SID_HEADER_BYTES: usize = 8;
 
@@ -156,7 +158,7 @@ fn query_token_user(token: HANDLE) -> io::Result<(AlignedBuffer, usize)> {
     if size_error.raw_os_error()
         != Some(i32::try_from(ERROR_INSUFFICIENT_BUFFER).unwrap_or(i32::MAX))
     {
-        return Err(stage_error("token-user size query", &size_error));
+        return Err(stage_error("token-user size query", size_error));
     }
     let minimum = u32::try_from(size_of::<TOKEN_USER>()).unwrap_or(u32::MAX);
     if required < minimum || required > MAX_TOKEN_USER_BYTES {
@@ -167,9 +169,9 @@ fn query_token_user(token: HANDLE) -> io::Result<(AlignedBuffer, usize)> {
     }
 
     let required_usize = usize::try_from(required)
-        .map_err(|error| stage_error("token-user size query", &io::Error::other(error)))?;
+        .map_err(|error| stage_error("token-user size query", io::Error::other(error)))?;
     let mut token_user_bytes = AlignedBuffer::zeroed(required_usize)
-        .map_err(|error| stage_error("token-user size query", &error))?;
+        .map_err(|error| stage_error("token-user size query", error))?;
     let mut returned = required;
     // SAFETY: `token` is live and `token_user_bytes` provides initialized, suitably aligned,
     // writable storage for exactly `required` bytes. `returned` is a writable output.
@@ -183,7 +185,7 @@ fn query_token_user(token: HANDLE) -> io::Result<(AlignedBuffer, usize)> {
         )
     };
     if loaded == 0 {
-        return Err(stage_error("token-user query", &io::Error::last_os_error()));
+        return Err(stage_error("token-user query", io::Error::last_os_error()));
     }
     if returned < minimum || returned > required {
         return Err(stage_invalid_data(
@@ -193,7 +195,7 @@ fn query_token_user(token: HANDLE) -> io::Result<(AlignedBuffer, usize)> {
     }
 
     let returned_usize = usize::try_from(returned)
-        .map_err(|error| stage_error("token-user bounds", &io::Error::other(error)))?;
+        .map_err(|error| stage_error("token-user bounds", io::Error::other(error)))?;
     Ok((token_user_bytes, returned_usize))
 }
 
@@ -266,7 +268,7 @@ fn copy_bounded_sid(
     }
 
     let mut sid = AlignedBuffer::zeroed(structural_length)
-        .map_err(|error| stage_error("token-user bounds", &error))?;
+        .map_err(|error| stage_error("token-user bounds", error))?;
     // SAFETY: Both ranges contain `structural_length` bytes, do not overlap, and the destination
     // is initialized, suitably aligned owned storage.
     unsafe {
@@ -287,7 +289,7 @@ fn open_process_token() -> io::Result<OwnedToken> {
     if opened == 0 {
         return Err(stage_error(
             "process-token open",
-            &io::Error::last_os_error(),
+            io::Error::last_os_error(),
         ));
     }
     if token.is_null() {
@@ -309,7 +311,7 @@ fn sid_to_string(sid: &AlignedBuffer, sub_authority_count: usize) -> io::Result<
     if converted == 0 {
         return Err(stage_error(
             "SID text conversion",
-            &io::Error::last_os_error(),
+            io::Error::last_os_error(),
         ));
     }
     if encoded.is_null() {
@@ -345,13 +347,9 @@ fn sid_to_string(sid: &AlignedBuffer, sub_authority_count: usize) -> io::Result<
     String::from_utf16(units).map_err(|error| {
         stage_error(
             "SID text conversion",
-            &io::Error::new(io::ErrorKind::InvalidData, error),
+            io::Error::new(io::ErrorKind::InvalidData, error),
         )
     })
-}
-
-fn stage_error(stage: &'static str, error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{stage}: {error}"))
 }
 
 fn stage_invalid_data(stage: &'static str, detail: &'static str) -> io::Error {

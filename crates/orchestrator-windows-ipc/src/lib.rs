@@ -54,6 +54,29 @@ use windows_sys::Win32::{
     },
 };
 
+#[derive(Debug)]
+struct StagedIoError {
+    stage: &'static str,
+    source: io::Error,
+}
+
+impl std::fmt::Display for StagedIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for StagedIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn stage_error(stage: &'static str, source: io::Error) -> io::Error {
+    let kind = source.kind();
+    io::Error::new(kind, StagedIoError { stage, source })
+}
+
 struct LocalAllocation(*mut c_void);
 
 impl Drop for LocalAllocation {

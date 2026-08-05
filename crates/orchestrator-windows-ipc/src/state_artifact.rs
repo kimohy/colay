@@ -25,7 +25,7 @@ use windows_sys::Win32::{
     System::SystemServices::ACCESS_ALLOWED_ACE_TYPE,
 };
 
-use crate::process_identity::current_process_user;
+use crate::{process_identity::current_process_user, stage_error};
 
 #[cfg(any(test, feature = "test-support"))]
 use windows_sys::Win32::Security::Authorization::{
@@ -146,19 +146,19 @@ pub fn ensure_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io
     let principals = expected_principals()?;
     let handle = open_target(path, kind, true)?;
     let before = read_descriptor_state(handle.0, kind, &principals)
-        .map_err(|error| stage_error("descriptor read", &error))?;
+        .map_err(|error| stage_error("descriptor read", error))?;
     if before.acl_result.is_ok() {
         return Ok(());
     }
 
     let acl = OwnedAcl::build(kind, &principals)
-        .map_err(|error| stage_error("ACL construction", &error))?;
-    install_acl(handle.0, &acl).map_err(|error| stage_error("descriptor write", &error))?;
+        .map_err(|error| stage_error("ACL construction", error))?;
+    install_acl(handle.0, &acl).map_err(|error| stage_error("descriptor write", error))?;
     let after = read_descriptor_state(handle.0, kind, &principals)
-        .map_err(|error| stage_error("post-write verification", &error))?;
+        .map_err(|error| stage_error("post-write verification", error))?;
     after
         .acl_result
-        .map_err(|error| stage_error("post-write verification", &error))?;
+        .map_err(|error| stage_error("post-write verification", error))?;
     if before.verified.owner_sid != after.verified.owner_sid {
         return Err(stage_invalid_data(
             "post-write verification",
@@ -179,18 +179,18 @@ pub fn verify_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io
     let principals = expected_principals()?;
     let handle = open_target(path, kind, false)?;
     let descriptor = read_descriptor_state(handle.0, kind, &principals)
-        .map_err(|error| stage_error("descriptor read", &error))?;
+        .map_err(|error| stage_error("descriptor read", error))?;
     descriptor
         .acl_result
-        .map_err(|error| stage_error("descriptor read", &error))
+        .map_err(|error| stage_error("descriptor read", error))
 }
 
 fn expected_principals() -> io::Result<OwnedExpectedPrincipals<'static>> {
     let user = current_process_user()?;
     let system = create_well_known_sid(WinLocalSystemSid)
-        .map_err(|error| stage_error("ACL construction", &error))?;
+        .map_err(|error| stage_error("ACL construction", error))?;
     let administrators = create_well_known_sid(WinBuiltinAdministratorsSid)
-        .map_err(|error| stage_error("ACL construction", &error))?;
+        .map_err(|error| stage_error("ACL construction", error))?;
     Ok(OwnedExpectedPrincipals {
         user: user.sid_bytes(),
         system,
@@ -578,7 +578,7 @@ fn open_target(path: &Path, kind: StateArtifactKind, writable: bool) -> io::Resu
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(stage_error("target open", &io::Error::last_os_error()));
+        return Err(stage_error("target open", io::Error::last_os_error()));
     }
     let handle = OwnedHandle(handle);
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
@@ -586,7 +586,7 @@ fn open_target(path: &Path, kind: StateArtifactKind, writable: bool) -> io::Resu
     if unsafe { GetFileInformationByHandle(handle.0, &raw mut information) } == 0 {
         return Err(stage_error(
             "object-kind validation",
-            &io::Error::last_os_error(),
+            io::Error::last_os_error(),
         ));
     }
     if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -840,10 +840,6 @@ fn bounds_error() -> io::Error {
     invalid_acl("ACL or security descriptor bounds overflow")
 }
 
-fn stage_error(stage: &'static str, error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{stage}: {error}"))
-}
-
 fn stage_invalid_data(stage: &'static str, detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{stage}: {detail}"))
 }
@@ -1060,7 +1056,10 @@ fn read_owner_sid_for_test(path: &Path, kind: StateArtifactKind) -> io::Result<B
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io, mem::size_of, os::windows::fs::symlink_file, path::Path, ptr, sync::Mutex};
+    use std::{
+        error::Error as _, fs, io, mem::size_of, os::windows::fs::symlink_file, path::Path, ptr,
+        sync::Mutex,
+    };
 
     use windows_sys::Win32::{
         Security::{
@@ -1080,8 +1079,8 @@ mod tests {
         ensure_private_state_artifact, expected_principals,
         force_descriptor_structure_failure_for_test, force_post_write_failure_for_test,
         inject_policy_acl_for_next_descriptor_read_for_test, read_owner_sid_for_test,
-        reset_set_security_info_calls_for_test, set_security_info_calls_for_test, verify_acl_bytes,
-        verify_private_state_artifact,
+        reset_set_security_info_calls_for_test, set_security_info_calls_for_test, stage_error,
+        verify_acl_bytes, verify_private_state_artifact,
     };
 
     const USER_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 232, 3, 0, 0];
@@ -1089,6 +1088,30 @@ mod tests {
     const ADMIN_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0];
     const EVERYONE_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
     static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn stage_error_preserves_native_source_chain() {
+        let staged = stage_error("target open", io::Error::from_raw_os_error(5));
+
+        assert_eq!(staged.kind(), io::ErrorKind::PermissionDenied);
+        assert!(staged.to_string().contains("target open"), "{staged}");
+        assert!(staged.to_string().contains("os error 5"), "{staged}");
+        let mut source = staged.source();
+        let native_code_is_preserved = loop {
+            let Some(error) = source else {
+                break false;
+            };
+            if error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+                == Some(5)
+            {
+                break true;
+            }
+            source = error.source();
+        };
+        assert!(native_code_is_preserved);
+    }
 
     #[derive(Clone)]
     struct TestAce {
