@@ -14,7 +14,7 @@ use windows_sys::Win32::{
         GetSecurityDescriptorLength, GetSecurityDescriptorOwner, InitializeAcl, IsValidAcl,
         IsValidSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-        SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        SE_SELF_RELATIVE, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -37,6 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static SET_SECURITY_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static FORCE_POST_WRITE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_DESCRIPTOR_STRUCTURE_FAILURE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateArtifactKind {
@@ -211,55 +213,79 @@ struct ExpectedPrincipals<'a> {
     administrators: &'a [u8],
 }
 
+enum AclCheckError {
+    Structural(io::Error),
+    Policy(io::Error),
+}
+
+impl AclCheckError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Structural(error) | Self::Policy(error) => error,
+        }
+    }
+}
+
 fn verify_acl_bytes(
     acl: Option<&[u8]>,
     protected: bool,
     kind: StateArtifactKind,
     principals: &ExpectedPrincipals<'_>,
 ) -> io::Result<()> {
+    check_acl_bytes(acl, protected, kind, principals).map_err(AclCheckError::into_io)
+}
+
+fn check_acl_bytes(
+    acl: Option<&[u8]>,
+    protected: bool,
+    kind: StateArtifactKind,
+    principals: &ExpectedPrincipals<'_>,
+) -> Result<(), AclCheckError> {
     if !protected {
-        return Err(invalid_acl("DACL is not protected"));
+        return Err(policy_acl("DACL is not protected"));
     }
-    let bytes = acl.ok_or_else(|| invalid_acl("DACL must be present and non-null"))?;
+    let bytes = acl.ok_or_else(|| policy_acl("DACL must be present and non-null"))?;
     if bytes.len() < size_of::<ACL>() {
-        return Err(invalid_acl("ACL header is truncated"));
+        return Err(structural_acl("ACL header is truncated"));
     }
 
-    let declared_acl_size = read_u16(bytes, 2, "ACL size field is truncated")?;
+    let declared_acl_size =
+        read_u16(bytes, 2, "ACL size field is truncated").map_err(AclCheckError::Structural)?;
     if usize::from(declared_acl_size) < bytes.len() {
-        return Err(invalid_acl(
+        return Err(structural_acl(
             "ACL contains trailing bytes after its declared size",
         ));
     }
     if usize::from(declared_acl_size) > bytes.len() {
-        return Err(invalid_acl("ACL size does not match bytes in use"));
+        return Err(structural_acl("ACL size does not match bytes in use"));
     }
-    let ace_count = read_u16(bytes, 4, "ACL ACE-count field is truncated")?;
+    let ace_count = read_u16(bytes, 4, "ACL ACE-count field is truncated")
+        .map_err(AclCheckError::Structural)?;
     if ace_count != 3 {
-        return Err(invalid_acl("DACL must contain exactly three trustee ACEs"));
+        return Err(policy_acl("DACL must contain exactly three trustee ACEs"));
     }
 
     let required_flags = match kind {
         StateArtifactKind::File => 0,
         StateArtifactKind::Directory => u8::try_from(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
-            .map_err(|_| invalid_acl("directory ACE flags overflow"))?,
+            .map_err(|_| structural_acl("directory ACE flags overflow"))?,
     };
     let mut found = [false; 3];
     let mut cursor = size_of::<ACL>();
     for _ in 0..usize::from(ace_count) {
         let (ace_end, principal) = verify_ace_record(bytes, cursor, required_flags, principals)?;
         if found[principal] {
-            return Err(invalid_acl("DACL contains a duplicate trustee"));
+            return Err(policy_acl("DACL contains a duplicate trustee"));
         }
         found[principal] = true;
         cursor = ace_end;
     }
 
     if cursor != bytes.len() {
-        return Err(invalid_acl("ACL contains trailing bytes after its ACEs"));
+        return Err(structural_acl("ACL contains trailing bytes after its ACEs"));
     }
     if !found.into_iter().all(|present| present) {
-        return Err(invalid_acl("DACL is missing a required trustee"));
+        return Err(policy_acl("DACL is missing a required trustee"));
     }
     Ok(())
 }
@@ -269,56 +295,68 @@ fn verify_ace_record(
     cursor: usize,
     required_flags: u8,
     principals: &ExpectedPrincipals<'_>,
-) -> io::Result<(usize, usize)> {
+) -> Result<(usize, usize), AclCheckError> {
+    if !cursor.is_multiple_of(size_of::<u32>()) {
+        return Err(structural_acl("ACE address is not DWORD-aligned"));
+    }
     let header_end = cursor
         .checked_add(size_of::<ACE_HEADER>())
-        .ok_or_else(|| invalid_acl("ACE header range overflow"))?;
+        .ok_or_else(|| structural_acl("ACE header range overflow"))?;
     let header = bytes
         .get(cursor..header_end)
-        .ok_or_else(|| invalid_acl("ACE header extends past ACL bytes in use"))?;
+        .ok_or_else(|| structural_acl("ACE header extends past ACL bytes in use"))?;
     let allowed_type = u8::try_from(ACCESS_ALLOWED_ACE_TYPE)
-        .map_err(|_| invalid_acl("allow ACE type does not fit in its header"))?;
+        .map_err(|_| structural_acl("allow ACE type does not fit in its header"))?;
     if header[0] != allowed_type {
-        return Err(invalid_acl("DACL contains a non-allow ACE"));
+        return Err(policy_acl("DACL contains a non-allow ACE"));
     }
     if header[1] != required_flags {
-        return Err(invalid_acl("ACE flags do not match the artifact kind"));
+        return Err(policy_acl("ACE flags do not match the artifact kind"));
     }
     let record_size = usize::from(u16::from_le_bytes([header[2], header[3]]));
     let sid_offset = size_of::<ACCESS_ALLOWED_ACE>()
         .checked_sub(size_of::<u32>())
-        .ok_or_else(|| invalid_acl("ACE SidStart offset underflow"))?;
+        .ok_or_else(|| structural_acl("ACE SidStart offset underflow"))?;
     if record_size < sid_offset {
-        return Err(invalid_acl("ACE is truncated before SidStart"));
+        return Err(structural_acl("ACE is truncated before SidStart"));
     }
     let record_end = cursor
         .checked_add(record_size)
-        .ok_or_else(|| invalid_acl("ACE range overflow"))?;
+        .ok_or_else(|| structural_acl("ACE range overflow"))?;
     let ace = bytes
         .get(cursor..record_end)
-        .ok_or_else(|| invalid_acl("ACE range extends past ACL bytes in use"))?;
-    if read_u32(ace, 4, "ACE is truncated before its access mask")? != FILE_ALL_ACCESS {
-        return Err(invalid_acl("ACE access mask is not exact full control"));
+        .ok_or_else(|| structural_acl("ACE range extends past ACL bytes in use"))?;
+    if !record_size.is_multiple_of(size_of::<u32>()) {
+        return Err(structural_acl("ACE size is not DWORD-aligned"));
+    }
+    if read_u32(ace, 4, "ACE is truncated before its access mask")
+        .map_err(AclCheckError::Structural)?
+        != FILE_ALL_ACCESS
+    {
+        return Err(policy_acl("ACE access mask is not exact full control"));
     }
 
     let sid = ace
         .get(sid_offset..)
-        .ok_or_else(|| invalid_acl("ACE is truncated before its trustee SID"))?;
+        .ok_or_else(|| structural_acl("ACE is truncated before its trustee SID"))?;
     if sid.len() < 8 {
-        return Err(invalid_acl("trustee SID header is truncated"));
+        return Err(structural_acl("trustee SID header is truncated"));
     }
     let sid_length = usize::from(sid[1])
         .checked_mul(size_of::<u32>())
         .and_then(|bytes| 8_usize.checked_add(bytes))
-        .ok_or_else(|| invalid_acl("trustee SID length overflow"))?;
+        .ok_or_else(|| structural_acl("trustee SID length overflow"))?;
     if sid_length > sid.len() {
-        return Err(invalid_acl("trustee SID extends past its containing ACE"));
+        return Err(structural_acl(
+            "trustee SID extends past its containing ACE",
+        ));
     }
     if sid_length != sid.len() {
-        return Err(invalid_acl("trustee SID must end exactly at the ACE end"));
+        return Err(structural_acl(
+            "trustee SID must end exactly at the ACE end",
+        ));
     }
-    validate_sid_prefix(sid)
-        .map_err(|_| invalid_acl("Windows rejected the bounded trustee SID"))?;
+    validate_sid_prefix(sid).map_err(AclCheckError::Structural)?;
 
     let principal = if sid == principals.user {
         0
@@ -327,9 +365,17 @@ fn verify_ace_record(
     } else if sid == principals.administrators {
         2
     } else {
-        return Err(invalid_acl("DACL contains an unexpected trustee"));
+        return Err(policy_acl("DACL contains an unexpected trustee"));
     };
     Ok((record_end, principal))
+}
+
+fn structural_acl(detail: &'static str) -> AclCheckError {
+    AclCheckError::Structural(invalid_acl(detail))
+}
+
+fn policy_acl(detail: &'static str) -> AclCheckError {
+    AclCheckError::Policy(invalid_acl(detail))
 }
 
 fn read_u16(bytes: &[u8], offset: usize, detail: &'static str) -> io::Result<u16> {
@@ -581,7 +627,8 @@ fn read_descriptor_state(
         return Err(invalid_acl("Windows returned a null security descriptor"));
     }
     let descriptor = LocalDescriptor(descriptor);
-    // SAFETY: `descriptor` owns a live descriptor returned by `GetSecurityInfo`.
+    // SAFETY: `descriptor` owns the live descriptor returned by `GetSecurityInfo`; this call reads
+    // its descriptor header and returns the descriptor's logical byte length.
     let descriptor_length = unsafe { GetSecurityDescriptorLength(descriptor.0) };
     let descriptor_length = usize::try_from(descriptor_length).map_err(|_| bounds_error())?;
     if !(20..=MAX_SECURITY_DESCRIPTOR_BYTES).contains(&descriptor_length) {
@@ -589,9 +636,24 @@ fn read_descriptor_state(
             "security descriptor length is outside the accepted bounds",
         ));
     }
-    // SAFETY: `GetSecurityDescriptorLength` reports the initialized descriptor allocation size.
+    // SAFETY: `GetSecurityInfo` returns a LocalAlloc-owned buffer containing the complete security
+    // descriptor. Its bounded logical length is readable while `descriptor` owns that buffer; the
+    // bytes remain opaque until control and component-pointer validation below.
     let bytes = unsafe { slice::from_raw_parts(descriptor.0.cast::<u8>(), descriptor_length) };
     let base = bytes.as_ptr() as usize;
+
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: The descriptor is live and both fixed-size outputs are writable.
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if control & SE_SELF_RELATIVE == 0 {
+        return Err(invalid_acl("security descriptor is not self-relative"));
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
 
     let mut owner: PSID = ptr::null_mut();
     let mut owner_defaulted = 0;
@@ -611,16 +673,6 @@ fn read_descriptor_state(
     let owner_length = bounded_sid_length(owner_tail, owner)?;
     let owner_sid = owner_tail[..owner_length].to_vec().into_boxed_slice();
 
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    // SAFETY: The descriptor is live and both fixed-size outputs are writable.
-    if unsafe { GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision) }
-        == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let protected = control & SE_DACL_PROTECTED != 0;
-
     let mut dacl_present = 0;
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut dacl_defaulted = 0;
@@ -637,11 +689,16 @@ fn read_descriptor_state(
         return Err(io::Error::last_os_error());
     }
 
-    let acl_result = if dacl_present == 0 || dacl.is_null() {
-        verify_acl_bytes(None, protected, kind, &principals.borrowed())
+    let acl_check = if dacl_present == 0 || dacl.is_null() {
+        check_acl_bytes(None, protected, kind, &principals.borrowed())
     } else {
-        descriptor_acl_bytes(bytes, base, dacl)
-            .and_then(|acl| verify_acl_bytes(Some(acl), protected, kind, &principals.borrowed()))
+        let acl = descriptor_acl_bytes(bytes, base, dacl)?;
+        check_acl_bytes(Some(acl), protected, kind, &principals.borrowed())
+    };
+    let acl_result = match acl_check {
+        Ok(()) => Ok(()),
+        Err(AclCheckError::Policy(error)) => Err(error),
+        Err(AclCheckError::Structural(error)) => return Err(error),
     };
     Ok(DescriptorState {
         verified: VerifiedDescriptor { owner_sid },
@@ -650,7 +707,14 @@ fn read_descriptor_state(
 }
 
 fn descriptor_acl_bytes(descriptor: &[u8], base: usize, dacl: *mut ACL) -> io::Result<&[u8]> {
+    #[cfg(test)]
+    if FORCE_DESCRIPTOR_STRUCTURE_FAILURE.load(Ordering::SeqCst) {
+        return Err(invalid_acl("forced structural DACL extraction failure"));
+    }
     let offset = pointer_offset(dacl.cast(), base, descriptor.len(), "DACL")?;
+    if !(dacl as usize).is_multiple_of(size_of::<u32>()) {
+        return Err(invalid_acl("DACL address is not DWORD-aligned"));
+    }
     let header_end = offset
         .checked_add(size_of::<ACL>())
         .ok_or_else(bounds_error)?;
@@ -786,6 +850,11 @@ fn force_post_write_failure_for_test(force: bool) {
 }
 
 #[cfg(test)]
+fn force_descriptor_structure_failure_for_test(force: bool) {
+    FORCE_DESCRIPTOR_STRUCTURE_FAILURE.store(force, Ordering::SeqCst);
+}
+
+#[cfg(test)]
 fn read_owner_sid_for_test(path: &Path, kind: StateArtifactKind) -> io::Result<Box<[u8]>> {
     let principals = expected_principals()?;
     let handle = open_target(path, kind, false)?;
@@ -829,7 +898,8 @@ mod tests {
     };
 
     use super::{
-        ExpectedPrincipals, StateArtifactKind, ensure_private_state_artifact,
+        AlignedBuffer, ExpectedPrincipals, StateArtifactKind, descriptor_acl_bytes,
+        ensure_private_state_artifact, force_descriptor_structure_failure_for_test,
         force_post_write_failure_for_test, read_owner_sid_for_test,
         reset_set_security_info_calls_for_test, set_security_info_calls_for_test, verify_acl_bytes,
         verify_private_state_artifact,
@@ -1568,6 +1638,50 @@ mod tests {
             "an unprotected child must require target-level hardening"
         );
         assert_eq!(set_security_info_calls_for_test(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn review_structural_descriptor_failure_does_not_repair() -> io::Result<()> {
+        let _guard = native_test_guard();
+        let temporary = tempfile::tempdir()?;
+        let file = temporary.path().join("structural-failure.db");
+        fs::write(&file, b"state")?;
+        set_test_dacl(
+            &file,
+            StateArtifactKind::File,
+            &permissive_sddl(StateArtifactKind::File)?,
+            true,
+        )?;
+        reset_set_security_info_calls_for_test();
+        force_descriptor_structure_failure_for_test(true);
+        let result = ensure_private_state_artifact(&file, StateArtifactKind::File);
+        force_descriptor_structure_failure_for_test(false);
+
+        let error = result
+            .err()
+            .ok_or_else(|| io::Error::other("structural descriptor failure was repaired"))?;
+        assert!(error.to_string().contains("structural"));
+        assert_eq!(set_security_info_calls_for_test(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn review_misaligned_dacl_is_rejected_before_native_validation() -> io::Result<()> {
+        let mut storage = AlignedBuffer::zeroed(size_of::<ACL>() + 1)?;
+        let misaligned_address = (storage.as_mut_ptr::<u8>() as usize)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("test DACL address overflow"))?;
+        // No dereference occurs here; this deliberately forms an in-allocation but DWORD-misaligned
+        // address to exercise the pre-native validation gate.
+        let dacl = ptr::with_exposed_provenance_mut::<ACL>(misaligned_address);
+        let descriptor = storage.as_bytes();
+        let base = descriptor.as_ptr() as usize;
+
+        let error = descriptor_acl_bytes(descriptor, base, dacl)
+            .err()
+            .ok_or_else(|| io::Error::other("misaligned DACL was accepted"))?;
+        assert!(error.to_string().contains("DWORD-aligned"));
         Ok(())
     }
 }
