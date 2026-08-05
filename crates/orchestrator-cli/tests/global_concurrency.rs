@@ -187,17 +187,23 @@ impl ConcurrencyFixture {
         if repositories.is_empty() {
             bail!("at least one repository is required");
         }
+        let spawn_barrier = self.root.join("daemon-spawn-barrier");
+        fs::create_dir(&spawn_barrier)?;
         let barrier = Arc::new(Barrier::new(repositories.len()));
         let mut clients = Vec::with_capacity(repositories.len());
         for repository in repositories {
             let barrier = Arc::clone(&barrier);
             let command = self.command.clone();
             let repository = repository.clone();
+            let spawn_barrier = spawn_barrier.clone();
+            let expected = repositories.len();
             clients.push(thread::spawn(move || {
                 barrier.wait();
-                command.run(
+                command.run_with_spawn_barrier(
                     &repository,
                     &[OsString::from("--json"), OsString::from("status")],
+                    &spawn_barrier,
+                    expected,
                 )
             }));
         }
@@ -315,7 +321,7 @@ impl ConcurrencyFixture {
         Ok(DaemonDiagnostics { instances, stderr })
     }
 
-    fn verify_spawned_contenders_resolved(&self) -> Result<()> {
+    fn verify_spawned_contenders_resolved(&self, expected: Option<usize>) -> Result<()> {
         let mut stderr_logs = Vec::new();
         let mut resolutions = Vec::new();
         for entry in fs::read_dir(&self.command.daemon_log_directory)? {
@@ -354,6 +360,24 @@ impl ConcurrencyFixture {
         if owner_count != 1 {
             bail!("expected one spawned live owner resolution, found {owner_count}");
         }
+        let reaped_count = resolutions
+            .iter()
+            .filter(|(_, resolution)| resolution.starts_with("reaped:"))
+            .count();
+        if let Some(expected) = expected {
+            if resolutions.len() != expected {
+                bail!(
+                    "expected exactly {expected} spawned contender resolutions, found {}",
+                    resolutions.len()
+                );
+            }
+            if reaped_count != expected.saturating_sub(1) {
+                bail!(
+                    "expected {} reaped contender resolutions, found {reaped_count}",
+                    expected.saturating_sub(1)
+                );
+            }
+        }
         for (id, resolution) in resolutions {
             let valid = resolution
                 .strip_prefix("owner:")
@@ -362,6 +386,26 @@ impl ConcurrencyFixture {
             if !valid {
                 bail!("invalid daemon child resolution for {id}: {resolution:?}");
             }
+        }
+        Ok(())
+    }
+
+    fn verify_spawn_barrier_arrivals(&self, expected: usize) -> Result<()> {
+        let barrier = self.root.join("daemon-spawn-barrier");
+        let entries = fs::read_dir(&barrier)?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut arrivals = 0;
+        for entry in entries {
+            if entry.file_type()?.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ready")
+            {
+                arrivals += 1;
+            }
+        }
+        if arrivals != expected {
+            bail!("expected {expected} pre-spawn barrier arrivals, found {arrivals}");
         }
         Ok(())
     }
@@ -532,7 +576,8 @@ impl CommandContext {
         let daemon_child_resolution = self
             .daemon_log_directory
             .join(format!("daemon-child-resolution-{command_id}.log"));
-        let status = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .args(args)
             .current_dir(repository)
             .env_clear()
@@ -549,9 +594,70 @@ impl CommandContext {
             .env("TEMP", &self.temp)
             .env("TMP", &self.temp)
             .stdout(Stdio::from(stdout.try_clone()?))
+            .stderr(Stdio::from(stderr.try_clone()?));
+        let status = command.status().context("failed to invoke colay")?;
+        stdout.seek(SeekFrom::Start(0))?;
+        stderr.seek(SeekFrom::Start(0))?;
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        stdout.read_to_end(&mut stdout_bytes)?;
+        stderr.read_to_end(&mut stderr_bytes)?;
+        Ok(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    }
+
+    fn run_with_spawn_barrier(
+        &self,
+        repository: &Path,
+        args: &[OsString],
+        barrier: &Path,
+        expected: usize,
+    ) -> Result<Output> {
+        #[cfg(windows)]
+        let system_root = env::var_os("SystemRoot").context("SystemRoot is not set")?;
+        #[cfg(not(windows))]
+        let system_root = "/";
+        let mut stdout = tempfile::tempfile()?;
+        let mut stderr = tempfile::tempfile()?;
+        let command_id = format!(
+            "{}-{}",
+            std::process::id(),
+            self.next_daemon_log.fetch_add(1, Ordering::Relaxed)
+        );
+        let daemon_log = self
+            .daemon_log_directory
+            .join(format!("daemon-stderr-{command_id}.log"));
+        let daemon_child_resolution = self
+            .daemon_log_directory
+            .join(format!("daemon-child-resolution-{command_id}.log"));
+        let status = Command::new(&self.executable)
+            .args(args)
+            .current_dir(repository)
+            .env_clear()
+            .env("COLAY_HOME", &self.colay_home)
+            .env("COLAY_TEST_DAEMON_STDERR", daemon_log)
+            .env(
+                "COLAY_TEST_DAEMON_CHILD_RESOLUTION",
+                daemon_child_resolution,
+            )
+            .env("COLAY_TEST_DAEMON_SPAWN_BARRIER", barrier)
+            .env(
+                "COLAY_TEST_DAEMON_SPAWN_BARRIER_COUNT",
+                expected.to_string(),
+            )
+            .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
+            .env("PATH", &self.path)
+            .env("PATHEXT", ".EXE;.CMD")
+            .env("SystemRoot", system_root)
+            .env("TEMP", &self.temp)
+            .env("TMP", &self.temp)
+            .stdout(Stdio::from(stdout.try_clone()?))
             .stderr(Stdio::from(stderr.try_clone()?))
             .status()
-            .context("failed to invoke colay")?;
+            .context("failed to invoke colay with a daemon spawn barrier")?;
         stdout.seek(SeekFrom::Start(0))?;
         stderr.seek(SeekFrom::Start(0))?;
         let mut stdout_bytes = Vec::new();
@@ -848,7 +954,7 @@ fn concurrent_clients_never_observe_sqlite_busy_or_duplicate_rows() -> Result<()
     let fixture = ConcurrencyFixture::new()?;
 
     let outputs = fixture.run_parallel_status_and_plan_clients(CLIENT_COUNT)?;
-    fixture.verify_spawned_contenders_resolved()?;
+    fixture.verify_spawned_contenders_resolved(None)?;
     let daemon_diagnostics = fixture.daemon_diagnostics()?;
     validate_daemon_diagnostics(&daemon_diagnostics)?;
 
@@ -887,7 +993,8 @@ fn distinct_legacy_workspace_contenders_import_once_without_receipt_cross_reuse(
 
     let outputs = fixture.run_parallel_status_clients(&repositories)?;
     let verification = (|| -> Result<()> {
-        fixture.verify_spawned_contenders_resolved()?;
+        fixture.verify_spawn_barrier_arrivals(seeds.len())?;
+        fixture.verify_spawned_contenders_resolved(Some(seeds.len()))?;
         let daemon_diagnostics = fixture.daemon_diagnostics()?;
         validate_daemon_diagnostics(&daemon_diagnostics)?;
         if outputs.len() != seeds.len() {
@@ -1004,7 +1111,7 @@ fn windows_colay_home_case_aliases_use_one_primary_daemon_endpoint() -> Result<(
         }
     }
 
-    fixture.verify_spawned_contenders_resolved()?;
+    fixture.verify_spawned_contenders_resolved(None)?;
     let daemon_diagnostics = fixture.daemon_diagnostics()?;
     validate_daemon_diagnostics(&daemon_diagnostics)?;
     validate_clean_client(0, &first, &daemon_diagnostics)?;

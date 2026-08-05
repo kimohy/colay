@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "test-fixtures")]
+use std::io::Write as _;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 #[cfg(windows)]
 use chrono::Utc;
@@ -587,6 +590,10 @@ async fn wait_until_ready(
                 }
             }
         }
+        #[cfg(feature = "test-fixtures")]
+        if !spawn_attempted {
+            wait_for_test_spawn_barrier().await?;
+        }
         spawn_contender_once(&mut child, &mut spawn_attempted, || {
             spawn_server(repository, explicit_config)
         })?;
@@ -611,6 +618,100 @@ async fn wait_until_ready(
             }
             bail!(
                 "user daemon did not publish IPC within {} seconds",
+                CONNECT_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+async fn wait_for_test_spawn_barrier() -> Result<()> {
+    let (barrier, expected) = match (
+        std::env::var_os("COLAY_TEST_DAEMON_SPAWN_BARRIER"),
+        std::env::var_os("COLAY_TEST_DAEMON_SPAWN_BARRIER_COUNT"),
+    ) {
+        (Some(barrier), Some(expected)) => (barrier, expected),
+        (None, None) => return Ok(()),
+        _ => bail!("daemon spawn barrier requires both path and expected count"),
+    };
+    let barrier = PathBuf::from(barrier);
+    if !barrier.is_dir() {
+        bail!(
+            "daemon spawn barrier is not a directory: {}",
+            barrier.display()
+        );
+    }
+    let expected = expected
+        .to_str()
+        .ok_or_else(|| anyhow!("daemon spawn barrier count is not valid UTF-8"))?
+        .parse::<usize>()
+        .context("daemon spawn barrier count is not a positive integer")?;
+    if expected == 0 {
+        bail!("daemon spawn barrier count must be greater than zero");
+    }
+
+    let marker = barrier.join(format!("{}.ready", std::process::id()));
+    let mut marker_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker)
+        .with_context(|| {
+            format!(
+                "cannot create daemon spawn barrier marker {}",
+                marker.display()
+            )
+        })?;
+    marker_file.write_all(b"ready\n").with_context(|| {
+        format!(
+            "cannot write daemon spawn barrier marker {}",
+            marker.display()
+        )
+    })?;
+    marker_file.sync_all().with_context(|| {
+        format!(
+            "cannot sync daemon spawn barrier marker {}",
+            marker.display()
+        )
+    })?;
+
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        let entries = std::fs::read_dir(&barrier)
+            .with_context(|| format!("cannot read daemon spawn barrier {}", barrier.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| {
+                format!(
+                    "cannot enumerate daemon spawn barrier {}",
+                    barrier.display()
+                )
+            })?;
+        let mut arrivals = 0;
+        for entry in entries {
+            let file_type = entry.file_type().with_context(|| {
+                format!(
+                    "cannot inspect daemon spawn barrier entry {}",
+                    entry.path().display()
+                )
+            })?;
+            if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ready")
+            {
+                arrivals += 1;
+            }
+        }
+        if arrivals == expected {
+            return Ok(());
+        }
+        if arrivals > expected {
+            bail!("daemon spawn barrier observed {arrivals} arrivals, expected exactly {expected}");
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "daemon spawn barrier timed out with {arrivals} of {expected} arrivals after {} seconds",
                 CONNECT_TIMEOUT.as_secs()
             );
         }
