@@ -154,8 +154,14 @@ impl GlobalDaemonBootstrap {
             .resolve_repository_workspace(repository)?
             .workspace_id;
         let legacy = RepositoryStatePaths::from_config(repository, config)?;
-        if let Some(plan) = LegacyImporter::inspect(&legacy, &self.paths)? {
-            LegacyImporter::apply(&self.database, workspace_id, &plan, &self.paths)?;
+        if let Some(inspection) = LegacyImporter::inspect_for_prepare(&legacy, &self.paths)? {
+            let prepared = LegacyImporter::prepare_inspection(
+                &self.database,
+                workspace_id,
+                inspection,
+                &self.paths,
+            )?;
+            LegacyImporter::commit(&self.database, prepared, &self.paths)?;
         }
         Ok(workspace_id)
     }
