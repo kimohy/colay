@@ -3,8 +3,12 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod process_identity;
+mod state_artifact;
 
 pub use process_identity::current_process_user_sid;
+pub use state_artifact::{
+    StateArtifactKind, ensure_private_state_artifact, verify_private_state_artifact,
+};
 
 use std::{
     ffi::{OsStr, OsString, c_void},
