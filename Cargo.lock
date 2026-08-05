@@ -929,6 +929,7 @@ dependencies = [
  "fs2",
  "hex",
  "orchestrator-domain",
+ "orchestrator-windows-ipc",
  "regex",
  "rusqlite",
  "same-file",
