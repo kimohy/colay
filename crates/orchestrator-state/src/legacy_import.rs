@@ -222,6 +222,31 @@ pub struct LegacyImportResult {
     pub imported_at: DateTime<Utc>,
 }
 
+/// Owns a sealed legacy import's private scratch and staging until authoritative commit or drop.
+///
+/// The value is intentionally opaque and non-cloneable. It contains no live `SQLite` connection;
+/// dropping an uncommitted value releases its file locks and removes only its owned temporary
+/// artifacts.
+#[must_use = "a prepared legacy import must be committed or explicitly dropped"]
+pub struct PreparedLegacyImport {
+    target: WorkspaceId,
+    plan: LegacyImportPlan,
+    expected_database: PathBuf,
+    state: PreparedLegacyImportState,
+}
+
+enum PreparedLegacyImportState {
+    Replay,
+    Pending(Box<PendingLegacyImport>),
+}
+
+struct PendingLegacyImport {
+    _scratch: LegacyImportScratch,
+    staging: LegacyImportStaging,
+    rewrite_path: PathBuf,
+    published_path: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LegacyImporter;
 
@@ -328,15 +353,17 @@ impl LegacyImporter {
         Ok(result)
     }
 
-    /// Imports a sealed plan into one registry-selected workspace. All database rows and the
-    /// ledger entry share one transaction; staged files are atomically renamed before commit and
-    /// removed automatically if that commit fails.
-    pub fn apply(
+    /// Performs source-local reinspection, capture, validation, migration, rewrite, and staging.
+    ///
+    /// The returned opaque value owns every cleanup guard required by [`Self::commit`]. Shared
+    /// target state is read only for an early replay check; commit repeats every authoritative
+    /// target, schema, and ledger check before mutation.
+    pub fn prepare(
         global: &Database,
         target: WorkspaceId,
         plan: &LegacyImportPlan,
         paths: &GlobalStatePaths,
-    ) -> StateResult<LegacyImportResult> {
+    ) -> StateResult<PreparedLegacyImport> {
         if global.path() != paths.database {
             return Err(StateError::InvalidRecord(
                 "legacy import database does not match the supplied global state paths".to_owned(),
@@ -345,7 +372,12 @@ impl LegacyImporter {
         ensure_target_database(global, target)?;
         if let Some(existing) = load_existing_result(global, target, plan)? {
             validate_published_import(&existing, target, paths)?;
-            return Ok(replayed_apply_result(existing));
+            return Ok(PreparedLegacyImport {
+                target,
+                plan: plan.clone(),
+                expected_database: paths.database.clone(),
+                state: PreparedLegacyImportState::Replay,
+            });
         }
         let inspected = Self::inspect(&plan.source, paths)?.ok_or_else(|| {
             StateError::InvalidRecord("legacy source disappeared before import".to_owned())
@@ -354,11 +386,16 @@ impl LegacyImporter {
         let scratch = LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?;
 
         let workspace_paths = paths.for_workspace(target);
-        let mut staging =
+        let staging =
             LegacyImportStaging::acquire(&workspace_paths.root, &plan.source_fingerprint)?;
         if let Some(existing) = load_existing_result(global, target, plan)? {
             validate_published_import(&existing, target, paths)?;
-            return Ok(replayed_apply_result(existing));
+            return Ok(PreparedLegacyImport {
+                target,
+                plan: plan.clone(),
+                expected_database: paths.database.clone(),
+                state: PreparedLegacyImportState::Replay,
+            });
         }
         staging.prepare()?;
         let staged_database = capture_staged_database(plan, &scratch, &staging)?;
@@ -391,8 +428,58 @@ impl LegacyImporter {
         drop(migrated);
         let rewrite_path = scratch.path().join("rewrite.db");
         prepare_rewrite_scratch(&migrated_path, &rewrite_path)?;
-
         let published_path = staging.published_path().to_path_buf();
+
+        Ok(PreparedLegacyImport {
+            target,
+            plan: plan.clone(),
+            expected_database: paths.database.clone(),
+            state: PreparedLegacyImportState::Pending(Box::new(PendingLegacyImport {
+                _scratch: scratch,
+                staging,
+                rewrite_path,
+                published_path,
+            })),
+        })
+    }
+
+    /// Authoritatively rechecks and consumes a prepared import under the shared-state writer.
+    ///
+    /// All database rows, append-only audit evidence, the import ledger, and atomic publication
+    /// share the existing transaction and rollback behavior.
+    pub fn commit(
+        global: &Database,
+        prepared: PreparedLegacyImport,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<LegacyImportResult> {
+        let PreparedLegacyImport {
+            target,
+            plan,
+            expected_database,
+            state,
+        } = prepared;
+        if global.path() != paths.database || expected_database != paths.database {
+            return Err(StateError::InvalidRecord(
+                "legacy import database does not match the prepared global state paths".to_owned(),
+            ));
+        }
+        ensure_target_database(global, target)?;
+        if let Some(existing) = load_existing_result(global, target, &plan)? {
+            validate_published_import(&existing, target, paths)?;
+            return Ok(replayed_apply_result(existing));
+        }
+        let PreparedLegacyImportState::Pending(pending) = state else {
+            return Err(StateError::InvalidRecord(
+                "prepared legacy import replay disappeared before authoritative commit".to_owned(),
+            ));
+        };
+        let PendingLegacyImport {
+            _scratch,
+            mut staging,
+            rewrite_path,
+            published_path,
+        } = *pending;
+
         let imported_at = Utc::now();
         let mut connection = global.raw_lock()?;
         let rewrite_path_text = rewrite_path.to_str().ok_or_else(|| {
@@ -408,7 +495,7 @@ impl LegacyImporter {
         let transaction_result = apply_transaction(
             &mut connection,
             target,
-            plan,
+            &plan,
             &published_path,
             imported_at,
             &mut staging,
@@ -420,6 +507,18 @@ impl LegacyImporter {
         }
         detach_result?;
         Ok(result)
+    }
+
+    /// Imports a sealed plan into one registry-selected workspace. This compatibility wrapper
+    /// preserves the original synchronous bootstrap behavior.
+    pub fn apply(
+        global: &Database,
+        target: WorkspaceId,
+        plan: &LegacyImportPlan,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<LegacyImportResult> {
+        let prepared = Self::prepare(global, target, plan, paths)?;
+        Self::commit(global, prepared, paths)
     }
 }
 

@@ -18,8 +18,8 @@ use orchestrator_domain::{
     WorkerResult, task_graph_proposal_hash,
 };
 use orchestrator_state::{
-    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig,
-    StateEnvironment, StateError, StoredArtifact, TaskListFilter,
+    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, PreparedLegacyImport,
+    RepositoryStatePaths, RootConfig, StateEnvironment, StateError, StoredArtifact, TaskListFilter,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -44,6 +44,168 @@ const DURABLE_SESSIONS_MIGRATION: &str =
     include_str!("../../../migrations/0004_durable_sessions.sql");
 const NONCANONICAL_INVALID_VALIDATION_JSON: &str = "{ \"errors\" : [ \"cycle\" ] }";
 static LEGACY_IMPORT_COMPLETION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn prepared_legacy_import_is_send() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<PreparedLegacyImport>();
+}
+
+#[test]
+fn dropping_prepared_import_cleans_owned_scratch_and_staging_without_target_mutation() -> TestResult
+{
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+
+    let imports = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports");
+    assert!(
+        imports
+            .join(format!("{}.staging", plan.source_fingerprint))
+            .is_dir()
+    );
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        1
+    );
+
+    drop(prepared);
+
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    Ok(())
+}
+
+#[test]
+fn preparation_rejects_source_mutation_after_inspection_without_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    fs::write(
+        fixture
+            .source
+            .root
+            .join(format!("tasks/{}/evidence.txt", fixture.task_id)),
+        b"mutated after sealed inspection",
+    )?;
+
+    let error =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
+            .err()
+            .ok_or("source mutation after inspection was accepted")?;
+
+    assert!(
+        error.to_string().contains("artifact") || error.to_string().contains("source changed"),
+        "unexpected source mutation error: {error}"
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    Ok(())
+}
+
+#[test]
+fn prepared_commit_rechecks_and_replays_existing_durable_import() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let first =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let replay = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)?;
+
+    assert!(!replay.imported);
+    assert_eq!(replay.source_fingerprint, first.source_fingerprint);
+    assert_eq!(replay.published_path, first.published_path);
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    Ok(())
+}
+
+#[test]
+fn prepared_publish_failure_rolls_back_rows_and_cleans_owned_staging() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let before = target_mutation_counts(&fixture)?;
+    let published = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports")
+        .join(&plan.source_fingerprint);
+    fs::create_dir(&published)?;
+    let sentinel = published.join("external-sentinel");
+    fs::write(&sentinel, b"must survive failed publication")?;
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)
+        .err()
+        .ok_or("publication over an occupied destination succeeded")?;
+
+    match error {
+        StateError::Io { path, .. } => assert_eq!(path, published),
+        other => return Err(format!("unexpected publication error: {other}").into()),
+    }
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
+    assert!(sentinel.is_file());
+    assert!(
+        !published
+            .with_file_name(format!("{}.staging", plan.source_fingerprint))
+            .exists()
+    );
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn prepared_commit_failure_rechecks_target_and_rolls_back_import_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let workspace = fixture.global.workspace(fixture.workspace_id);
+    workspace.append_event(audit_event(None, "target event one"))?;
+    workspace.append_event(audit_event(None, "target event two"))?;
+    Connection::open(fixture.global.path())?.execute(
+        "DELETE FROM task_events WHERE workspace_id = ?1 AND sequence = 1",
+        [fixture.workspace_id.to_string()],
+    )?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)
+        .err()
+        .ok_or("prepared commit accepted a target event-chain gap")?;
+
+    assert!(error.to_string().contains("audit event chain is invalid"));
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    Ok(())
+}
 
 #[test]
 fn legacy_import_completion_preserves_durable_truth_and_accepts_a_read_only_snapshot() -> TestResult
@@ -2520,6 +2682,24 @@ fn assert_no_published_import(fixture: &ImportFixture, fingerprint: &str) {
         .join("imports");
     assert!(!imports.join(fingerprint).exists());
     assert!(!imports.join(format!("{fingerprint}.staging")).exists());
+}
+
+fn scratch_attempt_count(fixture: &ImportFixture, fingerprint: &str) -> TestResult<usize> {
+    let fingerprint_root = fixture
+        .paths
+        .database
+        .parent()
+        .ok_or("global database has no parent")?
+        .join("import-scratch")
+        .join(fingerprint);
+    if !fingerprint_root.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_dir(fingerprint_root)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("attempt-"))
+        .count())
 }
 
 #[cfg(unix)]
