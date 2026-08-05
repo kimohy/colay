@@ -39,6 +39,8 @@ static SET_SECURITY_INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FORCE_POST_WRITE_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_DESCRIPTOR_STRUCTURE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static INJECTED_POLICY_ACL: Mutex<Option<Box<[u8]>>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateArtifactKind {
@@ -257,7 +259,7 @@ fn check_acl_bytes(
         ));
     }
     if usize::from(declared_acl_size) > bytes.len() {
-        return Err(structural_acl("ACL size does not match bytes in use"));
+        return Err(policy_acl("ACL size includes unused allocation slack"));
     }
     let ace_count = read_u16(bytes, 4, "ACL ACE-count field is truncated")
         .map_err(AclCheckError::Structural)?;
@@ -351,18 +353,19 @@ fn verify_ace_record(
             "trustee SID extends past its containing ACE",
         ));
     }
+    let trustee = &sid[..sid_length];
+    validate_sid_prefix(trustee).map_err(AclCheckError::Structural)?;
     if sid_length != sid.len() {
-        return Err(structural_acl(
-            "trustee SID must end exactly at the ACE end",
+        return Err(policy_acl(
+            "trustee SID does not end exactly at the ACE end (noncanonical suffix)",
         ));
     }
-    validate_sid_prefix(sid).map_err(AclCheckError::Structural)?;
 
-    let principal = if sid == principals.user {
+    let principal = if trustee == principals.user {
         0
-    } else if sid == principals.system {
+    } else if trustee == principals.system {
         1
-    } else if sid == principals.administrators {
+    } else if trustee == principals.administrators {
         2
     } else {
         return Err(policy_acl("DACL contains an unexpected trustee"));
@@ -692,7 +695,13 @@ fn read_descriptor_state(
     let acl_check = if dacl_present == 0 || dacl.is_null() {
         check_acl_bytes(None, protected, kind, &principals.borrowed())
     } else {
-        let acl = descriptor_acl_bytes(bytes, base, dacl)?;
+        let extracted_acl = descriptor_acl_bytes(bytes, base, dacl)?;
+        #[cfg(test)]
+        let injected_acl = take_injected_policy_acl_for_test()?;
+        #[cfg(test)]
+        let acl = injected_acl.as_deref().unwrap_or(extracted_acl);
+        #[cfg(not(test))]
+        let acl = extracted_acl;
         check_acl_bytes(Some(acl), protected, kind, &principals.borrowed())
     };
     let acl_result = match acl_check {
@@ -855,6 +864,22 @@ fn force_descriptor_structure_failure_for_test(force: bool) {
 }
 
 #[cfg(test)]
+fn inject_policy_acl_for_next_descriptor_read_for_test(acl: Box<[u8]>) -> io::Result<()> {
+    *INJECTED_POLICY_ACL
+        .lock()
+        .map_err(|_| io::Error::other("injected policy ACL lock was poisoned"))? = Some(acl);
+    Ok(())
+}
+
+#[cfg(test)]
+fn take_injected_policy_acl_for_test() -> io::Result<Option<Box<[u8]>>> {
+    Ok(INJECTED_POLICY_ACL
+        .lock()
+        .map_err(|_| io::Error::other("injected policy ACL lock was poisoned"))?
+        .take())
+}
+
+#[cfg(test)]
 fn read_owner_sid_for_test(path: &Path, kind: StateArtifactKind) -> io::Result<Box<[u8]>> {
     let principals = expected_principals()?;
     let handle = open_target(path, kind, false)?;
@@ -878,14 +903,15 @@ mod tests {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
         Security::{
-            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+            ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             Authorization::{
                 ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
                 SE_FILE_OBJECT, SetSecurityInfo,
             },
-            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-            INHERITED_ACE, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR, PSID, UNPROTECTED_DACL_SECURITY_INFORMATION,
+            CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAclInformation,
+            GetSecurityDescriptorDacl, INHERITED_ACE, IsValidAcl, OBJECT_INHERIT_ACE,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            UNPROTECTED_DACL_SECURITY_INFORMATION,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -898,9 +924,10 @@ mod tests {
     };
 
     use super::{
-        AlignedBuffer, ExpectedPrincipals, StateArtifactKind, descriptor_acl_bytes,
-        ensure_private_state_artifact, force_descriptor_structure_failure_for_test,
-        force_post_write_failure_for_test, read_owner_sid_for_test,
+        AlignedBuffer, ExpectedPrincipals, OwnedAcl, StateArtifactKind, descriptor_acl_bytes,
+        ensure_private_state_artifact, expected_principals,
+        force_descriptor_structure_failure_for_test, force_post_write_failure_for_test,
+        inject_policy_acl_for_next_descriptor_read_for_test, read_owner_sid_for_test,
         reset_set_security_info_calls_for_test, set_security_info_calls_for_test, verify_acl_bytes,
         verify_private_state_artifact,
     };
@@ -1122,6 +1149,87 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    fn aligned_bytes_mut(storage: &mut AlignedBuffer) -> &mut [u8] {
+        // SAFETY: `AlignedBuffer` owns initialized writable storage for exactly `byte_len` bytes.
+        unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr::<u8>(), storage.byte_len) }
+    }
+
+    fn exact_native_acl(kind: StateArtifactKind) -> io::Result<AlignedBuffer> {
+        let principals = expected_principals()?;
+        Ok(OwnedAcl::build(kind, &principals)?.storage)
+    }
+
+    fn native_acl_with_allocation_slack(kind: StateArtifactKind) -> io::Result<AlignedBuffer> {
+        let exact = exact_native_acl(kind)?;
+        let new_len = exact
+            .byte_len
+            .checked_add(size_of::<u32>())
+            .ok_or_else(|| io::Error::other("test ACL length overflow"))?;
+        let mut slack = AlignedBuffer::zeroed(new_len)?;
+        aligned_bytes_mut(&mut slack)[..exact.byte_len].copy_from_slice(exact.as_bytes());
+        let declared = u16::try_from(new_len)
+            .map_err(|_| io::Error::other("test ACL does not fit AclSize"))?;
+        aligned_bytes_mut(&mut slack)[2..4].copy_from_slice(&declared.to_le_bytes());
+        Ok(slack)
+    }
+
+    fn native_acl_with_allow_suffix(kind: StateArtifactKind) -> io::Result<AlignedBuffer> {
+        let exact = exact_native_acl(kind)?;
+        let first_ace = size_of::<ACL>();
+        let first_size = usize::from(u16::from_le_bytes([
+            exact.as_bytes()[first_ace + 2],
+            exact.as_bytes()[first_ace + 3],
+        ]));
+        let first_end = first_ace
+            .checked_add(first_size)
+            .ok_or_else(|| io::Error::other("test ACE end overflow"))?;
+        let suffix_len = size_of::<u32>();
+        let new_len = exact
+            .byte_len
+            .checked_add(suffix_len)
+            .ok_or_else(|| io::Error::other("test ACL length overflow"))?;
+        let mut suffixed = AlignedBuffer::zeroed(new_len)?;
+        let bytes = aligned_bytes_mut(&mut suffixed);
+        bytes[..first_end].copy_from_slice(&exact.as_bytes()[..first_end]);
+        bytes[first_end + suffix_len..].copy_from_slice(&exact.as_bytes()[first_end..]);
+        let total_size_u16 = u16::try_from(new_len)
+            .map_err(|_| io::Error::other("test ACL does not fit AclSize"))?;
+        bytes[2..4].copy_from_slice(&total_size_u16.to_le_bytes());
+        let expanded_first_size = u16::try_from(first_size + suffix_len)
+            .map_err(|_| io::Error::other("test ACE does not fit AceSize"))?;
+        bytes[first_ace + 2..first_ace + 4].copy_from_slice(&expanded_first_size.to_le_bytes());
+        Ok(suffixed)
+    }
+
+    fn native_acl_bytes_in_use(acl: &AlignedBuffer) -> io::Result<Box<[u8]>> {
+        let pointer = acl.words.as_ptr().cast::<ACL>();
+        // SAFETY: The test fixture is DWORD-aligned and fully contained in initialized storage.
+        if unsafe { IsValidAcl(pointer) } == 0 {
+            return Err(io::Error::other("Windows rejected the native test ACL"));
+        }
+        let mut information = ACL_SIZE_INFORMATION::default();
+        // SAFETY: Windows accepted the complete ACL and `information` is a writable output.
+        let loaded = unsafe {
+            GetAclInformation(
+                pointer,
+                (&raw mut information).cast(),
+                u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
+                    .map_err(|_| io::Error::other("test ACL information size overflow"))?,
+                AclSizeInformation,
+            )
+        };
+        if loaded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let bytes_in_use = usize::try_from(information.AclBytesInUse)
+            .map_err(|_| io::Error::other("test ACL bytes-in-use overflow"))?;
+        let bytes = acl
+            .as_bytes()
+            .get(..bytes_in_use)
+            .ok_or_else(|| io::Error::other("test ACL bytes in use exceed allocation"))?;
+        Ok(bytes.to_vec().into_boxed_slice())
     }
 
     fn test_sddl(kind: StateArtifactKind, extra: &str, protected: bool) -> io::Result<String> {
@@ -1683,5 +1791,45 @@ mod tests {
             .ok_or_else(|| io::Error::other("misaligned DACL was accepted"))?;
         assert!(error.to_string().contains("DWORD-aligned"));
         Ok(())
+    }
+
+    fn assert_native_noncanonical_acl_repairs_once(
+        label: &str,
+        acl: &AlignedBuffer,
+    ) -> io::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let file = temporary.path().join(format!("{label}.db"));
+        fs::write(&file, b"state")?;
+        let acl_bytes = native_acl_bytes_in_use(acl)?;
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+        reset_set_security_info_calls_for_test();
+
+        inject_policy_acl_for_next_descriptor_read_for_test(acl_bytes.clone())?;
+        assert!(
+            verify_private_state_artifact(&file, StateArtifactKind::File).is_err(),
+            "valid noncanonical ACL must fail exact read-only verification"
+        );
+        assert_eq!(set_security_info_calls_for_test(), 0);
+        inject_policy_acl_for_next_descriptor_read_for_test(acl_bytes)?;
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+        assert_eq!(set_security_info_calls_for_test(), 1);
+        verify_private_state_artifact(&file, StateArtifactKind::File)?;
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+        assert_eq!(set_security_info_calls_for_test(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn review_acl_allocation_slack_is_repaired_once() -> io::Result<()> {
+        let _guard = native_test_guard();
+        let acl = native_acl_with_allocation_slack(StateArtifactKind::File)?;
+        assert_native_noncanonical_acl_repairs_once("acl-slack", &acl)
+    }
+
+    #[test]
+    fn review_allow_ace_suffix_is_repaired_once() -> io::Result<()> {
+        let _guard = native_test_guard();
+        let acl = native_acl_with_allow_suffix(StateArtifactKind::File)?;
+        assert_native_noncanonical_acl_repairs_once("ace-suffix", &acl)
     }
 }
