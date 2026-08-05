@@ -133,6 +133,84 @@ fn daemon_style_inspect_and_prepare_migrates_once_but_records_two_inspections() 
     Ok(())
 }
 
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn attributed_legacy_inspection_marker_child() -> TestResult {
+    if std::env::var_os("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS").is_none() {
+        return Ok(());
+    }
+
+    for _ in 0..2 {
+        let fixture = ImportFixture::new()?;
+        let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+            .ok_or("legacy source was not found")?;
+        let prepared = LegacyImporter::prepare_inspection(
+            &fixture.global,
+            fixture.workspace_id,
+            inspection,
+            &fixture.paths,
+        )?;
+        LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn attributed_legacy_inspection_marker_records_two_passes_per_distinct_source() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let marker = fs::canonicalize(temporary.path())?.join("attributed-inspections");
+    fs::create_dir(&marker)?;
+    let test_executable = std::env::current_exe()?;
+
+    let absent_status = std::process::Command::new(&test_executable)
+        .args([
+            "--exact",
+            "attributed_legacy_inspection_marker_child",
+            "--test-threads=1",
+        ])
+        .env("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS", "1")
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER")
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR")
+        .status()?;
+    assert!(absent_status.success());
+    assert!(fs::read_dir(&marker)?.next().is_none());
+
+    let attributed_status = std::process::Command::new(test_executable)
+        .args([
+            "--exact",
+            "attributed_legacy_inspection_marker_child",
+            "--test-threads=1",
+        ])
+        .env("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS", "1")
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER")
+        .env("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR", &marker)
+        .status()?;
+    assert!(attributed_status.success());
+
+    let source_directories = fs::read_dir(&marker)?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(source_directories.len(), 2);
+    let mut aggregate = 0;
+    for source in source_directories {
+        let source_key = source.file_name().to_string_lossy().into_owned();
+        assert_eq!(source_key.len(), 64);
+        assert!(
+            source_key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        );
+        let events = fs::read_dir(source.path())?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert!(event.file_type()?.is_file());
+            assert_eq!(fs::metadata(event.path())?.len(), 0);
+            aggregate += 1;
+        }
+    }
+    assert_eq!(aggregate, 4);
+    Ok(())
+}
+
 #[test]
 fn prepared_inspection_rejects_logical_database_mutation_before_target_mutation() -> TestResult {
     let fixture = ImportFixture::new()?;
