@@ -4090,18 +4090,26 @@ fn record_attributed_legacy_inspection_marker(source_root_hash: &str) -> StateRe
     if marker.is_none() {
         return Ok(());
     }
-    let temporary_root = std::env::var_os("TEMP")
-        .or_else(|| std::env::var_os("TMP"))
-        .ok_or_else(|| {
-            StateError::InvalidRecord(
-                "attributed legacy inspection test marker requires a temporary root".to_owned(),
-            )
-        })?;
+    let temporary_root = attributed_legacy_inspection_temporary_root();
     append_attributed_legacy_inspection_marker(
         marker.as_deref().map(Path::new),
-        &PathBuf::from(temporary_root),
+        &temporary_root,
         source_root_hash,
     )
+}
+
+#[cfg(feature = "test-fixtures")]
+fn attributed_legacy_inspection_temporary_root() -> PathBuf {
+    for variable in ["TEMP", "TMP"] {
+        if let Some(root) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            return PathBuf::from(root);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(root) = std::env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(root);
+    }
+    std::env::temp_dir()
 }
 
 #[cfg(feature = "test-fixtures")]
@@ -4204,7 +4212,10 @@ fn reject_marker_link_components(path: &Path) -> StateResult<()> {
 mod legacy_inspection_marker_tests {
     use std::{fs, thread};
 
-    use super::{append_attributed_legacy_inspection_marker, append_legacy_inspection_marker};
+    use super::{
+        append_attributed_legacy_inspection_marker, append_legacy_inspection_marker,
+        attributed_legacy_inspection_temporary_root,
+    };
 
     #[test]
     fn legacy_inspection_marker_appends_only_the_fixed_token_below_temp()
@@ -4249,6 +4260,59 @@ mod legacy_inspection_marker_tests {
         append_attributed_legacy_inspection_marker(None, &root, &"a".repeat(64))?;
 
         assert!(fs::read_dir(root)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_marker_uses_supported_fallback_when_temp_and_tmp_are_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let fallback = tempfile::tempdir()?;
+        let test_executable = std::env::current_exe()?;
+        let mut command = std::process::Command::new(test_executable);
+        command
+            .args([
+                "--exact",
+                "legacy_import::legacy_inspection_marker_tests::attributed_marker_fallback_child",
+                "--test-threads=1",
+            ])
+            .env("COLAY_TEST_RUN_ATTRIBUTED_MARKER_FALLBACK", "1")
+            .env_remove("TEMP")
+            .env_remove("TMP");
+        #[cfg(unix)]
+        command.env("TMPDIR", fallback.path());
+        #[cfg(not(unix))]
+        command.env_remove("TMPDIR");
+
+        let status = command.status()?;
+
+        assert!(status.success());
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_marker_fallback_child() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("COLAY_TEST_RUN_ATTRIBUTED_MARKER_FALLBACK").is_none() {
+            return Ok(());
+        }
+        assert!(std::env::var_os("TEMP").is_none());
+        assert!(std::env::var_os("TMP").is_none());
+        let temporary_root = attributed_legacy_inspection_temporary_root();
+        #[cfg(unix)]
+        assert_eq!(
+            fs::canonicalize(&temporary_root)?,
+            fs::canonicalize(std::env::var_os("TMPDIR").ok_or("TMPDIR was not set")?)?
+        );
+        let marker = tempfile::Builder::new()
+            .prefix("colay-attributed-marker-")
+            .tempdir_in(&temporary_root)?;
+        let source = "e".repeat(64);
+
+        append_attributed_legacy_inspection_marker(Some(marker.path()), &temporary_root, &source)?;
+
+        let events = fs::read_dir(marker.path().join(source))?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(fs::metadata(events[0].path())?.len(), 0);
         Ok(())
     }
 
@@ -4359,8 +4423,16 @@ mod legacy_inspection_marker_tests {
     fn create_directory_link(
         target: &std::path::Path,
         link: &std::path::Path,
-    ) -> std::io::Result<()> {
-        std::os::windows::fs::symlink_dir(target, link)
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if !status.success() {
+            return Err(format!("could not create test junction: {status}").into());
+        }
+        Ok(())
     }
 }
 

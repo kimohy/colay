@@ -159,11 +159,13 @@ fn attributed_legacy_inspection_marker_child() -> TestResult {
 #[test]
 fn attributed_legacy_inspection_marker_records_two_passes_per_distinct_source() -> TestResult {
     let temporary = tempfile::tempdir()?;
-    let marker = fs::canonicalize(temporary.path())?.join("attributed-inspections");
+    let isolated_temporary_root = fs::canonicalize(temporary.path())?;
+    let marker = isolated_temporary_root.join("attributed-inspections");
     fs::create_dir(&marker)?;
     let test_executable = std::env::current_exe()?;
 
-    let absent_status = std::process::Command::new(&test_executable)
+    let mut absent_command = std::process::Command::new(&test_executable);
+    absent_command
         .args([
             "--exact",
             "attributed_legacy_inspection_marker_child",
@@ -171,12 +173,14 @@ fn attributed_legacy_inspection_marker_records_two_passes_per_distinct_source() 
         ])
         .env("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS", "1")
         .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER")
-        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR")
-        .status()?;
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR");
+    configure_isolated_temporary_environment(&mut absent_command, &isolated_temporary_root);
+    let absent_status = absent_command.status()?;
     assert!(absent_status.success());
     assert!(fs::read_dir(&marker)?.next().is_none());
 
-    let attributed_status = std::process::Command::new(test_executable)
+    let mut attributed_command = std::process::Command::new(test_executable);
+    attributed_command
         .args([
             "--exact",
             "attributed_legacy_inspection_marker_child",
@@ -184,8 +188,9 @@ fn attributed_legacy_inspection_marker_records_two_passes_per_distinct_source() 
         ])
         .env("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS", "1")
         .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER")
-        .env("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR", &marker)
-        .status()?;
+        .env("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR", &marker);
+    configure_isolated_temporary_environment(&mut attributed_command, &isolated_temporary_root);
+    let attributed_status = attributed_command.status()?;
     assert!(attributed_status.success());
 
     let source_directories = fs::read_dir(&marker)?.collect::<Result<Vec<_>, _>>()?;
@@ -209,6 +214,13 @@ fn attributed_legacy_inspection_marker_records_two_passes_per_distinct_source() 
     }
     assert_eq!(aggregate, 4);
     Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+fn configure_isolated_temporary_environment(command: &mut std::process::Command, root: &Path) {
+    command.env("TEMP", root).env("TMP", root);
+    #[cfg(unix)]
+    command.env("TMPDIR", root);
 }
 
 #[test]
