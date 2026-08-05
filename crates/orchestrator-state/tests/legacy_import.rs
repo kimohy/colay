@@ -235,6 +235,56 @@ fn prepared_inspection_rejects_file_added_after_initial_manifest_enumeration() -
     Ok(())
 }
 
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn prepared_inspection_rejects_post_read_artifact_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let original = fixture
+        .source
+        .root
+        .join(format!("tasks/{}/evidence.txt", fixture.task_id));
+    let artifact = fixture.source.root.join("reports/evidence.txt");
+    fs::create_dir_all(artifact.parent().ok_or("artifact path has no parent")?)?;
+    fs::rename(&original, &artifact)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE artifacts SET relative_path = 'reports/evidence.txt'",
+        [],
+    )?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    let artifact_for_hook = artifact.clone();
+    LegacyImporter::set_manifest_post_read_hook_for_test(move || {
+        #[cfg(unix)]
+        {
+            fs::remove_file(&artifact_for_hook)
+        }
+        #[cfg(windows)]
+        {
+            fs::write(&artifact_for_hook, b"changed after retained read")
+        }
+    });
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("artifact mutation after its retained read escaped final verification")?;
+
+    assert!(
+        matches!(
+            error,
+            StateError::ArtifactConflict(_) | StateError::Io { .. }
+        ) || error.to_string().contains("source file")
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
 #[test]
 fn prepared_inspection_rejects_changed_monitored_file_before_target_mutation() -> TestResult {
     let fixture = ImportFixture::new()?;
