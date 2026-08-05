@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::Write as _,
     path::{Component, Path, PathBuf},
@@ -17,10 +18,11 @@ use orchestrator_domain::{
 use orchestrator_state::reject_symlink_components;
 use orchestrator_state::{
     ArtifactStore, ConfigEnvironment, ConfigRequest, Database, DatabaseHealth, GlobalStatePaths,
-    LegacyImporter, RepositoryStatePaths, ResumeDisposition, RootConfig, SessionListFilter,
-    StateError, TaskListFilter, WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord,
-    WorkspaceReadRequest, WorkspaceRegistration, WorkspaceStatePaths, ensure_private_directory,
-    ensure_private_file, load_effective_config,
+    LegacyImporter, PreparedLegacyImport, PreparedLegacyInspection, RepositoryStatePaths,
+    ResumeDisposition, RootConfig, SessionListFilter, StateError, TaskListFilter,
+    WorkspaceDatabase, WorkspaceId, WorkspaceOutboxRecord, WorkspaceReadRequest,
+    WorkspaceRegistration, WorkspaceStatePaths, ensure_private_directory, ensure_private_file,
+    load_effective_config,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,7 +34,7 @@ use tokio::{
         AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _,
         BufReader,
     },
-    sync::{mpsc, oneshot},
+    sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -42,6 +44,7 @@ pub const WORKSPACE_DOCTOR_SCHEMA_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TASK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_BLOCKING_LEGACY_PREPARATIONS: usize = 4;
 
 #[cfg(test)]
 struct TaskStreamInterleaveHook {
@@ -631,8 +634,9 @@ impl IpcServer {
             .await;
         });
         let result = self.accept_loop(writer, cancellation).await;
-        writer_task.abort();
-        let _ = writer_task.await;
+        writer_task.await.map_err(|error| {
+            IpcError::Protocol(format!("daemon writer supervisor failed: {error}"))
+        })?;
         result
     }
 
@@ -1047,7 +1051,12 @@ async fn dispatch_request(
             ),
         );
     }
-    if let Some(response) = dispatch_read_request(database, paths, &request, startup_workspace_id) {
+    let evidence_lookup = request.action == "workspace.doctor.lookup"
+        && request.payload.get("legacy_source_fingerprint").is_some();
+    if !evidence_lookup
+        && let Some(response) =
+            dispatch_read_request(database, paths, &request, startup_workspace_id)
+    {
         return response;
     }
     if !matches!(
@@ -1060,6 +1069,7 @@ async fn dispatch_request(
             | "workspace.resume"
             | "workspace.selection"
             | "workspace.usage.override"
+            | "workspace.doctor.lookup"
             | "daemon.stop"
     ) {
         return IpcResponse::failure(request.request_id, "unsupported IPC action");
@@ -1447,20 +1457,499 @@ struct WriterRequest {
     response: oneshot::Sender<IpcResponse>,
 }
 
-async fn writer_loop(
+struct RegistrationPreparationInput {
     database: Arc<Database>,
     paths: GlobalStatePaths,
-    mut receiver: mpsc::Receiver<WriterRequest>,
-    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
-) {
-    while let Some(command) = receiver.recv().await {
-        let activation_request = command.request.clone();
-        let mut response = process_writer_request(&database, &paths, command.request);
+    workspace_id: WorkspaceId,
+    source: RepositoryStatePaths,
+}
+
+struct EvidenceInspectionInput {
+    database: Arc<Database>,
+    paths: GlobalStatePaths,
+    request: IpcRequest,
+}
+
+trait RegistrationCommit: Send {
+    fn commit(
+        self: Box<Self>,
+        database: &Database,
+        paths: &GlobalStatePaths,
+    ) -> Result<bool, IpcError>;
+}
+
+trait WriterBackend: Send + Sync + 'static {
+    fn prepare_registration(
+        &self,
+        input: RegistrationPreparationInput,
+    ) -> Result<Box<dyn RegistrationCommit>, IpcError>;
+
+    fn inspect_evidence(&self, input: EvidenceInspectionInput) -> Result<Value, IpcError>;
+}
+
+struct StateWriterBackend;
+
+impl WriterBackend for StateWriterBackend {
+    fn prepare_registration(
+        &self,
+        input: RegistrationPreparationInput,
+    ) -> Result<Box<dyn RegistrationCommit>, IpcError> {
+        let prepared = inspect_registration_for_prepare(&input)?
+            .map(|inspection| prepare_registration_inspection(&input, inspection))
+            .transpose()?;
+        Ok(Box::new(StateRegistrationCommit { prepared }))
+    }
+
+    fn inspect_evidence(&self, input: EvidenceInspectionInput) -> Result<Value, IpcError> {
+        workspace_doctor_lookup(&input.database, &input.paths, &input.request)
+    }
+}
+
+fn inspect_registration_for_prepare(
+    input: &RegistrationPreparationInput,
+) -> Result<Option<PreparedLegacyInspection>, IpcError> {
+    let inspection = LegacyImporter::inspect_for_prepare(&input.source, &input.paths)?;
+    #[cfg(test)]
+    tests::record_registration_inspection_for_prepare();
+    Ok(inspection)
+}
+
+fn prepare_registration_inspection(
+    input: &RegistrationPreparationInput,
+    inspection: PreparedLegacyInspection,
+) -> Result<PreparedLegacyImport, IpcError> {
+    let prepared = LegacyImporter::prepare_inspection(
+        &input.database,
+        input.workspace_id,
+        inspection,
+        &input.paths,
+    )?;
+    #[cfg(test)]
+    tests::record_registration_prepare_inspection();
+    Ok(prepared)
+}
+
+struct StateRegistrationCommit {
+    prepared: Option<PreparedLegacyImport>,
+}
+
+impl RegistrationCommit for StateRegistrationCommit {
+    fn commit(
+        self: Box<Self>,
+        database: &Database,
+        paths: &GlobalStatePaths,
+    ) -> Result<bool, IpcError> {
+        self.prepared
+            .map(|prepared| LegacyImporter::commit(database, prepared, paths))
+            .transpose()
+            .map(|result| result.is_some_and(|result| result.imported))
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegistrationSemantics {
+    source: RepositoryStatePaths,
+    explicit_config: Option<PathBuf>,
+}
+
+enum LaneJobInput {
+    Registration(RegistrationPreparationInput),
+    Evidence(EvidenceInspectionInput),
+}
+
+enum LaneJobOutput {
+    Registration(Box<dyn RegistrationCommit>),
+    Evidence(Value),
+}
+
+#[derive(Clone)]
+enum FinalizedLaneOutcome {
+    Registration(Result<bool, String>),
+    Evidence(Result<Value, String>),
+}
+
+enum RegistrationGenerationState {
+    Queued(Box<LaneJobInput>),
+    Running,
+    Ready(Result<LaneJobOutput, String>),
+    Finalized(FinalizedLaneOutcome),
+}
+
+struct RegistrationGeneration {
+    workspace_id: WorkspaceId,
+    semantics: Option<RegistrationSemantics>,
+    remaining_admissions: usize,
+    state: RegistrationGenerationState,
+}
+
+#[derive(Default)]
+struct WorkspacePreparationLane {
+    active: Option<u64>,
+    queued: VecDeque<u64>,
+}
+
+enum WriterAdmission {
+    Immediate {
+        response: oneshot::Sender<IpcResponse>,
+        value: IpcResponse,
+    },
+    Ordinary(WriterRequest),
+    Registration {
+        command: WriterRequest,
+        generation: u64,
+    },
+    Evidence {
+        command: WriterRequest,
+        generation: u64,
+    },
+}
+
+struct SequencedWriterAdmission {
+    sequence: u64,
+    action: WriterAdmission,
+}
+
+struct WriterScheduler {
+    next_admission_sequence: u64,
+    last_drained_sequence: Option<u64>,
+    next_generation: u64,
+    admissions: VecDeque<SequencedWriterAdmission>,
+    lanes: HashMap<WorkspaceId, WorkspacePreparationLane>,
+    generations: HashMap<u64, RegistrationGeneration>,
+    jobs: JoinSet<(u64, Result<LaneJobOutput, String>)>,
+    permits: Arc<Semaphore>,
+    backend: Arc<dyn WriterBackend>,
+}
+
+impl WriterScheduler {
+    fn new(backend: Arc<dyn WriterBackend>) -> Self {
+        Self {
+            next_admission_sequence: 0,
+            last_drained_sequence: None,
+            next_generation: 0,
+            admissions: VecDeque::new(),
+            lanes: HashMap::new(),
+            generations: HashMap::new(),
+            jobs: JoinSet::new(),
+            permits: Arc::new(Semaphore::new(MAX_BLOCKING_LEGACY_PREPARATIONS)),
+            backend,
+        }
+    }
+
+    fn admit(
+        &mut self,
+        database: &Arc<Database>,
+        paths: &GlobalStatePaths,
+        command: WriterRequest,
+    ) -> bool {
+        if command.request.action == "workspace.doctor.lookup" {
+            let request_id = command.request.request_id.clone();
+            match resolve_evidence_admission(database, paths, &command.request) {
+                Ok(Some((workspace_id, input))) => {
+                    let generation =
+                        self.create_generation(workspace_id, None, LaneJobInput::Evidence(input));
+                    if let Some(entry) = self.generations.get_mut(&generation) {
+                        entry.remaining_admissions = 1;
+                        self.push_admission(WriterAdmission::Evidence {
+                            command,
+                            generation,
+                        });
+                    } else {
+                        self.push_admission(WriterAdmission::Immediate {
+                            response: command.response,
+                            value: IpcResponse::failure(
+                                request_id,
+                                "evidence preparation could not be scheduled",
+                            ),
+                        });
+                    }
+                }
+                Ok(None) => self.push_admission(WriterAdmission::Ordinary(command)),
+                Err(error) => self.push_admission(WriterAdmission::Immediate {
+                    response: command.response,
+                    value: IpcResponse::failure(request_id, error.to_string()),
+                }),
+            }
+            return false;
+        }
+        if command.request.action != "workspace.register" {
+            let stops_admission = command.request.action == "daemon.stop";
+            self.push_admission(WriterAdmission::Ordinary(command));
+            return stops_admission;
+        }
+        let request_id = command.request.request_id.clone();
+        match resolve_registration_admission(database, paths, &command.request) {
+            Ok((input, semantics)) => {
+                let workspace_id = input.workspace_id;
+                let generation = self.join_or_create_generation(workspace_id, semantics, input);
+                if let Some(entry) = self.generations.get_mut(&generation) {
+                    entry.remaining_admissions += 1;
+                    self.push_admission(WriterAdmission::Registration {
+                        command,
+                        generation,
+                    });
+                } else {
+                    self.push_admission(WriterAdmission::Immediate {
+                        response: command.response,
+                        value: IpcResponse::failure(
+                            request_id,
+                            "workspace registration could not be scheduled",
+                        ),
+                    });
+                }
+            }
+            Err(error) => self.push_admission(WriterAdmission::Immediate {
+                response: command.response,
+                value: IpcResponse::failure(request_id, error.to_string()),
+            }),
+        }
+        false
+    }
+
+    fn push_admission(&mut self, action: WriterAdmission) {
+        let sequence = self.next_admission_sequence;
+        self.next_admission_sequence = self.next_admission_sequence.wrapping_add(1);
+        self.admissions
+            .push_back(SequencedWriterAdmission { sequence, action });
+    }
+
+    fn join_or_create_generation(
+        &mut self,
+        workspace_id: WorkspaceId,
+        semantics: RegistrationSemantics,
+        input: RegistrationPreparationInput,
+    ) -> u64 {
+        let lane = self.lanes.entry(workspace_id).or_default();
+        let joinable = lane
+            .queued
+            .back()
+            .copied()
+            .or(lane.active)
+            .filter(|generation| {
+                self.generations
+                    .get(generation)
+                    .and_then(|existing| existing.semantics.as_ref())
+                    .is_some_and(|existing| *existing == semantics)
+            });
+        if let Some(generation) = joinable {
+            return generation;
+        }
+
+        self.create_generation(
+            workspace_id,
+            Some(semantics),
+            LaneJobInput::Registration(input),
+        )
+    }
+
+    fn create_generation(
+        &mut self,
+        workspace_id: WorkspaceId,
+        semantics: Option<RegistrationSemantics>,
+        input: LaneJobInput,
+    ) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.generations.insert(
+            generation,
+            RegistrationGeneration {
+                workspace_id,
+                semantics,
+                remaining_admissions: 0,
+                state: RegistrationGenerationState::Queued(Box::new(input)),
+            },
+        );
+        let lane = self.lanes.entry(workspace_id).or_default();
+        if lane.active.is_none() {
+            lane.active = Some(generation);
+            self.start_generation(generation);
+        } else {
+            lane.queued.push_back(generation);
+        }
+        generation
+    }
+
+    fn start_generation(&mut self, generation: u64) {
+        let Some(entry) = self.generations.get_mut(&generation) else {
+            return;
+        };
+        let RegistrationGenerationState::Queued(input) =
+            std::mem::replace(&mut entry.state, RegistrationGenerationState::Running)
+        else {
+            return;
+        };
+        let permits = Arc::clone(&self.permits);
+        let backend = Arc::clone(&self.backend);
+        self.jobs.spawn(async move {
+            let permit = permits
+                .acquire_owned()
+                .await
+                .map_err(|error| format!("legacy preparation capacity closed: {error}"));
+            let result = match permit {
+                Ok(permit) => {
+                    let prepared = tokio::task::spawn_blocking(move || match *input {
+                        LaneJobInput::Registration(input) => backend
+                            .prepare_registration(input)
+                            .map(LaneJobOutput::Registration),
+                        LaneJobInput::Evidence(input) => {
+                            backend.inspect_evidence(input).map(LaneJobOutput::Evidence)
+                        }
+                    })
+                    .await
+                    .map_err(|error| format!("legacy preparation job failed: {error}"))
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    drop(permit);
+                    prepared
+                }
+                Err(error) => Err(error),
+            };
+            (generation, result)
+        });
+    }
+
+    fn complete_generation(&mut self, generation: u64, result: Result<LaneJobOutput, String>) {
+        if let Some(entry) = self.generations.get_mut(&generation) {
+            entry.state = RegistrationGenerationState::Ready(result);
+        }
+    }
+
+    fn head_ready(&self) -> bool {
+        match self.admissions.front().map(|admission| &admission.action) {
+            Some(WriterAdmission::Immediate { .. } | WriterAdmission::Ordinary(_)) => true,
+            Some(
+                WriterAdmission::Registration { generation, .. }
+                | WriterAdmission::Evidence { generation, .. },
+            ) => self.generations.get(generation).is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    RegistrationGenerationState::Ready(_)
+                        | RegistrationGenerationState::Finalized(_)
+                )
+            }),
+            None => false,
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.admissions.is_empty() && self.jobs.is_empty()
+    }
+
+    fn drain_one(
+        &mut self,
+        database: &Database,
+        paths: &GlobalStatePaths,
+        workspace_activations: Option<&mpsc::UnboundedSender<WorkspaceActivation>>,
+    ) {
+        let Some(admission) = self.admissions.pop_front() else {
+            return;
+        };
+        if let Some(previous) = self.last_drained_sequence {
+            debug_assert_eq!(admission.sequence, previous.wrapping_add(1));
+        } else {
+            debug_assert_eq!(admission.sequence, 0);
+        }
+        self.last_drained_sequence = Some(admission.sequence);
+        match admission.action {
+            WriterAdmission::Immediate { response, value } => {
+                let _ = response.send(value);
+            }
+            WriterAdmission::Ordinary(command) => {
+                let response = process_writer_request(database, paths, command.request);
+                let _ = command.response.send(response);
+            }
+            WriterAdmission::Registration {
+                command,
+                generation,
+            } => self.finish_registration(
+                database,
+                paths,
+                workspace_activations,
+                command,
+                generation,
+            ),
+            WriterAdmission::Evidence {
+                command,
+                generation,
+            } => self.finish_evidence(command, generation),
+        }
+    }
+
+    fn finish_registration(
+        &mut self,
+        database: &Database,
+        paths: &GlobalStatePaths,
+        workspace_activations: Option<&mpsc::UnboundedSender<WorkspaceActivation>>,
+        command: WriterRequest,
+        generation: u64,
+    ) {
+        let Some(workspace_id) = self
+            .generations
+            .get(&generation)
+            .map(|entry| entry.workspace_id)
+        else {
+            let response = IpcResponse::failure(
+                command.request.request_id,
+                "workspace registration preparation disappeared",
+            );
+            let _ = command.response.send(response);
+            return;
+        };
+        let outcome = {
+            let Some(entry) = self.generations.get_mut(&generation) else {
+                return;
+            };
+            match std::mem::replace(&mut entry.state, RegistrationGenerationState::Running) {
+                RegistrationGenerationState::Ready(prepared) => {
+                    let result = prepared.and_then(|prepared| match prepared {
+                        LaneJobOutput::Registration(prepared) => prepared
+                            .commit(database, paths)
+                            .map_err(|error| error.to_string()),
+                        LaneJobOutput::Evidence(_) => {
+                            Err("registration lane produced evidence output".to_owned())
+                        }
+                    });
+                    entry.state = RegistrationGenerationState::Finalized(
+                        FinalizedLaneOutcome::Registration(result.clone()),
+                    );
+                    result
+                }
+                RegistrationGenerationState::Finalized(FinalizedLaneOutcome::Registration(
+                    result,
+                )) => {
+                    entry.state = RegistrationGenerationState::Finalized(
+                        FinalizedLaneOutcome::Registration(result.clone()),
+                    );
+                    result
+                }
+                state => {
+                    entry.state = state;
+                    Err("registration preparation was not ready".to_owned())
+                }
+            }
+        };
+        if matches!(
+            self.generations.get(&generation).map(|entry| &entry.state),
+            Some(RegistrationGenerationState::Finalized(_))
+        ) {
+            self.advance_lane(generation);
+        }
+
+        let request_id = command.request.request_id.clone();
+        let mut response = match outcome {
+            Ok(imported) => IpcResponse::success(
+                request_id,
+                &json!({
+                    "workspace_id": workspace_id,
+                    "imported_legacy_state": imported,
+                }),
+            ),
+            Err(error) => IpcResponse::failure(request_id, error),
+        };
         if response.outcome.get("status").and_then(Value::as_str) == Some("ok")
-            && activation_request.action == "workspace.register"
-            && let Some(sender) = workspace_activations.as_ref()
+            && let Some(sender) = workspace_activations
         {
-            match workspace_activation(&database, &activation_request, &response).and_then(
+            match workspace_activation(database, &command.request, &response).and_then(
                 |activation| {
                     sender
                         .send(activation)
@@ -1474,6 +1963,202 @@ async fn writer_loop(
             }
         }
         let _ = command.response.send(response);
+
+        let remove = if let Some(entry) = self.generations.get_mut(&generation) {
+            entry.remaining_admissions = entry.remaining_admissions.saturating_sub(1);
+            entry.remaining_admissions == 0
+        } else {
+            false
+        };
+        if remove {
+            self.generations.remove(&generation);
+        }
+    }
+
+    fn finish_evidence(&mut self, command: WriterRequest, generation: u64) {
+        let outcome = {
+            let Some(entry) = self.generations.get_mut(&generation) else {
+                let response = IpcResponse::failure(
+                    command.request.request_id,
+                    "evidence preparation disappeared",
+                );
+                let _ = command.response.send(response);
+                return;
+            };
+            match std::mem::replace(&mut entry.state, RegistrationGenerationState::Running) {
+                RegistrationGenerationState::Ready(result) => {
+                    let result = result.and_then(|result| match result {
+                        LaneJobOutput::Evidence(value) => Ok(value),
+                        LaneJobOutput::Registration(_) => {
+                            Err("evidence lane produced registration output".to_owned())
+                        }
+                    });
+                    entry.state = RegistrationGenerationState::Finalized(
+                        FinalizedLaneOutcome::Evidence(result.clone()),
+                    );
+                    result
+                }
+                RegistrationGenerationState::Finalized(FinalizedLaneOutcome::Evidence(result)) => {
+                    entry.state = RegistrationGenerationState::Finalized(
+                        FinalizedLaneOutcome::Evidence(result.clone()),
+                    );
+                    result
+                }
+                state => {
+                    entry.state = state;
+                    Err("evidence inspection was not ready".to_owned())
+                }
+            }
+        };
+        self.advance_lane(generation);
+        let response = match outcome {
+            Ok(value) => IpcResponse::success(command.request.request_id, &value),
+            Err(error) => IpcResponse::failure(command.request.request_id, error),
+        };
+        let _ = command.response.send(response);
+        self.generations.remove(&generation);
+    }
+
+    fn advance_lane(&mut self, generation: u64) {
+        let Some(workspace_id) = self
+            .generations
+            .get(&generation)
+            .map(|entry| entry.workspace_id)
+        else {
+            return;
+        };
+        let next = {
+            let Some(lane) = self.lanes.get_mut(&workspace_id) else {
+                return;
+            };
+            if lane.active != Some(generation) {
+                return;
+            }
+            lane.active = lane.queued.pop_front();
+            lane.active
+        };
+        if let Some(next) = next {
+            self.start_generation(next);
+        } else {
+            self.lanes.remove(&workspace_id);
+        }
+    }
+}
+
+fn resolve_registration_admission(
+    database: &Arc<Database>,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Result<(RegistrationPreparationInput, RegistrationSemantics), IpcError> {
+    let payload = serde_json::from_value::<RegisterWorkspacePayload>(request.payload.clone())?;
+    let registration = database.resolve_repository_workspace(&payload.repository)?;
+    if request
+        .workspace_id
+        .is_some_and(|expected| expected != registration.workspace_id)
+    {
+        return Err(IpcError::Protocol(
+            "request workspace does not match the registered repository".to_owned(),
+        ));
+    }
+    let mut config = RootConfig::default();
+    config.orchestrator.state_dir = payload.state_dir;
+    let source = RepositoryStatePaths::from_config(&registration.canonical_path, &config)?;
+    let semantics = RegistrationSemantics {
+        source: source.clone(),
+        explicit_config: payload.explicit_config,
+    };
+    Ok((
+        RegistrationPreparationInput {
+            database: Arc::clone(database),
+            paths: paths.clone(),
+            workspace_id: registration.workspace_id,
+            source,
+        },
+        semantics,
+    ))
+}
+
+fn resolve_evidence_admission(
+    database: &Arc<Database>,
+    paths: &GlobalStatePaths,
+    request: &IpcRequest,
+) -> Result<Option<(WorkspaceId, EvidenceInspectionInput)>, IpcError> {
+    let payload = serde_json::from_value::<WorkspaceDoctorLookupPayload>(request.payload.clone())?;
+    let Some(registration) = database.find_repository_workspace(&payload.repository)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        registration.workspace_id,
+        EvidenceInspectionInput {
+            database: Arc::clone(database),
+            paths: paths.clone(),
+            request: request.clone(),
+        },
+    )))
+}
+
+async fn writer_loop(
+    database: Arc<Database>,
+    paths: GlobalStatePaths,
+    receiver: mpsc::Receiver<WriterRequest>,
+    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
+) {
+    writer_loop_with_backend(
+        database,
+        paths,
+        receiver,
+        workspace_activations,
+        Arc::new(StateWriterBackend),
+    )
+    .await;
+}
+
+async fn writer_loop_with_backend(
+    database: Arc<Database>,
+    paths: GlobalStatePaths,
+    mut receiver: mpsc::Receiver<WriterRequest>,
+    workspace_activations: Option<mpsc::UnboundedSender<WorkspaceActivation>>,
+    backend: Arc<dyn WriterBackend>,
+) {
+    let mut scheduler = WriterScheduler::new(backend);
+    let mut receiver_open = true;
+    loop {
+        if scheduler.head_ready() {
+            scheduler.drain_one(&database, &paths, workspace_activations.as_ref());
+            tokio::task::yield_now().await;
+            continue;
+        }
+        if !receiver_open && scheduler.is_idle() {
+            break;
+        }
+        tokio::select! {
+            command = receiver.recv(), if receiver_open => {
+                match command {
+                    Some(command) => {
+                        if scheduler.admit(&database, &paths, command) {
+                            receiver.close();
+                            receiver_open = false;
+                        }
+                    }
+                    None => receiver_open = false,
+                }
+            }
+            completed = scheduler.jobs.join_next(), if !scheduler.jobs.is_empty() => {
+                if let Some(completed) = completed {
+                    match completed {
+                        Ok((generation, result)) => scheduler.complete_generation(generation, result),
+                        Err(error) => {
+                            let message = format!("legacy preparation supervisor failed: {error}");
+                            if let Some((generation, _)) = scheduler.generations.iter().find(|(_, entry)| {
+                                matches!(entry.state, RegistrationGenerationState::Running)
+                            }) {
+                                scheduler.complete_generation(*generation, Err(message));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1516,6 +2201,7 @@ fn process_writer_request(
         "workspace.resume" => resume_workspace_task(database, &request),
         "workspace.selection" => save_workspace_selection(database, &request),
         "workspace.usage.override" => override_workspace_usage(database, &request),
+        "workspace.doctor.lookup" => workspace_doctor_lookup(database, paths, &request),
         "daemon.stop" => request_daemon_stop(database),
         _ => Err(IpcError::Protocol("unsupported writer action".to_owned())),
     };
@@ -2156,10 +2842,11 @@ mod tests {
 
     use super::{
         IPC_SCHEMA_VERSION, IpcError, IpcRequest, IpcResponse, LegacyImportDoctorStatus,
-        MAX_REQUEST_BYTES, TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook,
-        WorkspaceDoctorLookup, WorkspaceDoctorLookupPayload, dispatch_read_request,
-        dispatch_request, handle_connection, process_writer_request, resume_workspace_task,
-        workspace_conversation, workspace_doctor_lookup, workspace_projection,
+        MAX_REQUEST_BYTES, RegistrationPreparationInput, StateWriterBackend,
+        TASK_STREAM_INTERLEAVE_HOOK, TaskStreamInterleaveHook, WorkspaceDoctorLookup,
+        WorkspaceDoctorLookupPayload, WriterBackend, dispatch_read_request, dispatch_request,
+        handle_connection, process_writer_request, resume_workspace_task, workspace_conversation,
+        workspace_doctor_lookup, workspace_projection,
     };
     #[cfg(windows)]
     use super::{
@@ -2220,6 +2907,62 @@ mod tests {
             include_str!("../../../migrations/0008_result_integration.sql"),
         ),
     ];
+
+    thread_local! {
+        static REGISTRATION_PREPARATION_API_COUNTS: std::cell::Cell<(u32, u32)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+
+    fn reset_registration_preparation_api_counts() {
+        REGISTRATION_PREPARATION_API_COUNTS.with(|counts| counts.set((0, 0)));
+    }
+
+    pub(super) fn record_registration_inspection_for_prepare() {
+        REGISTRATION_PREPARATION_API_COUNTS.with(|counts| {
+            let (inspections, preparations) = counts.get();
+            counts.set((inspections.saturating_add(1), preparations));
+        });
+    }
+
+    pub(super) fn record_registration_prepare_inspection() {
+        REGISTRATION_PREPARATION_API_COUNTS.with(|counts| {
+            let (inspections, preparations) = counts.get();
+            counts.set((inspections, preparations.saturating_add(1)));
+        });
+    }
+
+    fn registration_preparation_api_counts() -> (u32, u32) {
+        REGISTRATION_PREPARATION_API_COUNTS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn state_writer_backend_consumes_one_retained_inspection_per_registration_preparation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        let home = temporary.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+            std::fs::canonicalize(home)?,
+        )?)?;
+        let database = Arc::new(Database::open(&paths.database)?);
+        database.migrate_with_backup(&paths.backups)?;
+        let registration = database.resolve_repository_workspace(&repository)?;
+        let (source, _) = seed_legacy_source(&repository, Path::new(".legacy-colay"), &paths)?;
+
+        reset_registration_preparation_api_counts();
+        let prepared = StateWriterBackend.prepare_registration(RegistrationPreparationInput {
+            database,
+            paths,
+            workspace_id: registration.workspace_id,
+            source,
+        })?;
+
+        assert_eq!(registration_preparation_api_counts(), (1, 1));
+        drop(prepared);
+        Ok(())
+    }
 
     #[test]
     fn daemon_ping_omits_startup_workspace_receipt_when_unset()
@@ -3517,3 +4260,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "ipc_scheduler_tests.rs"]
+mod scheduler_tests;
