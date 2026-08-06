@@ -46,6 +46,22 @@ static FORCE_POST_WRITE_FAILURE: AtomicBool = AtomicBool::new(false);
 static FORCE_DESCRIPTOR_STRUCTURE_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static INJECTED_POLICY_ACL: Mutex<Option<Box<[u8]>>> = Mutex::new(None);
+#[cfg(test)]
+static RETAINED_HANDLE_TRACE: Mutex<Option<Vec<RetainedHandleOperation>>> = Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedHandleOperationKind {
+    DescriptorRead,
+    AclWrite,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetainedHandleOperation {
+    kind: RetainedHandleOperationKind,
+    handle: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateArtifactKind {
@@ -627,6 +643,8 @@ fn read_descriptor_state(
     kind: StateArtifactKind,
     principals: &ExpectedPrincipals<'_>,
 ) -> io::Result<DescriptorState> {
+    #[cfg(test)]
+    record_retained_handle_operation_for_test(RetainedHandleOperationKind::DescriptorRead, handle)?;
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: The handle is retained and live; all optional component outputs are null and the
     // descriptor output receives one LocalAlloc-owned self-relative descriptor.
@@ -830,7 +848,10 @@ fn bounded_sid_length(bytes: &[u8], sid: PSID) -> io::Result<usize> {
 
 fn install_acl(handle: HANDLE, acl: &OwnedAcl) -> io::Result<()> {
     #[cfg(test)]
-    SET_SECURITY_INFO_CALLS.fetch_add(1, Ordering::SeqCst);
+    {
+        record_retained_handle_operation_for_test(RetainedHandleOperationKind::AclWrite, handle)?;
+        SET_SECURITY_INFO_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
     // SAFETY: The retained handle and constructed non-null ACL are live. Only DACL protection is
     // changed; owner, group, and SACL pointers are intentionally null.
     let status = unsafe {
@@ -1037,6 +1058,47 @@ fn set_security_info_calls_for_test() -> usize {
 }
 
 #[cfg(test)]
+fn record_retained_handle_operation_for_test(
+    kind: RetainedHandleOperationKind,
+    handle: HANDLE,
+) -> io::Result<()> {
+    let mut trace = RETAINED_HANDLE_TRACE
+        .lock()
+        .map_err(|_| io::Error::other("retained-handle trace lock was poisoned"))?;
+    if let Some(operations) = trace.as_mut() {
+        operations.push(RetainedHandleOperation {
+            kind,
+            handle: handle as usize,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn trace_retained_handle_operations_for_test(
+    operation: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Vec<RetainedHandleOperation>> {
+    {
+        let mut trace = RETAINED_HANDLE_TRACE
+            .lock()
+            .map_err(|_| io::Error::other("retained-handle trace lock was poisoned"))?;
+        if trace.is_some() {
+            return Err(io::Error::other("retained-handle trace is already active"));
+        }
+        *trace = Some(Vec::new());
+    }
+
+    let operation_result = operation();
+    let operations = RETAINED_HANDLE_TRACE
+        .lock()
+        .map_err(|_| io::Error::other("retained-handle trace lock was poisoned"))?
+        .take()
+        .ok_or_else(|| io::Error::other("retained-handle trace ended without an active trace"))?;
+    operation_result?;
+    Ok(operations)
+}
+
+#[cfg(test)]
 fn force_post_write_failure_for_test(force: bool) {
     FORCE_POST_WRITE_FAILURE.store(force, Ordering::SeqCst);
 }
@@ -1093,11 +1155,12 @@ mod tests {
     };
 
     use super::{
-        AlignedBuffer, ExpectedPrincipals, OwnedAcl, StateArtifactKind, descriptor_acl_bytes,
-        ensure_private_state_artifact, expected_principals,
-        force_descriptor_structure_failure_for_test, force_post_write_failure_for_test,
-        inject_policy_acl_for_next_descriptor_read_for_test, read_owner_sid_for_test,
-        reset_set_security_info_calls_for_test, set_security_info_calls_for_test, stage_error,
+        AlignedBuffer, ExpectedPrincipals, OwnedAcl, RetainedHandleOperationKind,
+        StateArtifactKind, descriptor_acl_bytes, ensure_private_state_artifact,
+        expected_principals, force_descriptor_structure_failure_for_test,
+        force_post_write_failure_for_test, inject_policy_acl_for_next_descriptor_read_for_test,
+        read_owner_sid_for_test, reset_set_security_info_calls_for_test,
+        set_security_info_calls_for_test, stage_error, trace_retained_handle_operations_for_test,
         verify_acl_bytes, verify_private_state_artifact,
     };
 
@@ -1213,6 +1276,15 @@ mod tests {
         ])
     }
 
+    fn exact_directory_acl() -> Vec<u8> {
+        let flags = directory_flags();
+        acl(&[
+            TestAce::allow(&USER_SID, flags),
+            TestAce::allow(&SYSTEM_SID, flags),
+            TestAce::allow(&ADMIN_SID, flags),
+        ])
+    }
+
     fn assert_invalid(result: io::Result<()>, fragment: &str) {
         assert!(result.is_err(), "malformed ACL must fail closed");
         let Some(error) = result.err() else {
@@ -1292,14 +1364,25 @@ mod tests {
     #[test]
     fn owned_acl_builds_exact_normal_and_localsystem_principal_sets() -> io::Result<()> {
         for kind in [StateArtifactKind::File, StateArtifactKind::Directory] {
-            for expected in [
-                ExpectedPrincipals::from_roles(&USER_SID, &SYSTEM_SID, &ADMIN_SID)?,
-                ExpectedPrincipals::from_roles(&SYSTEM_SID, &SYSTEM_SID, &ADMIN_SID)?,
-            ] {
-                let acl = OwnedAcl::build(kind, &expected)?;
-                let bytes = native_acl_bytes_in_use(&acl.storage)?;
-                verify_acl_bytes(Some(&bytes), true, kind, &expected)?;
-            }
+            let normal = ExpectedPrincipals::from_roles(&USER_SID, &SYSTEM_SID, &ADMIN_SID)?;
+            let normal_acl = OwnedAcl::build(kind, &normal)?;
+            let normal_bytes = native_acl_bytes_in_use(&normal_acl.storage)?;
+            let canonical = match kind {
+                StateArtifactKind::File => exact_file_acl(),
+                StateArtifactKind::Directory => exact_directory_acl(),
+            };
+            assert_eq!(
+                normal_bytes.as_ref(),
+                canonical.as_slice(),
+                "normal-user ACL bytes must remain in user, SYSTEM, Administrators order"
+            );
+            verify_acl_bytes(Some(&normal_bytes), true, kind, &normal)?;
+
+            let local_system =
+                ExpectedPrincipals::from_roles(&SYSTEM_SID, &SYSTEM_SID, &ADMIN_SID)?;
+            let local_system_acl = OwnedAcl::build(kind, &local_system)?;
+            let local_system_bytes = native_acl_bytes_in_use(&local_system_acl.storage)?;
+            verify_acl_bytes(Some(&local_system_bytes), true, kind, &local_system)?;
         }
         Ok(())
     }
@@ -1729,15 +1812,46 @@ mod tests {
         fs::write(&file, b"state")?;
         fs::create_dir(&directory)?;
 
-        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
-        verify_private_state_artifact(&file, StateArtifactKind::File)?;
-        ensure_private_state_artifact(&directory, StateArtifactKind::Directory)?;
-        verify_private_state_artifact(&directory, StateArtifactKind::Directory)?;
-        reset_set_security_info_calls_for_test();
+        for (path, kind) in [
+            (file.as_path(), StateArtifactKind::File),
+            (directory.as_path(), StateArtifactKind::Directory),
+        ] {
+            set_test_dacl(path, kind, &permissive_sddl(kind)?, true)?;
+            let owner_before = read_owner_sid_for_test(path, kind)?;
 
-        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
-        ensure_private_state_artifact(&directory, StateArtifactKind::Directory)?;
-        assert_eq!(set_security_info_calls_for_test(), 0);
+            reset_set_security_info_calls_for_test();
+            let operations = trace_retained_handle_operations_for_test(|| {
+                ensure_private_state_artifact(path, kind)
+            })?;
+            assert_eq!(set_security_info_calls_for_test(), 1);
+            assert_eq!(
+                operations
+                    .iter()
+                    .map(|operation| operation.kind)
+                    .collect::<Vec<_>>(),
+                [
+                    RetainedHandleOperationKind::DescriptorRead,
+                    RetainedHandleOperationKind::AclWrite,
+                    RetainedHandleOperationKind::DescriptorRead,
+                ],
+                "repair must read, write, and post-read through the retained handle"
+            );
+            let retained_handle = operations[0].handle;
+            assert!(
+                operations
+                    .iter()
+                    .all(|operation| operation.handle == retained_handle),
+                "repair descriptor reads and ACL write must use one retained handle"
+            );
+
+            verify_private_state_artifact(path, kind)?;
+            reset_set_security_info_calls_for_test();
+            ensure_private_state_artifact(path, kind)?;
+            assert_eq!(set_security_info_calls_for_test(), 0);
+
+            let owner_after = read_owner_sid_for_test(path, kind)?;
+            assert_eq!(owner_before, owner_after);
+        }
         Ok(())
     }
 
