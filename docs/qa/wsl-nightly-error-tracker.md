@@ -969,7 +969,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
 | `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
-| `WIN-007` | medium | fix-in-progress (reviewed exact-HEAD fake-only marker A/B pending) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
+| `WIN-007` | medium | fix-in-progress (preflight passed into the first arm; full reviewed A/B blocked by `WIN-008`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
+| `WIN-008` | medium | open | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1895,6 +1896,74 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   and one reviewed exact-HEAD, fake-only marker A/B run confirms the required
   observations, cleanup, provenance, and evidence JSON; this preflight fix
   does not change the status of `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`.
+
+### 2026-08-07 reviewed exact-HEAD A/B attempt — failed, not retried
+
+- The worktree was clean at exact source HEAD
+  `9567f55091abaa46a2bb3a369f9bcfe9afb439e0`. A fresh
+  `cargo build -p colay --bins --features test-fixtures` with
+  `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` exited zero. The rebuilt
+  `colay.exe` SHA-256 was
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6` and the
+  rebuilt fake-provider SHA-256 was
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+  The reviewed stress harness remained
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`
+  (`282943` bytes), and the amended marker diagnostic remained
+  `ae1096e03d7b37ebbf1162df9bd84e411ed33309f644b42a2e823ea32905c761`
+  (`117388` bytes). Exact-path CIM checks found zero candidate processes before
+  the invocation.
+- The amended diagnostic was invoked exactly once through the verified portable
+  PowerShell 7.6.4 binary with separated arguments and all four exact hashes.
+  It exited `1` after `21.080141s` wall time; the JSON interval was `14.4527341s`
+  (`2026-08-06T15:24:53.1494952Z` through
+  `2026-08-06T15:25:07.6022293Z`). Evidence
+  `marker-attribution-ab-20260806T152453147Z.json` is `82691` bytes with SHA-256
+  `72be48777e1532d7a5a962f51747b6b6a9f4140b38f24589e659de8aefc74baa`.
+- The evidence status is `failed`: `1/8` observations (pair 1, order 1,
+  `aggregate_only`), `0/4` completed pairs, `0` retries, and `3/10` exact input
+  hash checkpoints (`initial-pre-mutation`, `before-pair-01`, `final`). All
+  recorded checkpoints contain the four expected hashes. The run remained
+  fake-provider-only with `0` provider credential keys. The failure was a
+  `ReadError` at stress-harness `Get-Sha256` line 2513 while hashing the runtime
+  `state.db`: Windows reported that another process was using the file.
+- Failure cleanup stopped the daemon and left zero final or independently
+  queried exact candidate processes, but recorded one cleanup error because
+  pre-cleanup marker evidence was unavailable. Consequently the JSON has no
+  retain/split decision. Per the one-run rule the diagnostic was not retried,
+  authoritative stress was not run, and `WIN-007` remains `fix-in-progress`.
+  The amended zero-candidate collection preflight itself passed and entered the
+  first arm; the distinct database-hash blocker is tracked as `WIN-008`.
+  `WIN-005`, `WIN-006`, `WSL-022`, and `WSL-023` are unchanged.
+
+## WIN-008: marker A/B hashes the active daemon's global database
+
+### Observation and impact
+
+- The one reviewed exact-HEAD, fake-only marker A/B attempt recorded one
+  `aggregate_only` observation, then failed while `Get-AbDatabaseHealthEvidence`
+  called the stress harness's `Get-SqliteFamilyHashes` against the runtime
+  global `colay-home/state/state.db` before the active daemon had been stopped.
+  `Get-FileHash` at stress line 2513 received a Windows sharing violation because
+  another process was using the database.
+- Failure cleanup subsequently stopped the daemon and left zero residual exact
+  candidate processes, but the run could not provide the required pre-cleanup
+  marker evidence. It therefore recorded one cleanup error, only `3/10` hash
+  checkpoints, `0/4` completed pairs, and no retain/split decision. This is a
+  diagnostic-harness acceptance blocker; the evidence does not establish a
+  product latency or correctness regression.
+
+### Evidence and closure gate
+
+- Evidence `marker-attribution-ab-20260806T152453147Z.json` (`82691` bytes) has
+  SHA-256 `72be48777e1532d7a5a962f51747b6b6a9f4140b38f24589e659de8aefc74baa`
+  and status `failed`. The run was fake-provider-only, passed zero provider
+  credentials, used all four reviewed exact hashes, and was not retried.
+- Status: `open`. Closure requires a separately reviewed fail-closed harness
+  correction and a newly authorized one-shot exact-HEAD A/B run that completes
+  all eight observations, four counterbalanced pairs, ten exact input hash
+  checkpoints, zero retries, zero cleanup errors/residual processes, and an
+  explicit retain/split decision. Authoritative stress remains unrun.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
