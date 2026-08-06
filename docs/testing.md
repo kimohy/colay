@@ -91,6 +91,33 @@ registration, the current-SID-only named-pipe DACL, singleton ownership,
 non-Git plan-first behavior, all four fake provider doctor fixtures, idempotent
 legacy import, junction redirect rejection, and the 32-client cold-start fan-in.
 
+### LocalSystem state-artifact ACL correction
+
+Implementation commit `24cd2743398affd74bc74d0edab8590022f0dbd0`
+(`fix: normalize LocalSystem state ACL principals`) has the following focused source evidence:
+
+```text
+cargo test -p orchestrator-windows-ipc state_artifact::tests::required_principals_ -- --nocapture --test-threads=1  # 2 passed
+cargo test -p orchestrator-windows-ipc state_artifact::tests::bounded_localsystem_ -- --nocapture --test-threads=1  # 1 passed
+cargo test -p orchestrator-windows-ipc state_artifact --all-features -- --nocapture --test-threads=1                 # 28 passed
+cargo test -p orchestrator-state permissions::tests::windows_ --all-features -- --nocapture --test-threads=1         # 8 passed
+cargo fmt --all -- --check                                                                                             # passed
+```
+
+The synthetic collision tests are
+`required_principals_only_normalize_local_system_collision` and
+`required_principals_reject_other_role_collisions`; they permit only `user == SYSTEM` and reject
+all administrator-role collisions. `bounded_localsystem_acl_requires_each_unique_trustee_once`
+requires exactly one ACE for SYSTEM and Administrators, accepts either trustee order, and rejects
+missing, duplicate, and unknown trustees. The normal-user three-ACE regression is
+`owned_acl_builds_exact_normal_and_localsystem_principal_sets`.
+
+`retained_handle_localsystem_file_and_directory_fast_paths_when_applicable` is a conditional native
+test: on a LocalSystem host it verifies file and directory `ensure -> verify -> ensure` and that the
+second ensure performs no security write; on this normal-user Windows host the LocalSystem branch
+was skipped. Bounded native LocalSystem release QA is therefore required before `WIN-006` can close;
+source tests alone do not establish native or nightly closure.
+
 ### Native Windows state ACL registration stress
 
 Run the native acceptance harness from PowerShell 7.2 or newer after building
@@ -114,18 +141,29 @@ The run is a failure unless five sequential incumbent registrations have
 nearest-rank p95 at or below 5,000 ms, four simultaneous registrations each
 finish within 8,000 ms, and the source still declares the unchanged 10,000 ms
 IPC response timeout. Each source is a distinct non-empty schema-v8 database.
+Successful command timing is the operating-system process lifetime from
+`StartTime` through `ExitTime`; synchronous CIM observation and debug-event
+processing do not run inside that measured interval. After the latency phase
+and main-daemon shutdown, a separate fresh state root runs the functional
+`DEBUG_PROCESS` audit. Its time is explicitly excluded from the 5,000/8,000 ms
+acceptance limits. The audit covers only the controlled child tree rooted at the
+exact PowerShell process launched by the harness; it is neither a host-wide
+process monitor nor evidence against Administrator or `SYSTEM` activity.
+
 The harness compares every source SQLite-family hash before and after import,
 requires exactly two content-free inspection markers per imported source,
 validates workspace/path/import/session and publication-ledger cardinality,
 runs SQLite integrity and foreign-key checks, and requires zero tasks, task
-attempts, worktrees, coordinator leases, and worker leases. `Win32_Process`
-ancestry observation must find zero attributable `whoami.exe` or `icacls.exe`
-launches. After daemon stop, the endpoint status, live lease count, and all
-attributable Colay, fake-provider, `whoami.exe`, and `icacls.exe` processes must
-be absent. The harness writes timestamped JSON plus `summary.json`, including
+attempts, worktrees, coordinator leases, and worker leases. The functional
+child-tree audit must find no `whoami.exe` or `icacls.exe` launch. Post-stop
+identity-checked residue observation separately requires the endpoint, live
+leases, and attributable Colay, fake-provider, and utility processes to be
+absent. The harness writes timestamped JSON plus `summary.json`, including
 failure evidence when safe.
 
-Source-fixed Windows evidence at `a52945d` (native ACL commits
+#### Historical source-fixed baseline at `a52945d` — not current Task 5 acceptance evidence
+
+The earlier source-fixed baseline (native ACL commits
 `c83200d`, `83181f0`, `ab5617e`, `361391a`, `4e5e408`, `d1efe8e`, and
 `3b6b8ec`; receipt/concurrency commits through `c841b75`, `77936e9`, and
 `a52945d`) used run `20260805T093708005Z`. The five sequential times were
@@ -149,14 +187,43 @@ The exact debug binaries were SHA-256
 `2197cef5b4120ce60072b9d657ba42f19f32d2933d9dfc899fc1efcf50724196`
 (`colay.exe`) and
 `9b146633d2914023021f695837572c4a5d9c013e887b0c2b1990b67787ddbba3`
-(`colay-e2e-fake-provider.exe`).
+(`colay-e2e-fake-provider.exe`). This superseded harness run is retained as a
+historical baseline only and does not establish acceptance for the current
+source or current harness.
 
-The original failures each passed 10/10 exact serial repetitions. The
-`live_doctor_` group passed 4/4 serial in 42.147 seconds and 4/4 with default
+At `a52945d`, the original failures each passed 10/10 exact serial repetitions.
+The `live_doctor_` group passed 4/4 serial in 42.147 seconds and 4/4 with default
 threads in 19.478 seconds. Full `global_doctor` passed 33/33 serial in 156.932
-seconds and 33/33 with default threads in 45.997 seconds. Published Windows CI
-and nightly verification remain required; these source checks do not close
-`WIN-005`, `WSL-022`, or `WSL-023`.
+seconds and 33/33 with default threads in 45.997 seconds. These historical
+source checks do not establish current acceptance.
+
+#### Failed Task 5 attempt `20260805T111210158Z` — superseded harness, not accepted
+
+The evidence file
+`windows-state-acl-stress-20260805T111210158Z.json` has SHA-256
+`17c62be3578f4d34ed2500ee757e18380d74a131a71a2b2f44f5e0cd501bd914`.
+Source was `244ee2b1901a516dcabf56e747f6d78a7abeaaae`; harness SHA-256 was
+`c8c052458aed79317235ae6aba192e1f3589b6b9ac5ec5fbbbeabbcdc5209ce0`.
+The exact binary SHA-256 values were
+`21563398d0e5c8d658b1c0e1499bb04a22c12621b03d2213be0c4850b4a6913d`
+for `colay.exe` and
+`280fb96d1130f4cb69af5bc3d84053f4c17695a5e2a9ed3d8b2da8767fe5f83d`
+for the fake provider. Serial times were
+`[5020, 1963, 2080, 1763, 2029]` ms. For five samples, the nearest-rank p95 is
+the maximum, `5020` ms, which exceeded the unchanged `5000` ms limit. The old
+harness stopped at that threshold, so concurrent registration, durable-state
+acceptance, marker acceptance, SQLite acceptance, and the functional process
+audit did not run and must not be inferred as passing. Cleanup did complete:
+the daemon and endpoint were stopped, live leases and residual processes were
+zero, cleanup errors were zero, and minimum free space was `7.537 GiB`.
+
+Follow-up characterization identified synchronous `Win32_Process` CIM
+observation inside the timed wait path as measurement interference. That
+observation was removed from latency measurement and the functional process
+audit was separated. This diagnosis does not convert the failed run into a
+pass; current acceptance remains pending. Published Windows CI and nightly
+verification also remain required; neither the historical source checks nor the
+failed attempt close `WIN-005`, `WSL-022`, or `WSL-023`.
 
 Run the Linux commands inside WSL with Cargo build output on the Linux-native
 filesystem, not under `/mnt/<drive>`. A native checkout is preferred; when the

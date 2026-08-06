@@ -502,3 +502,27 @@ Stop daemon; require endpoint/live row/process cleanup, SQLite integrity/FKs, un
 - [ ] Stable API/type names agree across tasks; IPC timeout and schema remain unchanged.
 - [ ] No command fallback/cache/thread token/schema mutation/real-provider automated test/worktree deletion/premature closure appears.
 - [ ] Tasks 1-3 preserve the two receipt files; Task 4 alone commits them.
+
+## 2026-08-06 completed-plan correction — LocalSystem state ACLs
+
+Implementation commit `24cd2743398affd74bc74d0edab8590022f0dbd0`
+(`fix: normalize LocalSystem state ACL principals`) corrects the completed three-principal
+assumption without rewriting this plan's historical task record. The required trustees are unique
+validated binary SIDs: normally current user/SYSTEM/Builtin Administrators (three ACEs), and for
+LocalSystem SYSTEM/Builtin Administrators (two ACEs). The only permitted role collision is
+`current user == SYSTEM`; any collision involving Builtin Administrators fails closed, as do
+duplicate trustees in an actual DACL.
+
+Focused source verification on 2026-08-06 passed:
+
+- `cargo test -p orchestrator-windows-ipc state_artifact::tests::required_principals_ -- --nocapture --test-threads=1` — 2 passed;
+- `cargo test -p orchestrator-windows-ipc state_artifact::tests::bounded_localsystem_ -- --nocapture --test-threads=1` — 1 passed;
+- `cargo test -p orchestrator-windows-ipc state_artifact --all-features -- --nocapture --test-threads=1` — 28 passed;
+- `cargo test -p orchestrator-state permissions::tests::windows_ --all-features -- --nocapture --test-threads=1` — 8 passed; and
+- `cargo fmt --all -- --check` — passed.
+
+The conditional native LocalSystem fast-path branch was not exercised on the normal-user Windows
+host. Before `WIN-006` closes, release QA must record bounded native LocalSystem
+`ensure -> verify -> ensure` evidence; native/nightly closure remains pending. A LocalSystem state
+directory must not be downgraded to an unpatched binary, which cannot verify the two-ACE policy;
+that downgrade is unsupported and fails closed unless the correction is backported.

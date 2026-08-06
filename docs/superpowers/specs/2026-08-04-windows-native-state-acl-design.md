@@ -49,6 +49,15 @@ inheritance flags. The DACL is non-null and protected. The operation preserves t
 Unknown trustees, broad trustees, deny ACEs, object/callback ACEs, inherited ACEs, extra access
 bits, missing access bits, and non-canonical flags all fail exact verification.
 
+> **2026-08-06 amendment — LocalSystem principal normalization.**
+> `2026-08-06-windows-localsystem-state-acl-design.md` controls role collisions, ACE count,
+> tests, and rollback for this contract. The required trustees are validated unique binary SIDs:
+> normally the current user, SYSTEM, and Builtin Administrators (three ACEs); when the current
+> user is LocalSystem, SYSTEM is the same SID and the exact set is SYSTEM and Builtin
+> Administrators (two ACEs). Only `current user == SYSTEM` is normalized. Every other role
+> collision, and every duplicate ACE in an on-disk ACL, fails closed. An unpatched LocalSystem
+> downgrade is unsupported and must fail closed unless this correction is backported.
+
 There is no path-result cache and no DACL-result cache. A same-handle exact-DACL check is the fast
 path. Only the successfully acquired current process identity is cached. The process-local ACL
 mutex remains for the first implementation so repair and verification sequences in one process are
@@ -154,8 +163,10 @@ fields. Verification requires:
 - a non-null DACL pointer (a NULL DACL grants access to everyone and is never accepted or passed to
   `SetSecurityInfo`);
 - `SE_DACL_PROTECTED` set and no accepted reliance on inherited policy;
-- exactly three `ACCESS_ALLOWED_ACE_TYPE` records;
-- exactly one binary SID match for each of current user, SYSTEM, and Builtin Administrators;
+- exactly one `ACCESS_ALLOWED_ACE_TYPE` record for each required unique binary SID: normally
+  current user, SYSTEM, and Builtin Administrators (three ACEs), or SYSTEM and Builtin
+  Administrators for LocalSystem (two ACEs);
+- exactly one binary SID match for every required unique trustee;
 - full-control file access masks for every ACE;
 - exactly `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE` on directory ACEs and zero flags on file
   ACEs; and
@@ -245,8 +256,9 @@ Unit and Windows integration coverage verifies:
   trailing data rejection;
 - missing and NULL DACL rejection;
 - required protected (`P`) control and rejection of inherited/unprotected descriptors;
-- exact allow ACE type, exact full-control mask, exact three principals, no duplicates, and exact
-  file versus directory inheritance flags;
+- exact allow ACE type, exact full-control mask, one ACE for every required unique trustee
+  (normally three, LocalSystem two), no duplicates, and exact file versus directory inheritance
+  flags;
 - rejection of deny, audit, object, callback, unknown, broad, and malformed ACEs;
 - file/directory kind mismatch and reparse-point rejection while using the retained handle;
 - permissive and deny-containing descriptor repair, owner preservation, exact post-write
@@ -320,8 +332,11 @@ real-provider probes remain manual and are never added to tests or CI.
 
 This change has no persisted-schema, IPC-schema, configuration, audit-record, or provider-wire
 format change. Exact native DACLs express the same current user/SYSTEM/Administrators policy as the
-existing `icacls` result, so artifacts hardened by either implementation remain mutually readable.
-The current Windows SID API keeps its existing public string result.
+existing `icacls` result, so normal-user artifacts hardened by either implementation remain
+mutually readable. The LocalSystem two-ACE policy is governed by the 2026-08-06 amendment: an
+unpatched binary cannot verify it, so an unpatched LocalSystem downgrade is unsupported and fails
+closed unless the correction is backported. The current Windows SID API keeps its existing public
+string result.
 
 The required Windows APIs are standard supported security and file-handle APIs already represented
 inside the audited FFI crate. Missing access rights or unsupported behavior fails closed; there is

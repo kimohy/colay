@@ -967,7 +967,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
-| `WIN-005` | high | fix-in-progress (source checks passed; published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1775,17 +1776,19 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   plan을 `apply`하면서 다시 inspect한다. 준비 완료 뒤 daemon을 시작한 클라이언트가 같은
   workspace를 IPC `workspace.register`로 무조건 등록해 동일 source를 세 번째로 inspect한다.
 - legacy inspect는 SQLite family capture, snapshot migration, event/document 검증, 파일 hash를
-  수행한다. Windows의 scratch/private-path 보장은 이 과정에서 `whoami.exe`와 `icacls.exe`
-  utility process를 반복 생성하므로 병렬 CI 부하에서 중복 비용이 증폭된다.
+  수행한다. 결함이 관찰된 당시 Windows scratch/private-path 보장은 이 과정에서
+  `whoami.exe`와 `icacls.exe`를 반복 생성해 병렬 CI 부하에서 중복 비용을 증폭했다. 현재
+  source는 retained non-reparse handles의 native DACL repair/verification으로 이 utility 경로를
+  제거했지만, 중복 registration 자체를 생략하는 bootstrap receipt 계약은 계속 필요하다.
 - 일반 IPC 응답 제한을 30초로 늘리는 timeout-only 수정은 중복 작업과 writer 점유를 그대로
   정상화하므로 거부했다. exact spawned daemon owner가 bootstrap 등록 영수증을 제공한 경우에만
   중복 `workspace.register`를 생략하고, incumbent daemon과 새 workspace 등록 경로는 유지한다.
-- 상태: `fix-in-progress (source checks passed; published CI/nightly verification pending)`.
+- 상태: `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`.
   test-fixtures 전용 content-free inspect marker의 승인된 완료 계약은 plan inspect와
   sealed-plan apply reinspection 합계 2회다. source hash와 import ledger/workspace cardinality는
   유지해야 한다. `WIN-005`, `WSL-022`, `WSL-023`은 published verification 전에는 닫지 않는다.
 
-### 2026-08-05 source-fixed Windows evidence
+### Historical source-fixed baseline — not current acceptance
 
 - Source `a52945d`에는 native ACL commits `c83200d`, `83181f0`, `ab5617e`, `361391a`,
   `4e5e408`, `d1efe8e`, `3b6b8ec`와 receipt/concurrency commits through `c841b75`,
@@ -1816,7 +1819,89 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Original failures는 각각 exact serial 10/10 통과했다. `live_doctor_`는 serial 4/4
   (`42.147s`), default 4/4 (`19.478s`), full `global_doctor`는 serial 33/33
   (`156.932s`), default 33/33 (`45.997s`) 통과했다. 모든 run은 실제 nonzero test count를
-  보고했고 registration timeout은 없었다.
+  보고했고 registration timeout은 없었다. 이 superseded harness 결과는 historical baseline이며
+  현재 source와 현재 harness의 acceptance를 대신하지 않는다.
+
+### 2026-08-05 failed Task 5 evidence — superseded harness, not accepted
+
+- Run `20260805T111210158Z`의 evidence
+  `windows-state-acl-stress-20260805T111210158Z.json` SHA-256은
+  `17c62be3578f4d34ed2500ee757e18380d74a131a71a2b2f44f5e0cd501bd914`이다.
+  Source는 `244ee2b1901a516dcabf56e747f6d78a7abeaaae`, harness SHA-256은
+  `c8c052458aed79317235ae6aba192e1f3589b6b9ac5ec5fbbbeabbcdc5209ce0`였다.
+  Exact binary SHA-256은 `colay.exe`
+  `21563398d0e5c8d658b1c0e1499bb04a22c12621b03d2213be0c4850b4a6913d`, fake-only
+  `colay-e2e-fake-provider.exe`
+  `280fb96d1130f4cb69af5bc3d84053f4c17695a5e2a9ed3d8b2da8767fe5f83d`였다.
+- Serial times는 `[5020, 1963, 2080, 1763, 2029]` ms였다. 5개 표본의 nearest-rank
+  p95는 최댓값 `5020` ms이므로 변경하지 않은 `5000` ms 기준을 초과했다. 당시 harness가
+  즉시 중단했으므로 concurrent registration, durable/marker/SQLite acceptance와 functional
+  process audit은 실행되지 않았고 통과로 추론해서는 안 된다.
+- Cleanup은 완료됐다. daemon과 endpoint는 stopped였고 live lease, residual process,
+  cleanup error는 모두 0, 최소 여유 공간은 `7.537 GiB`였다.
+- 후속 characterization은 timed wait 안의 synchronous `Win32_Process` CIM 관찰이 측정을
+  간섭했음을 확인했다. latency 측정에서 이 관찰을 제거하고 functional process audit을
+  분리했지만, 이 진단이 실패 실행을 통과로 바꾸지는 않는다. 현재 acceptance는 pending이다.
+
+### 2026-08-06 pre-execution harness hardening — reviewed, not yet executed
+
+- 권위 실행을 재시도하기 전에 측정·cleanup·source provenance와 PID 재사용 방어를 정적
+  반례로 검증했다. 최종 stress harness SHA-256은
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`
+  (`282943` bytes)이며 보안/프로세스와 측정/증거 독립 리뷰가 모두
+  Critical/Important/Minor 0으로 Ready 판정했다.
+- 최종 marker A/B diagnostic SHA-256은
+  `dc25a9a39ffdd3d3159a6d1d4bb021dbf6fa7e609f06d4db2f8568af66e28d55`
+  (`117379` bytes)이다. alias mutation, custom Alias-backed PSDrive, parameter alias/축약,
+  dynamic invocation/member, stop-dominance, lexical scope, daemon identity/handle cleanup 반례를
+  fail-closed로 고정했고 독립 결합 리뷰가 Ready 판정했다.
+- 두 스크립트는 실제 A/B, stress, 제품 또는 provider를 실행하지 않았다. stress는 전체 Git
+  worktree가 clean이고 caller가 넘긴 exact commit과 HEAD가 일치할 때만 self-test/product를
+  시작한다. 따라서 검토된 tracked 변경을 커밋하고 exact HEAD 바이너리를 재빌드하기 전에는
+  권위 실행하지 않는다.
+
+## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
+
+### 관찰 및 영향
+
+- current process user가 LocalSystem이면 current-user SID와 well-known SYSTEM SID가 모두
+  `S-1-5-18`이다. 현재 builder는 `[SYSTEM, SYSTEM, Administrators]` 세 ACE를 만들지만
+  verifier는 duplicate trustee를 거부한다.
+- 그 결과 LocalSystem 기반 Windows service 또는 scheduled task에서는 기존 state artifact를
+  검증할 수 없고 repair가 만든 ACL도 post-build self-verification에서 실패한다. 일반 사용자
+  SID가 SYSTEM과 다른 대화형 실행은 이 결함의 영향을 받지 않는다.
+
+### 승인된 설계와 검증 상태
+
+- 2026-08-06 사용자가 구현 진행을 승인했다. 설계는 current-user, SYSTEM, Administrators 역할을
+  검증된 binary SID의 고유 집합으로 정규화하는 것이다. 일반 사용자는 기존의 정확한 3 ACE,
+  LocalSystem은 `[SYSTEM, Administrators]`의 정확한 2 ACE를 사용하며 실제 중복·미지·광범위
+  trustee와 잘못된 mask/flag/type은 계속 거부한다.
+- 허용되는 역할 중복은 current-user와 SYSTEM이 같은 경우뿐이다. current-user와
+  Administrators 또는 SYSTEM과 Administrators가 같은 synthetic 입력은 fail-closed로
+  거부한다. 구현은 synthetic `user == SYSTEM` RED 테스트, native
+  ensure/verify/idempotence, 일반 사용자 3-ACE 회귀와 state 통합 검증을 수행한다.
+
+### 2026-08-06 구현 및 source 검증
+
+- 구현 commit은 `24cd2743398affd74bc74d0edab8590022f0dbd0`
+  (`fix: normalize LocalSystem state ACL principals`)이다. validated binary SID 역할을
+  정규화하여 normal user에는 정확히 3 ACE, LocalSystem에는 정확히 2 ACE
+  (`SYSTEM`, `Administrators`)만 요구한다. `current user == SYSTEM`만 허용하고 그 밖의
+  역할 충돌과 on-disk duplicate trustee는 fail-closed로 거부한다.
+- Focused source commands passed: `cargo test -p orchestrator-windows-ipc
+  state_artifact::tests::required_principals_ -- --nocapture --test-threads=1` (2/2),
+  `cargo test -p orchestrator-windows-ipc state_artifact::tests::bounded_localsystem_ --
+  --nocapture --test-threads=1` (1/1), `cargo test -p orchestrator-windows-ipc state_artifact
+  --all-features -- --nocapture --test-threads=1` (28/28), `cargo test -p orchestrator-state
+  permissions::tests::windows_ --all-features -- --nocapture --test-threads=1` (8/8), and
+  `cargo fmt --all -- --check`.
+- Conditional native `retained_handle_localsystem_file_and_directory_fast_paths_when_applicable`
+  skipped its LocalSystem branch on the normal-user Windows host. `WIN-006` remains
+  `fix-in-progress (source tests passed; LocalSystem native/nightly verification pending)` until
+  bounded native LocalSystem release QA and nightly verification are recorded. Do not mark it fixed
+  or close `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`. Downgrading a LocalSystem state directory
+  to an unpatched binary is unsupported and must fail closed unless the correction is backported.
 
 ## WSL-009: config 없는 기존 DB의 migration 진입 실패 (WSL/Windows 공통)
 
@@ -1909,6 +1994,14 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
     `0.1.1-nightly.20260803.95cf4d3`).
 
 ## Update log
+
+### 2026-08-06
+
+- `WIN-005`의 실패 증거는 그대로 not accepted로 보존했다. 권위 재실행 전 stress/marker
+  스크립트를 독립 리뷰 가능한 exact hash로 동결했고 실제 A/B/stress/provider 실행은 하지 않았다.
+- LocalSystem의 역할 SID 중복으로 native state ACL이 자체 실패하는 `WIN-006`을 추가했다.
+  사용자는 고유-SID 정책의 구현을 승인했다. source/native/nightly 검증 전에는 fixed로
+  전환하지 않는다.
 
 ### 2026-08-04
 
