@@ -1952,7 +1952,9 @@ $migrationBaseline = $initialHashCheckpoint.migrations
 Register-AbVolume -Path $resolvedEvidenceRoot -Label 'evidence_root'
 Register-AbVolume -Path ([System.IO.Path]::GetTempPath()) -Label 'runtime_root'
 [void](Assert-FreeDisk)
-$preexisting = Get-AbExactCandidateProcesses @($script:ResolvedColay, $script:ResolvedFake)
+$preexisting = @(
+    Get-AbExactCandidateProcesses @($script:ResolvedColay, $script:ResolvedFake)
+)
 if ($preexisting.Count -ne 0) {
     throw "candidate process residue exists before A/B diagnostic: $($preexisting | ConvertTo-Json -Depth 10 -Compress)"
 }

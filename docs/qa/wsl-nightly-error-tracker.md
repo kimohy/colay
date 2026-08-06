@@ -969,6 +969,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
 | `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
+| `WIN-007` | medium | fix-in-progress (reviewed exact-HEAD fake-only marker A/B pending) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1859,6 +1860,41 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   worktree가 clean이고 caller가 넘긴 exact commit과 HEAD가 일치할 때만 self-test/product를
   시작한다. 따라서 검토된 tracked 변경을 커밋하고 exact HEAD 바이너리를 재빌드하기 전에는
   권위 실행하지 않는다.
+
+## WIN-007: marker A/B zero-candidate preflight strict-mode failure
+
+### First invocation and isolated RED
+
+- The first marker A/B invocation exited `1` in `8.9s`, before producing any
+  observation (`0` observations) or marker evidence JSON. The exact rebuilt
+  inputs were `colay.exe` SHA-256
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  fake-provider SHA-256
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness SHA-256
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`,
+  and marker diagnostic SHA-256
+  `dc25a9a39ffdd3d3159a6d1d4bb021dbf6fa7e609f06d4db2f8568af66e28d55`.
+- Isolated portable PowerShell `7.6.4` RED using the committed marker
+  function-definition prefix and those exact no-residue executable paths
+  confirmed `is_null=True`, then exited `1` with
+  `The property 'Count' cannot be found on this object.` No product command,
+  A/B observation, stress run, provider, or marker evidence JSON was created.
+
+### Root cause, selected fix, and closure gate
+
+- `Get-AbExactCandidateProcesses` correctly emits a pipeline. Assigning its
+  zero-item output directly to `$preexisting` unwraps it to `$null`; under
+  `Set-StrictMode -Version Latest`, the existing `$preexisting.Count` residue
+  check therefore throws before the diagnostic can begin.
+- The selected minimal caller-side fix wraps only the main preflight assignment
+  in `@(...)`, so `$preexisting` is an `Object[]` for zero, one, or many
+  candidates. The strict-mode residue failure remains unchanged for nonzero
+  candidates, and the two cleanup callers already use the same normalization.
+- Status: `fix-in-progress`. `WIN-007` may close only after independent review
+  and one reviewed exact-HEAD, fake-only marker A/B run confirms the required
+  observations, cleanup, provenance, and evidence JSON; this preflight fix
+  does not change the status of `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
