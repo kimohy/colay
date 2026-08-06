@@ -942,7 +942,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-010` | high | fix-in-progress (first exact A/B preserved; diagnostic seed-schema fix pending exact rerun) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WIN-010` | high | fix-in-progress (corrected exact A/B passed; one-shot stress and CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -2376,6 +2376,43 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   changed to `source_root_hash`. No blind retry is allowed: the correction must pass
   the focused suite and independent review, be committed as new exact inputs, then
   receive one fresh A/B run before the one-shot authoritative stress.
+
+### 2026-08-06 corrected exact A/B closure run
+
+- After the focused RED/GREEN cycle and two independent READY reviews, the correction
+  was committed as `ae1ef4496e0370ac44e5f184b23c8aeec847c4a4`. A clean exact-HEAD
+  build pinned `colay.exe`
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`, fake
+  provider `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness `9f64b3ffb7a0b3fb340bbc265d0042d1c5fcbf265ee3e3c873e057f30ecaaaaa`,
+  corrected diagnostic `f1997a51cae6ad81fb22160ca6528875e21df32deb219c711e56be8f779cdd55`,
+  and portable PowerShell
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+  Candidate-process and dirty-tree counts were both zero before launch.
+- The corrected diagnostic was invoked exactly once with separated arguments and all
+  four expected hashes. It exited `0` after `114.8s`; no retry was used. Evidence
+  `artifacts/qa/windows-state-acl/marker-attribution-ab-20260806T194629005Z.json`
+  is `521,592` bytes with SHA-256
+  `a1858abb9b12ea3f1f7247ff3bc05be3672565bf0ba9db79eadd01d63675e2b1`.
+  The stored result is schema `2`, status `passed`, with exactly eight observations,
+  four completed pairs, zero retries, eight fresh equal-length runtime roots, a
+  variant-neutral environment shape, OS-process-lifetime measurement, and no
+  synchronous wait-loop CIM.
+- All ten exact input checkpoints matched in order: `initial-pre-mutation`, each
+  `before-pair-NN`/`after-pair-NN` for pairs 01 through 04, and `final`. Provider
+  credential-key count was zero, `fake_provider_only` was true, and every observation
+  had null failure, online readiness, cleanup error count zero, residual-process count
+  zero, live-lease count zero, SQLite integrity `ok`, zero foreign-key violations, and
+  zero writable rows. All observations recorded aggregate marker count `2`; the four
+  aggregate-only arms had attributed group/event `0/0`, while the four attributed
+  arms had exactly one durable `source_root_hash` group and two distinct events.
+  Final host candidate-process count was independently zero.
+- The non-authoritative result retains
+  `split-latency-marker-off-and-correctness-marker-on-phases`: registration pair
+  exceedances were zero, but order bias and seed timing remain too noisy to combine
+  attribution with latency acceptance. `WIN-010` therefore remains open only for the
+  one-shot authoritative stress plus published CI/nightly verification; that stress
+  had not yet been run when this evidence was committed.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
