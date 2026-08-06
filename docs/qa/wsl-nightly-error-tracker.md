@@ -925,7 +925,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-08-03
+- 마지막 갱신: 2026-08-07
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
@@ -942,12 +942,12 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-015` | medium | fix-in-progress (PowerShell 7.2/7.6 focused passes; exact A/B/stress pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
-| `WIN-014` | low | fix-in-progress (deterministic fixture and 48/48 focused passes; review/merge pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
-| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24 and 7.6 focused passes; exact A/B/stress pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
-| `WIN-012` | medium | fix-in-progress (structural matrix passed on PowerShell 7.2/7.6; exact A/B/stress pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
-| `WIN-011` | medium | fix-in-progress (PID matrix passed on PowerShell 7.2/7.6; exact stress re-acceptance pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
-| `WIN-010` | high | fix-in-progress (corrected A/B passed; stress blocked by WIN-011 and latency gates; CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WIN-015` | medium | fix-in-progress (independently reviewed; PowerShell 7.2/7.6 and fresh exact A/B pass; stress/merge pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
+| `WIN-014` | low | fix-in-progress (independently reviewed; deterministic fixture, 48/48 focused, and fresh exact A/B pass; merge pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
+| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6 and fresh exact A/B pass; stress/merge pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
+| `WIN-012` | medium | fix-in-progress (structural matrix and fresh exact A/B pass; stress/merge pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
+| `WIN-011` | medium | fix-in-progress (PID matrix and fresh exact A/B pass; exact stress re-acceptance pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
+| `WIN-010` | high | fix-in-progress (fresh exact A/B passed; one-shot stress and CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -2618,6 +2618,44 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `48/48` concurrently on official PowerShell 7.2.24 in `18.8s` and pinned PowerShell
   7.6.4 in `21.0s`. `WIN-015` remains
   `fix-in-progress` until independent review and fresh exact A/B/stress evidence.
+
+### 2026-08-07 final reviewed exact-input A/B verification — passed once
+
+- The independently reviewed correction was committed as clean source commit
+  `c33c2b0cf512e34a7b5790646999c063465fac24`. Immediately before the run the
+  worktree and exact candidate-process set were both clean. The one authorized A/B
+  invocation exited `0` after `108.7s`; it was not retried. Its stored interval is
+  `100.9648368s`.
+- Evidence
+  `artifacts/qa/windows-state-acl/marker-attribution-ab-20260806T205047199Z.json`
+  is `515,993` bytes with SHA-256
+  `f519c51bfb11a99baf996e1a410a9edc74818a1ba8463813ac9d7c710e0e9305`.
+  It pins `colay.exe`
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`, fake
+  provider `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  marker diagnostic `f1997a51cae6ad81fb22160ca6528875e21df32deb219c711e56be8f779cdd55`,
+  and portable PowerShell 7.6.4
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The stored schema-2 result is `passed` with decision
+  `split-latency-marker-off-and-correctness-marker-on-phases`: exactly four pairs,
+  eight observations, zero retries, and eight fresh equal-length runtime roots. All
+  ten input checkpoints were present in exact order from `initial-pre-mutation`
+  through pair 01..04 before/after checkpoints to `final`, with every input hash
+  unchanged. Measurement was OS-process-lifetime, synchronous wait-loop CIM was
+  false, the environment shape was variant-neutral, provider credential-key count
+  was zero, and `fake_provider_only` was true.
+- Every observation reached online readiness with null failure, unchanged source DB
+  family, unchanged source config, unchanged generated provider config, SQLite
+  integrity `ok`, zero foreign-key violations, and zero writable rows before and
+  after cleanup. Every observation recorded aggregate marker count `2`; each of the
+  four aggregate-only arms recorded attributed group/event `0/0`, while each of the
+  four attributed arms recorded exactly `1/2`. All cleanup-error, residual-process,
+  live-lease, process-setup-failure, and final host-residual counts were zero.
+- This result closes the pending A/B prerequisite for `WIN-010` through `WIN-015` but
+  is intentionally non-authoritative for latency. The unchanged 5,000ms serial-p95
+  and 8,000ms per-concurrent-command gates still require one clean-HEAD authoritative
+  stress run; no A/B retry will be used to replace this evidence.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
