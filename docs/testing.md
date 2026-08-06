@@ -155,6 +155,14 @@ keeps the aggregate inspection marker but omits the attributed-marker environmen
 key entirely. It must record exactly 18 aggregate events for the nine imports and
 leave its attributed sentinel directory empty.
 
+Immediately after `daemon start`, the main harness anchors the exact schema-v1
+daemon UUID, integral PID, and resolved Colay executable path, then permits only
+identity-preserving `booting`/`probing` status transitions until exact `online`.
+This readiness gate uses one cleanup-inclusive monotonic 5,000 ms deadline and
+finishes before any serial or concurrent registration timer starts. Its evidence
+is recorded as `measurement_diagnostics.main_daemon_readiness` and is explicitly
+excluded from the 5,000/8,000 ms latency thresholds.
+
 After the latency phase and main-daemon shutdown, a separate fresh state root runs
 the functional `DEBUG_PROCESS` audit with attributed markers enabled. Its time is
 explicitly excluded from the 5,000/8,000 ms acceptance limits. That correctness
@@ -163,6 +171,10 @@ two distinct empty events, and the group must equal the durable
 `source_root_hash`. The audit covers only the controlled child tree rooted at the
 exact PowerShell process launched by the harness; it is neither a host-wide
 process monitor nor evidence against Administrator or `SYSTEM` activity.
+The generated child serializes its complete readiness transition with an explicit
+JSON depth. The parent rejects stderr, missing or truncated nested readiness data,
+identity drift, invalid states, and any command budget that exceeds the actual
+remaining cleanup-inclusive deadline before accepting the child result.
 
 The harness compares every source SQLite-family hash before and after import,
 validates workspace/path/import/session and publication-ledger cardinality,

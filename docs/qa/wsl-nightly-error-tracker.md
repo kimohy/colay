@@ -2228,6 +2228,45 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   stress was intentionally not run. `WIN-005`, `WIN-006`, `WSL-022`, and
   `WSL-023` remain unchanged.
 
+### 2026-08-07 independent stress-readiness review corrections — focused only
+
+- Independent review found five separate fail-open or evidence-integrity gaps in
+  the phase-split stress source: marker phase values were case-insensitive; the
+  main latency path could register while its daemon was still booting; readiness
+  subprocess cleanup could extend beyond the advertised 5,000 ms bound; the
+  generated child success JSON used the default shallow serialization depth and
+  the parent did not validate its nested readiness evidence; and focused tests
+  omitted status-side malformed, command-failure, hanging, late-online, and slow
+  initial-parse paths.
+- The focused correction accepts only exact-case `LatencyAttributedOff` and
+  `CorrectnessAttributedOn`. Main latency now anchors canonical UUID, safe integral
+  PID, and the exact resolved Colay path immediately after `daemon start`, permits
+  only identity-stable `booting`/`probing` transitions to exact `online`, and stores
+  this pre-measurement gate under
+  `measurement_diagnostics.main_daemon_readiness` with threshold inclusion set to
+  false.
+- Main and generated-child status runners now share one monotonic overall deadline.
+  At process launch they recompute the actual remaining time and require command
+  execution plus explicit exit-confirmation and output-drain maxima to fit within
+  it; every process wait and drain is capped by that same deadline. Focused real
+  30-second hanging-process fixtures prove bounded failure, status-only invocation,
+  exit confirmation, completed pipes, disposal, zero exact-generation residue,
+  and zero cleanup errors on both paths.
+- Generated-child success and failure output now uses explicit depth-30 JSON with
+  serialization warnings promoted to failure. The parent rejects any stderr and
+  validates the full online transition, canonical anchored/online/poll identity,
+  poll cardinality and states, elapsed bound, and every launch budget. Round-trip
+  fixtures preserve `polls` and `online_document.data.status.instance` as objects
+  and reject missing, scalar, or truncated evidence.
+- Portable PowerShell 7.6.4 focused tests cover immediate and delayed online,
+  UUID/PID/path drift, state/phase mismatch, terminal/unknown states, malformed
+  schema/command/UUID/PID/path, command failure, late online, slow initial parsing,
+  cleanup-inclusive hangs, and nested JSON validation. No marker A/B,
+  authoritative stress, product/provider inference, or Cargo gate was run for this
+  correction. `WIN-005` remains
+  `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`;
+  `WIN-006`, `WSL-022`, and `WSL-023` also remain open/pending and unchanged.
+
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
 ### 관찰 및 영향
