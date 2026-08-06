@@ -136,6 +136,7 @@ fn verify_file_permissions(path: &Path, metadata: &fs::Metadata) -> StateResult<
 
 #[cfg(windows)]
 fn verify_file_permissions(path: &Path, _metadata: &fs::Metadata) -> StateResult<()> {
+    let _acl_guard = windows_acl_guard()?;
     let target = canonical_acl_target(path)?;
     orchestrator_windows_ipc::verify_private_state_artifact(&target, StateArtifactKind::File)
         .map_err(|error| StateError::io(&target, error))
@@ -156,15 +157,35 @@ fn set_windows_permissions(path: &Path, kind: StateArtifactKind) -> StateResult<
         .map_err(|error| StateError::io(&target, error))
 }
 
+#[cfg(all(windows, test))]
+std::thread_local! {
+    static WINDOWS_ACL_GUARD_ACQUISITIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 #[cfg(windows)]
 fn windows_acl_guard() -> StateResult<std::sync::MutexGuard<'static, ()>> {
     use std::sync::{Mutex, OnceLock};
 
     static WINDOWS_ACL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    WINDOWS_ACL_LOCK
+    let guard = WINDOWS_ACL_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .map_err(|_| permission_error("Windows ACL hardening lock was poisoned"))
+        .map_err(|_| permission_error("Windows ACL hardening lock was poisoned"))?;
+    #[cfg(test)]
+    WINDOWS_ACL_GUARD_ACQUISITIONS.with(|count| count.set(count.get() + 1));
+    Ok(guard)
+}
+
+#[cfg(all(windows, test))]
+fn reset_windows_acl_guard_acquisitions_for_test() {
+    WINDOWS_ACL_GUARD_ACQUISITIONS.with(|count| count.set(0));
+}
+
+#[cfg(all(windows, test))]
+fn windows_acl_guard_acquisitions_for_test() -> usize {
+    WINDOWS_ACL_GUARD_ACQUISITIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(windows)]
@@ -295,6 +316,22 @@ mod tests {
         ensure_private_file(&file)?;
         ensure_private_file(&file)?;
         verify_private_file(&file)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ensure_and_verify_acquire_the_shared_state_acl_gate() -> StateResult<()> {
+        let temporary = crate::CanonicalTempDir::new("tempdir")?;
+        let file = temporary.path().join("state.json");
+        fs::write(&file, b"{}\r\n").map_err(|error| StateError::io(&file, error))?;
+        ensure_private_file(&file)?;
+
+        reset_windows_acl_guard_acquisitions_for_test();
+        ensure_private_file(&file)?;
+        assert_eq!(windows_acl_guard_acquisitions_for_test(), 1);
+        verify_private_file(&file)?;
+        assert_eq!(windows_acl_guard_acquisitions_for_test(), 2);
+        Ok(())
     }
 
     #[cfg(windows)]

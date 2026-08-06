@@ -120,8 +120,13 @@ async fn startup_fallback_reports_the_actually_executed_resolved_target()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = tempfile::tempdir()?;
     let working_directory = std::fs::canonicalize(fixture.path())?;
+    let fake = fake_binary();
+    let fake_basename = fake
+        .file_name()
+        .ok_or("compiled fake provider path has no basename")?
+        .to_owned();
     let fallback = PreparedInvocation {
-        executable: fake_binary(),
+        executable: fake.clone(),
         args: vec!["--version".into()],
         stdin: Vec::new(),
         working_directory: working_directory.clone(),
@@ -133,7 +138,9 @@ async fn startup_fallback_reports_the_actually_executed_resolved_target()
         fallback: None,
     };
     let primary = PreparedInvocation {
-        executable: working_directory.join("missing-fake-provider"),
+        executable: working_directory
+            .join("missing-primary")
+            .join(fake_basename),
         fallback: Some(Box::new(fallback.clone())),
         ..fallback
     };
@@ -148,7 +155,7 @@ async fn startup_fallback_reports_the_actually_executed_resolved_target()
         .resolved_executable
         .ok_or("completed worker omitted process resolution evidence")?;
 
-    assert_eq!(evidence.configured, fake_binary());
+    assert_eq!(evidence.configured, fake);
     assert_eq!(evidence.path, fake_binary());
     assert_eq!(evidence.validation.working_directory, working_directory);
     Ok(())

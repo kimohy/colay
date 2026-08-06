@@ -36,6 +36,13 @@ const MAX_SECURITY_DESCRIPTOR_BYTES: usize = 128 * 1024;
 static STATE_ARTIFACT_REPAIR: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
+std::thread_local! {
+    static STATE_ARTIFACT_REPAIR_ACQUISITIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -156,9 +163,7 @@ struct DescriptorState {
 }
 
 pub fn ensure_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io::Result<()> {
-    let _repair = STATE_ARTIFACT_REPAIR
-        .lock()
-        .map_err(|_| io::Error::other("state-artifact ACL repair lock was poisoned"))?;
+    let _repair = state_artifact_repair_guard()?;
     let owned_principals = expected_principals()?;
     let principals = owned_principals.borrowed()?;
     let handle = open_target(path, kind, true)?;
@@ -193,6 +198,7 @@ pub fn ensure_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io
 }
 
 pub fn verify_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io::Result<()> {
+    let _repair = state_artifact_repair_guard()?;
     let owned_principals = expected_principals()?;
     let principals = owned_principals.borrowed()?;
     let handle = open_target(path, kind, false)?;
@@ -346,6 +352,25 @@ fn check_acl_bytes(
         return Err(policy_acl("DACL is missing a required trustee"));
     }
     Ok(())
+}
+
+fn state_artifact_repair_guard() -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    let guard = STATE_ARTIFACT_REPAIR
+        .lock()
+        .map_err(|_| io::Error::other("state-artifact ACL repair lock was poisoned"))?;
+    #[cfg(test)]
+    STATE_ARTIFACT_REPAIR_ACQUISITIONS.with(|count| count.set(count.get() + 1));
+    Ok(guard)
+}
+
+#[cfg(test)]
+fn reset_state_artifact_repair_acquisitions_for_test() {
+    STATE_ARTIFACT_REPAIR_ACQUISITIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn state_artifact_repair_acquisitions_for_test() -> usize {
+    STATE_ARTIFACT_REPAIR_ACQUISITIONS.with(std::cell::Cell::get)
 }
 
 fn verify_ace_record(
@@ -1160,8 +1185,9 @@ mod tests {
         expected_principals, force_descriptor_structure_failure_for_test,
         force_post_write_failure_for_test, inject_policy_acl_for_next_descriptor_read_for_test,
         read_owner_sid_for_test, reset_set_security_info_calls_for_test,
-        set_security_info_calls_for_test, stage_error, trace_retained_handle_operations_for_test,
-        verify_acl_bytes, verify_private_state_artifact,
+        reset_state_artifact_repair_acquisitions_for_test, set_security_info_calls_for_test,
+        stage_error, state_artifact_repair_acquisitions_for_test,
+        trace_retained_handle_operations_for_test, verify_acl_bytes, verify_private_state_artifact,
     };
 
     const USER_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 232, 3, 0, 0];
@@ -1831,6 +1857,22 @@ mod tests {
         assert_eq!(set_security_info_calls_for_test(), 0);
         verify_private_state_artifact(&file, StateArtifactKind::File)?;
         verify_private_state_artifact(&directory, StateArtifactKind::Directory)
+    }
+
+    #[test]
+    fn ensure_and_verify_acquire_the_shared_in_process_acl_gate() -> io::Result<()> {
+        let _guard = native_test_guard();
+        let temporary = tempfile::tempdir()?;
+        let file = temporary.path().join("state.db");
+        fs::write(&file, b"state")?;
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+
+        reset_state_artifact_repair_acquisitions_for_test();
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+        assert_eq!(state_artifact_repair_acquisitions_for_test(), 1);
+        verify_private_state_artifact(&file, StateArtifactKind::File)?;
+        assert_eq!(state_artifact_repair_acquisitions_for_test(), 2);
+        Ok(())
     }
 
     #[test]

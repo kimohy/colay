@@ -800,6 +800,57 @@ before any probe, uniformly for Codex, Claude, Gemini, and Agy.
 - Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
 - Release completion: a newly published nightly passes isolated WSL clean-install QA and the issue status changes to `fixed`.
 
+## WSL-024: fake-provider-only worker guard is an incomplete basename denylist
+
+- Severity: high
+- Status: fix-in-progress (focused RED/GREEN and local full gates passed; CI, merge, and nightly verification pending)
+- Affected scope: tests and CI with `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`
+
+### Observation and risk
+
+`ProcessAdapterRuntime` applies a final fake-only guard before starting a provider
+worker. The guard rejected the default Codex, Claude, and Gemini executable basenames
+on both Unix and Windows, but omitted the configured Agy default `agy`/`agy.exe`.
+It was also a denylist: renamed or wrapped executables such as `agy-real` and
+`codex-nightly` passed, and only the primary invocation was checked, allowing a fake
+primary to carry a real fallback. Consequently a test that accidentally reached the
+production worker runtime could start a real provider even though fake-only mode was
+enabled. The current tests and Windows harnesses use exact compiled fake-provider
+paths, so no real provider invocation was observed; the guard was nevertheless a
+fail-open CI policy inconsistency.
+
+### Correction and verification
+
+- Fake-only worker execution now permits only the exact test-support basename families
+  `fake-provider-cli[.exe]` and `colay-e2e-fake-provider[.exe]`. Every other basename,
+  including all four default real providers, arbitrary renamed/wrapper names, empty
+  names, and unsupported fixture names, fails closed. The flag-off behavior remains
+  unchanged.
+- The guard validates the primary and every prepared fallback before starting the
+  primary, so a successful fake primary cannot defer the policy check until a real
+  fallback is selected.
+- RED first reproduced both independent bypasses: the arbitrary-name rejection matrix
+  and fake-primary/real-fallback case failed. GREEN passed both focused tests plus all
+  27 provider unit tests. The fallback fixture retained a nonexistent primary path but
+  now uses the exact compiled fake basename; all 20 production-runtime provider E2E
+  cases passed with fake-only mode enabled. Workspace-wide formatting, Clippy, and
+  tests then passed with fake-only mode enabled and provider credentials cleared. PR
+  CI and published-nightly WSL validation remain the completion gates.
+- This basename allowlist prevents accidental use of default, renamed, or wrapper
+  provider commands; it is not a cryptographic identity check against a hostile binary
+  deliberately substituted under an allowed test-support filename. E2E tests retain
+  exact Cargo-built fixture paths, and the Windows stress gate additionally pins the
+  fake binary SHA-256. A future canonical-path or content-hash contract can strengthen
+  the generic runtime boundary without broadening this correction's claim.
+
+### Completion conditions
+
+- Source completion: all four default provider identities are rejected by the
+  fake-only production worker guard and fake fixtures remain allowed.
+- Release completion: the change passes the three-platform fake-only CI matrix and a
+  newly published nightly completes isolated WSL QA without unintended provider
+  invocation.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
@@ -942,12 +993,14 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
+| `WIN-016` | medium | fix-in-progress (native/state mutex RED/GREEN and local full gates pass; CI/nightly pending) | read-only ACL verification can race an in-process ACL repair sequence |
 | `WIN-015` | medium | fix-in-progress (reviewed PowerShell 7.2/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
 | `WIN-014` | low | fix-in-progress (reviewed deterministic fixture, exact A/B, and authoritative stress pass; merge/CI pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
 | `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
 | `WIN-012` | medium | fix-in-progress (structural matrix, exact A/B, and authoritative stress pass; merge/CI pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
 | `WIN-011` | medium | fix-in-progress (PID matrix, exact A/B, and authoritative stress pass; merge/CI pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
 | `WIN-010` | high | fix-in-progress (fresh exact A/B and authoritative stress passed; CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WSL-024` | high | fix-in-progress (fail-closed allowlist/fallback RED/GREEN and local full gates passed; CI/merge/nightly pending) | fake-provider-only worker guard is an incomplete basename denylist and skips fallbacks |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -2620,6 +2673,41 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   7.6.4 in `21.0s`. Independent review returned READY, and the later exact A/B and
   authoritative stress passed. `WIN-015` remains `fix-in-progress` only until merge
   and published CI verification.
+
+## WIN-016: read-only ACL verification can race an in-process ACL repair sequence
+
+### Observation and correction
+
+- The Windows native artifact API serialized `ensure_private_state_artifact` with
+  `STATE_ARTIFACT_REPAIR`, but `verify_private_state_artifact` bypassed that mutex.
+  The state permission layer had the same asymmetry: mutation held
+  `WINDOWS_ACL_LOCK`, while read-only verification did not. A concurrent doctor or
+  verifier could therefore observe the old non-exact DACL during the bounded repair
+  sequence and report a transient permissions failure even though repair completed
+  successfully.
+- Native verification now acquires the same repair mutex as native ensure. State
+  verification also acquires the same state ACL mutex as its mutation path before
+  canonicalizing and entering the native layer. Both state paths use the identical
+  `state -> native` lock order; direct callers of the native API are protected by the
+  native mutex.
+- Initial scheduler-based Windows regressions reproduced both gate bypasses before the
+  correction. Their final form avoids scheduler timing: thread-local acquisition
+  counters assert that ensure and verify each enter the same mutex helper.
+  `ensure_and_verify_acquire_the_shared_in_process_acl_gate` covers the native gate,
+  and `windows_ensure_and_verify_acquire_the_shared_state_acl_gate` covers the state
+  gate. The complete Windows IPC suite passed `47/47`, the focused Windows state
+  permission suite passed `9/9`, and both changed packages passed Clippy with warnings
+  denied. After the deterministic refinement, workspace-wide formatting, Clippy, and
+  tests passed again with fake-only mode enabled and provider credentials cleared.
+  Three-platform CI, merge, and published-nightly verification remain pending.
+
+### Completion conditions
+
+- Source completion: read-only verification cannot enter either ACL sequence while a
+  same-process ensure/repair operation holds its corresponding gate, with consistent
+  lock ordering and focused regression coverage.
+- Release completion: the exact source revision passes the three-platform CI matrix
+  and the published nightly passes isolated WSL and Windows-facing doctor QA.
 
 ### 2026-08-07 final reviewed exact-input A/B verification — passed once
 

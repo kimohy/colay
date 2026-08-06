@@ -115,8 +115,8 @@ impl AdapterRuntime for ProcessAdapterRuntime {
         request: &WorkerRequest,
         invocation: PreparedInvocation,
     ) -> Result<WorkerHandle, ProviderError> {
-        enforce_fake_provider_only(&invocation.executable)?;
         invocation.validate()?;
+        enforce_fake_provider_only(&invocation)?;
         let mut primary = invocation;
         let fallback = primary.fallback.take().map(|fallback| *fallback);
         let (active, session, remaining_fallback, startup_fallback_reason) =
@@ -710,10 +710,21 @@ fn validate_safe_probe(args: &[OsString]) -> Result<(), ProviderError> {
     }
 }
 
-fn enforce_fake_provider_only(executable: &Path) -> Result<(), ProviderError> {
+fn enforce_fake_provider_only(invocation: &PreparedInvocation) -> Result<(), ProviderError> {
     let fake_only =
         std::env::var_os("COLAY_TEST_FAKE_PROVIDERS_ONLY").is_some_and(|value| value == "1");
-    validate_fake_provider_executable(executable, fake_only)
+    validate_fake_provider_invocation(invocation, fake_only)
+}
+
+fn validate_fake_provider_invocation(
+    invocation: &PreparedInvocation,
+    fake_only: bool,
+) -> Result<(), ProviderError> {
+    validate_fake_provider_executable(&invocation.executable, fake_only)?;
+    if let Some(fallback) = &invocation.fallback {
+        validate_fake_provider_executable(&fallback.executable, fake_only)?;
+    }
+    Ok(())
 }
 
 fn validate_fake_provider_executable(
@@ -728,12 +739,15 @@ fn validate_fake_provider_executable(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if matches!(
+    if !matches!(
         basename.as_str(),
-        "codex" | "codex.exe" | "claude" | "claude.exe" | "gemini" | "gemini.exe"
+        "fake-provider-cli"
+            | "fake-provider-cli.exe"
+            | "colay-e2e-fake-provider"
+            | "colay-e2e-fake-provider.exe"
     ) {
         return Err(ProviderError::Runtime(format!(
-            "fake-provider-only mode refuses real provider executable {basename}"
+            "fake-provider-only mode refuses non-test-support provider executable {basename}"
         )));
     }
     Ok(())
@@ -742,6 +756,21 @@ fn validate_fake_provider_executable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_invocation(executable: &str) -> PreparedInvocation {
+        PreparedInvocation {
+            executable: executable.into(),
+            args: vec![OsString::from("--version")],
+            stdin: Vec::new(),
+            working_directory: ".".into(),
+            timeout_seconds: 30,
+            stdout_limit: 1024,
+            stderr_limit: 1024,
+            output: StructuredOutput::AgyText,
+            codex_app_server: None,
+            fallback: None,
+        }
+    }
 
     #[test]
     fn public_probe_requires_a_native_provider_executable() {
@@ -759,18 +788,7 @@ mod tests {
 
     #[test]
     fn worker_requires_a_native_provider_executable() {
-        let invocation = PreparedInvocation {
-            executable: "fake-provider-cli".into(),
-            args: vec![OsString::from("--version")],
-            stdin: Vec::new(),
-            working_directory: ".".into(),
-            timeout_seconds: 30,
-            stdout_limit: 1024,
-            stderr_limit: 1024,
-            output: StructuredOutput::AgyText,
-            codex_app_server: None,
-            fallback: None,
-        };
+        let invocation = test_invocation("fake-provider-cli");
 
         assert_eq!(
             command_spec(&invocation, &RedactionConfig::default()).executable_policy,
@@ -813,7 +831,15 @@ mod tests {
     }
 
     #[test]
-    fn fake_provider_only_guard_rejects_real_cli_basenames() {
+    fn fake_provider_only_guard_allows_only_test_support_basenames() {
+        for executable in [
+            "fake-provider-cli",
+            "fake-provider-cli.exe",
+            "colay-e2e-fake-provider",
+            "colay-e2e-fake-provider.exe",
+        ] {
+            assert!(validate_fake_provider_executable(Path::new(executable), true).is_ok());
+        }
         for executable in [
             "codex",
             "codex.exe",
@@ -821,13 +847,29 @@ mod tests {
             "claude.exe",
             "gemini",
             "gemini.exe",
+            "agy",
+            "agy.exe",
+            "agy-real",
+            "codex-nightly",
+            "renamed-provider",
+            "provider-wrapper.exe",
+            "",
         ] {
             assert!(validate_fake_provider_executable(Path::new(executable), true).is_err());
         }
-        assert!(
-            validate_fake_provider_executable(Path::new("fake-provider-cli.exe"), true).is_ok()
-        );
-        assert!(validate_fake_provider_executable(Path::new("codex"), false).is_ok());
+        assert!(validate_fake_provider_executable(Path::new("renamed-provider"), false).is_ok());
+    }
+
+    #[test]
+    fn fake_provider_only_guard_validates_fallback_before_start() {
+        let mut invocation = test_invocation("fake-provider-cli");
+        invocation.fallback = Some(Box::new(test_invocation("codex")));
+        assert!(validate_fake_provider_invocation(&invocation, true).is_err());
+
+        invocation.fallback = Some(Box::new(test_invocation("colay-e2e-fake-provider")));
+        assert!(validate_fake_provider_invocation(&invocation, true).is_ok());
+        invocation.fallback = Some(Box::new(test_invocation("renamed-provider")));
+        assert!(validate_fake_provider_invocation(&invocation, false).is_ok());
     }
 
     #[test]
