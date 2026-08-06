@@ -126,15 +126,22 @@ the exact test-fixtures binaries. The host must provide Python with SQLite
 schema-17 `STRICT` tables without invoking a SQLite command shell. The harness
 accepts only `colay-e2e-fake-provider.exe`, clears provider credential variables
 from every child, and passes every process argument with
-`ProcessStartInfo.ArgumentList.Add`.
+`ProcessStartInfo.ArgumentList.Add`. Run it only from the exact clean commit that
+was used to build both binaries; the mandatory commit argument makes source drift
+fail closed.
 
 ```powershell
 cargo build -p colay --bins --features test-fixtures
+$sourceCommit = (git rev-parse HEAD).Trim()
+if (-not [string]::IsNullOrWhiteSpace((git status --porcelain=v1 --untracked-files=all))) {
+  throw 'authoritative Windows stress requires a clean worktree'
+}
 New-Item -ItemType Directory -Force artifacts\qa\windows-state-acl | Out-Null
 & scripts\qa\windows-state-acl-stress.ps1 `
   -ColayExe (Resolve-Path target\debug\colay.exe) `
   -FakeProviderExe (Resolve-Path target\debug\colay-e2e-fake-provider.exe) `
-  -EvidenceRoot (Resolve-Path artifacts\qa\windows-state-acl)
+  -EvidenceRoot (Resolve-Path artifacts\qa\windows-state-acl) `
+  -ExpectedSourceCommit $sourceCommit
 ```
 
 The run is a failure unless five sequential incumbent registrations have
@@ -143,23 +150,29 @@ finish within 8,000 ms, and the source still declares the unchanged 10,000 ms
 IPC response timeout. Each source is a distinct non-empty schema-v8 database.
 Successful command timing is the operating-system process lifetime from
 `StartTime` through `ExitTime`; synchronous CIM observation and debug-event
-processing do not run inside that measured interval. After the latency phase
-and main-daemon shutdown, a separate fresh state root runs the functional
-`DEBUG_PROCESS` audit. Its time is explicitly excluded from the 5,000/8,000 ms
-acceptance limits. The audit covers only the controlled child tree rooted at the
+processing do not run inside that measured interval. The latency environment
+keeps the aggregate inspection marker but omits the attributed-marker environment
+key entirely. It must record exactly 18 aggregate events for the nine imports and
+leave its attributed sentinel directory empty.
+
+After the latency phase and main-daemon shutdown, a separate fresh state root runs
+the functional `DEBUG_PROCESS` audit with attributed markers enabled. Its time is
+explicitly excluded from the 5,000/8,000 ms acceptance limits. That correctness
+phase must record exactly two aggregate events and one attributed group containing
+two distinct empty events, and the group must equal the durable
+`source_root_hash`. The audit covers only the controlled child tree rooted at the
 exact PowerShell process launched by the harness; it is neither a host-wide
 process monitor nor evidence against Administrator or `SYSTEM` activity.
 
 The harness compares every source SQLite-family hash before and after import,
-requires exactly two content-free inspection markers per imported source,
 validates workspace/path/import/session and publication-ledger cardinality,
 runs SQLite integrity and foreign-key checks, and requires zero tasks, task
 attempts, worktrees, coordinator leases, and worker leases. The functional
 child-tree audit must find no `whoami.exe` or `icacls.exe` launch. Post-stop
 identity-checked residue observation separately requires the endpoint, live
 leases, and attributable Colay, fake-provider, and utility processes to be
-absent. The harness writes timestamped JSON plus `summary.json`, including
-failure evidence when safe.
+absent. The harness writes schema-2 timestamped JSON plus `summary.json`, with
+separate latency/correctness marker-phase evidence and failure evidence when safe.
 
 #### Historical source-fixed baseline at `a52945d` — not current Task 5 acceptance evidence
 
