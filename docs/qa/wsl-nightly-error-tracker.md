@@ -942,12 +942,12 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-015` | medium | fix-in-progress (independently reviewed; PowerShell 7.2/7.6 and fresh exact A/B pass; stress/merge pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
-| `WIN-014` | low | fix-in-progress (independently reviewed; deterministic fixture, 48/48 focused, and fresh exact A/B pass; merge pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
-| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6 and fresh exact A/B pass; stress/merge pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
-| `WIN-012` | medium | fix-in-progress (structural matrix and fresh exact A/B pass; stress/merge pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
-| `WIN-011` | medium | fix-in-progress (PID matrix and fresh exact A/B pass; exact stress re-acceptance pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
-| `WIN-010` | high | fix-in-progress (fresh exact A/B passed; one-shot stress and CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WIN-015` | medium | fix-in-progress (reviewed PowerShell 7.2/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
+| `WIN-014` | low | fix-in-progress (reviewed deterministic fixture, exact A/B, and authoritative stress pass; merge/CI pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
+| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
+| `WIN-012` | medium | fix-in-progress (structural matrix, exact A/B, and authoritative stress pass; merge/CI pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
+| `WIN-011` | medium | fix-in-progress (PID matrix, exact A/B, and authoritative stress pass; merge/CI pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
+| `WIN-010` | high | fix-in-progress (fresh exact A/B and authoritative stress passed; CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -973,7 +973,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
-| `WIN-005` | high | fix-in-progress (pre-timing source separation passed focused checks; exact re-acceptance pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-005` | high | fix-in-progress (unchanged latency limits passed authoritative re-acceptance; merge/CI/nightly pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 | `WIN-007` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
 | `WIN-008` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
@@ -2656,6 +2656,61 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   is intentionally non-authoritative for latency. The unchanged 5,000ms serial-p95
   and 8,000ms per-concurrent-command gates still require one clean-HEAD authoritative
   stress run; no A/B retry will be used to replace this evidence.
+
+### 2026-08-07 authoritative Windows stress re-acceptance — passed once
+
+- The A/B record was committed as documentation-only commit
+  `471fe9ae3ee387c1d3d0681f50545ee9949463b9`. With that exact source commit,
+  a clean worktree, and zero live `colay` or fake-provider candidate processes, the
+  frozen stress harness was invoked exactly once through verified portable
+  PowerShell 7.6.4. It exited `0` after `185.8s`; it was not retried. The stored run
+  interval is `184.5972696s`.
+- Evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260806T205955735Z.json`
+  is `495,117` bytes with SHA-256
+  `2b4230584d839c0d2fa064b2b9f22743518dfb2c09c270e6c6008cc10d8ff418`.
+  It records schema `2`, status `passed`, null failure, no acceptance failures, exact
+  clean source identity, stress SHA-256
+  `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  `colay.exe` SHA-256
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  and fake-provider SHA-256
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+- The unchanged OS-process-lifetime gates passed. Serial measurements were
+  `[3564, 4293, 3555, 3055, 4117]ms`, so both nearest-rank p95 and maximum were
+  `4293ms` against `5000ms`. Concurrent measurements were
+  `[4216, 6538, 7674, 7572]ms`, with maximum `7674ms` against the per-command
+  `8000ms` limit.
+- All nine schema-v8 sources were created and retained before the timing self-test
+  and daemon start, using the exact ordered labels `seed-schema-v8-1` through
+  `seed-schema-v8-9`. Every command used OS-process-lifetime measurement, integral
+  exit `0`, Boolean `timed_out=false`, and nonnegative integral elapsed time. Fixture
+  write measurements were `[3947, 746, 737, 762, 751, 762, 771, 3070, 4459]ms`
+  (minimum/median/maximum `737/762/4459ms`) and were explicitly excluded from the
+  product latency thresholds.
+- The latency phase omitted the attributed environment key and recorded aggregate
+  marker `18`, attributed groups/events `0/0`. The threshold-excluded correctness
+  phase recorded aggregate `2`, exactly one `source_root_hash` group and two events,
+  with the group matching the durable source. Global durable cardinalities were
+  workspace paths/workspaces `10/10` and imports/sessions `9/9`; publication roots,
+  imports, and locks matched expected counts `10/9/9`, with no staging or unexpected
+  items. All nine source SQLite families were unchanged.
+- SQLite integrity was `ok`, foreign-key violations were zero, and all task,
+  attempt, worktree, worker-lease, and coordinator-lease counts were zero. The
+  threshold-excluded functional process audit passed: its observer recorded `43`
+  starts and `43` exits with structurally identical PID/count maps, no active PID at
+  finish, and no forbidden utility or ownership refusal. The seven top-level process
+  setup failures were intentional failure-injection evidence from six setup cases
+  plus one batch-start case; all 15 cleanup self-test cases passed with one expected
+  injected cleanup error and zero unexpected errors or residue.
+- Provider isolation remained intact: `fake_provider_only=true`, provider credential
+  names were absent from both timing and failure-cleanup environments, and the
+  self-tests invoked no provider. Both main and audit daemons ended stopped; live
+  leases, cleanup errors, residual processes before/after force, forced cleanup, and
+  the independent post-run host candidate-process count were all zero.
+- This closes the local authoritative Windows source re-acceptance for `WIN-005` and
+  `WIN-010` through `WIN-015`. Their index entries remain `fix-in-progress` until the
+  reviewed commits are merged and published CI/nightly verification completes.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
