@@ -1903,6 +1903,34 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   or close `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`. Downgrading a LocalSystem state directory
   to an unpatched binary is unsupported and must fail closed unless the correction is backported.
 
+### 2026-08-06 post-review fresh Windows source gates
+
+- Independent security/correctness review initially raised three Important findings. Their fixes
+  are `7a1cb38bb14ad09318c95f1f5735c24b8af2aadf`
+  (`fix: close LocalSystem ACL review findings`),
+  `c1e4951dc1cf6c560a5be172b41c6a8d78a3ae01`
+  (`test: gate retained-handle ACL repair identity`), and
+  `7f2e3e755009c02e826c7075d898e3555c16114a`
+  (`docs: scope LocalSystem ACL rollback`). Each scoped re-review is Ready, with no open
+  Critical, Important, or Minor finding. The subsequent Clippy-only correction is
+  `0351c55a5938dd905be0f34128b0b34fd97c8605`
+  (`fix: remove redundant ACL principal borrow`); this is the exact source HEAD used below.
+- With process-scoped `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0`, fresh commands on that HEAD
+  exited zero: `cargo test -p orchestrator-windows-ipc state_artifact --all-features --
+  --nocapture --test-threads=1` (28 passed, 0 failed, 18 filtered), `cargo test -p
+  orchestrator-state permissions::tests --all-features -- --nocapture --test-threads=1`
+  (8 passed, 0 failed, 113 filtered; the remaining selected integration binaries ran zero tests),
+  `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, and `cargo test --workspace --all-features` (exit zero; 912.6 seconds). The suite
+  uses the repository fake-provider support; no real provider inference was invoked.
+- The unconditional normal-user owner/same-handle native gate
+  `retained_handle_repair_preserves_owner_and_uses_one_handle` executed and passed. The conditional
+  `retained_handle_localsystem_file_and_directory_fast_paths_when_applicable` test executed on
+  this normal-user host, but its LocalSystem assertion body correctly skipped because the process
+  is not LocalSystem. Therefore bounded native LocalSystem release QA and published-nightly
+  verification remain pending. `WIN-005`, `WIN-006`, `WSL-022`, and `WSL-023` stay open; this
+  source evidence does not close any of them.
+
 ## WSL-009: config 없는 기존 DB의 migration 진입 실패 (WSL/Windows 공통)
 
 ### 재현 및 영향
