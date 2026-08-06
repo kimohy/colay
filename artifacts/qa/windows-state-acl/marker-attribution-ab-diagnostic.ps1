@@ -1789,8 +1789,15 @@ function Get-AbDatabaseHealthEvidence {
     param(
         [Parameter(Mandatory = $true)][string]$Database,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
-        [Parameter(Mandatory = $true)][string]$Label
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('ActiveDaemon', 'PostStopStable')]
+        [string]$Phase,
+        [Parameter(Mandatory = $true)][bool]$PostStopQuiescenceConfirmed
     )
+    if ($Phase -eq 'PostStopStable' -and -not $PostStopQuiescenceConfirmed) {
+        throw "$Label PostStopStable database health requires confirmed quiescence"
+    }
     $integrity = Invoke-Sqlite -Database $Database -Sql 'PRAGMA integrity_check;' `
         -WorkingDirectory $script:RunRoot -Environment $Environment -ReadOnly -Csv `
         -Label "$Label-integrity"
@@ -1803,10 +1810,24 @@ function Get-AbDatabaseHealthEvidence {
     if ($foreignKeys.Count -ne 0) {
         throw "$Label SQLite foreign_key_check found $($foreignKeys.Count) violation(s)"
     }
+    $canonicalPhase = if ($Phase -eq 'PostStopStable') { 'PostStopStable' } else { 'ActiveDaemon' }
+    $databaseFamilyHashScope = if ($canonicalPhase -ceq 'PostStopStable') {
+        'post-stop-stable-sqlite-family'
+    } else {
+        'intentionally-omitted-active-daemon'
+    }
+    $databaseFamilyHashes = if ($canonicalPhase -ceq 'PostStopStable') {
+        Get-SqliteFamilyHashes $Database
+    } else {
+        $null
+    }
     return [pscustomobject][ordered]@{
         integrity_check = 'ok'
         foreign_key_violation_count = 0
-        database_family_hashes = Get-SqliteFamilyHashes $Database
+        health_phase = $canonicalPhase
+        post_stop_quiescence_confirmed = $PostStopQuiescenceConfirmed
+        database_family_hash_scope = $databaseFamilyHashScope
+        database_family_hashes = $databaseFamilyHashes
     }
 }
 
@@ -2207,7 +2228,8 @@ try {
                     -Environment $environment
                 $globalDatabase = Join-Path $script:ColayHome 'state/state.db'
                 $observation.database_health = Get-AbDatabaseHealthEvidence -Database $globalDatabase `
-                    -Environment $environment -Label $armLabel
+                    -Environment $environment -Label $armLabel -Phase ActiveDaemon `
+                    -PostStopQuiescenceConfirmed $false
                 $observation.zero_writable_rows = Assert-ZeroWritableRows -Database $globalDatabase `
                     -Environment $environment
 
@@ -2313,10 +2335,43 @@ try {
                     } catch {
                         $cleanupErrors.Add("live lease query: $($_.Exception.Message)")
                     }
+                    $retainedHandleEvidence = $observation.cleanup.retained_handle
+                    $retainedWaitSignaled = $false
+                    if ($null -ne $retainedHandleEvidence) {
+                        $initialWaitProperty = `
+                            $retainedHandleEvidence.PSObject.Properties['initial_wait_result']
+                        $finalWaitProperty = `
+                            $retainedHandleEvidence.PSObject.Properties['final_wait_result']
+                        $retainedWaitSignaled = (
+                            $null -ne $initialWaitProperty -and
+                            $null -ne $initialWaitProperty.Value -and
+                            [uint64]$initialWaitProperty.Value -eq 0
+                        ) -or (
+                            $null -ne $finalWaitProperty -and
+                            $null -ne $finalWaitProperty.Value -and
+                            [uint64]$finalWaitProperty.Value -eq 0
+                        )
+                    }
+                    $postStopQuiescenceConfirmed = (
+                        $null -ne $observation.cleanup.daemon_stop -and
+                        [string]$observation.cleanup.daemon_stop.schema_version -ceq '1' -and
+                        [string]$observation.cleanup.daemon_stop.command -ceq 'daemon_stop' -and
+                        [string]$observation.cleanup.daemon_stop.data.status.state -ceq 'stopped' -and
+                        $retainedWaitSignaled -and
+                        @($retainedHandleEvidence.errors).Count -eq 0 -and
+                        $null -ne $observation.cleanup.endpoint_status -and
+                        [string]$observation.cleanup.endpoint_status.schema_version -ceq '1' -and
+                        [string]$observation.cleanup.endpoint_status.command -ceq 'daemon_status' -and
+                        [string]$observation.cleanup.endpoint_status.data.status.state -ceq 'stopped' -and
+                        $null -ne $observation.cleanup.live_lease_count -and
+                        [int]$observation.cleanup.live_lease_count -eq 0
+                    )
                     try {
                         $observation.cleanup.database_health_after_cleanup = `
                             Get-AbDatabaseHealthEvidence -Database $globalDatabase `
-                                -Environment $environment -Label "$armLabel-after-cleanup"
+                                -Environment $environment -Label "$armLabel-after-cleanup" `
+                                -Phase PostStopStable `
+                                -PostStopQuiescenceConfirmed $postStopQuiescenceConfirmed
                         $observation.cleanup.zero_writable_rows_after_cleanup = `
                             Assert-ZeroWritableRows -Database $globalDatabase -Environment $environment
                     } catch {

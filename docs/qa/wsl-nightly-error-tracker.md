@@ -970,7 +970,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 | `WIN-007` | medium | fix-in-progress (preflight passed into the first arm; full reviewed A/B blocked by `WIN-008`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
-| `WIN-008` | medium | open | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
+| `WIN-008` | medium | fix-in-progress (focused phase/quiescence checks passed; reviewed one-shot A/B pending) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1959,11 +1959,43 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   SHA-256 `72be48777e1532d7a5a962f51747b6b6a9f4140b38f24589e659de8aefc74baa`
   and status `failed`. The run was fake-provider-only, passed zero provider
   credentials, used all four reviewed exact hashes, and was not retried.
-- Status: `open`. Closure requires a separately reviewed fail-closed harness
-  correction and a newly authorized one-shot exact-HEAD A/B run that completes
-  all eight observations, four counterbalanced pairs, ten exact input hash
-  checkpoints, zero retries, zero cleanup errors/residual processes, and an
-  explicit retain/split decision. Authoritative stress remains unrun.
+- Status: `fix-in-progress`. The approved design is
+  `docs/superpowers/specs/2026-08-07-windows-marker-active-db-hash-design.md`.
+  `Get-AbDatabaseHealthEvidence` now requires an explicit `ActiveDaemon` or
+  `PostStopStable` phase plus an explicit post-stop-quiescence boolean. Active
+  health preserves the exact integrity and foreign-key checks but reports
+  `intentionally-omitted-active-daemon` with null family hashes. Stable health
+  rejects a false gate before raw hashing and hashes exactly once only when the
+  gate is true. `Get-Sha256` and `Get-SqliteFamilyHashes` remain unchanged.
+- The post-stop caller derives its gate only after an exact successful
+  `daemon_stop` document, a signaled retained-handle initial or final wait with
+  zero retained-handle errors, an exact stopped `daemon_status` document, and a
+  zero live-lease result. Endpoint state or a delay alone is not accepted.
+- Focused RED under the verified portable PowerShell `7.6.4` opened a temporary
+  file read/write with `FileShare.ReadWrite`; `Get-FileHash` still failed with
+  `The process cannot access the file ... because it is being used by another
+  process.` The extracted old health helper then failed because parameter
+  `Phase` did not exist. Focused GREEN on the amended helper passed: active
+  health made `0` family-hash calls, rejected post-stop health made `0`, and
+  confirmed stable post-stop health made exactly `1`; both active and stable
+  retained the two SQLite health queries.
+- Portable PowerShell `7.6.4` parser and exact AST/call-order checks passed with
+  `parser_errors=0`, `health_calls=2`, and
+  `existing_static_contract=passed`. They verify the active and stable call
+  sites, the fail-before-hash guard, all four quiescence evidence inputs, and
+  that every input precedes the stable hash call. The amended marker is
+  `120674` bytes with SHA-256
+  `d81a7df7380913cbbec239ff23720b29c0d8db27ceb63174dcb5f2c6b7e137b9`;
+  the unchanged stress harness remains
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  No marker, stress, product, Cargo, or provider command was run for this
+  focused correction.
+- `WIN-007` and `WIN-008` remain open pending independent review and one newly
+  authorized exact-clean-HEAD A/B invocation. Closure still requires all eight
+  observations, four counterbalanced pairs, ten exact input hash checkpoints,
+  zero retries, zero credentials, zero cleanup errors/residual processes,
+  active health with intentionally omitted hashes, stable post-stop hashes,
+  and an explicit retain/split decision. Authoritative stress remains unrun.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
