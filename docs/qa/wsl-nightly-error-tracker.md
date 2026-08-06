@@ -969,8 +969,9 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
 | `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
-| `WIN-007` | medium | fix-in-progress (preflight passed into the first arm; full reviewed A/B blocked by `WIN-008`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
-| `WIN-008` | medium | fix-in-progress (focused phase/quiescence checks passed; reviewed one-shot A/B pending) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
+| `WIN-007` | medium | fix-in-progress (preflight and six corrected observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
+| `WIN-008` | medium | fix-in-progress (six active/stable health observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
+| `WIN-009` | medium | open | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1996,6 +1997,80 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   zero retries, zero credentials, zero cleanup errors/residual processes,
   active health with intentionally omitted hashes, stable post-stop hashes,
   and an explicit retain/split decision. Authoritative stress remains unrun.
+
+### 2026-08-07 reviewed exact-HEAD A/B attempt — readiness failure, not retried
+
+- The worktree was clean at exact source HEAD
+  `806ac3e76c8eaf4862350875698304d48610fc49`. Exact-path CIM checks found zero
+  candidate processes before the invocation. A fresh
+  `cargo build -p colay --bins --features test-fixtures` with
+  `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` exited zero in `14.15s`.
+- The exact inputs were `colay.exe`
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  fake provider
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  marker
+  `d81a7df7380913cbbec239ff23720b29c0d8db27ceb63174dcb5f2c6b7e137b9`,
+  and stress harness
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  The marker was invoked exactly once through verified portable PowerShell
+  `7.6.4` with separated arguments and all four expected hashes. It exited `1`
+  after `80.266637s`; it was not retried and authoritative stress was not run.
+- Evidence `marker-attribution-ab-20260806T160044318Z.json` is `398026` bytes
+  with SHA-256
+  `a51f3358e3890b78a25cc81718502dda0302d4d2dc44e8173fb2e699c4154fb2`.
+  Its interval is `73.4005223s` (`2026-08-06T16:00:44.3193643Z` through
+  `2026-08-06T16:01:57.7198866Z`) and status is `failed`.
+- Independent PowerShell 7.6.4 parsing confirmed `7/8` recorded observations,
+  `0/4` summary pairs because delta analysis was not reached, `0` retries, and
+  `9/10` exact input-hash checkpoints. The first six observations fully
+  completed pairs 1 through 3. Every recorded checkpoint contains all four
+  expected hashes. Execution remained fake-provider-only with zero provider
+  credential keys.
+- Each of the six completed observations reports active integrity `ok`, zero
+  foreign-key violations, phase `ActiveDaemon`, scope
+  `intentionally-omitted-active-daemon`, and null family hashes. Each cleanup
+  then confirms a stopped daemon and endpoint, a signaled retained handle with
+  zero errors, zero live leases, zero residual processes, and phase
+  `PostStopStable` with confirmed quiescence and all three database-family
+  hashes. This exercises the `WIN-008` correction without satisfying the full
+  closure gate.
+- Observation 7 was pair 4, order 1, variant `attributed`. Its `daemon start`
+  command exited zero and returned an exact schema-v1 `daemon_start` document,
+  but both status state and instance phase were `booting`.
+  `Open-AbDaemonIdentity` therefore refused before opening a retained handle.
+  Cleanup stopped the daemon, observed a stopped endpoint and zero live leases,
+  and left zero final or independently queried exact candidate processes. It
+  recorded two consequential cleanup errors: stable database health correctly
+  refused unconfirmed quiescence, and pre-cleanup marker evidence was
+  unavailable.
+- No retain/split decision was produced. `WIN-007` and `WIN-008` remain
+  `fix-in-progress`; the distinct readiness blocker is `WIN-009`. `WIN-005`,
+  `WIN-006`, `WSL-022`, and `WSL-023` are unchanged.
+
+## WIN-009: marker A/B rejects an exit-zero booting daemon start
+
+### Observation and impact
+
+- The reviewed one-shot A/B completed six arms before an exit-zero
+  `daemon start --json` returned schema-v1 `daemon_start` with state and phase
+  `booting`. The marker requires immediate `online` status before retained
+  identity capture, so it failed closed before registration in the seventh arm.
+- This blocks marker attribution and authoritative Windows stress acceptance,
+  but the preserved evidence does not establish a registration-latency or
+  provider regression. The daemon was stopped cleanly and no exact candidate
+  process remained.
+
+### Status and closure gate
+
+- Status: `open`. Before another one-shot A/B, determine whether the CLI must
+  withhold a successful `daemon_start` response until online readiness or the
+  marker must perform a bounded identity-preserving readiness transition.
+  Any correction requires focused fail-closed tests and independent review.
+- Closure still requires one new exact-clean-HEAD invocation with all eight
+  observations, four counterbalanced pairs, ten checkpoints, zero retries,
+  zero credentials, zero cleanup errors, and zero residual processes, plus an
+  explicit retain/split decision. Do not retry the preserved failed run.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
