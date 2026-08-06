@@ -143,7 +143,8 @@ pub fn ensure_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io
     let _repair = STATE_ARTIFACT_REPAIR
         .lock()
         .map_err(|_| io::Error::other("state-artifact ACL repair lock was poisoned"))?;
-    let principals = expected_principals()?;
+    let owned_principals = expected_principals()?;
+    let principals = owned_principals.borrowed()?;
     let handle = open_target(path, kind, true)?;
     let before = read_descriptor_state(handle.0, kind, &principals)
         .map_err(|error| stage_error("descriptor read", error))?;
@@ -176,7 +177,8 @@ pub fn ensure_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io
 }
 
 pub fn verify_private_state_artifact(path: &Path, kind: StateArtifactKind) -> io::Result<()> {
-    let principals = expected_principals()?;
+    let owned_principals = expected_principals()?;
+    let principals = owned_principals.borrowed()?;
     let handle = open_target(path, kind, false)?;
     let descriptor = read_descriptor_state(handle.0, kind, &principals)
         .map_err(|error| stage_error("descriptor read", error))?;
@@ -205,19 +207,47 @@ struct OwnedExpectedPrincipals<'a> {
 }
 
 impl OwnedExpectedPrincipals<'_> {
-    fn borrowed(&self) -> ExpectedPrincipals<'_> {
-        ExpectedPrincipals {
-            user: self.user,
-            system: self.system.as_bytes(),
-            administrators: self.administrators.as_bytes(),
-        }
+    fn borrowed(&self) -> io::Result<ExpectedPrincipals<'_>> {
+        ExpectedPrincipals::from_roles(
+            self.user,
+            self.system.as_bytes(),
+            self.administrators.as_bytes(),
+        )
     }
 }
 
+const MAX_EXPECTED_PRINCIPALS: usize = 3;
+
 struct ExpectedPrincipals<'a> {
-    user: &'a [u8],
-    system: &'a [u8],
-    administrators: &'a [u8],
+    sids: [&'a [u8]; MAX_EXPECTED_PRINCIPALS],
+    len: usize,
+}
+
+impl<'a> ExpectedPrincipals<'a> {
+    fn from_roles(user: &'a [u8], system: &'a [u8], administrators: &'a [u8]) -> io::Result<Self> {
+        for sid in [user, system, administrators] {
+            validate_sid_prefix(sid)?;
+        }
+        if system == administrators || user == administrators {
+            return Err(invalid_acl(
+                "required state ACL roles have an unsupported role SID collision",
+            ));
+        }
+        if user == system {
+            return Ok(Self {
+                sids: [system, administrators, administrators],
+                len: 2,
+            });
+        }
+        Ok(Self {
+            sids: [user, system, administrators],
+            len: 3,
+        })
+    }
+
+    fn as_slice(&self) -> &[&'a [u8]] {
+        &self.sids[..self.len]
+    }
 }
 
 enum AclCheckError {
@@ -268,8 +298,13 @@ fn check_acl_bytes(
     }
     let ace_count = read_u16(bytes, 4, "ACL ACE-count field is truncated")
         .map_err(AclCheckError::Structural)?;
-    if ace_count != 3 {
-        return Err(policy_acl("DACL must contain exactly three trustee ACEs"));
+    let required = principals.as_slice();
+    let required_count = u16::try_from(required.len())
+        .map_err(|_| structural_acl("required principal count overflow"))?;
+    if ace_count != required_count {
+        return Err(policy_acl(
+            "DACL trustee ACE count does not match the exact required principal count",
+        ));
     }
 
     let required_flags = match kind {
@@ -277,7 +312,7 @@ fn check_acl_bytes(
         StateArtifactKind::Directory => u8::try_from(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
             .map_err(|_| structural_acl("directory ACE flags overflow"))?,
     };
-    let mut found = [false; 3];
+    let mut found = [false; MAX_EXPECTED_PRINCIPALS];
     let mut cursor = size_of::<ACL>();
     for _ in 0..usize::from(ace_count) {
         let (ace_end, principal) = verify_ace_record(bytes, cursor, required_flags, principals)?;
@@ -291,7 +326,7 @@ fn check_acl_bytes(
     if cursor != bytes.len() {
         return Err(structural_acl("ACL contains trailing bytes after its ACEs"));
     }
-    if !found.into_iter().all(|present| present) {
+    if !found[..required.len()].iter().all(|present| *present) {
         return Err(policy_acl("DACL is missing a required trustee"));
     }
     Ok(())
@@ -366,15 +401,11 @@ fn verify_ace_record(
         ));
     }
 
-    let principal = if trustee == principals.user {
-        0
-    } else if trustee == principals.system {
-        1
-    } else if trustee == principals.administrators {
-        2
-    } else {
-        return Err(policy_acl("DACL contains an unexpected trustee"));
-    };
+    let principal = principals
+        .as_slice()
+        .iter()
+        .position(|required| trustee == *required)
+        .ok_or_else(|| policy_acl("DACL contains an unexpected trustee"))?;
     Ok((record_end, principal))
 }
 
@@ -462,27 +493,16 @@ fn validate_sid_prefix(sid: &[u8]) -> io::Result<()> {
 }
 
 impl OwnedAcl {
-    fn build(
-        kind: StateArtifactKind,
-        principals: &OwnedExpectedPrincipals<'_>,
-    ) -> io::Result<Self> {
-        let principals = principals.borrowed();
-        for sid in [
-            principals.user,
-            principals.system,
-            principals.administrators,
-        ] {
+    fn build(kind: StateArtifactKind, principals: &ExpectedPrincipals<'_>) -> io::Result<Self> {
+        let required = principals.as_slice();
+        for sid in required {
             validate_sid_prefix(sid)?;
         }
         let sid_offset = size_of::<ACCESS_ALLOWED_ACE>()
             .checked_sub(size_of::<u32>())
             .ok_or_else(bounds_error)?;
         let mut ace_bytes = 0_usize;
-        for sid in [
-            principals.user,
-            principals.system,
-            principals.administrators,
-        ] {
+        for sid in required {
             let ace_len = sid_offset.checked_add(sid.len()).ok_or_else(bounds_error)?;
             ace_bytes = ace_bytes.checked_add(ace_len).ok_or_else(bounds_error)?;
         }
@@ -502,12 +522,8 @@ impl OwnedAcl {
             StateArtifactKind::File => 0,
             StateArtifactKind::Directory => OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
         };
-        for sid in [
-            principals.user,
-            principals.system,
-            principals.administrators,
-        ] {
-            // SAFETY: The ACL has exact checked capacity for all three ACEs. Every SID is complete,
+        for sid in required {
+            // SAFETY: The ACL has exact checked capacity for all required ACEs. Every SID is complete,
             // validated, and remains live through this synchronous call.
             let added = unsafe {
                 AddAccessAllowedAceEx(
@@ -609,7 +625,7 @@ fn open_target(path: &Path, kind: StateArtifactKind, writable: bool) -> io::Resu
 fn read_descriptor_state(
     handle: HANDLE,
     kind: StateArtifactKind,
-    principals: &OwnedExpectedPrincipals<'_>,
+    principals: &ExpectedPrincipals<'_>,
 ) -> io::Result<DescriptorState> {
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: The handle is retained and live; all optional component outputs are null and the
@@ -698,7 +714,7 @@ fn read_descriptor_state(
     }
 
     let acl_check = if dacl_present == 0 || dacl.is_null() {
-        check_acl_bytes(None, protected, kind, &principals.borrowed())
+        check_acl_bytes(None, protected, kind, principals)
     } else {
         let extracted_acl = descriptor_acl_bytes(bytes, base, dacl)?;
         #[cfg(test)]
@@ -707,7 +723,7 @@ fn read_descriptor_state(
         let acl = injected_acl.as_deref().unwrap_or(extracted_acl);
         #[cfg(not(test))]
         let acl = extracted_acl;
-        check_acl_bytes(Some(acl), protected, kind, &principals.borrowed())
+        check_acl_bytes(Some(acl), protected, kind, principals)
     };
     let acl_result = match acl_check {
         Ok(()) => Ok(()),
@@ -974,7 +990,8 @@ pub mod test_support {
         kind: StateArtifactKind,
     ) -> io::Result<StateArtifactAclAccessDeniedGuard> {
         let target = validate_temporary_fixture_target(path)?;
-        let principals = expected_principals()?;
+        let owned_principals = expected_principals()?;
+        let principals = owned_principals.borrowed()?;
         let exact_acl = OwnedAcl::build(kind, &principals)?;
         let handle = open_target(&target, kind, true)?;
         let user = crate::current_process_user_sid()?;
@@ -1047,7 +1064,8 @@ fn take_injected_policy_acl_for_test() -> io::Result<Option<Box<[u8]>>> {
 
 #[cfg(test)]
 fn read_owner_sid_for_test(path: &Path, kind: StateArtifactKind) -> io::Result<Box<[u8]>> {
-    let principals = expected_principals()?;
+    let owned_principals = expected_principals()?;
+    let principals = owned_principals.borrowed()?;
     let handle = open_target(path, kind, false)?;
     Ok(read_descriptor_state(handle.0, kind, &principals)?
         .verified
@@ -1138,9 +1156,15 @@ mod tests {
 
     fn principals() -> ExpectedPrincipals<'static> {
         ExpectedPrincipals {
-            user: &USER_SID,
-            system: &SYSTEM_SID,
-            administrators: &ADMIN_SID,
+            sids: [&USER_SID, &SYSTEM_SID, &ADMIN_SID],
+            len: 3,
+        }
+    }
+
+    fn local_system_principals() -> ExpectedPrincipals<'static> {
+        ExpectedPrincipals {
+            sids: [&SYSTEM_SID, &ADMIN_SID, &ADMIN_SID],
+            len: 2,
         }
     }
 
@@ -1182,6 +1206,13 @@ mod tests {
         ])
     }
 
+    fn exact_local_system_file_acl() -> Vec<u8> {
+        acl(&[
+            TestAce::allow(&SYSTEM_SID, 0),
+            TestAce::allow(&ADMIN_SID, 0),
+        ])
+    }
+
     fn assert_invalid(result: io::Result<()>, fragment: &str) {
         assert!(result.is_err(), "malformed ACL must fail closed");
         let Some(error) = result.err() else {
@@ -1192,6 +1223,85 @@ mod tests {
             error.to_string().contains(fragment),
             "expected {fragment:?} in {error}"
         );
+    }
+
+    #[test]
+    fn required_principals_only_normalize_local_system_collision() -> io::Result<()> {
+        let local_system = ExpectedPrincipals::from_roles(&SYSTEM_SID, &SYSTEM_SID, &ADMIN_SID)?;
+        assert_eq!(
+            local_system.as_slice(),
+            [SYSTEM_SID.as_slice(), ADMIN_SID.as_slice()]
+        );
+
+        let normal = ExpectedPrincipals::from_roles(&USER_SID, &SYSTEM_SID, &ADMIN_SID)?;
+        assert_eq!(
+            normal.as_slice(),
+            [
+                USER_SID.as_slice(),
+                SYSTEM_SID.as_slice(),
+                ADMIN_SID.as_slice()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn required_principals_reject_other_role_collisions() {
+        for result in [
+            ExpectedPrincipals::from_roles(&ADMIN_SID, &SYSTEM_SID, &ADMIN_SID),
+            ExpectedPrincipals::from_roles(&USER_SID, &ADMIN_SID, &ADMIN_SID),
+            ExpectedPrincipals::from_roles(&SYSTEM_SID, &SYSTEM_SID, &SYSTEM_SID),
+        ] {
+            assert_invalid(result.map(|_| ()), "role SID collision");
+        }
+    }
+
+    #[test]
+    fn bounded_localsystem_acl_requires_each_unique_trustee_once() {
+        let expected = local_system_principals();
+        for exact in [
+            exact_local_system_file_acl(),
+            acl(&[
+                TestAce::allow(&ADMIN_SID, 0),
+                TestAce::allow(&SYSTEM_SID, 0),
+            ]),
+        ] {
+            assert!(
+                verify_acl_bytes(Some(&exact), true, StateArtifactKind::File, &expected).is_ok()
+            );
+        }
+
+        for invalid in [
+            acl(&[TestAce::allow(&SYSTEM_SID, 0)]),
+            acl(&[
+                TestAce::allow(&SYSTEM_SID, 0),
+                TestAce::allow(&SYSTEM_SID, 0),
+                TestAce::allow(&ADMIN_SID, 0),
+            ]),
+            acl(&[
+                TestAce::allow(&SYSTEM_SID, 0),
+                TestAce::allow(&EVERYONE_SID, 0),
+            ]),
+        ] {
+            assert!(
+                verify_acl_bytes(Some(&invalid), true, StateArtifactKind::File, &expected).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_acl_builds_exact_normal_and_localsystem_principal_sets() -> io::Result<()> {
+        for kind in [StateArtifactKind::File, StateArtifactKind::Directory] {
+            for expected in [
+                ExpectedPrincipals::from_roles(&USER_SID, &SYSTEM_SID, &ADMIN_SID)?,
+                ExpectedPrincipals::from_roles(&SYSTEM_SID, &SYSTEM_SID, &ADMIN_SID)?,
+            ] {
+                let acl = OwnedAcl::build(kind, &expected)?;
+                let bytes = native_acl_bytes_in_use(&acl.storage)?;
+                verify_acl_bytes(Some(&bytes), true, kind, &expected)?;
+            }
+        }
+        Ok(())
     }
 
     fn native_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1215,7 +1325,8 @@ mod tests {
     }
 
     fn exact_native_acl(kind: StateArtifactKind) -> io::Result<AlignedBuffer> {
-        let principals = expected_principals()?;
+        let owned_principals = expected_principals()?;
+        let principals = owned_principals.borrowed()?;
         Ok(OwnedAcl::build(kind, &principals)?.storage)
     }
 
@@ -1354,7 +1465,7 @@ mod tests {
         count[4..6].copy_from_slice(&2_u16.to_le_bytes());
         assert_invalid(
             verify_acl_bytes(Some(&count), true, StateArtifactKind::File, &expected),
-            "three",
+            "exact required principal count",
         );
 
         let mut trailing = exact_file_acl();
@@ -1600,6 +1711,34 @@ mod tests {
         assert_eq!(set_security_info_calls_for_test(), 0);
         verify_private_state_artifact(&file, StateArtifactKind::File)?;
         verify_private_state_artifact(&directory, StateArtifactKind::Directory)
+    }
+
+    #[test]
+    fn retained_handle_localsystem_file_and_directory_fast_paths_when_applicable() -> io::Result<()>
+    {
+        let _guard = native_test_guard();
+        let owned = expected_principals()?;
+        let expected = owned.borrowed()?;
+        if expected.as_slice().len() != 2 {
+            return Ok(());
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let file = temporary.path().join("state.db");
+        let directory = temporary.path().join("imports");
+        fs::write(&file, b"state")?;
+        fs::create_dir(&directory)?;
+
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+        verify_private_state_artifact(&file, StateArtifactKind::File)?;
+        ensure_private_state_artifact(&directory, StateArtifactKind::Directory)?;
+        verify_private_state_artifact(&directory, StateArtifactKind::Directory)?;
+        reset_set_security_info_calls_for_test();
+
+        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
+        ensure_private_state_artifact(&directory, StateArtifactKind::Directory)?;
+        assert_eq!(set_security_info_calls_for_test(), 0);
+        Ok(())
     }
 
     #[test]
