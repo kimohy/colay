@@ -969,9 +969,9 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
 | `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
-| `WIN-007` | medium | fix-in-progress (preflight and six corrected observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
-| `WIN-008` | medium | fix-in-progress (six active/stable health observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
-| `WIN-009` | medium | fix-in-progress (focused review fix and static contracts passed; exact-hash re-review and one-shot A/B pending) | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
+| `WIN-007` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
+| `WIN-008` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
+| `WIN-009` | medium | fixed (reviewed exact-HEAD A/B passed) | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1893,7 +1893,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   in `@(...)`, so `$preexisting` is an `Object[]` for zero, one, or many
   candidates. The strict-mode residue failure remains unchanged for nonzero
   candidates, and the two cleanup callers already use the same normalization.
-- Status: `fix-in-progress`. `WIN-007` may close only after independent review
+- At that point, status remained `fix-in-progress`. `WIN-007` could close only
+  after independent review
   and one reviewed exact-HEAD, fake-only marker A/B run confirms the required
   observations, cleanup, provenance, and evidence JSON; this preflight fix
   does not change the status of `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`.
@@ -1960,7 +1961,7 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   SHA-256 `72be48777e1532d7a5a962f51747b6b6a9f4140b38f24589e659de8aefc74baa`
   and status `failed`. The run was fake-provider-only, passed zero provider
   credentials, used all four reviewed exact hashes, and was not retried.
-- Status: `fix-in-progress`. The approved design is
+- At that point, status remained `fix-in-progress`. The approved design is
   `docs/superpowers/specs/2026-08-07-windows-marker-active-db-hash-design.md`.
   `Get-AbDatabaseHealthEvidence` now requires an explicit `ActiveDaemon` or
   `PostStopStable` phase plus an explicit post-stop-quiescence boolean. Active
@@ -1991,7 +1992,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
   No marker, stress, product, Cargo, or provider command was run for this
   focused correction.
-- `WIN-007` and `WIN-008` remain open pending independent review and one newly
+- Before the later full verification, `WIN-007` and `WIN-008` remained open
+  pending independent review and one newly
   authorized exact-clean-HEAD A/B invocation. Closure still requires all eight
   observations, four counterbalanced pairs, ten exact input hash checkpoints,
   zero retries, zero credentials, zero cleanup errors/residual processes,
@@ -2063,7 +2065,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 
 ### Status and closure gate
 
-- Status: `fix-in-progress`. The marker now parses exact schema-v1
+- Before the successful one-shot verification below, status remained
+  `fix-in-progress`. The marker now parses exact schema-v1
   `daemon_start`/`daemon_status` identity documents, anchors the canonical UUID,
   integral PID, state/phase, and reviewed `colay.exe` path, and permits only
   `booting` or `probing` before exact `online`. An immediate online start makes
@@ -2119,12 +2122,80 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   The unchanged stress harness remains
   `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
   No marker A/B, authoritative stress, product, Cargo, or provider command was
-  run for this focused correction. Exact-hash re-review and the reviewed
-  one-shot invocation are still required.
-- Closure still requires one new exact-clean-HEAD invocation with all eight
+  run for this focused correction. At that stage, exact-hash re-review and the
+  reviewed one-shot invocation were still required.
+- The remaining closure gate required one new exact-clean-HEAD invocation with
+  all eight
   observations, four counterbalanced pairs, ten checkpoints, zero retries,
   zero credentials, zero cleanup errors, and zero residual processes, plus an
   explicit retain/split decision. Do not retry the preserved failed run.
+
+### 2026-08-07 reviewed exact-HEAD A/B verification — passed once
+
+- The worktree was clean at exact source HEAD
+  `2f3910555efca4ef5ff114622931d93c009b8754`. A fresh
+  `cargo build -p colay --bins --features test-fixtures` with process-scoped
+  `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` exited zero. Exact-path CIM
+  checks found zero candidate processes before the invocation.
+- The rebuilt `colay.exe` was `29926400` bytes with SHA-256
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`; the
+  rebuilt fake provider was `2843648` bytes with SHA-256
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+  The reviewed marker was `132883` bytes with SHA-256
+  `d2b458e1491d446b2b630afdab4a3a18f8be7c23b1c408c94eac273a92b76e06`, and
+  the unchanged stress harness was `282943` bytes with SHA-256
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  The eight schema-v8 seed migrations were independently hashed before the
+  run and remained exact across all checkpoints.
+- The marker was invoked exactly once through verified portable PowerShell
+  `7.6.4`, with separated arguments and all four expected hashes. It exited
+  zero without a retry. Evidence
+  `marker-attribution-ab-20260806T165359620Z.json` is `511414` bytes with
+  SHA-256
+  `ff8ec6cc65754b262024b61009b84f37e01f988535fd717af78ca65cef1fb2db`.
+  Its interval is `107.2623837s` (`2026-08-06T16:53:59.6209025Z` through
+  `2026-08-06T16:55:46.8832862Z`) and status is `passed`.
+- Independent parsing confirmed all eight observations, all four
+  counterbalanced pairs, zero retries, and all ten exact input-hash
+  checkpoints. Every checkpoint retained the exact binary, marker, stress,
+  and migration inputs. Execution was fake-provider-only and exposed zero
+  provider credential keys.
+- Every readiness result reached exact `online` with elapsed times
+  `[37, 1, 1, 0, 150, 1, 0, 0]` ms, all strictly below the `5000` ms bound.
+  Seven starts were immediately online. The remaining start was exact
+  `booting` and reached exact online in one status poll: its command budget
+  was `4820` ms, command elapsed time was `53` ms, observed elapsed time was
+  `145` ms, and total readiness time was `150` ms. The anchored UUID, PID,
+  reviewed executable path, state/phase, and every poll identity matched.
+  Each exact online document preceded a verified retained-handle/CIM identity
+  capture with the same UUID, PID, path, and online state.
+- Registration OS-process-lifetime measurements, in pair order, were
+  `[aggregate_only 6946, attributed 4149]`,
+  `[attributed 6665, aggregate_only 5978]`,
+  `[aggregate_only 1314, attributed 5228]`, and
+  `[attributed 3387, aggregate_only 1333]` ms. Independent parsing linked the
+  delta inputs exactly to those registration timings and confirmed readiness
+  timing did not enter delta analysis.
+- All eight active-daemon database checks reported integrity `ok`, zero
+  foreign-key violations, phase `ActiveDaemon`, intentionally omitted/null
+  family hashes, and no sharing violation. After exact stop, every observation
+  reported a signaled retained handle with zero errors, an exact stopped
+  endpoint, zero live leases, phase `PostStopStable`, confirmed quiescence,
+  and hashes for the database, WAL, and SHM family. Source/config hashes and
+  durable cardinalities were unchanged; writable task, attempt, worktree, and
+  lease rows remained zero. Cleanup errors, recorded residual processes, and
+  an independent post-run exact-path CIM query were all zero.
+- The explicit decision is
+  `split-latency-marker-off-and-correctness-marker-on-phases`: three of four
+  registration pairs exceeded the allowed attribution delta, the median delta
+  was `1370.5` ms against a `183` ms limit, and order bias was `812` ms against
+  the same limit. Seed timing also exceeded its confounder limits. Therefore
+  the current attributable marker must be disabled during the authoritative
+  latency phase and enabled only during the separate correctness phase; this
+  non-authoritative A/B is not a product latency acceptance result.
+- These gates close `WIN-007`, `WIN-008`, and `WIN-009`. Authoritative Windows
+  stress was intentionally not run. `WIN-005`, `WIN-006`, `WSL-022`, and
+  `WSL-023` remain unchanged.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
@@ -2288,6 +2359,17 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
     `0.1.1-nightly.20260803.95cf4d3`).
 
 ## Update log
+
+### 2026-08-07
+
+- Exact clean HEAD `2f39105`에서 reviewed marker A/B를 단 한 번 실행해 8개 observation,
+  4개 counterbalanced pair, 10개 input-hash checkpoint, 0 retry, 0 credential key,
+  0 cleanup error/residual process를 확인했다. `WIN-007`, `WIN-008`, `WIN-009`를 `fixed`로
+  전환했다.
+- Attribution marker가 latency를 유의하게 교란하므로 결정은
+  `split-latency-marker-off-and-correctness-marker-on-phases`이다. 권위 latency stress는 marker를
+  끈 phase, correctness는 marker를 켠 별도 phase로 수행해야 하며 아직 실행하지 않았다.
+  `WIN-005`, `WIN-006`, `WSL-022`, `WSL-023`은 변경하지 않았다.
 
 ### 2026-08-06
 
