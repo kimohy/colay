@@ -971,7 +971,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 | `WIN-007` | medium | fix-in-progress (preflight and six corrected observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
 | `WIN-008` | medium | fix-in-progress (six active/stable health observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
-| `WIN-009` | medium | open | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
+| `WIN-009` | medium | fix-in-progress (focused readiness, static contracts, and independent review passed; reviewed one-shot A/B pending) | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -2063,10 +2063,57 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 
 ### Status and closure gate
 
-- Status: `open`. Before another one-shot A/B, determine whether the CLI must
-  withhold a successful `daemon_start` response until online readiness or the
-  marker must perform a bounded identity-preserving readiness transition.
-  Any correction requires focused fail-closed tests and independent review.
+- Status: `fix-in-progress`. The marker now parses exact schema-v1
+  `daemon_start`/`daemon_status` identity documents, anchors the canonical UUID,
+  integral PID, state/phase, and reviewed `colay.exe` path, and permits only
+  `booting` or `probing` before exact `online`. An immediate online start makes
+  zero status calls. Otherwise a monotonic five-second deadline polls only the
+  separated `--json daemon status` command, gives each child only the remaining
+  budget after a fixed 100ms cleanup reserve, and uses a fixed bounded 50ms
+  interval. Identity drift, terminal/non-progress state, malformed JSON,
+  state/phase mismatch, and timeout all fail before CIM, native handle capture,
+  or registration.
+- Readiness evidence is a separate observation field containing the original
+  and final states, poll count and per-poll bounds, elapsed time, anchored
+  identity, exact online document, and any failure. Only that exact online
+  document reaches the existing retained-handle capture, which still performs
+  its online check before the bounded CIM query and now accepts only exact
+  `daemon_start` or `daemon_status` command variants. The A/B decision continues
+  to read only `registration.elapsed_ms`; readiness elapsed time is not a
+  decision input.
+- This marker-only correction records a contract drift rather than changing the
+  product: the older startup-recovery design says successful `daemon start`
+  should return only after online readiness, while the current daemon and its
+  lifecycle tests intentionally expose `booting -> probing -> online`
+  asynchronously after IPC startup. Product supervision semantics remain
+  unchanged.
+- Verified portable PowerShell `7.6.4` focused RED reproduced
+  `daemon start expected exact state 'online', found 'booting'` and exited `1`.
+  The desired pre-implementation matrix also exited `1` because the strict
+  identity parser did not exist. The amended extracted-function GREEN matrix
+  exited `0` with `focused_readiness_matrix=passed`, covering immediate online,
+  delayed booting/probing/online, UUID/PID/path drift, terminal and malformed
+  status, state/phase mismatch, fractional PID, noncanonical UUID, non-exact
+  state/command case, bounded timeout including a late online subprocess result,
+  and online-before-CIM behavior.
+- The parser/AST check exited `0` with `parser_errors=0`,
+  `readiness_ast_contract=passed`, and `existing_static_contract=passed`. It
+  proves readiness precedes retained identity capture, retained identity
+  precedes registration, the readiness loop contains no CIM/native-handle,
+  SQLite, durable-state, or registration call, and the decision retains exactly
+  two `registration.elapsed_ms` inputs. The existing active-database behavioral
+  and static-contract fixtures also passed after distinguishing their cleanup
+  endpoint-status call from the new readiness status call.
+- The amended marker is `132441` bytes with SHA-256
+  `ae08b02574cb63e218a8ec0d7f38c8d380e7278d171ae598ab6bbccd7d08ab15`.
+  The unchanged stress harness remains
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  No marker A/B, authoritative stress, product, Cargo, or provider command was
+  run for this focused correction. Independent security/correctness re-review
+  of that exact marker hash returned Ready with zero Critical, Important, or
+  Minor findings after the online-result deadline guard and late-online fixture
+  resolved its initial Important finding. The reviewed one-shot invocation is
+  still required.
 - Closure still requires one new exact-clean-HEAD invocation with all eight
   observations, four counterbalanced pairs, ten checkpoints, zero retries,
   zero credentials, zero cleanup errors, and zero residual processes, plus an

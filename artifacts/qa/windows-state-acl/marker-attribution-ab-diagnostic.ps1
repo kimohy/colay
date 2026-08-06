@@ -17,6 +17,9 @@ $ErrorActionPreference = 'Stop'
 
 $MinimumFreeGiB = 5
 $CimOperationTimeoutSec = 5
+$DaemonReadinessTimeoutMs = 5000
+$DaemonReadinessPollIntervalMs = 50
+$DaemonReadinessCleanupReserveMs = 100
 $ExpectedObservationCount = 8
 $ExpectedPairCount = 4
 $ExpectedRetryCount = 0
@@ -1295,57 +1298,267 @@ function Get-AbExactCandidateProcesses {
     })
 }
 
-function Open-AbDaemonIdentity {
+function ConvertTo-AbDaemonDocumentIdentity {
     param(
-        [Parameter(Mandatory = $true)]$DaemonStartDocument,
+        [Parameter(Mandatory = $true)]$Document,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('daemon_start', 'daemon_status')]
+        [string]$ExpectedCommand,
         [Parameter(Mandatory = $true)][string]$ExpectedExecutable
     )
-    if ($DaemonStartDocument.schema_version -isnot [string] -or
-        [string]$DaemonStartDocument.schema_version -cne '1' -or
-        $DaemonStartDocument.command -isnot [string] -or
-        [string]$DaemonStartDocument.command -cne 'daemon_start') {
-        throw 'daemon start did not return exact schema-v1 daemon_start JSON'
+    if ($null -eq $Document -or
+        $Document.PSObject.Properties.Name -cnotcontains 'schema_version' -or
+        $Document.PSObject.Properties.Name -cnotcontains 'command' -or
+        $Document.PSObject.Properties.Name -cnotcontains 'data' -or
+        $Document.schema_version -isnot [string] -or
+        [string]$Document.schema_version -cne '1' -or
+        $Document.command -isnot [string] -or
+        [string]$Document.command -cne $ExpectedCommand) {
+        throw "$ExpectedCommand did not return exact schema-v1 $ExpectedCommand JSON"
     }
-    $instance = $DaemonStartDocument.data.status.instance
+    if ($null -eq $Document.data -or
+        $Document.data.PSObject.Properties.Name -cnotcontains 'status' -or
+        $null -eq $Document.data.status -or
+        $Document.data.status.PSObject.Properties.Name -cnotcontains 'state' -or
+        $Document.data.status.PSObject.Properties.Name -cnotcontains 'instance') {
+        throw "$ExpectedCommand JSON has no exact status identity"
+    }
+    $status = $Document.data.status
+    $instance = $status.instance
     if ($null -eq $instance) {
-        throw 'daemon start JSON has no exact instance identity'
+        throw "$ExpectedCommand JSON has no exact instance identity"
     }
-    foreach ($propertyName in @('instance_id', 'pid', 'executable_path')) {
-        if ($instance.PSObject.Properties.Name -notcontains $propertyName) {
-            throw "daemon start instance is missing exact property: $propertyName"
+    foreach ($propertyName in @('instance_id', 'pid', 'phase', 'executable_path')) {
+        if ($instance.PSObject.Properties.Name -cnotcontains $propertyName) {
+            throw "$ExpectedCommand instance is missing exact property: $propertyName"
         }
     }
-    if ($instance.instance_id -isnot [string] -or
-        $instance.executable_path -isnot [string] -or
-        $DaemonStartDocument.data.status.state -isnot [string]) {
-        throw 'daemon start instance id, executable path, and state must be exact JSON strings'
+    if ($status.state -isnot [string] -or
+        $instance.phase -isnot [string] -or
+        $instance.instance_id -isnot [string] -or
+        $instance.executable_path -isnot [string]) {
+        throw "$ExpectedCommand state, phase, instance id, and executable path must be exact JSON strings"
     }
+    $state = [string]$status.state
+    $phase = [string]$instance.phase
+    if ([string]::IsNullOrWhiteSpace($state) -or
+        [string]::IsNullOrWhiteSpace($phase) -or
+        $state -cne $phase) {
+        throw "$ExpectedCommand state/phase mismatch: state '$state', phase '$phase'"
+    }
+
     $instanceIdText = [string]$instance.instance_id
     try {
-        $instanceId = ([guid]::Parse($instanceIdText)).ToString('D')
+        $instanceId = ([guid]::ParseExact($instanceIdText, 'D')).ToString('D')
     } catch {
-        throw "daemon start returned a malformed instance id: $instanceIdText"
+        throw "$ExpectedCommand returned a malformed instance id: $instanceIdText"
     }
-    $daemonState = [string]$DaemonStartDocument.data.status.state
-    if ($daemonState -cne 'online') {
-        throw "daemon start expected exact state 'online', found '$daemonState'"
+    if ($instanceIdText -cne $instanceId) {
+        throw "$ExpectedCommand instance id is not canonical UUID text: $instanceIdText"
     }
+
     $integralPidTypes = @(
         [byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64]
     )
-    if ($integralPidTypes -notcontains $instance.pid.GetType()) {
-        throw "daemon start PID is not an exact JSON integer: $($instance.pid.GetType().FullName)"
+    if ($null -eq $instance.pid -or $integralPidTypes -notcontains $instance.pid.GetType()) {
+        $actualPidType = if ($null -eq $instance.pid) { 'null' } else { $instance.pid.GetType().FullName }
+        throw "$ExpectedCommand PID is not an exact JSON integer: $actualPidType"
     }
     $rawPid = [int64]$instance.pid
     if ($rawPid -le 0 -or $rawPid -gt [uint32]::MaxValue -or $rawPid -eq $PID) {
-        throw "daemon start returned an unsafe process id: $rawPid"
+        throw "$ExpectedCommand returned an unsafe process id: $rawPid"
     }
-    $processId = [uint32]$rawPid
-    $jsonPath = ConvertTo-AbComparableWindowsPath ([string]$instance.executable_path)
+
+    $executablePathText = [string]$instance.executable_path
+    if ([string]::IsNullOrWhiteSpace($executablePathText) -or
+        -not [System.IO.Path]::IsPathFullyQualified($executablePathText)) {
+        throw "$ExpectedCommand executable path is not an exact absolute path: $executablePathText"
+    }
+    $jsonPath = ConvertTo-AbComparableWindowsPath $executablePathText
     $expectedPath = ConvertTo-AbComparableWindowsPath $ExpectedExecutable
     if (-not $jsonPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "daemon start executable path mismatch: expected $expectedPath, found $jsonPath"
+        throw "$ExpectedCommand executable path mismatch: expected $expectedPath, found $jsonPath"
     }
+
+    return [pscustomobject][ordered]@{
+        Document = $Document
+        Command = [string]$Document.command
+        State = $state
+        Phase = $phase
+        InstanceId = $instanceId
+        ProcessId = [uint32]$rawPid
+        ExecutablePath = $jsonPath
+    }
+}
+
+function Wait-AbDaemonReadiness {
+    param(
+        [Parameter(Mandatory = $true)]$DaemonStartDocument,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutable,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    $evidenceKey = 'ColayMarkerAbDaemonReadinessEvidence'
+    $polls = [System.Collections.Generic.List[object]]::new()
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $anchor = $null
+    $evidence = [pscustomobject][ordered]@{
+        readiness_status = 'failed'
+        original_state = $null
+        final_state = $null
+        poll_count = 0
+        elapsed_ms = 0
+        overall_timeout_ms = $DaemonReadinessTimeoutMs
+        poll_interval_ms = $DaemonReadinessPollIntervalMs
+        cleanup_reserve_ms = $DaemonReadinessCleanupReserveMs
+        status_command = @('--json', 'daemon', 'status')
+        anchored_identity = $null
+        polls = @()
+        online_document = $null
+        failure = $null
+    }
+    try {
+        $anchor = ConvertTo-AbDaemonDocumentIdentity -Document $DaemonStartDocument `
+            -ExpectedCommand daemon_start -ExpectedExecutable $ExpectedExecutable
+        $evidence.original_state = $anchor.State
+        $evidence.final_state = $anchor.State
+        $evidence.anchored_identity = [pscustomobject][ordered]@{
+            instance_id = $anchor.InstanceId
+            process_id = [int]$anchor.ProcessId
+            executable_path = $anchor.ExecutablePath
+        }
+        if (@('booting', 'probing', 'online') -cnotcontains $anchor.State) {
+            throw "daemon readiness start returned terminal or non-progress state '$($anchor.State)'"
+        }
+        if ($anchor.State -ceq 'online') {
+            $evidence.readiness_status = 'online'
+            $evidence.online_document = $DaemonStartDocument
+            $evidence.elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+            return [pscustomobject][ordered]@{
+                Evidence = $evidence
+                OnlineDocument = $DaemonStartDocument
+            }
+        }
+
+        while ($true) {
+            $remainingBeforeSleepMs = $DaemonReadinessTimeoutMs - [int64]$stopwatch.ElapsedMilliseconds
+            $sleepBudgetMs = $remainingBeforeSleepMs - $DaemonReadinessCleanupReserveMs
+            if ($sleepBudgetMs -le 0) {
+                throw "daemon readiness timed out after ${DaemonReadinessTimeoutMs}ms"
+            }
+            $sleepMs = [int][Math]::Min($DaemonReadinessPollIntervalMs, $sleepBudgetMs)
+            Start-Sleep -Milliseconds $sleepMs
+
+            $remainingMs = $DaemonReadinessTimeoutMs - [int64]$stopwatch.ElapsedMilliseconds
+            $commandBudgetMs = [int]($remainingMs - $DaemonReadinessCleanupReserveMs)
+            if ($commandBudgetMs -le 0) {
+                throw "daemon readiness timed out after ${DaemonReadinessTimeoutMs}ms"
+            }
+            $pollNumber = $polls.Count + 1
+            $commandLabel = "$Label-daemon-readiness-{0:D3}" -f $pollNumber
+            $pollEvidence = [pscustomobject][ordered]@{
+                poll = $pollNumber
+                command_label = $commandLabel
+                command_timeout_ms = $commandBudgetMs
+                command_elapsed_ms = $null
+                command_exit_code = $null
+                command_timed_out = $null
+                observed_elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                state = $null
+                phase = $null
+                instance_id = $null
+                process_id = $null
+                executable_path = $null
+            }
+            $polls.Add($pollEvidence)
+            $evidence.poll_count = $polls.Count
+            $evidence.polls = $polls.ToArray()
+            $statusResult = Invoke-Colay -Repository $Repository `
+                -ArgumentValues @('--json', 'daemon', 'status') `
+                -Environment $Environment -Label $commandLabel `
+                -TimeoutMs $commandBudgetMs
+            $pollEvidence.command_elapsed_ms = [int64]$statusResult.elapsed_ms
+            $pollEvidence.command_exit_code = [int]$statusResult.exit_code
+            $pollEvidence.command_timed_out = [bool]$statusResult.timed_out
+            $pollEvidence.observed_elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+            if ([int64]$stopwatch.ElapsedMilliseconds -ge $DaemonReadinessTimeoutMs) {
+                throw "daemon readiness timed out after ${DaemonReadinessTimeoutMs}ms"
+            }
+            if ([bool]$statusResult.timed_out -or [int]$statusResult.exit_code -ne 0) {
+                throw "daemon readiness status poll $pollNumber did not exit successfully"
+            }
+            $statusDocument = Assert-StatusJson $statusResult
+            $statusIdentity = ConvertTo-AbDaemonDocumentIdentity -Document $statusDocument `
+                -ExpectedCommand daemon_status -ExpectedExecutable $ExpectedExecutable
+            $pollEvidence.state = $statusIdentity.State
+            $pollEvidence.phase = $statusIdentity.Phase
+            $pollEvidence.instance_id = $statusIdentity.InstanceId
+            $pollEvidence.process_id = [int]$statusIdentity.ProcessId
+            $pollEvidence.executable_path = $statusIdentity.ExecutablePath
+            if ($statusIdentity.InstanceId -cne $anchor.InstanceId -or
+                $statusIdentity.ProcessId -ne $anchor.ProcessId -or
+                -not $statusIdentity.ExecutablePath.Equals(
+                    $anchor.ExecutablePath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                throw "daemon readiness identity drift at status poll $pollNumber"
+            }
+            if ([int64]$stopwatch.ElapsedMilliseconds -ge $DaemonReadinessTimeoutMs) {
+                throw "daemon readiness timed out after ${DaemonReadinessTimeoutMs}ms"
+            }
+
+            $evidence.final_state = $statusIdentity.State
+            if ($statusIdentity.State -ceq 'online') {
+                $evidence.readiness_status = 'online'
+                $evidence.online_document = $statusDocument
+                $evidence.elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                return [pscustomobject][ordered]@{
+                    Evidence = $evidence
+                    OnlineDocument = $statusDocument
+                }
+            }
+            if (@('booting', 'probing') -cnotcontains $statusIdentity.State) {
+                throw "daemon readiness status poll $pollNumber returned terminal or non-progress state '$($statusIdentity.State)'"
+            }
+        }
+    } catch {
+        $evidence.poll_count = $polls.Count
+        $evidence.polls = $polls.ToArray()
+        $evidence.elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+        $evidence.failure = $_.Exception.Message
+        $_.Exception.Data[$evidenceKey] = $evidence
+        throw
+    } finally {
+        $stopwatch.Stop()
+    }
+}
+
+function Open-AbDaemonIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$DaemonDocument,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutable
+    )
+    if ($null -eq $DaemonDocument -or
+        $DaemonDocument.PSObject.Properties.Name -cnotcontains 'command' -or
+        $DaemonDocument.command -isnot [string]) {
+        throw 'retained daemon identity requires exact daemon_start or daemon_status JSON'
+    }
+    $daemonCommand = [string]$DaemonDocument.command
+    if ($daemonCommand -cne 'daemon_start' -and $daemonCommand -cne 'daemon_status') {
+        throw 'retained daemon identity requires exact daemon_start or daemon_status JSON'
+    }
+    $documentIdentity = ConvertTo-AbDaemonDocumentIdentity -Document $DaemonDocument `
+        -ExpectedCommand $daemonCommand -ExpectedExecutable $ExpectedExecutable
+    $daemonState = $documentIdentity.State
+    if ($daemonState -cne 'online') {
+        throw "retained daemon identity expected exact state 'online', found '$daemonState'"
+    }
+    $instanceId = $documentIdentity.InstanceId
+    $processId = $documentIdentity.ProcessId
+    $rawPid = [int64]$processId
+    $jsonPath = $documentIdentity.ExecutablePath
+    $expectedPath = ConvertTo-AbComparableWindowsPath $ExpectedExecutable
 
     $rows = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" `
         -Property ProcessId, ParentProcessId, CreationDate, Name, ExecutablePath `
@@ -1435,6 +1648,7 @@ function Open-AbDaemonIdentity {
             Handle = $handle
             Evidence = [pscustomobject][ordered]@{
                 capture_status = 'verified-retained-handle'
+                daemon_command = $documentIdentity.Command
                 instance_id = $instanceId
                 daemon_state = $daemonState
                 process_id = [int]$processId
@@ -2103,6 +2317,21 @@ try {
                 }
                 seed_timing = $null
                 daemon_start = $null
+                daemon_readiness = [pscustomobject][ordered]@{
+                    readiness_status = 'not-attempted'
+                    original_state = $null
+                    final_state = $null
+                    poll_count = 0
+                    elapsed_ms = 0
+                    overall_timeout_ms = $DaemonReadinessTimeoutMs
+                    poll_interval_ms = $DaemonReadinessPollIntervalMs
+                    cleanup_reserve_ms = $DaemonReadinessCleanupReserveMs
+                    status_command = @('--json', 'daemon', 'status')
+                    anchored_identity = $null
+                    polls = @()
+                    online_document = $null
+                    failure = $null
+                }
                 daemon_identity = [pscustomobject][ordered]@{
                     capture_status = 'not-attempted'
                     primary_failure = $null
@@ -2173,8 +2402,25 @@ try {
                     -Environment $environment -Label "$armLabel-daemon-start" -TimeoutMs 40000
                 $startDocument = Assert-StatusJson $started
                 $observation.daemon_start = $started
+                $readiness = $null
                 try {
-                    $daemonIdentity = Open-AbDaemonIdentity -DaemonStartDocument $startDocument `
+                    $readiness = Wait-AbDaemonReadiness -DaemonStartDocument $startDocument `
+                        -ExpectedExecutable $script:ResolvedColay -Repository $emptyRepository `
+                        -Environment $environment -Label $armLabel
+                    $observation.daemon_readiness = $readiness.Evidence
+                } catch {
+                    $readinessFailureEvidence = `
+                        $_.Exception.Data['ColayMarkerAbDaemonReadinessEvidence']
+                    if ($null -ne $readinessFailureEvidence) {
+                        $observation.daemon_readiness = $readinessFailureEvidence
+                    } else {
+                        $observation.daemon_readiness.failure = $_.Exception.Message
+                    }
+                    throw
+                }
+                try {
+                    $daemonIdentity = Open-AbDaemonIdentity `
+                        -DaemonDocument $readiness.OnlineDocument `
                         -ExpectedExecutable $script:ResolvedColay
                     $observation.daemon_identity = $daemonIdentity.Evidence
                 } catch {
