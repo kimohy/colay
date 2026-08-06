@@ -173,10 +173,11 @@ fields. Verification requires:
 - no deny, audit, object, callback, broad, duplicate, unknown, malformed, or trailing ACE data.
 
 ACE comparison is order-independent for acceptance, because trustee order does not change this
-allow-only policy. Repair constructs the canonical ACL in deterministic current-user, SYSTEM,
-Administrators order so repeated reads are stable. All ACL and ACE sizes use checked arithmetic,
-are bounded by Windows ACL limits, and are validated with `InitializeAcl`, `AddAccessAllowedAceEx`,
-and the relevant SID/ACL validation APIs before installation.
+allow-only policy. Repair constructs the canonical ACL in deterministic normalized unique-principal
+order so repeated reads are stable: current-user, SYSTEM, Administrators for a normal user, and
+SYSTEM, Administrators for LocalSystem. All ACL and ACE sizes use checked arithmetic, are bounded
+by Windows ACL limits, and are validated with `InitializeAcl`, `AddAccessAllowedAceEx`, and the
+relevant SID/ACL validation APIs before installation.
 
 If the first same-handle read is already exact, `ensure` returns without a write. This is the normal
 steady-state path. If it differs, `ensure` snapshots the owner SID, builds a non-null bounded ACL,
