@@ -942,7 +942,12 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-010` | high | fix-in-progress (corrected exact A/B passed; one-shot stress and CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WIN-015` | medium | fix-in-progress (PowerShell 7.2/7.6 focused passes; exact A/B/stress pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
+| `WIN-014` | low | fix-in-progress (deterministic fixture and 48/48 focused passes; review/merge pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
+| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24 and 7.6 focused passes; exact A/B/stress pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
+| `WIN-012` | medium | fix-in-progress (structural matrix passed on PowerShell 7.2/7.6; exact A/B/stress pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
+| `WIN-011` | medium | fix-in-progress (PID matrix passed on PowerShell 7.2/7.6; exact stress re-acceptance pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
+| `WIN-010` | high | fix-in-progress (corrected A/B passed; stress blocked by WIN-011 and latency gates; CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -968,7 +973,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
-| `WIN-005` | high | fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-005` | high | fix-in-progress (pre-timing source separation passed focused checks; exact re-acceptance pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 | `WIN-007` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
 | `WIN-008` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
@@ -1792,6 +1797,80 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   sealed-plan apply reinspection 합계 2회다. source hash와 import ledger/workspace cardinality는
   유지해야 한다. `WIN-005`, `WSL-022`, `WSL-023`은 published verification 전에는 닫지 않는다.
 
+### 2026-08-06 exact-HEAD authoritative stress — failed, not retried
+
+- Clean source commit `7212e5386db7c2c6a6d3f0456e59e0b132500980` was invoked exactly
+  once through portable PowerShell 7.6.4 with separated arguments. The pinned stress
+  harness was `9f64b3ffb7a0b3fb340bbc265d0042d1c5fcbf265ee3e3c873e057f30ecaaaaa`,
+  `colay.exe` was `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  and the fake provider was
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+  The external shell invocation exited `1` after `193.5s` of wall time and was not retried. The
+  artifact interval was `192.2597939s` (`2026-08-06T19:49:44.2558103Z` through
+  `2026-08-06T19:52:56.5156042Z`).
+- Preserved schema-2 evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260806T194944250Z.json`
+  is `465,770` bytes with SHA-256
+  `fd229cbfe2e337b16af985aa1624e638fb909cd265806974234e08881ee53fbb`;
+  its companion `summary.json` is `99,943` bytes with SHA-256
+  `2b4168e19c3417e5d4c2efd8b3c3c860f75d679fff87fd470c1efa233a4918ef`.
+- Registration timing did not meet acceptance: serial OS-process lifetimes were
+  `4928, 5399, 5040, 4941, 4034ms`, so nearest-rank p95 was `5399ms` against
+  `5000ms`; concurrent lifetimes were `6579, 7723, 7800, 8358ms`, with
+  `concurrent-register-9` exceeding the `8000ms` limit by `358ms`. These two
+  acceptance failures remain valid `WIN-005` evidence independently of the later
+  process-audit harness failure. Limits were not relaxed.
+- The latency phase otherwise reached aggregate inspection count `18`, attributed
+  group/event `0/0`, five serial and four concurrent completions, SQLite integrity
+  `ok`, zero foreign-key violations, zero writable rows, and source commit identity
+  `verified_clean`. The correctness helper child exited `0` after `16,316ms`, and its
+  emitted `functional-audit.json` reported status `success`, but `WIN-011` then aborted
+  the parent validator. Consequently
+  `process_audit.functional` and correctness aggregate/group/event/source-hash fields
+  remained null and no authoritative correctness result was published or accepted.
+- Cleanup stopped both main and audit daemons, confirmed stopped endpoints and zero
+  live leases, left zero residual processes, zero cleanup errors, zero forbidden
+  utility launches, and zero ownership refusals. All provider credential names were
+  cleared and `fake_provider_only` was true. This failed run is not authoritative
+  acceptance and cannot close `WIN-005` or `WIN-010`.
+
+### Host-write control and pre-timing fixture separation
+
+- The unchanged Python/SQLite schema-v8 seed control was also materially slower than
+  the accepted `20260805T093708005Z` baseline. Its nine-write median changed from
+  `744ms` (minimum `688ms`, maximum `3670ms`) to `3308ms` (minimum `2448ms`,
+  maximum `3786ms`), about `4.45x`, while read-only Python controls improved from
+  median `157ms` (mean `156ms`) to median `102ms` (mean `101ms`). The corrected A/B
+  immediately before stress likewise
+  recorded seed times from `2994ms` to `12541ms` and registration from `1332ms` to
+  `5926ms`, then rejected combined timing because of seed and order noise.
+- Runtime crate changes since the accepted product baseline are limited to an
+  attributed-marker environment lookup that returns before I/O when its key is absent
+  and LocalSystem principal normalization on the existing ACL path. Neither explains
+  a multi-second normal-user regression. Therefore the observed user-visible threshold
+  failures remain a hard merge failure, but the evidence does not attribute them to a
+  product, marker, or LocalSystem regression. Newly written SQLite/Windows filesystem
+  contention is the stronger current confounder and working hypothesis, not a proven
+  cause. Thresholds remain `5000/8000ms`.
+- The harness now creates and verifies all nine distinct latency sources before the
+  timing self-test and before daemon startup, retains them in an exact index map, and
+  only registers those prepared paths during the measured serial/concurrent phases.
+  It fail-closed validates the exact ordered labels `seed-schema-v8-1..9`, retained
+  integer indexes, OS-process-lifetime method, integral exit `0`, Boolean non-timeout,
+  and nonnegative integral elapsed time. It publishes all nine seed-write times,
+  min/median/max, exact labels and source count as
+  `measurement_diagnostics.latency_source_preparation` with
+  `timing_included_in_latency_thresholds=false`. This uses no sleep and does not
+  subtract setup from a command lifetime. It removes synchronous synthetic fresh-file
+  creation from the measured period and reduces overlap risk from antivirus/indexer
+  work, but does not observe or guarantee that background work has finished.
+- Focused RED proved there were two in-timing fixture creation sites. GREEN requires
+  one exact `1..9` pre-timing call site and passed with the unchanged marker, readiness,
+  cleanup, and threshold contracts. If a fresh exact run still exceeds a product
+  limit, test-fixtures-only inspect/prepare/queue/commit telemetry is required before
+  any product optimization; durability, fsync, ACL, and verification checks must not
+  be weakened speculatively.
+
 ### Historical source-fixed baseline — not current acceptance
 
 - Source `a52945d`에는 native ACL commits `c83200d`, `83181f0`, `ab5617e`, `361391a`,
@@ -2413,6 +2492,132 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   attribution with latency acceptance. `WIN-010` therefore remains open only for the
   one-shot authoritative stress plus published CI/nightly verification; that stress
   had not yet been run when this evidence was committed.
+
+## WIN-011: process-audit PID multiset comparison is insertion-order sensitive
+
+### Observation and root cause
+
+- The one-shot authoritative stress reached the strong process-audit evidence check
+  and then reported `process audit start/exit PID multiset changed`. Direct parsing of
+  the preserved failure payload found exactly `45` start keys and `45` exit keys with
+  zero missing, extra, or changed counts. Only the JSON property order differed.
+- `Assert-EquivalentJson` serialized two ordinary PowerShell hashtables and compared
+  their compressed JSON strings. Hashtable enumeration order is not a semantic part
+  of a PID multiset, so equal start/exit evidence could fail nondeterministically.
+
+### Focused correction and remaining gate
+
+- An interim dedicated PID comparator removed insertion-order sensitivity, but review
+  found its `[int64]` casts would also accept string, Boolean, or fractional count
+  values. It was therefore removed rather than retained as a second, weaker contract.
+  The strong audit now uses the shared structural JSON comparator, which compares PID
+  property names ordinally and preserves each count's JSON scalar type and value.
+- Focused coverage accepts different PID-map insertion order and rejects an occurrence
+  count change, same-cardinality PID substitution, string, Boolean, and fractional
+  count values. The complete suite passed `48/48` on official PowerShell 7.2.24 and
+  pinned PowerShell 7.6.4. No authoritative stress retry has been performed for this
+  uncommitted correction.
+- `WIN-011` remains `fix-in-progress` until independent review, a new exact-input
+  commit, and one fresh authoritative stress run. That run
+  must also satisfy the unchanged `WIN-005` 5,000ms serial-p95 and 8,000ms per-command
+  concurrent limits before either issue can close.
+
+## WIN-012: generic JSON equivalence loses JSON structure
+
+### Observation and correction
+
+- The same review found that `Assert-EquivalentJson` used pipeline serialization and
+  raw string equality. Besides treating object insertion order as data, PowerShell
+  pipeline enumeration converts a singleton array such as `@('PATH')` into scalar
+  JSON `"PATH"`, so an array/scalar contract violation could compare equal.
+- The focused RED rejected a root and nested SQLite-family object with identical
+  values in different property order. The correction serializes with explicit
+  `ConvertTo-Json -InputObject`, parses both values with `JsonDocument`, and performs
+  a recursive `JsonElement` comparison. Object property names are compared ordinally
+  independent of insertion order; arrays retain order and shape, and scalar JSON
+  type/value remains significant.
+- GREEN accepts reordered root/nested objects including the empty SQLite primary-file
+  suffix key and rejects reversed arrays, singleton-array versus scalar, number/string,
+  boolean/string, changed SHA-256, and missing suffix cases. The same comparator covers
+  PID multisets without scalar coercion. The complete suite passed `48/48` on official
+  PowerShell 7.2.24 and pinned PowerShell 7.6.4. Exact A/B/stress and published
+  verification are still required before `WIN-012` closes.
+
+## WIN-013: JSON equivalence violated the declared PowerShell 7.2 runtime floor
+
+### Observation and correction
+
+- Independent review found that the interim `JsonNode.DeepEquals` implementation was
+  introduced while the stress, focused-test, and diagnostic scripts still declare
+  `#requires -Version 7.2`. That API is absent from the .NET 6 and .NET 7
+  `System.Text.Json` assemblies used by PowerShell 7.2/7.3. A first recursive rewrite
+  also used `JsonElement.GetPropertyCount()`, another API absent before .NET 8.
+- The final implementation uses only the .NET 6-compatible `JsonDocument.Parse`,
+  `JsonElement.EnumerateObject`, `EnumerateArray`, `GetArrayLength`, `GetRawText`, and
+  scalar accessors. Both expected and actual objects are materialized into ordinal
+  dictionaries with duplicate-name rejection before cardinality and recursive value
+  comparison. The focused static contract forbids `JsonNode.DeepEquals` from returning.
+- The final official 7.2 release, PowerShell `7.2.24` on `.NET 6.0.35`, was downloaded
+  from its GitHub release with its published `hashes.sha256`. The manifest SHA-256 is
+  `934fca92dd10e7ca324f69240881b3789c3927b8691818ea9484bf1002bca9aa`;
+  the 107,886,044-byte ZIP's published and local SHA-256 both equal
+  `a1ccb6d8ad52f917470a136c3752af4465f261bcbe570cf44f52aa69ae6e867e`.
+  Extracted `pwsh.exe` is 289,824 bytes, SHA-256
+  `689a44bf484cef719bf5022396c2bd82ee81860029eb1152f06c4771d9b032b6`,
+  with a valid Microsoft Corporation Authenticode signature.
+- After the separate `WIN-015` residue-probe correction, the complete focused suite
+  passed `48/48` on official PowerShell 7.2.24 in `18.8s` and on pinned PowerShell
+  7.6.4 in `21.0s`; all three relevant scripts parsed with zero errors. `WIN-013`
+  remains `fix-in-progress` until fresh exact A/B/stress evidence passes.
+
+## WIN-014: readiness deadline fixture can expire before its required status poll
+
+### Observation and correction
+
+- A latest-snapshot focused run executed beside the process-audit helper and reached
+  the expected `timed out after 35ms` failure, but the fixture then failed because its
+  mock status-call list was still empty. Host scheduling had consumed the deliberately
+  tiny deadline before the first poll, so the test did not deterministically exercise
+  the post-command monotonic deadline path it claimed to cover.
+- The fixture now uses a 500ms overall budget and enqueues one mock status response
+  that records the call, waits 600ms, and returns `booting`. It requires exactly one
+  recorded poll and the exact `timed out after 500ms` failure. No production readiness
+  timeout, cleanup reserve, or command implementation changed.
+- The corrected fixture passed in the complete `48/48` suite on both official
+  PowerShell 7.2.24 and pinned PowerShell 7.6.4. `WIN-014` remains `fix-in-progress`
+  until independent review and merge.
+
+## WIN-015: PowerShell 7.2 can enumerate exited processes with empty identity fields
+
+### Observation and correction
+
+- The first official PowerShell 7.2.24 compatibility run passed `43/46` focused cases.
+  Three deadline-cleanup cases failed after successful termination because
+  `Get-Process -Id` briefly returned the already exited candidate with
+  `HasExited=true` and null `StartTime`/`Path`. PowerShell 7.6.4 returned no candidate
+  for the same state. Direct `GetFullPath($candidate.Path)` therefore raised a test
+  error unrelated to a live process leak.
+- Both stress-harness process-generation observers now check `HasExited` before
+  reading identity fields and recheck it if an identity read races with termination.
+  An exited candidate is reported as non-live with no observation error. A live
+  candidate with an unreadable creation time or executable path remains
+  `process_exists=true`, `identity_verified=false`, and fail-closed. The focused
+  manual residue checks use the shared observer; the emergency cleanup path performs
+  the same exit-first check before any identity-bound kill.
+- Review then found two full-harness failure-cleanup self-test checks that still
+  equated a non-null `Get-Process` result with a live process, plus a batch rollback
+  catch that converted every identity-read failure to `not running`. The self-tests
+  now use a shared exit-aware liveness observer, and batch rollback uses the exact
+  generation observer. A live unverified rollback candidate is recorded as a cleanup
+  failure and treated as still running; neither path performs an unbound kill.
+- A deterministic mock covers both sides: exited/null identity is accepted as
+  non-live, while live/null identity produces an observation error. The generated
+  audit-child observer is also required to reject a live unverified candidate.
+  A static contract rejects raw self-test liveness checks and direct
+  `Process.GetProcessById` rollback inspection. Complete focused suites then passed
+  `48/48` concurrently on official PowerShell 7.2.24 in `18.8s` and pinned PowerShell
+  7.6.4 in `21.0s`. `WIN-015` remains
+  `fix-in-progress` until independent review and fresh exact A/B/stress evidence.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 

@@ -141,6 +141,7 @@ $requiredStressFunctions = @(
     'Get-AttributedInspectionSnapshot',
     'Assert-LatencyInspectionMarkers',
     'Assert-CorrectnessInspectionMarkers',
+    'ConvertTo-NormalizedProcessCreationUtc',
     'ConvertTo-NormalizedExecutablePath',
     'Assert-HarnessDeadlineContract',
     'Get-MonotonicElapsedCeilingMs',
@@ -150,6 +151,11 @@ $requiredStressFunctions = @(
     'Wait-MainDaemonReadiness',
     'Assert-AuditDaemonReadinessEvidence',
     'Assert-StatusJson',
+    'Get-ProcessGenerationObservation',
+    'Get-ProcessLivenessObservation',
+    'Test-JsonElementStructuralEquality',
+    'Assert-EquivalentJson',
+    'Assert-LatencySourcePreparationEvidence',
     'Complete-FailedHarnessProcess',
     'Start-HarnessProcess',
     'Wait-HarnessProcess',
@@ -167,9 +173,316 @@ Invoke-TestCase 'stress harness exposes the marker phase helpers' {
     }
 }
 
+Invoke-TestCase 'latency source fixtures are fully prepared before daemon timing' {
+    $stressText = $stressAst.Extent.Text
+    $seedPattern = 'New-LegacyWorkspace\s+-Index\s+\$index\s+-Root\s+\$workspaceRoot'
+    $seedMatches = [regex]::Matches($stressText, $seedPattern)
+    Assert-Equal 1 $seedMatches.Count `
+        'latency fixture creation must have one exact pre-timing call site'
+    $verifiedCleanOffset = $stressText.IndexOf(
+        '$summary.source_identity.verification_status = ''verified_clean''',
+        [System.StringComparison]::Ordinal
+    )
+    $timingSelfTestOffset = $stressText.IndexOf(
+        '$summary.measurement_diagnostics.timing_self_test =',
+        [System.StringComparison]::Ordinal
+    )
+    $daemonStartOffset = $stressText.IndexOf(
+        '$started = Invoke-Colay -Repository',
+        [System.StringComparison]::Ordinal
+    )
+    Assert-True ($verifiedCleanOffset -ge 0) 'verified-clean statement was not found'
+    Assert-True ($timingSelfTestOffset -ge 0) 'timing self-test statement was not found'
+    Assert-True ($daemonStartOffset -ge 0) 'main daemon start statement was not found'
+    Assert-True (
+        $verifiedCleanOffset -lt $seedMatches[0].Index -and
+        $seedMatches[0].Index -lt $timingSelfTestOffset -and
+        $timingSelfTestOffset -lt $daemonStartOffset
+    ) 'latency fixture ordering is not verified-clean, seed, timing self-test, daemon start'
+    Assert-True ($stressText -match '\$latencySeeds\s*=\s*@\{\}') `
+        'latency fixture preparation does not retain an exact seed map'
+    Assert-True ($stressText -match 'foreach\s*\(\$index\s+in\s+1\.\.9\)') `
+        'latency fixture preparation does not cover all nine sources before timing'
+    $retainedSeedPattern = '\$seed\s*=\s*\$latencySeeds\[\$index\]'
+    Assert-Equal 2 ([regex]::Matches($stressText, $retainedSeedPattern).Count) `
+        'serial and concurrent registration must each consume the retained seed map exactly once'
+    Assert-True ([regex]::IsMatch(
+            $stressText,
+            'for\s*\(\$index\s*=\s*1;\s*\$index\s*-le\s*5;\s*\$index\+\+\)\s*\{\s*\$seed\s*=\s*\$latencySeeds\[\$index\]',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline
+        )) 'serial registration does not consume retained seed indexes 1 through 5'
+    Assert-True ([regex]::IsMatch(
+            $stressText,
+            'foreach\s*\(\$index\s+in\s+6\.\.9\)\s*\{\s*\$seed\s*=\s*\$latencySeeds\[\$index\]',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline
+        )) 'concurrent registration does not consume retained seed indexes 6 through 9'
+    Assert-True ($stressText -match 'Assert-LatencySourcePreparationEvidence\s+-Seeds\s+\$latencySeeds') `
+        'latency fixture preparation does not validate retained sources and command evidence'
+    Assert-True ($stressText -match 'latency_source_preparation\s*=') `
+        'latency fixture preparation evidence is not published'
+    Assert-True ($stressText -match 'timing_included_in_latency_thresholds\s*=\s*\$false') `
+        'latency fixture preparation evidence does not explicitly exclude setup timing'
+}
+
+Invoke-TestCase 'failure cleanup residue checks use exit-aware fail-closed observers' {
+    $selfTestText = (Get-FunctionAst -Ast $stressAst `
+            -Name 'Invoke-HarnessFailureCleanupSelfTest').Extent.Text
+    Assert-Equal 0 ([regex]::Matches($selfTestText, 'Get-Process\s+-Id').Count) `
+        'failure cleanup self-test still uses raw process-null liveness checks'
+    Assert-Equal 2 ([regex]::Matches($selfTestText, 'Get-ProcessLivenessObservation').Count) `
+        'failure cleanup self-test does not use the shared liveness observer at both sites'
+
+    $batchText = (Get-FunctionAst -Ast $stressAst -Name 'Start-OwnedHarnessProcessBatch').Extent.Text
+    Assert-True ($batchText -notmatch 'GetProcessById') `
+        'batch rollback still uses a fail-open direct process identity read'
+    Assert-True ($batchText -match 'Get-ProcessGenerationObservation') `
+        'batch rollback does not use the shared generation observer'
+    Assert-True ([regex]::IsMatch(
+            $batchText,
+            'process_exists\s+-and\s*-not\s+\$generationObservation\.identity_verified',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline
+        )) 'batch rollback does not fail closed on a live unverified process'
+}
+
 foreach ($name in $requiredStressFunctions) {
     if ($availableStressFunctions -ccontains $name) {
         . ([scriptblock]::Create((Get-FunctionAst -Ast $stressAst -Name $name).Extent.Text))
+    }
+}
+
+if ($availableStressFunctions -ccontains 'Get-ProcessGenerationObservation') {
+    Invoke-TestCase 'process generation observation separates exited empty-path candidates from live ambiguity' {
+        function Get-Process {
+            return $script:processObservationCandidate
+        }
+        $expectedStartedAt = [datetime]::UtcNow
+        $expectedExecutable = [System.IO.Path]::GetFullPath((Join-Path $PSHOME 'pwsh.exe'))
+
+        $script:processObservationCandidate = [pscustomobject]@{
+            HasExited = $true
+            StartTime = $null
+            Path = $null
+        }
+        $script:processObservationCandidate | Add-Member -MemberType ScriptMethod `
+            -Name Dispose -Value { }
+        $exited = Get-ProcessGenerationObservation -ProcessId 4242 `
+            -ExpectedCreationTimeUtc $expectedStartedAt -ExpectedExecutablePath $expectedExecutable
+        Assert-True (-not $exited.process_exists) `
+            'exited empty-path candidate was reported as a live process'
+        Assert-True (-not $exited.identity_verified) `
+            'exited empty-path candidate was reported as identity-verified'
+        Assert-True ($null -eq $exited.observation_error) `
+            'exited empty-path candidate retained an observation error'
+        $exitedLiveness = Get-ProcessLivenessObservation -ProcessId 4242
+        Assert-True (-not $exitedLiveness.process_exists) `
+            'liveness observer reported an exited candidate as live'
+        Assert-True ($null -eq $exitedLiveness.observation_error) `
+            'liveness observer retained an error for an exited candidate'
+
+        $script:processObservationCandidate = [pscustomobject]@{
+            HasExited = $false
+            StartTime = $expectedStartedAt.ToLocalTime()
+            Path = $null
+        }
+        $script:processObservationCandidate | Add-Member -MemberType ScriptMethod `
+            -Name Dispose -Value { }
+        $ambiguous = Get-ProcessGenerationObservation -ProcessId 4242 `
+            -ExpectedCreationTimeUtc $expectedStartedAt -ExpectedExecutablePath $expectedExecutable
+        Assert-True $ambiguous.process_exists 'live empty-path candidate was reported as absent'
+        Assert-True (-not $ambiguous.identity_verified) `
+            'live empty-path candidate was reported as identity-verified'
+        Assert-True (-not [string]::IsNullOrWhiteSpace([string]$ambiguous.observation_error)) `
+            'live empty-path candidate did not fail closed with an observation error'
+        $liveLiveness = Get-ProcessLivenessObservation -ProcessId 4242
+        Assert-True $liveLiveness.process_exists `
+            'liveness observer reported a live candidate as absent'
+        Assert-True ($null -eq $liveLiveness.observation_error) `
+            'liveness observer reported an unexpected error for a readable live candidate'
+    }
+}
+
+if ($availableStressFunctions -ccontains 'Assert-LatencySourcePreparationEvidence') {
+    Invoke-TestCase 'latency source preparation evidence fails closed on labels and command state' {
+        $newFixture = {
+            $seeds = @{}
+            $commands = @()
+            foreach ($index in 1..9) {
+                $seeds[$index] = [pscustomobject]@{ index = [int]$index }
+                $commands += [pscustomobject]@{
+                    label = "seed-schema-v8-$index"
+                    measurement_method = 'os-process-lifetime'
+                    exit_code = [int]0
+                    timed_out = $false
+                    elapsed_ms = [int64](10 * $index)
+                }
+            }
+            return [pscustomobject]@{ seeds = $seeds; commands = $commands }
+        }
+
+        $valid = & $newFixture
+        $evidence = Assert-LatencySourcePreparationEvidence -Seeds $valid.seeds `
+            -CommandEvidence $valid.commands
+        Assert-Equal 9 $evidence.source_count 'latency source preparation source count'
+        Assert-Equal 10 $evidence.minimum_ms 'latency source preparation minimum'
+        Assert-Equal 50 $evidence.median_ms 'latency source preparation median'
+        Assert-Equal 90 $evidence.maximum_ms 'latency source preparation maximum'
+        Assert-True $evidence.completed_before_timing_self_test `
+            'latency source preparation did not record timing self-test exclusion'
+        Assert-True (-not $evidence.timing_included_in_latency_thresholds) `
+            'latency source preparation included fixture writes in product latency'
+
+        $reordered = & $newFixture
+        [array]::Reverse($reordered.commands)
+        Assert-Throws -Action {
+            Assert-LatencySourcePreparationEvidence -Seeds $reordered.seeds `
+                -CommandEvidence $reordered.commands
+        } -MessagePattern 'label mismatch' -Message 'latency source preparation accepted reordered labels'
+
+        $missingSeed = & $newFixture
+        [void]$missingSeed.seeds.Remove(9)
+        Assert-Throws -Action {
+            Assert-LatencySourcePreparationEvidence -Seeds $missingSeed.seeds `
+                -CommandEvidence $missingSeed.commands
+        } -MessagePattern 'retained 8 sources' -Message 'latency source preparation accepted a missing seed'
+
+        $wrongIndex = & $newFixture
+        $wrongIndex.seeds[9].index = '9'
+        Assert-Throws -Action {
+            Assert-LatencySourcePreparationEvidence -Seeds $wrongIndex.seeds `
+                -CommandEvidence $wrongIndex.commands
+        } -MessagePattern 'invalid source at index 9' `
+            -Message 'latency source preparation accepted a non-integral seed index'
+
+        foreach ($case in @(
+                [pscustomobject]@{ property = 'measurement_method'; value = 'wall-clock'; pattern = 'lacks OS process lifetime' },
+                [pscustomobject]@{ property = 'exit_code'; value = '0'; pattern = 'did not exit successfully' },
+                [pscustomobject]@{ property = 'timed_out'; value = $true; pattern = 'invalid timeout evidence' },
+                [pscustomobject]@{ property = 'timed_out'; value = 'false'; pattern = 'invalid timeout evidence' },
+                [pscustomobject]@{ property = 'elapsed_ms'; value = -1; pattern = 'invalid elapsed time evidence' },
+                [pscustomobject]@{ property = 'elapsed_ms'; value = '10'; pattern = 'invalid elapsed time evidence' }
+            )) {
+            $invalid = & $newFixture
+            $invalid.commands[0].($case.property) = $case.value
+            Assert-Throws -Action {
+                Assert-LatencySourcePreparationEvidence -Seeds $invalid.seeds `
+                    -CommandEvidence $invalid.commands
+            } -MessagePattern $case.pattern `
+                -Message "latency source preparation accepted invalid $($case.property)"
+        }
+    }
+}
+
+if ($availableStressFunctions -ccontains 'Assert-EquivalentJson') {
+    Invoke-TestCase 'process audit PID multiset comparison ignores map insertion order and rejects mismatches' {
+        $starts = [ordered]@{}
+        $starts['30472'] = 1
+        $starts['16344'] = 2
+        $starts['16164'] = 1
+        $exits = [ordered]@{}
+        $exits['16164'] = 1
+        $exits['16344'] = 2
+        $exits['30472'] = 1
+        Assert-True (($starts | ConvertTo-Json -Compress) -cne ($exits | ConvertTo-Json -Compress)) `
+            'PID multiset fixture did not preserve its deliberate JSON property-order difference'
+        Assert-EquivalentJson -Expected $starts -Actual $exits `
+            -Label 'reordered fixture'
+
+        $wrongCount = [ordered]@{}
+        $wrongCount['16164'] = 1
+        $wrongCount['16344'] = 1
+        $wrongCount['30472'] = 1
+        Assert-Throws -Action {
+            Assert-EquivalentJson -Expected $starts -Actual $wrongCount `
+                -Label 'count mismatch fixture'
+        } -MessagePattern 'count mismatch fixture changed' `
+            -Message 'process audit PID multiset accepted a changed occurrence count'
+
+        $wrongPid = [ordered]@{}
+        $wrongPid['16164'] = 1
+        $wrongPid['16344'] = 2
+        $wrongPid['99999'] = 1
+        Assert-Throws -Action {
+            Assert-EquivalentJson -Expected $starts -Actual $wrongPid `
+                -Label 'PID mismatch fixture'
+        } -MessagePattern 'PID mismatch fixture changed' `
+            -Message 'process audit PID multiset accepted a changed PID key'
+
+        foreach ($invalidCount in @('1', $true, [double]1.5)) {
+            $wrongType = [ordered]@{}
+            $wrongType['16164'] = 1
+            $wrongType['16344'] = 2
+            $wrongType['30472'] = $invalidCount
+            Assert-Throws -Action {
+                Assert-EquivalentJson -Expected $starts -Actual $wrongType `
+                    -Label 'PID count type fixture'
+            } -MessagePattern 'PID count type fixture changed' `
+                -Message "process audit PID multiset accepted count value '$invalidCount'"
+        }
+    }
+}
+
+if ($availableStressFunctions -ccontains 'Assert-EquivalentJson') {
+    Invoke-TestCase 'JSON equivalence ignores object order but preserves arrays and scalar types' {
+        $equivalenceText = (Get-FunctionAst -Ast $stressAst -Name 'Assert-EquivalentJson').Extent.Text
+        $structuralText = (Get-FunctionAst -Ast $stressAst `
+                -Name 'Test-JsonElementStructuralEquality').Extent.Text
+        Assert-True (($equivalenceText + $structuralText) -notmatch 'JsonNode.*DeepEquals') `
+            'JSON equivalence uses JsonNode.DeepEquals, which is unavailable on PowerShell 7.2/.NET 6'
+        $expectedFamily = [ordered]@{
+            '' = [ordered]@{ bytes = 4096; sha256 = ('a' * 64) }
+            '-wal' = [ordered]@{ bytes = 0; sha256 = ('b' * 64) }
+        }
+        $reorderedFamily = [ordered]@{
+            '-wal' = [ordered]@{ sha256 = ('b' * 64); bytes = 0 }
+            '' = [ordered]@{ sha256 = ('a' * 64); bytes = 4096 }
+        }
+        Assert-EquivalentJson -Expected $expectedFamily -Actual $reorderedFamily `
+            -Label 'reordered object fixture'
+
+        $orderedArray = @(1, 2)
+        $reorderedArray = @(2, 1)
+        Assert-Throws -Action {
+            Assert-EquivalentJson -Expected $orderedArray -Actual $reorderedArray `
+                -Label 'array order fixture'
+        } -MessagePattern 'array order fixture changed' `
+            -Message 'JSON equivalence ignored array order'
+
+        $singletonArray = @('PATH')
+        Assert-Throws -Action {
+            Assert-EquivalentJson -Expected $singletonArray -Actual 'PATH' `
+                -Label 'singleton array fixture'
+        } -MessagePattern 'singleton array fixture changed' `
+            -Message 'JSON equivalence collapsed a singleton array to its scalar'
+
+        foreach ($scalarCase in @(
+                [pscustomobject]@{ expected = 4096; actual = '4096'; label = 'number type fixture' },
+                [pscustomobject]@{ expected = $true; actual = 'true'; label = 'boolean type fixture' }
+            )) {
+            Assert-Throws -Action {
+                Assert-EquivalentJson -Expected $scalarCase.expected -Actual $scalarCase.actual `
+                    -Label $scalarCase.label
+            } -MessagePattern ([regex]::Escape("$($scalarCase.label) changed")) `
+                -Message "JSON equivalence ignored $($scalarCase.label)"
+        }
+
+        $changedHash = [ordered]@{
+            '' = [ordered]@{ bytes = 4096; sha256 = ('c' * 64) }
+            '-wal' = [ordered]@{ bytes = 0; sha256 = ('b' * 64) }
+        }
+        Assert-Throws -Action {
+            Assert-EquivalentJson -Expected $expectedFamily -Actual $changedHash `
+                -Label 'hash fixture'
+        } -MessagePattern 'hash fixture changed' `
+            -Message 'JSON equivalence ignored a changed source hash'
+
+        $missingSuffix = [ordered]@{
+            '' = [ordered]@{ bytes = 4096; sha256 = ('a' * 64) }
+        }
+        Assert-Throws -Action {
+            Assert-EquivalentJson -Expected $expectedFamily -Actual $missingSuffix `
+                -Label 'suffix fixture'
+        } -MessagePattern 'suffix fixture changed' `
+            -Message 'JSON equivalence ignored a missing SQLite suffix'
     }
 }
 
@@ -632,20 +945,13 @@ try {
             Assert-True (($commandRow.deadline.command_timeout_ms + $commandRow.deadline.exit_wait_limit_ms +
                     $commandRow.deadline.output_drain_limit_ms) -le $commandRow.deadline.remaining_at_launch_ms) `
                 'main hanging status launch budget exceeded actual remaining time'
-            $candidate = Get-Process -Id $publishedPid -ErrorAction SilentlyContinue
-            if ($null -ne $candidate) {
-                try {
-                    $sameGeneration = $candidate.StartTime.ToUniversalTime() -eq
-                        ([datetime]$commandRow.process_started_at_utc).ToUniversalTime() -and
-                        ([System.IO.Path]::GetFullPath($candidate.Path)).Equals(
-                            $script:mainPortablePowerShell,
-                            [System.StringComparison]::OrdinalIgnoreCase
-                        )
-                    Assert-True (-not $sameGeneration) 'main hanging status left exact process residue'
-                } finally {
-                    $candidate.Dispose()
-                }
-            }
+            $residue = Get-ProcessGenerationObservation -ProcessId $publishedPid `
+                -ExpectedCreationTimeUtc ([datetime]$commandRow.process_started_at_utc) `
+                -ExpectedExecutablePath $script:mainPortablePowerShell
+            Assert-True (-not ($residue.process_exists -and -not $residue.identity_verified)) `
+                "main hanging status could not verify process residue: $($residue.observation_error)"
+            Assert-True (-not $residue.expected_generation_live) `
+                'main hanging status left exact process residue'
             Remove-Item -LiteralPath $script:mainHangMarker -Force
         }
 
@@ -937,20 +1243,13 @@ try {
                     "deadline continuation $($case.name) exceeded original budget plus tolerance"
                 Assert-True ($sealedStopwatch.ElapsedMilliseconds -lt 1200) `
                     "deadline continuation $($case.name) exceeded its original absolute endpoint"
-                $candidate = Get-Process -Id $processId -ErrorAction SilentlyContinue
-                if ($null -ne $candidate) {
-                    try {
-                        $sameGeneration = $candidate.StartTime.ToUniversalTime() -eq $processStartedAt -and
-                            ([System.IO.Path]::GetFullPath($candidate.Path)).Equals(
-                                $script:mainPortablePowerShell,
-                                [System.StringComparison]::OrdinalIgnoreCase
-                            )
-                        Assert-True (-not $sameGeneration) `
-                            "deadline continuation $($case.name) left exact process residue"
-                    } finally {
-                        $candidate.Dispose()
-                    }
-                }
+                $residue = Get-ProcessGenerationObservation -ProcessId $processId `
+                    -ExpectedCreationTimeUtc $processStartedAt `
+                    -ExpectedExecutablePath $script:mainPortablePowerShell
+                Assert-True (-not ($residue.process_exists -and -not $residue.identity_verified)) `
+                    "deadline continuation $($case.name) could not verify process residue: $($residue.observation_error)"
+                Assert-True (-not $residue.expected_generation_live) `
+                    "deadline continuation $($case.name) left exact process residue"
             }
         }
 
@@ -1036,12 +1335,26 @@ try {
                     $safetyCandidate = Get-Process -Id $processId -ErrorAction SilentlyContinue
                     if ($null -ne $safetyCandidate) {
                         try {
-                            $sameSafetyGeneration = $safetyCandidate.StartTime.ToUniversalTime() -eq
-                                $processStartedAt -and
-                                ([System.IO.Path]::GetFullPath($safetyCandidate.Path)).Equals(
-                                    $script:mainPortablePowerShell,
-                                    [System.StringComparison]::OrdinalIgnoreCase
-                                )
+                            $sameSafetyGeneration = $false
+                            if (-not $safetyCandidate.HasExited) {
+                                try {
+                                    $safetyPath = [string]$safetyCandidate.Path
+                                    if ([string]::IsNullOrWhiteSpace($safetyPath)) {
+                                        throw 'live safety-cleanup candidate exposed no executable path'
+                                    }
+                                    $sameSafetyGeneration = $safetyCandidate.StartTime.ToUniversalTime() -eq
+                                        $processStartedAt -and
+                                        ([System.IO.Path]::GetFullPath($safetyPath)).Equals(
+                                            $script:mainPortablePowerShell,
+                                            [System.StringComparison]::OrdinalIgnoreCase
+                                        )
+                                } catch {
+                                    $identityFailure = $_
+                                    $exitedAfterFailure = $false
+                                    try { $exitedAfterFailure = [bool]$safetyCandidate.HasExited } catch { }
+                                    if (-not $exitedAfterFailure) { throw $identityFailure }
+                                }
+                            }
                             if ($sameSafetyGeneration) {
                                 try { $safetyCandidate.Kill($true) } catch { }
                                 try { [void]$safetyCandidate.WaitForExit(1000) } catch { }
@@ -1055,24 +1368,13 @@ try {
                     "direct cleanup $caseName exceeded original budget plus tolerance"
                 Assert-True ($sealedStopwatch.ElapsedMilliseconds -lt 1200) `
                     "direct cleanup $caseName exceeded its original absolute endpoint"
-                $candidate = Get-Process -Id $processId -ErrorAction SilentlyContinue
-                if ($null -ne $candidate) {
-                    try {
-                        $sameGeneration = $candidate.StartTime.ToUniversalTime() -eq $processStartedAt -and
-                            ([System.IO.Path]::GetFullPath($candidate.Path)).Equals(
-                                $script:mainPortablePowerShell,
-                                [System.StringComparison]::OrdinalIgnoreCase
-                            )
-                        if ($sameGeneration) {
-                            try { $candidate.Kill($true) } catch { }
-                            try { [void]$candidate.WaitForExit(1000) } catch { }
-                        }
-                        Assert-True (-not $sameGeneration) `
-                            "direct cleanup $caseName left exact process residue"
-                    } finally {
-                        $candidate.Dispose()
-                    }
-                }
+                $residue = Get-ProcessGenerationObservation -ProcessId $processId `
+                    -ExpectedCreationTimeUtc $processStartedAt `
+                    -ExpectedExecutablePath $script:mainPortablePowerShell
+                Assert-True (-not ($residue.process_exists -and -not $residue.identity_verified)) `
+                    "direct cleanup $caseName could not verify process residue: $($residue.observation_error)"
+                Assert-True (-not $residue.expected_generation_live) `
+                    "direct cleanup $caseName left exact process residue"
             }
         }
 
@@ -1586,6 +1888,8 @@ try {
             $residue = Get-ProcessGenerationObservation -ProcessId $publishedPid `
                 -ExpectedCreationFileTimeUtc ([long]$cleanup.process_creation_file_time_utc) `
                 -ExpectedExecutablePath ([string]$cleanup.executable_path)
+            Assert-True (-not ($residue.process_exists -and -not $residue.identity_verified)) `
+                "audit hanging status could not verify process residue: $($residue.observation_error)"
             Assert-True (-not $residue.expected_generation_live) 'audit hanging status left exact process residue'
             Remove-Item -LiteralPath $script:auditHangMarker -Force
         }
@@ -1703,17 +2007,22 @@ try {
         Invoke-TestCase 'audit readiness enforces its monotonic overall deadline' {
             $script:readinessCalls.Clear()
             $script:readinessDocuments.Clear()
-            $script:AuditDaemonReadinessTimeoutMs = 35
+            $script:AuditDaemonReadinessTimeoutMs = 500
             $script:AuditDaemonReadinessPollIntervalMs = 1
-            $script:AuditDaemonReadinessCleanupReserveMs = 5
-            $script:AuditDaemonReadinessExitWaitLimitMs = 4
-            $script:AuditDaemonReadinessOutputDrainLimitMs = 1
+            $script:AuditDaemonReadinessCleanupReserveMs = 50
+            $script:AuditDaemonReadinessExitWaitLimitMs = 40
+            $script:AuditDaemonReadinessOutputDrainLimitMs = 10
+            $script:readinessDocuments.Enqueue([pscustomobject]@{
+                    delay_ms = 600
+                    document = New-DaemonDocument -Command daemon_status -State booting `
+                        -ExecutablePath $expectedColay
+                })
             $start = New-DaemonDocument -Command daemon_start -State booting -ExecutablePath $expectedColay
             Assert-Throws -Action {
                 Wait-AuditDaemonReadiness -DaemonStartDocument $start `
                     -ExpectedExecutable $expectedColay -Repository $repository -Label 'timeout'
-            } -MessagePattern 'timed out after 35ms' -Message 'readiness exceeded its overall deadline without timeout'
-            Assert-True ($script:readinessCalls.Count -gt 0) 'timeout fixture did not exercise a status poll'
+            } -MessagePattern 'timed out after 500ms' -Message 'readiness exceeded its overall deadline without timeout'
+            Assert-Equal 1 $script:readinessCalls.Count 'timeout fixture status poll count'
         }
     }
 
@@ -1765,7 +2074,10 @@ try {
         $contractTail = @"
 `$staticContract = Assert-AbStaticContract -DiagnosticPath '$escapedDiagnosticPath'
 `$importContract = Import-StressHarnessFunctions '$escapedStressPath'
-return [pscustomobject]@{ static = `$staticContract; import = `$importContract }
+`$expectedProbe = [ordered]@{ first = 1; nested = [ordered]@{ alpha = `$true; beta = 'value' } }
+`$actualProbe = [ordered]@{ nested = [ordered]@{ beta = 'value'; alpha = `$true }; first = 1 }
+Assert-EquivalentJson -Expected `$expectedProbe -Actual `$actualProbe -Label 'imported comparer probe'
+return [pscustomobject]@{ static = `$staticContract; import = `$importContract; comparer_probe = 'passed' }
 "@
         $contractFixture = [scriptblock]::Create($prefix + $contractTail)
         $stressHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stressPath).Hash.ToLowerInvariant()
@@ -1783,6 +2095,10 @@ return [pscustomobject]@{ static = `$staticContract; import = `$importContract }
             'marker stress import pre-stop timing CIM count'
         Assert-True ($contract.import.function_count -gt 0) `
             'marker stress import closure was empty'
+        Assert-True ($contract.import.function_names -ccontains 'Test-JsonElementStructuralEquality') `
+            'marker stress import closure omitted the structural JSON helper'
+        Assert-Equal passed $contract.comparer_probe `
+            'marker stress imported comparer did not accept reordered objects'
 
         $mutatedStressPath = Join-Path $tempRoot 'unapproved-free-variable-stress.ps1'
         $stressSource = Get-Content -Raw -LiteralPath $stressPath

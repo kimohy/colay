@@ -300,8 +300,16 @@ function Get-ProcessGenerationObservation {
     if ($null -eq $candidate) { return $observation }
     $observation.process_exists = $true
     try {
+        if ($candidate.HasExited) {
+            $observation.process_exists = $false
+            return $observation
+        }
         $observedCreation = ConvertTo-NormalizedProcessCreationUtc $candidate.StartTime.ToUniversalTime()
-        $observedPath = ConvertTo-NormalizedExecutablePath $candidate.Path
+        $rawObservedPath = [string]$candidate.Path
+        if ([string]::IsNullOrWhiteSpace($rawObservedPath)) {
+            throw 'live process exposed no executable path'
+        }
+        $observedPath = ConvertTo-NormalizedExecutablePath $rawObservedPath
         $observation.observed_creation_time_utc = $observedCreation.ToString('o')
         $observation.observed_executable_path = $observedPath
         $observation.identity_verified = $true
@@ -312,6 +320,34 @@ function Get-ProcessGenerationObservation {
                 [StringComparison]::OrdinalIgnoreCase
             )
     } catch {
+        $observation.observation_error = $_.Exception.Message
+        try {
+            if ($candidate.HasExited) {
+                $observation.process_exists = $false
+                $observation.observation_error = $null
+            }
+        } catch { }
+    } finally {
+        $candidate.Dispose()
+    }
+    return $observation
+}
+
+function Get-ProcessLivenessObservation {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    $observation = [pscustomobject][ordered]@{
+        process_id = $ProcessId
+        process_exists = $false
+        observation_error = $null
+    }
+    $candidate = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $candidate) { return $observation }
+    try {
+        if (-not $candidate.HasExited) {
+            $observation.process_exists = $true
+        }
+    } catch {
+        $observation.process_exists = $true
         $observation.observation_error = $_.Exception.Message
     } finally {
         $candidate.Dispose()
@@ -1757,17 +1793,31 @@ function Start-OwnedHarnessProcessBatch {
                     -FailureStage 'batch-start' -Terminate `
                     -DeferObservation:([bool]$record.DeferObservation)
                 $identityStillRunning = $false
+                $generationObservation = $null
                 if ($null -ne $processId) {
-                    $candidate = $null
-                    try {
-                        $candidate = [System.Diagnostics.Process]::GetProcessById($processId)
-                        $identityStillRunning = (ConvertTo-NormalizedProcessCreationUtc $candidate.StartTime.ToUniversalTime()) -eq
-                            (ConvertTo-NormalizedProcessCreationUtc $processStartedAt) -and
-                            -not $candidate.WaitForExit(0)
-                    } catch {
-                        $identityStillRunning = $false
-                    } finally {
-                        if ($null -ne $candidate) { $candidate.Dispose() }
+                    $expectedExecutablePath = if ($record.PSObject.Properties.Name -contains 'OwnershipIdentity' -and
+                        $null -ne $record.OwnershipIdentity) {
+                        [string]$record.OwnershipIdentity.executable_path
+                    } else { $null }
+                    if ($null -eq $processStartedAt -or
+                        [string]::IsNullOrWhiteSpace($expectedExecutablePath)) {
+                        $identityStillRunning = $true
+                        $cleanupFailures.Add(
+                            "process ${processId}: batch rollback omitted its expected process identity"
+                        )
+                    } else {
+                        $generationObservation = Get-ProcessGenerationObservation -ProcessId $processId `
+                            -ExpectedCreationTimeUtc $processStartedAt `
+                            -ExpectedExecutablePath $expectedExecutablePath
+                        if ($generationObservation.process_exists -and
+                            -not $generationObservation.identity_verified) {
+                            $identityStillRunning = $true
+                            $cleanupFailures.Add(
+                                "process ${processId}: batch rollback could not verify process generation: $($generationObservation.observation_error)"
+                            )
+                        } else {
+                            $identityStillRunning = [bool]$generationObservation.expected_generation_live
+                        }
                     }
                 }
                 $cleanupRows.Add([pscustomobject][ordered]@{
@@ -1777,6 +1827,7 @@ function Start-OwnedHarnessProcessBatch {
                     failure_stage = 'batch-start'
                     exit_confirmed = [bool]$cleanup.exit_confirmed
                     process_identity_running_after_cleanup = $identityStillRunning
+                    process_generation_observation = $generationObservation
                     stdout_completed = $null -eq $stdoutTask -or [bool]$stdoutTask.IsCompleted
                     stderr_completed = $null -eq $stderrTask -or [bool]$stderrTask.IsCompleted
                     process_disposed = [bool]$cleanup.process_disposed
@@ -2476,9 +2527,14 @@ function Invoke-HarnessFailureCleanupSelfTest {
                 [string]::IsNullOrWhiteSpace([string]$setupEvidence.process_identity.exit_time_utc))) {
             throw "setup-failure self-test $($setupCase.stage) omitted its normalized creation/exit identity"
         }
+        $setupLivenessObservation = $null
         if ([bool]$setupCase.child_started) {
-            if ($null -eq $setupEvidence.process_id -or
-                $null -ne (Get-Process -Id ([int]$setupEvidence.process_id) -ErrorAction SilentlyContinue)) {
+            if ($null -eq $setupEvidence.process_id) {
+                throw "setup-failure self-test $($setupCase.stage) omitted its started process id"
+            }
+            $setupLivenessObservation = Get-ProcessLivenessObservation `
+                -ProcessId ([int]$setupEvidence.process_id)
+            if ($setupLivenessObservation.process_exists) {
                 throw "setup-failure self-test $($setupCase.stage) left its started process alive"
             }
             if (-not $setupEvidence.cleanup.exit_confirmed -or
@@ -2509,6 +2565,7 @@ function Invoke-HarnessFailureCleanupSelfTest {
             stdin_closed = [bool]$setupEvidence.cleanup.stdin_closed
             process_disposed = [bool]$setupEvidence.cleanup.process_disposed
             cleanup_error_count = @($setupEvidence.cleanup.cleanup_errors).Count
+            process_liveness_observation = $setupLivenessObservation
         })
     }
     $batchEvidenceIndex = $script:ProcessBatchCleanupEvidence.Count
@@ -2546,6 +2603,11 @@ function Invoke-HarnessFailureCleanupSelfTest {
     $batchEvidence = $script:ProcessBatchCleanupEvidence[$batchEvidenceIndex]
     $batchSetupEvidence = $script:ProcessSetupFailureEvidence[$batchSetupEvidenceIndex]
     $batchRecord = $batchEvidence.records[0]
+    $batchSetupLivenessObservation = if ($null -eq $batchSetupEvidence.process_id) {
+        $null
+    } else {
+        Get-ProcessLivenessObservation -ProcessId ([int]$batchSetupEvidence.process_id)
+    }
     if ($batchEvidence.requested_count -ne 4 -or $batchEvidence.failed_request_index -ne 2 -or
         $batchEvidence.started_record_count -ne 1 -or $batchEvidence.cleaned_record_count -ne 1 -or
         @($batchEvidence.cleanup_errors).Count -ne 0 -or
@@ -2558,7 +2620,8 @@ function Invoke-HarnessFailureCleanupSelfTest {
         -not $batchSetupEvidence.cleanup.stdout_completed -or
         -not $batchSetupEvidence.cleanup.stderr_completed -or
         @($batchSetupEvidence.cleanup.cleanup_errors).Count -ne 0 -or
-        $null -ne (Get-Process -Id ([int]$batchSetupEvidence.process_id) -ErrorAction SilentlyContinue)) {
+        $null -eq $batchSetupLivenessObservation -or
+        $batchSetupLivenessObservation.process_exists) {
         throw "batch-start ownership self-test cleanup evidence was incomplete: $($batchEvidence | ConvertTo-Json -Compress -Depth 8)"
     }
     $batchStartOwnership = [pscustomobject][ordered]@{
@@ -2571,6 +2634,7 @@ function Invoke-HarnessFailureCleanupSelfTest {
         record_residue_count = 0
         incomplete_pipe_task_count = 0
         cleanup_error_count = 0
+        setup_failure_process_liveness = $batchSetupLivenessObservation
     }
     $descendantPipeCommand = @'
 $descendantInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -3158,12 +3222,156 @@ function Get-SqliteFamilyHashes {
     return $hashes
 }
 
+function Test-JsonElementStructuralEquality {
+    param(
+        [Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Expected,
+        [Parameter(Mandatory = $true)][System.Text.Json.JsonElement]$Actual
+    )
+    if ($Expected.ValueKind -ne $Actual.ValueKind) { return $false }
+
+    switch ([string]$Expected.ValueKind) {
+        'Object' {
+            $expectedProperties = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new(
+                [System.StringComparer]::Ordinal
+            )
+            $actualProperties = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new(
+                [System.StringComparer]::Ordinal
+            )
+            foreach ($property in $Expected.EnumerateObject()) {
+                if (-not $expectedProperties.TryAdd($property.Name, $property.Value)) { return $false }
+            }
+            foreach ($property in $Actual.EnumerateObject()) {
+                if (-not $actualProperties.TryAdd($property.Name, $property.Value)) { return $false }
+            }
+            if ($expectedProperties.Count -ne $actualProperties.Count) { return $false }
+            foreach ($property in $expectedProperties.GetEnumerator()) {
+                if (-not $actualProperties.ContainsKey($property.Key)) { return $false }
+                if (-not (Test-JsonElementStructuralEquality -Expected $property.Value `
+                            -Actual $actualProperties[$property.Key])) {
+                    return $false
+                }
+            }
+            return $true
+        }
+        'Array' {
+            if ($Expected.GetArrayLength() -ne $Actual.GetArrayLength()) { return $false }
+            $expectedItems = [System.Collections.Generic.List[System.Text.Json.JsonElement]]::new()
+            $actualItems = [System.Collections.Generic.List[System.Text.Json.JsonElement]]::new()
+            foreach ($item in $Expected.EnumerateArray()) { $expectedItems.Add($item) }
+            foreach ($item in $Actual.EnumerateArray()) { $actualItems.Add($item) }
+            for ($index = 0; $index -lt $expectedItems.Count; $index++) {
+                if (-not (Test-JsonElementStructuralEquality -Expected $expectedItems[$index] `
+                            -Actual $actualItems[$index])) {
+                    return $false
+                }
+            }
+            return $true
+        }
+        'String' {
+            return [string]::Equals(
+                $Expected.GetString(),
+                $Actual.GetString(),
+                [System.StringComparison]::Ordinal
+            )
+        }
+        'Number' { return $Expected.GetRawText() -ceq $Actual.GetRawText() }
+        'True' { return $true }
+        'False' { return $true }
+        'Null' { return $true }
+        default { return $Expected.GetRawText() -ceq $Actual.GetRawText() }
+    }
+}
+
 function Assert-EquivalentJson {
     param($Expected, $Actual, [string]$Label)
-    $expectedJson = $Expected | ConvertTo-Json -Depth 20 -Compress
-    $actualJson = $Actual | ConvertTo-Json -Depth 20 -Compress
-    if ($expectedJson -cne $actualJson) {
-        throw "$Label changed: expected $expectedJson, found $actualJson"
+    $expectedJson = ConvertTo-Json -InputObject $Expected -Depth 20 -Compress
+    $actualJson = ConvertTo-Json -InputObject $Actual -Depth 20 -Compress
+    $expectedDocument = [System.Text.Json.JsonDocument]::Parse($expectedJson)
+    $actualDocument = [System.Text.Json.JsonDocument]::Parse($actualJson)
+    try {
+        if (-not (Test-JsonElementStructuralEquality -Expected $expectedDocument.RootElement `
+                    -Actual $actualDocument.RootElement)) {
+            throw "$Label changed: expected $expectedJson, found $actualJson"
+        }
+    } finally {
+        $expectedDocument.Dispose()
+        $actualDocument.Dispose()
+    }
+}
+
+function Assert-LatencySourcePreparationEvidence {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Seeds,
+        [Parameter(Mandatory = $true)][object[]]$CommandEvidence
+    )
+    $expectedLabels = @(1..9 | ForEach-Object { "seed-schema-v8-$_" })
+    if ($Seeds.Count -ne $expectedLabels.Count) {
+        throw "latency fixture preparation retained $($Seeds.Count) sources; expected $($expectedLabels.Count)"
+    }
+
+    $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+    foreach ($index in 1..9) {
+        if (-not $Seeds.Contains($index)) {
+            throw "latency fixture preparation omitted retained source index $index"
+        }
+        $seed = $Seeds[$index]
+        if ($null -eq $seed -or $seed.PSObject.Properties.Name -cnotcontains 'index' -or
+            $null -eq $seed.index -or $integralTypes -notcontains $seed.index.GetType() -or
+            [int64]$seed.index -ne [int64]$index) {
+            throw "latency fixture preparation retained an invalid source at index $index"
+        }
+    }
+
+    $seedCommands = @($CommandEvidence | Where-Object {
+            $_.PSObject.Properties.Name -ccontains 'label' -and
+            $_.label -is [string] -and
+            ([string]$_.label).StartsWith('seed-schema-v8-', [System.StringComparison]::Ordinal)
+        })
+    if ($seedCommands.Count -ne $expectedLabels.Count) {
+        throw "latency fixture preparation recorded $($seedCommands.Count) seed commands; expected $($expectedLabels.Count)"
+    }
+    for ($offset = 0; $offset -lt $expectedLabels.Count; $offset++) {
+        $command = $seedCommands[$offset]
+        foreach ($propertyName in @('label', 'measurement_method', 'exit_code', 'timed_out', 'elapsed_ms')) {
+            if ($command.PSObject.Properties.Name -cnotcontains $propertyName) {
+                throw "latency fixture command $offset omitted $propertyName"
+            }
+        }
+        if ($command.label -isnot [string] -or [string]$command.label -cne $expectedLabels[$offset]) {
+            throw "latency fixture command label mismatch at ordinal $offset"
+        }
+        if ($command.measurement_method -isnot [string] -or
+            [string]$command.measurement_method -cne 'os-process-lifetime') {
+            throw "latency fixture command $($command.label) lacks OS process lifetime evidence"
+        }
+        if ($null -eq $command.exit_code -or
+            $integralTypes -notcontains $command.exit_code.GetType() -or
+            [int64]$command.exit_code -ne 0) {
+            throw "latency fixture command $($command.label) did not exit successfully"
+        }
+        if ($command.timed_out -isnot [bool] -or [bool]$command.timed_out) {
+            throw "latency fixture command $($command.label) has invalid timeout evidence"
+        }
+        if ($null -eq $command.elapsed_ms -or
+            $integralTypes -notcontains $command.elapsed_ms.GetType() -or
+            [int64]$command.elapsed_ms -lt 0) {
+            throw "latency fixture command $($command.label) has invalid elapsed time evidence"
+        }
+    }
+
+    $seedWriteTimes = @($seedCommands | ForEach-Object { [int64]$_.elapsed_ms })
+    $sortedSeedWriteTimes = @($seedWriteTimes | Sort-Object)
+    return [pscustomobject][ordered]@{
+        scope = 'fixture-only-python-sqlite-write-not-product-latency'
+        source_count = $Seeds.Count
+        command_labels = @($expectedLabels)
+        seed_write_times_ms = $seedWriteTimes
+        minimum_ms = [int64]$sortedSeedWriteTimes[0]
+        median_ms = [int64]$sortedSeedWriteTimes[4]
+        maximum_ms = [int64]$sortedSeedWriteTimes[-1]
+        completed_before_timing_self_test = $true
+        completed_before_daemon_start = $true
+        timing_included_in_latency_thresholds = $false
     }
 }
 
@@ -4873,8 +5081,16 @@ function Get-ProcessGenerationObservation {
     if ($null -eq $candidate) { return $observation }
     $observation.process_exists = $true
     try {
+        if ($candidate.HasExited) {
+            $observation.process_exists = $false
+            return $observation
+        }
         $observedCreation = $candidate.StartTime.ToUniversalTime().ToFileTimeUtc()
-        $observedPath = [System.IO.Path]::GetFullPath($candidate.Path)
+        $rawObservedPath = [string]$candidate.Path
+        if ([string]::IsNullOrWhiteSpace($rawObservedPath)) {
+            throw 'live process exposed no executable path'
+        }
+        $observedPath = [System.IO.Path]::GetFullPath($rawObservedPath)
         $observation.observed_creation_file_time_utc = $observedCreation
         $observation.observed_executable_path = $observedPath
         $observation.identity_verified = $true
@@ -4883,6 +5099,12 @@ function Get-ProcessGenerationObservation {
             (ConvertTo-ComparablePath $ExpectedExecutablePath)
     } catch {
         $observation.observation_error = $_.Exception.Message
+        try {
+            if ($candidate.HasExited) {
+                $observation.process_exists = $false
+                $observation.observation_error = $null
+            }
+        } catch { }
     } finally {
         $candidate.Dispose()
     }
@@ -5897,7 +6119,8 @@ function Assert-StrongProcessAuditEvidence {
         $key = [string][uint32]$record.process_id
         $exitCounts[$key] = 1 + [int]$exitCounts[$key]
     }
-    Assert-EquivalentJson $startCounts $exitCounts 'process audit start/exit PID multiset'
+    Assert-EquivalentJson -Expected $startCounts -Actual $exitCounts `
+        -Label 'process audit start/exit PID multiset'
     $startPaths = @($starts | ForEach-Object { [string]$_.path })
     if ((ConvertTo-ComparableWindowsPath $startPaths[0]) -cne (ConvertTo-ComparableWindowsPath $ExpectedPowerShell)) {
         throw 'process audit first observed process was not exact portable pwsh'
@@ -6006,6 +6229,7 @@ $summary = [ordered]@{
     acceptance_failures = @()
     measurement_diagnostics = [pscustomobject][ordered]@{
         main_daemon_readiness = $null
+        latency_source_preparation = $null
         source_clean_tree_command_evidence_redaction_self_test = $null
         early_failure_input_identity_self_test = $null
         timing_self_test = $null
@@ -6091,6 +6315,7 @@ $auditEmptyRepository = $null
 $auditGlobalDatabase = $null
 $auditHelperExe = $null
 $auditPowerShell = $null
+$latencySeeds = $null
 
 try {
     if ($ExpectedSourceCommit -cnotmatch '^[0-9a-f]{40}$') {
@@ -6213,6 +6438,18 @@ try {
     $summary.source_identity.verified_commit = $actualSourceCommit
     $summary.source_identity.verification_status = 'verified_clean'
     $summary.source_commit = $actualSourceCommit
+
+    $latencySeeds = @{}
+    foreach ($index in 1..9) {
+        if ($latencySeeds.ContainsKey($index)) {
+            throw "duplicate latency fixture index: $index"
+        }
+        $latencySeeds[$index] = New-LegacyWorkspace -Index $index -Root $workspaceRoot `
+            -Environment $environment
+    }
+    $summary.measurement_diagnostics.latency_source_preparation = `
+        Assert-LatencySourcePreparationEvidence -Seeds $latencySeeds `
+        -CommandEvidence $script:CommandEvidence.ToArray()
     $summary.measurement_diagnostics.source_clean_tree_command_evidence_redaction_self_test = `
         Invoke-SourceCleanTreeCommandEvidenceRedactionSelfTest
     $summary.measurement_diagnostics.early_failure_input_identity_self_test = `
@@ -6250,7 +6487,7 @@ try {
 
     $serialTimes = [System.Collections.Generic.List[int64]]::new()
     for ($index = 1; $index -le 5; $index++) {
-        $seed = New-LegacyWorkspace -Index $index -Root $workspaceRoot -Environment $environment
+        $seed = $latencySeeds[$index]
         $seeds.Add($seed)
         Add-SourceEvidence -Seed $seed -Summary $summary
         $result = Invoke-Colay -Repository $seed.repository -ArgumentValues @('--json', 'status') `
@@ -6272,7 +6509,7 @@ try {
 
     $concurrentSeeds = [System.Collections.Generic.List[object]]::new()
     foreach ($index in 6..9) {
-        $seed = New-LegacyWorkspace -Index $index -Root $workspaceRoot -Environment $environment
+        $seed = $latencySeeds[$index]
         $seeds.Add($seed)
         $concurrentSeeds.Add($seed)
         Add-SourceEvidence -Seed $seed -Summary $summary

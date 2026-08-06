@@ -148,6 +148,15 @@ The run is a failure unless five sequential incumbent registrations have
 nearest-rank p95 at or below 5,000 ms, four simultaneous registrations each
 finish within 8,000 ms, and the source still declares the unchanged 10,000 ms
 IPC response timeout. Each source is a distinct non-empty schema-v8 database.
+All nine latency sources are created and verified before the timing self-test and
+before daemon startup, then retained by exact index for the measured registrations.
+The harness records their Python/SQLite write times and min/median/max as
+`measurement_diagnostics.latency_source_preparation`, explicitly excluded from
+product latency thresholds. It does not sleep, subtract setup from a command, or
+relax a threshold. This ordering removes the synchronous fixture writes from the
+measured period and reduces the risk that subsequent host scanning overlaps the
+existing-workspace registration measurement; it does not claim to observe or wait
+for background scanning to finish.
 Successful command timing is the operating-system process lifetime from
 `StartTime` through `ExitTime`; synchronous CIM observation and debug-event
 processing do not run inside that measured interval. The latency environment
@@ -169,6 +178,12 @@ terminates and drains the exact child under the original absolute endpoints and
 then fails. A continuation cannot create a fresh cleanup budget from current time.
 Only an omitted four-parameter deadline set selects ordinary mode; an explicitly
 supplied set must contain a running stopwatch and valid positive overall budget.
+Post-cleanup process liveness/generation probes check `HasExited` before reading
+`StartTime` or `Path`, because PowerShell 7.2 can briefly enumerate an already exited
+process with empty identity fields. Such an exited candidate is non-live; a genuinely
+live candidate whose creation time or executable path cannot be read remains a
+fail-closed verification error. Batch rollback records this ambiguity as a cleanup
+failure and never converts an identity-read exception into `not running`.
 The marker diagnostic recognizes `PSBoundParameters` only as an explicit PowerShell
 automatic variable; arbitrary unqualified variables remain forbidden. Contract-failure
 cleanup must also stop the OS-process-lifetime stopwatch before any CIM-reachable path.
@@ -192,7 +207,13 @@ The harness compares every source SQLite-family hash before and after import,
 validates workspace/path/import/session and publication-ledger cardinality,
 runs SQLite integrity and foreign-key checks, and requires zero tasks, task
 attempts, worktrees, coordinator leases, and worker leases. The functional
-child-tree audit must find no `whoami.exe` or `icacls.exe` launch. Post-stop
+child-tree audit compares start/exit PID multisets by exact PID and JSON scalar
+value/type, independent of map insertion order, and must find no `whoami.exe` or
+`icacls.exe` launch. General JSON equivalence uses a PowerShell 7.2-compatible
+recursive `JsonDocument`/`JsonElement` comparison after
+`ConvertTo-Json -InputObject`: object property order is ignored while array order,
+singleton-array shape, scalar types, hashes, and SQLite suffix keys remain exact.
+Post-stop
 identity-checked residue observation separately requires the endpoint, live
 leases, and attributable Colay, fake-provider, and utility processes to be
 absent. The harness writes schema-2 timestamped JSON plus `summary.json`, with
