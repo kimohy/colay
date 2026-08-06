@@ -44,6 +44,12 @@ The pre-cleanup call must pass `ActiveDaemon`; the cleanup call must pass `PostS
 result objects keep the same health fields. They also carry an explicit hash scope, with the active
 record containing a null family-hash value rather than silently implying a snapshot.
 
+`PostStopStable` also requires explicit quiescence evidence. The caller must have a successful
+`daemon stop` document, a signaled retained daemon handle with no cleanup errors, a stopped endpoint,
+and zero live leases. The health helper refuses the stable phase before calling the hasher when that
+gate is false. Merely receiving `state=stopped`, entering a `finally` block, or waiting for an
+arbitrary delay is not proof that the database writer released its handle.
+
 ## Rejected alternatives
 
 - **Open hashes with `FileShare.ReadWrite`.** This removes the sharing error but permits the daemon
@@ -63,8 +69,11 @@ Before another A/B run:
 1. Reproduce the `Get-FileHash` sharing failure with a focused temporary-file fixture (RED).
 2. Parse the amended marker with PowerShell 7.6.4.
 3. Extract the health helper into an isolated test scope with stubbed SQLite/hash functions and
-   prove that `ActiveDaemon` makes zero hash calls while `PostStopStable` makes exactly one.
-4. Statistically verify the two production call sites use the intended explicit phases.
+   prove that `ActiveDaemon` makes zero hash calls, rejected `PostStopStable` makes zero hash calls,
+   and confirmed-quiescent `PostStopStable` makes exactly one.
+4. Statically verify the two production call sites use the intended explicit phases and that the
+   post-stop gate is derived from the stop document, retained-handle wait, endpoint status, and live
+   lease result.
 5. Re-run the existing marker static-contract checks and review the exact marker hash.
 
 After review, rebuild exact clean HEAD binaries and invoke the marker once. `WIN-007` and `WIN-008`

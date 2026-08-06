@@ -23,11 +23,13 @@ run and the new reviewed one-shot result in the QA tracker.
 2. Build an isolated PowerShell test around the extracted `Get-AbDatabaseHealthEvidence` function.
    Initially require the two explicit phases and prove the active phase makes zero family-hash calls;
    confirm the test fails before implementation.
-3. Add a mandatory `ValidateSet('ActiveDaemon', 'PostStopStable')` phase parameter. Preserve exact
-   integrity/foreign-key checks. Return an explicit hash scope and null hashes for `ActiveDaemon`;
-   call `Get-SqliteFamilyHashes` exactly once for `PostStopStable`.
-4. Pass `ActiveDaemon` at the pre-cleanup call and `PostStopStable` only after stop/status/lease
-   cleanup gates.
+3. Add a mandatory `ValidateSet('ActiveDaemon', 'PostStopStable')` phase parameter and an explicit
+   post-stop-quiescence input. Preserve exact integrity/foreign-key checks. Return an explicit hash
+   scope and null hashes for `ActiveDaemon`; refuse `PostStopStable` before hashing unless its gate
+   is true; call `Get-SqliteFamilyHashes` exactly once for a confirmed stable phase.
+4. Pass `ActiveDaemon` at the pre-cleanup call. Derive the post-stop gate from a successful daemon
+   stop document, a signaled retained daemon handle with zero errors, a stopped endpoint, and zero
+   live leases; then pass `PostStopStable`. Do not substitute a sleep or endpoint status alone.
 5. Re-run the focused test, parser check, exact-callsite AST check, and existing static-contract
    verification. Do not execute marker, stress, product, or provider in this task.
 6. Update `WIN-008` to `fix-in-progress` with the design, focused RED/GREEN evidence, exact amended
