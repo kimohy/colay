@@ -1391,6 +1391,19 @@ function ConvertTo-AbDaemonDocumentIdentity {
     }
 }
 
+function Assert-AbDaemonReadinessDeadline {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Stopwatch]$Stopwatch,
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$OverallTimeoutMs
+    )
+    if ([int64]$Stopwatch.ElapsedMilliseconds -ge $OverallTimeoutMs) {
+        throw "daemon readiness timed out after ${OverallTimeoutMs}ms"
+    }
+}
+
 function Wait-AbDaemonReadiness {
     param(
         [Parameter(Mandatory = $true)]$DaemonStartDocument,
@@ -1428,6 +1441,8 @@ function Wait-AbDaemonReadiness {
             process_id = [int]$anchor.ProcessId
             executable_path = $anchor.ExecutablePath
         }
+        [void](Assert-AbDaemonReadinessDeadline -Stopwatch $stopwatch `
+            -OverallTimeoutMs $DaemonReadinessTimeoutMs)
         if (@('booting', 'probing', 'online') -cnotcontains $anchor.State) {
             throw "daemon readiness start returned terminal or non-progress state '$($anchor.State)'"
         }
@@ -1482,9 +1497,8 @@ function Wait-AbDaemonReadiness {
             $pollEvidence.command_exit_code = [int]$statusResult.exit_code
             $pollEvidence.command_timed_out = [bool]$statusResult.timed_out
             $pollEvidence.observed_elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
-            if ([int64]$stopwatch.ElapsedMilliseconds -ge $DaemonReadinessTimeoutMs) {
-                throw "daemon readiness timed out after ${DaemonReadinessTimeoutMs}ms"
-            }
+            [void](Assert-AbDaemonReadinessDeadline -Stopwatch $stopwatch `
+                -OverallTimeoutMs $DaemonReadinessTimeoutMs)
             if ([bool]$statusResult.timed_out -or [int]$statusResult.exit_code -ne 0) {
                 throw "daemon readiness status poll $pollNumber did not exit successfully"
             }
@@ -1504,9 +1518,8 @@ function Wait-AbDaemonReadiness {
                 )) {
                 throw "daemon readiness identity drift at status poll $pollNumber"
             }
-            if ([int64]$stopwatch.ElapsedMilliseconds -ge $DaemonReadinessTimeoutMs) {
-                throw "daemon readiness timed out after ${DaemonReadinessTimeoutMs}ms"
-            }
+            [void](Assert-AbDaemonReadinessDeadline -Stopwatch $stopwatch `
+                -OverallTimeoutMs $DaemonReadinessTimeoutMs)
 
             $evidence.final_state = $statusIdentity.State
             if ($statusIdentity.State -ceq 'online') {

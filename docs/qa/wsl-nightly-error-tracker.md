@@ -971,7 +971,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 | `WIN-007` | medium | fix-in-progress (preflight and six corrected observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
 | `WIN-008` | medium | fix-in-progress (six active/stable health observations passed; full reviewed A/B blocked by `WIN-009`) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
-| `WIN-009` | medium | fix-in-progress (focused readiness, static contracts, and independent review passed; reviewed one-shot A/B pending) | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
+| `WIN-009` | medium | fix-in-progress (focused review fix and static contracts passed; exact-hash re-review and one-shot A/B pending) | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -2104,16 +2104,23 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   two `registration.elapsed_ms` inputs. The existing active-database behavioral
   and static-contract fixtures also passed after distinguishing their cleanup
   endpoint-status call from the new readiness status call.
-- The amended marker is `132441` bytes with SHA-256
-  `ae08b02574cb63e218a8ec0d7f38c8d380e7278d171ae598ab6bbccd7d08ab15`.
+- Formal controller review of the prior exact hash found that the common
+  monotonic deadline was checked after a status subprocess but not after the
+  initial start-document parse. An injected schema-property/parser delay
+  therefore produced the focused RED
+  `immediate online document parsed after the absolute deadline was accepted`
+  and exit `1`. The correction uses one common deadline assertion after initial
+  parsing/anchoring, after each status subprocess, and again after status
+  parsing/identity comparison. The delayed-immediate-online GREEN case now
+  fails timed out with a null online document, zero polls, zero status calls,
+  and zero CIM; the complete focused matrix and both static fixtures exit zero.
+- The amended marker is `132883` bytes with SHA-256
+  `d2b458e1491d446b2b630afdab4a3a18f8be7c23b1c408c94eac273a92b76e06`.
   The unchanged stress harness remains
   `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
   No marker A/B, authoritative stress, product, Cargo, or provider command was
-  run for this focused correction. Independent security/correctness re-review
-  of that exact marker hash returned Ready with zero Critical, Important, or
-  Minor findings after the online-result deadline guard and late-online fixture
-  resolved its initial Important finding. The reviewed one-shot invocation is
-  still required.
+  run for this focused correction. Exact-hash re-review and the reviewed
+  one-shot invocation are still required.
 - Closure still requires one new exact-clean-HEAD invocation with all eight
   observations, four counterbalanced pairs, ten checkpoints, zero retries,
   zero credentials, zero cleanup errors, and zero residual processes, plus an
