@@ -1393,6 +1393,43 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn assert_repair_preserves_owner_and_uses_one_handle(
+        path: &Path,
+        kind: StateArtifactKind,
+    ) -> io::Result<()> {
+        set_test_dacl(path, kind, &permissive_sddl(kind)?, true)?;
+        let owner_before = read_owner_sid_for_test(path, kind)?;
+
+        reset_set_security_info_calls_for_test();
+        let operations = trace_retained_handle_operations_for_test(|| {
+            ensure_private_state_artifact(path, kind)
+        })?;
+        assert_eq!(set_security_info_calls_for_test(), 1);
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.kind)
+                .collect::<Vec<_>>(),
+            [
+                RetainedHandleOperationKind::DescriptorRead,
+                RetainedHandleOperationKind::AclWrite,
+                RetainedHandleOperationKind::DescriptorRead,
+            ],
+            "repair must read, write, and post-read through the retained handle"
+        );
+        let retained_handle = operations[0].handle;
+        assert!(
+            operations
+                .iter()
+                .all(|operation| operation.handle == retained_handle),
+            "repair descriptor reads and ACL write must use one retained handle"
+        );
+
+        let owner_after = read_owner_sid_for_test(path, kind)?;
+        assert_eq!(owner_before, owner_after);
+        Ok(())
+    }
+
     fn set_test_dacl(
         path: &Path,
         kind: StateArtifactKind,
@@ -1816,41 +1853,11 @@ mod tests {
             (file.as_path(), StateArtifactKind::File),
             (directory.as_path(), StateArtifactKind::Directory),
         ] {
-            set_test_dacl(path, kind, &permissive_sddl(kind)?, true)?;
-            let owner_before = read_owner_sid_for_test(path, kind)?;
-
-            reset_set_security_info_calls_for_test();
-            let operations = trace_retained_handle_operations_for_test(|| {
-                ensure_private_state_artifact(path, kind)
-            })?;
-            assert_eq!(set_security_info_calls_for_test(), 1);
-            assert_eq!(
-                operations
-                    .iter()
-                    .map(|operation| operation.kind)
-                    .collect::<Vec<_>>(),
-                [
-                    RetainedHandleOperationKind::DescriptorRead,
-                    RetainedHandleOperationKind::AclWrite,
-                    RetainedHandleOperationKind::DescriptorRead,
-                ],
-                "repair must read, write, and post-read through the retained handle"
-            );
-            let retained_handle = operations[0].handle;
-            assert!(
-                operations
-                    .iter()
-                    .all(|operation| operation.handle == retained_handle),
-                "repair descriptor reads and ACL write must use one retained handle"
-            );
-
+            assert_repair_preserves_owner_and_uses_one_handle(path, kind)?;
             verify_private_state_artifact(path, kind)?;
             reset_set_security_info_calls_for_test();
             ensure_private_state_artifact(path, kind)?;
             assert_eq!(set_security_info_calls_for_test(), 0);
-
-            let owner_after = read_owner_sid_for_test(path, kind)?;
-            assert_eq!(owner_before, owner_after);
         }
         Ok(())
     }
@@ -1956,25 +1963,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_handle_repair_preserves_owner() -> io::Result<()> {
+    fn retained_handle_repair_preserves_owner_and_uses_one_handle() -> io::Result<()> {
         let _guard = native_test_guard();
         let temporary = tempfile::tempdir()?;
         let file = temporary.path().join("owner.db");
         fs::write(&file, b"state")?;
-        set_test_dacl(
-            &file,
-            StateArtifactKind::File,
-            &permissive_sddl(StateArtifactKind::File)?,
-            true,
-        )?;
-        let before = read_owner_sid_for_test(&file, StateArtifactKind::File)?;
-
-        reset_set_security_info_calls_for_test();
-        ensure_private_state_artifact(&file, StateArtifactKind::File)?;
-        let after = read_owner_sid_for_test(&file, StateArtifactKind::File)?;
-        assert_eq!(before, after);
-        assert_eq!(set_security_info_calls_for_test(), 1);
-        Ok(())
+        assert_repair_preserves_owner_and_uses_one_handle(&file, StateArtifactKind::File)
     }
 
     #[test]
