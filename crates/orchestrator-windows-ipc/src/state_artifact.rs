@@ -576,7 +576,7 @@ impl OwnedAcl {
                 "constructed ACL bytes in use do not match its bounded allocation",
             ));
         }
-        verify_acl_bytes(Some(storage.as_bytes()), true, kind, &principals)?;
+        verify_acl_bytes(Some(storage.as_bytes()), true, kind, principals)?;
         Ok(Self { storage })
     }
 }
