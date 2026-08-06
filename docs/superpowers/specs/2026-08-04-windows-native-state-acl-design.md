@@ -100,9 +100,9 @@ mutate. These operations apply to one already-created target only. They do not c
 recurse, delete, rename, follow links, or relax a descriptor.
 
 The existing named-pipe, mutex, and secure-directory-tree functions retain their current-user-only
-owner and one-ACE contracts. The state-artifact three-principal verifier is separate and must not be
-substituted into those IPC paths. Existing pipe endpoint identity validation and mutex validation
-must not be loosened.
+owner and one-ACE contracts. The state-artifact normalized unique-principal verifier is separate
+and must not be substituted into those IPC paths. Existing pipe endpoint identity validation and
+mutex validation must not be loosened.
 
 ## Current process identity
 
@@ -344,11 +344,13 @@ inside the audited FFI crate. Missing access rights or unsupported behavior fail
 no runtime downgrade to command utilities.
 
 Rollback is code-only: revert to the prior implementation without a database or state migration.
-The exact protected DACLs written by the native implementation remain valid for the old verifier.
-Rollback must not delete or rewrite state, weaken ACLs, raise the IPC timeout, or remove the
-owner-bound receipt. If production evidence requires disabling native mutation, writable Windows
-state operations must fail closed until a reviewed fix is available rather than silently using an
-unverified fallback.
+For normal-user artifacts, the exact protected three-ACE DACLs written by the native implementation
+remain valid for the old verifier. LocalSystem two-ACE artifacts do not: an unpatched verifier
+rejects them, so an unpatched LocalSystem rollback is unsupported and fails closed unless the
+correction is backported. Rollback must not delete or rewrite state, weaken ACLs, raise the IPC
+timeout, or remove the owner-bound receipt. If production evidence requires disabling native
+mutation, writable Windows state operations must fail closed until a reviewed fix is available
+rather than silently using an unverified fallback.
 
 ## Rejected alternatives
 
