@@ -1863,6 +1863,37 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   시작한다. 따라서 검토된 tracked 변경을 커밋하고 exact HEAD 바이너리를 재빌드하기 전에는
   권위 실행하지 않는다.
 
+### 2026-08-07 marker phase split and audit readiness source fix — focused verification passed
+
+- Reviewed exact-HEAD marker A/B의 결정
+  `split-latency-marker-off-and-correctness-marker-on-phases`를 stress harness에 반영했다.
+  main latency 환경은 aggregate marker만 설정하고 attributed marker 환경 키를 완전히 생략한다.
+  빈 sentinel directory를 유지하면서 startup `0`, serial 누적 `2/4/6/8/10`, concurrent 완료 후
+  aggregate `18`과 attributed group/event `0/0`을 fail-closed로 검증한다. 기존 response deadline,
+  OS-process-lifetime timing, durable publication/source immutability, SQLite, zero-writable-row,
+  process ownership 및 cleanup gate는 변경하지 않았다.
+- threshold에서 제외된 별도 process-audit 환경만 attributed marker를 켠다. 이 phase는 aggregate
+  `2`, durable `source_root_hash`와 같은 64-hex group 한 개, 서로 다른 빈 event file 두 개를
+  검증한다. top-level stress evidence만 schema `2`로 올리고 exact phase policy 및
+  `inspection_markers.latency_phase`/`correctness_phase`를 분리했다. 호환 scalar
+  `inspection_count`는 latency aggregate `18`이며 product IPC/status, generated audit child,
+  C# audit-helper의 schema-v1 계약은 그대로다. source evidence의 opaque durable 값은 더 이상
+  latency marker group을 암시하지 않도록 `source_root_hash`로 기록한다.
+- Generated audit child는 exit-zero `daemon_start`의 canonical UUID, safe integral PID, exact
+  `colay.exe` path를 고정한다. 즉시 online이 아니면 separated `--json daemon status`만 monotonic
+  `5000ms` 전체 deadline 안에서 poll하며 booting/probing만 허용한다. 모든 응답에서
+  `state == phase` 및 동일 identity를 요구하고 terminal/malformed/drift/timeout은 registration 전에
+  거부하며 readiness transition을 child evidence에 남긴다.
+- Portable PowerShell `7.6.4` focused RED는 기존 환경이 mode 없이 attributed key를 항상 넣고,
+  main latency 경로가 attributed group을 요구하며, phase evidence/readiness helper가 없는 상태를
+  exit `1`로 재현했다. 구현 후 focused marker-phase matrix와 두 PowerShell parser 검증은 통과했다.
+  기존 process-audit helper 회귀와 active-database/readiness marker static-contract fixture도
+  각각 통과했다.
+  이 source 검증에서는 authoritative stress, marker A/B, 제품/provider inference 및 Cargo gate를
+  실행하지 않았다. 따라서 `WIN-005`는
+  `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`를
+  유지하며 `WIN-006`, `WSL-022`, `WSL-023`도 닫지 않는다.
+
 ## WIN-007: marker A/B zero-candidate preflight strict-mode failure
 
 ### First invocation and isolated RED

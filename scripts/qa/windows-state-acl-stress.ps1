@@ -716,7 +716,10 @@ function New-IsolatedEnvironment {
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$FakeProvider,
         [Parameter(Mandatory = $true)][string]$InspectionMarker,
-        [Parameter(Mandatory = $true)][string]$InspectionMarkerDirectory
+        [Parameter(Mandatory = $true)][string]$InspectionMarkerDirectory,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('LatencyAttributedOff', 'CorrectnessAttributedOn')]
+        [string]$MarkerPhase
     )
     $userHome = Join-Path $Root 'user-home'
     $temp = Join-Path $Root 'temp'
@@ -729,7 +732,6 @@ function New-IsolatedEnvironment {
         'COLAY_HOME' = $ColayHomePath
         'COLAY_TEST_FAKE_PROVIDERS_ONLY' = '1'
         'COLAY_TEST_LEGACY_INSPECT_MARKER' = $InspectionMarker
-        'COLAY_TEST_LEGACY_INSPECT_MARKER_DIR' = $InspectionMarkerDirectory
         'COLAY_TEST_DAEMON_STDERR' = (Join-Path $Root 'daemon-stderr.log')
         'COLAY_TEST_DAEMON_CHILD_RESOLUTION' = (Join-Path $Root 'daemon-child-resolution.log')
         'HOME' = $userHome
@@ -744,6 +746,9 @@ function New-IsolatedEnvironment {
         'PATH' = (Split-Path -Parent $FakeProvider)
         'PATHEXT' = '.EXE;.CMD'
         'RUST_BACKTRACE' = '1'
+    }
+    if ($MarkerPhase -ceq 'CorrectnessAttributedOn') {
+        $environment['COLAY_TEST_LEGACY_INSPECT_MARKER_DIR'] = $InspectionMarkerDirectory
     }
     foreach ($key in $ProviderKeyNames) {
         [void]$environment.Remove($key)
@@ -2931,7 +2936,7 @@ function New-LegacyWorkspace {
             before = $hashes
             after = $null
         }
-        inspection_group_id = $null
+        source_root_hash = $null
         source_evidence = $null
         config_sha256 = Get-Sha256 (Join-Path $state 'config.toml')
     }
@@ -2946,7 +2951,7 @@ function Add-SourceEvidence {
         index = $Seed.index
         session_id = $Seed.session_id
         database = $Seed.database
-        inspection_group_id = $null
+        source_root_hash = $null
         sqlite_family_hashes = $Seed.source_hashes
         config_sha256 = $Seed.config_sha256
     }
@@ -3003,25 +3008,54 @@ function Get-AttributedInspectionSnapshot {
     return ,$groups
 }
 
-function Assert-NewAttributedInspectionGroups {
+function Assert-LatencyInspectionMarkers {
     param(
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Before,
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$After,
-        [Parameter(Mandatory = $true)][int]$ExpectedNewCount,
+        [Parameter(Mandatory = $true)][string]$AggregateMarker,
+        [Parameter(Mandatory = $true)][string]$AttributedDirectory,
+        [Parameter(Mandatory = $true)][ValidateRange(0, [int]::MaxValue)][int]$ExpectedAggregateCount,
         [Parameter(Mandatory = $true)][string]$Label
     )
-    foreach ($groupId in $Before.Keys) {
-        if (-not $After.Contains($groupId)) {
-            throw "$Label removed attributed inspection group $groupId"
-        }
-        Assert-EquivalentJson $Before[$groupId].event_names $After[$groupId].event_names `
-            "$Label existing attributed inspection group $groupId"
+    $aggregateCount = Get-InspectionCount $AggregateMarker
+    if ($aggregateCount -ne $ExpectedAggregateCount) {
+        throw "$Label aggregate inspection count was $aggregateCount; expected exactly $ExpectedAggregateCount"
     }
-    $newGroupIds = @($After.Keys | Where-Object { -not $Before.Contains($_) } | Sort-Object)
-    if ($newGroupIds.Count -ne $ExpectedNewCount) {
-        throw "$Label produced $($newGroupIds.Count) new attributed inspection groups; expected exactly $ExpectedNewCount"
+    $groups = Get-AttributedInspectionSnapshot $AttributedDirectory
+    if ($groups.Count -ne 0) {
+        throw "$Label produced $($groups.Count) attributed inspection group(s); expected exactly zero"
     }
-    return $newGroupIds
+    return [pscustomobject][ordered]@{
+        aggregate_count = $aggregateCount
+        attributed_group_count = 0
+        attributed_event_count = 0
+        groups = @()
+    }
+}
+
+function Assert-CorrectnessInspectionMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$AggregateMarker,
+        [Parameter(Mandatory = $true)][string]$AttributedDirectory,
+        [Parameter(Mandatory = $true)][string]$ExpectedGroup,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    if ($ExpectedGroup -cnotmatch '^[0-9a-f]{64}$') {
+        throw "$Label expected group is not one lowercase 64-hex source_root_hash"
+    }
+    $aggregateCount = Get-InspectionCount $AggregateMarker
+    if ($aggregateCount -ne 2) {
+        throw "$Label aggregate inspection count was $aggregateCount; expected exactly 2"
+    }
+    $groups = Get-AttributedInspectionSnapshot $AttributedDirectory
+    if ($groups.Count -ne 1 -or -not $groups.Contains($ExpectedGroup)) {
+        throw "$Label did not contain exactly the durable source_root_hash marker group"
+    }
+    $group = $groups[$ExpectedGroup]
+    return [pscustomobject][ordered]@{
+        aggregate_count = $aggregateCount
+        attributed_group_count = 1
+        attributed_event_count = [int]$group.event_count
+        groups = @($group)
+    }
 }
 
 function Assert-DatabaseHealth {
@@ -3124,9 +3158,9 @@ WHERE wp.is_current = 1 AND selected.session_id = '$sessionId';
         if ($sourceRootHash -cnotmatch '^[0-9a-f]{64}$') {
             throw "workspace $($seed.index) result_json has malformed opaque source_root_hash"
         }
-        $seed.inspection_group_id = $sourceRootHash
+        $seed.source_root_hash = $sourceRootHash
         if ($null -ne $seed.source_evidence) {
-            $seed.source_evidence.inspection_group_id = $sourceRootHash
+            $seed.source_evidence.source_root_hash = $sourceRootHash
         }
         $workspaceId = [string]$rows[0].workspace_id
         $sourceFingerprint = [string]$rows[0].source_fingerprint
@@ -3909,6 +3943,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:ChildProcessLineFailureForTest = $null
 $script:LastChildProcessCleanup = $null
+$script:AuditDaemonReadinessTimeoutMs = 5000
+$script:AuditDaemonReadinessPollIntervalMs = 50
+$script:AuditDaemonReadinessCleanupReserveMs = 100
 
 function ConvertTo-ComparablePath {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -4261,6 +4298,237 @@ function Invoke-ColayDocument {
     catch { throw "$Label did not emit valid JSON: $($_.Exception.Message)" }
 }
 
+function ConvertTo-AuditDaemonDocumentIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Document,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('daemon_start', 'daemon_status')]
+        [string]$ExpectedCommand,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutable
+    )
+    if ($null -eq $Document -or
+        $Document.PSObject.Properties.Name -cnotcontains 'schema_version' -or
+        $Document.PSObject.Properties.Name -cnotcontains 'command' -or
+        $Document.PSObject.Properties.Name -cnotcontains 'data' -or
+        $Document.schema_version -isnot [string] -or
+        [string]$Document.schema_version -cne '1' -or
+        $Document.command -isnot [string] -or
+        [string]$Document.command -cne $ExpectedCommand) {
+        throw "$ExpectedCommand did not return exact schema-v1 $ExpectedCommand JSON"
+    }
+    if ($null -eq $Document.data -or
+        $Document.data.PSObject.Properties.Name -cnotcontains 'status' -or
+        $null -eq $Document.data.status -or
+        $Document.data.status.PSObject.Properties.Name -cnotcontains 'state' -or
+        $Document.data.status.PSObject.Properties.Name -cnotcontains 'instance') {
+        throw "$ExpectedCommand JSON has no exact status identity"
+    }
+    $status = $Document.data.status
+    $instance = $status.instance
+    if ($null -eq $instance) { throw "$ExpectedCommand JSON has no exact instance identity" }
+    foreach ($propertyName in @('instance_id', 'pid', 'phase', 'executable_path')) {
+        if ($instance.PSObject.Properties.Name -cnotcontains $propertyName) {
+            throw "$ExpectedCommand instance is missing exact property: $propertyName"
+        }
+    }
+    if ($status.state -isnot [string] -or
+        $instance.phase -isnot [string] -or
+        $instance.instance_id -isnot [string] -or
+        $instance.executable_path -isnot [string]) {
+        throw "$ExpectedCommand state, phase, instance id, and executable path must be exact JSON strings"
+    }
+    $state = [string]$status.state
+    $phase = [string]$instance.phase
+    if ([string]::IsNullOrWhiteSpace($state) -or
+        [string]::IsNullOrWhiteSpace($phase) -or
+        $state -cne $phase) {
+        throw "$ExpectedCommand state/phase mismatch: state '$state', phase '$phase'"
+    }
+
+    $instanceIdText = [string]$instance.instance_id
+    try {
+        $instanceId = ([guid]::ParseExact($instanceIdText, 'D')).ToString('D')
+    } catch {
+        throw "$ExpectedCommand returned a malformed instance id: $instanceIdText"
+    }
+    if ($instanceIdText -cne $instanceId) {
+        throw "$ExpectedCommand instance id is not canonical UUID text: $instanceIdText"
+    }
+
+    $integralPidTypes = @(
+        [byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64]
+    )
+    if ($null -eq $instance.pid -or $integralPidTypes -notcontains $instance.pid.GetType()) {
+        $actualPidType = if ($null -eq $instance.pid) { 'null' } else { $instance.pid.GetType().FullName }
+        throw "$ExpectedCommand PID is not an exact JSON integer: $actualPidType"
+    }
+    $rawPid = [int64]$instance.pid
+    if ($rawPid -le 0 -or $rawPid -gt [uint32]::MaxValue -or $rawPid -eq $PID) {
+        throw "$ExpectedCommand returned an unsafe process id: $rawPid"
+    }
+
+    $executablePathText = [string]$instance.executable_path
+    if ([string]::IsNullOrWhiteSpace($executablePathText) -or
+        -not [System.IO.Path]::IsPathFullyQualified($executablePathText)) {
+        throw "$ExpectedCommand executable path is not an exact absolute path: $executablePathText"
+    }
+    $jsonPath = ConvertTo-ComparablePath $executablePathText
+    $expectedPath = ConvertTo-ComparablePath $ExpectedExecutable
+    if (-not $jsonPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$ExpectedCommand executable path mismatch: expected $expectedPath, found $jsonPath"
+    }
+
+    return [pscustomobject][ordered]@{
+        Document = $Document
+        Command = [string]$Document.command
+        State = $state
+        Phase = $phase
+        InstanceId = $instanceId
+        ProcessId = [uint32]$rawPid
+        ExecutablePath = $jsonPath
+    }
+}
+
+function Assert-AuditDaemonReadinessDeadline {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$Stopwatch,
+        [Parameter(Mandatory = $true)][ValidateRange(1, [int]::MaxValue)][int]$OverallTimeoutMs
+    )
+    if ([int64]$Stopwatch.ElapsedMilliseconds -ge $OverallTimeoutMs) {
+        throw "audit daemon readiness timed out after ${OverallTimeoutMs}ms"
+    }
+}
+
+function Wait-AuditDaemonReadiness {
+    param(
+        [Parameter(Mandatory = $true)]$DaemonStartDocument,
+        [Parameter(Mandatory = $true)][string]$ExpectedExecutable,
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    $evidenceKey = 'ColayStressAuditDaemonReadinessEvidence'
+    $polls = [System.Collections.Generic.List[object]]::new()
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $evidence = [pscustomobject][ordered]@{
+        readiness_status = 'failed'
+        original_state = $null
+        final_state = $null
+        poll_count = 0
+        elapsed_ms = 0
+        overall_timeout_ms = $script:AuditDaemonReadinessTimeoutMs
+        poll_interval_ms = $script:AuditDaemonReadinessPollIntervalMs
+        cleanup_reserve_ms = $script:AuditDaemonReadinessCleanupReserveMs
+        status_command = @('--json', 'daemon', 'status')
+        anchored_identity = $null
+        polls = @()
+        online_document = $null
+        failure = $null
+    }
+    try {
+        $anchor = ConvertTo-AuditDaemonDocumentIdentity -Document $DaemonStartDocument `
+            -ExpectedCommand daemon_start -ExpectedExecutable $ExpectedExecutable
+        $evidence.original_state = $anchor.State
+        $evidence.final_state = $anchor.State
+        $evidence.anchored_identity = [pscustomobject][ordered]@{
+            instance_id = $anchor.InstanceId
+            process_id = [int64]$anchor.ProcessId
+            executable_path = $anchor.ExecutablePath
+        }
+        [void](Assert-AuditDaemonReadinessDeadline -Stopwatch $stopwatch `
+            -OverallTimeoutMs $script:AuditDaemonReadinessTimeoutMs)
+        if (@('booting', 'probing', 'online') -cnotcontains $anchor.State) {
+            throw "audit daemon readiness start returned terminal or non-progress state '$($anchor.State)'"
+        }
+        if ($anchor.State -ceq 'online') {
+            $evidence.readiness_status = 'online'
+            $evidence.online_document = $DaemonStartDocument
+            $evidence.elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+            return [pscustomobject][ordered]@{
+                Evidence = $evidence
+                OnlineDocument = $DaemonStartDocument
+            }
+        }
+
+        while ($true) {
+            $remainingBeforeSleepMs = $script:AuditDaemonReadinessTimeoutMs - [int64]$stopwatch.ElapsedMilliseconds
+            $sleepBudgetMs = $remainingBeforeSleepMs - $script:AuditDaemonReadinessCleanupReserveMs
+            if ($sleepBudgetMs -le 0) {
+                throw "audit daemon readiness timed out after $($script:AuditDaemonReadinessTimeoutMs)ms"
+            }
+            $sleepMs = [int][Math]::Min($script:AuditDaemonReadinessPollIntervalMs, $sleepBudgetMs)
+            Start-Sleep -Milliseconds $sleepMs
+
+            $remainingMs = $script:AuditDaemonReadinessTimeoutMs - [int64]$stopwatch.ElapsedMilliseconds
+            $commandBudgetMs = [int]($remainingMs - $script:AuditDaemonReadinessCleanupReserveMs)
+            if ($commandBudgetMs -le 0) {
+                throw "audit daemon readiness timed out after $($script:AuditDaemonReadinessTimeoutMs)ms"
+            }
+            $pollNumber = $polls.Count + 1
+            $commandLabel = "$Label-daemon-readiness-{0:D3}" -f $pollNumber
+            $pollEvidence = [pscustomobject][ordered]@{
+                poll = $pollNumber
+                command_label = $commandLabel
+                command_timeout_ms = $commandBudgetMs
+                observed_elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                state = $null
+                phase = $null
+                instance_id = $null
+                process_id = $null
+                executable_path = $null
+            }
+            $polls.Add($pollEvidence)
+            $evidence.poll_count = $polls.Count
+            $evidence.polls = $polls.ToArray()
+            $statusDocument = Invoke-ColayDocument -Repository $Repository `
+                -Arguments @('--json', 'daemon', 'status') -Label $commandLabel `
+                -TimeoutMs $commandBudgetMs
+            $pollEvidence.observed_elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+            [void](Assert-AuditDaemonReadinessDeadline -Stopwatch $stopwatch `
+                -OverallTimeoutMs $script:AuditDaemonReadinessTimeoutMs)
+            $statusIdentity = ConvertTo-AuditDaemonDocumentIdentity -Document $statusDocument `
+                -ExpectedCommand daemon_status -ExpectedExecutable $ExpectedExecutable
+            $pollEvidence.state = $statusIdentity.State
+            $pollEvidence.phase = $statusIdentity.Phase
+            $pollEvidence.instance_id = $statusIdentity.InstanceId
+            $pollEvidence.process_id = [int64]$statusIdentity.ProcessId
+            $pollEvidence.executable_path = $statusIdentity.ExecutablePath
+            if ($statusIdentity.InstanceId -cne $anchor.InstanceId -or
+                $statusIdentity.ProcessId -ne $anchor.ProcessId -or
+                -not $statusIdentity.ExecutablePath.Equals(
+                    $anchor.ExecutablePath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                throw "audit daemon readiness identity drift at status poll $pollNumber"
+            }
+            [void](Assert-AuditDaemonReadinessDeadline -Stopwatch $stopwatch `
+                -OverallTimeoutMs $script:AuditDaemonReadinessTimeoutMs)
+
+            $evidence.final_state = $statusIdentity.State
+            if ($statusIdentity.State -ceq 'online') {
+                $evidence.readiness_status = 'online'
+                $evidence.online_document = $statusDocument
+                $evidence.elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+                return [pscustomobject][ordered]@{
+                    Evidence = $evidence
+                    OnlineDocument = $statusDocument
+                }
+            }
+            if (@('booting', 'probing') -cnotcontains $statusIdentity.State) {
+                throw "audit daemon readiness status poll $pollNumber returned terminal or non-progress state '$($statusIdentity.State)'"
+            }
+        }
+    } catch {
+        $evidence.poll_count = $polls.Count
+        $evidence.polls = $polls.ToArray()
+        $evidence.elapsed_ms = [int64]$stopwatch.ElapsedMilliseconds
+        $evidence.failure = $_.Exception.Message
+        $_.Exception.Data[$evidenceKey] = $evidence
+        throw
+    } finally {
+        $stopwatch.Stop()
+    }
+}
+
 function Get-SqliteFamilyHashes {
     param([string]$Database)
     $hashes = [ordered]@{}
@@ -4354,6 +4622,7 @@ $processLineFailureSelfTest = Invoke-ChildProcessLineFailureSelfTest
 $primaryFailure = $null
 $cleanupFailures = [System.Collections.Generic.List[string]]::new()
 $durable = $null
+$daemonReadiness = $null
 try {
     if (Test-Path -LiteralPath (Join-Path $AuditColayHome 'state/state.db')) {
         throw 'audit COLAY_HOME had a pre-existing global database'
@@ -4363,8 +4632,9 @@ try {
     }
     $started = Invoke-ColayDocument -Repository $EmptyRepository -Arguments @('--json', 'daemon', 'start') `
         -Label 'audit daemon start' -TimeoutMs 40000
-    if ([string]$started.schema_version -cne '1' -or [string]$started.command -cne 'daemon_start' -or
-        [string]$started.data.status.state -cne 'online') { throw 'audit daemon start did not return exact online status' }
+    $readiness = Wait-AuditDaemonReadiness -DaemonStartDocument $started `
+        -ExpectedExecutable $ColayExe -Repository $EmptyRepository -Label 'audit'
+    $daemonReadiness = $readiness.Evidence
 
     $registered = Invoke-ColayDocument -Repository $LegacyRepository -Arguments @('--json', 'status') `
         -Label 'audit legacy registration' -TimeoutMs 40000
@@ -4410,6 +4680,9 @@ try {
     if ($actualConfigHash -cne $ExpectedConfigSha256) { throw 'audit legacy config hash changed' }
 }
 catch {
+    if ($_.Exception.Data.Contains('ColayStressAuditDaemonReadinessEvidence')) {
+        $daemonReadiness = $_.Exception.Data['ColayStressAuditDaemonReadinessEvidence']
+    }
     $primaryFailure = $_
 }
 finally {
@@ -4456,6 +4729,7 @@ if ($null -ne $primaryFailure -or $cleanupFailures.Count -ne 0) {
         primary_failure = $primaryFailureMessage
         cleanup_failures = $cleanupFailureMessages
         cleanup_state = if ($cleanupFailureMessages.Count -eq 0) { 'stopped' } else { 'failed' }
+        daemon_readiness = $daemonReadiness
         process_line_failure_self_test = $processLineFailureSelfTest
     }
     try {
@@ -4471,6 +4745,7 @@ if ($null -ne $primaryFailure -or $cleanupFailures.Count -ne 0) {
     status = 'passed'
     imported_workspace_id = [string]$durable.import.workspace_id
     source_root_hash = [string]$durable.import.result.source_root_hash
+    daemon_readiness = $daemonReadiness
     cleanup_state = 'stopped'
     process_line_failure_self_test = $processLineFailureSelfTest
 } | ConvertTo-Json -Compress
@@ -4600,7 +4875,7 @@ function Assert-StrongProcessAuditEvidence {
 
 $runStamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
 $summary = [ordered]@{
-    schema_version = 1
+    schema_version = 2
     run_id = $runStamp
     started_at_utc = [datetime]::UtcNow.ToString('o')
     completed_at_utc = $null
@@ -4646,13 +4921,32 @@ $summary = [ordered]@{
         command_timings = @()
     }
     inspection_count = $null
+    marker_phase_policy = 'split-latency-marker-off-and-correctness-marker-on-phases'
     inspection_markers = [pscustomobject][ordered]@{
-        attributed_directory = $null
-        attributed_group_count = $null
-        attributed_event_count = $null
-        groups = @()
-        legacy_aggregate_file = $null
-        legacy_aggregate_count = $null
+        latency_phase = [pscustomobject][ordered]@{
+            marker_phase = 'LatencyAttributedOff'
+            aggregate_file = $null
+            aggregate_count = $null
+            attributed_environment_key_present = $null
+            attributed_sentinel_directory = $null
+            attributed_group_count = $null
+            attributed_event_count = $null
+            groups = @()
+            timing_included_in_latency_thresholds = $true
+        }
+        correctness_phase = [pscustomobject][ordered]@{
+            marker_phase = 'CorrectnessAttributedOn'
+            aggregate_file = $null
+            aggregate_count = $null
+            attributed_environment_key_present = $null
+            attributed_directory = $null
+            attributed_group_count = $null
+            attributed_event_count = $null
+            groups = @()
+            source_root_hash = $null
+            source_root_hash_matches_group = $null
+            timing_included_in_latency_thresholds = $false
+        }
     }
     forbidden_utility_launches = @()
     process_ownership_refusals = @()
@@ -4744,10 +5038,15 @@ try {
     }
     $environment = New-IsolatedEnvironment -ColayHomePath $script:ColayHome -Root $script:RunRoot `
         -FakeProvider $resolvedFake -InspectionMarker $inspectionMarker `
-        -InspectionMarkerDirectory $inspectionMarkerDirectory
+        -InspectionMarkerDirectory $inspectionMarkerDirectory -MarkerPhase LatencyAttributedOff
     New-Item -ItemType Directory -Path $inspectionMarkerDirectory -ErrorAction Stop | Out-Null
-    $summary.inspection_markers.attributed_directory = $inspectionMarkerDirectory
-    $summary.inspection_markers.legacy_aggregate_file = $inspectionMarker
+    $summary.inspection_markers.latency_phase.aggregate_file = $inspectionMarker
+    $summary.inspection_markers.latency_phase.attributed_environment_key_present = `
+        $environment.Contains('COLAY_TEST_LEGACY_INSPECT_MARKER_DIR')
+    $summary.inspection_markers.latency_phase.attributed_sentinel_directory = $inspectionMarkerDirectory
+    if ($summary.inspection_markers.latency_phase.attributed_environment_key_present) {
+        throw 'latency environment unexpectedly contains the attributed marker key'
+    }
     New-FakeProviderConfig -ColayHomePath $script:ColayHome -FakeProvider $resolvedFake
 
     $timeoutSource = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'crates/orchestrator-cli/src/ipc_client.rs') -Raw
@@ -4844,14 +5143,14 @@ try {
     $started = Invoke-Colay -Repository $emptyRepository -ArgumentValues @('--json', 'daemon', 'start') `
         -Environment $environment -Label 'start-empty-incumbent' -TimeoutMs 40000
     [void](Assert-StatusJson $started)
-    $emptyInspectionGroups = Get-AttributedInspectionSnapshot $inspectionMarkerDirectory
-    if ($emptyInspectionGroups.Count -ne 0) { throw 'empty incumbent unexpectedly inspected an attributed legacy source' }
+    $latencyMarkerState = Assert-LatencyInspectionMarkers -AggregateMarker $inspectionMarker `
+        -AttributedDirectory $inspectionMarkerDirectory -ExpectedAggregateCount 0 `
+        -Label 'empty incumbent latency phase'
     $seeds = [System.Collections.Generic.List[object]]::new()
     [void](Assert-DurableState -Seeds @() -ExpectedWorkspaceCount 1 -Environment $environment)
 
     $serialTimes = [System.Collections.Generic.List[int64]]::new()
     for ($index = 1; $index -le 5; $index++) {
-        $beforeInspectionGroups = Get-AttributedInspectionSnapshot $inspectionMarkerDirectory
         $seed = New-LegacyWorkspace -Index $index -Root $workspaceRoot -Environment $environment
         $seeds.Add($seed)
         Add-SourceEvidence -Seed $seed -Summary $summary
@@ -4860,16 +5159,13 @@ try {
         [void](Assert-StatusJson $result)
         $serialTimes.Add([int64]$result.elapsed_ms)
         $summary.serial_times_ms = $serialTimes.ToArray()
-        $afterInspectionGroups = Get-AttributedInspectionSnapshot $inspectionMarkerDirectory
-        $newInspectionGroups = @(Assert-NewAttributedInspectionGroups -Before $beforeInspectionGroups `
-            -After $afterInspectionGroups -ExpectedNewCount 1 -Label "serial workspace $index")
+        $latencyMarkerState = Assert-LatencyInspectionMarkers -AggregateMarker $inspectionMarker `
+            -AttributedDirectory $inspectionMarkerDirectory -ExpectedAggregateCount (2 * $index) `
+            -Label "serial workspace $index latency phase"
         $sourceHashesAfter = Get-SqliteFamilyHashes $seed.database
         $seed.source_hashes.after = $sourceHashesAfter
         Assert-EquivalentJson $seed.source_hashes.before $sourceHashesAfter "serial source $index SQLite family"
         [void](Assert-DurableState -Seeds $seeds.ToArray() -ExpectedWorkspaceCount (1 + $seeds.Count) -Environment $environment)
-        if ([string]$seed.inspection_group_id -cne [string]$newInspectionGroups[0]) {
-            throw "serial workspace $index durable source_root_hash does not match its new opaque inspection group"
-        }
     }
     $summary.serial_times_ms = $serialTimes.ToArray()
     $serialMax = [int64](($serialTimes.ToArray() | Measure-Object -Maximum).Maximum)
@@ -4882,7 +5178,6 @@ try {
         $concurrentSeeds.Add($seed)
         Add-SourceEvidence -Seed $seed -Summary $summary
     }
-    $concurrentInspectionGroupsBefore = Get-AttributedInspectionSnapshot $inspectionMarkerDirectory
     $concurrentRequests = [System.Collections.Generic.List[object]]::new()
     foreach ($seed in $concurrentSeeds) {
         $concurrentRequests.Add([pscustomobject]@{
@@ -4950,31 +5245,24 @@ try {
     if ($concurrentFailures.Count -ne 0) {
         throw "concurrent registration failure(s): $($concurrentFailures -join '; ')"
     }
-    $concurrentInspectionGroupsAfter = Get-AttributedInspectionSnapshot $inspectionMarkerDirectory
-    $newConcurrentInspectionGroups = @(Assert-NewAttributedInspectionGroups -Before $concurrentInspectionGroupsBefore `
-        -After $concurrentInspectionGroupsAfter -ExpectedNewCount 4 -Label 'concurrent workspaces')
     $summary.concurrent_times_ms = $concurrentTimes.ToArray()
     $summary.concurrent_max_ms = [int64](($concurrentTimes.ToArray() | Measure-Object -Maximum).Maximum)
 
     $durableState = Assert-DurableState -Seeds $seeds.ToArray() -ExpectedWorkspaceCount 10 -Environment $environment
     $summary.durable_state = $durableState
-    $durableConcurrentGroups = @($concurrentSeeds | ForEach-Object { [string]$_.inspection_group_id } | Sort-Object)
-    Assert-EquivalentJson $newConcurrentInspectionGroups $durableConcurrentGroups `
-        'concurrent opaque inspection groups versus durable source_root_hash values'
     foreach ($seed in $seeds) {
         $after = Get-SqliteFamilyHashes $seed.database
         $seed.source_hashes.after = $after
         Assert-EquivalentJson $seed.source_hashes.before $after "source $($seed.index) SQLite family"
     }
-    $finalInspectionGroups = Get-AttributedInspectionSnapshot $inspectionMarkerDirectory
-    if ($finalInspectionGroups.Count -ne 9) {
-        throw "final attributed inspection group count was $($finalInspectionGroups.Count); expected exactly 9"
-    }
-    $summary.inspection_markers.attributed_group_count = $finalInspectionGroups.Count
-    $summary.inspection_markers.attributed_event_count = 2 * $finalInspectionGroups.Count
-    $summary.inspection_markers.groups = @($finalInspectionGroups.Values | Sort-Object group_id)
-    $summary.inspection_markers.legacy_aggregate_count = Get-InspectionCount $inspectionMarker
-    $summary.inspection_count = $summary.inspection_markers.attributed_event_count
+    $latencyMarkerState = Assert-LatencyInspectionMarkers -AggregateMarker $inspectionMarker `
+        -AttributedDirectory $inspectionMarkerDirectory -ExpectedAggregateCount 18 `
+        -Label 'final latency phase'
+    $summary.inspection_markers.latency_phase.aggregate_count = $latencyMarkerState.aggregate_count
+    $summary.inspection_markers.latency_phase.attributed_group_count = $latencyMarkerState.attributed_group_count
+    $summary.inspection_markers.latency_phase.attributed_event_count = $latencyMarkerState.attributed_event_count
+    $summary.inspection_markers.latency_phase.groups = @($latencyMarkerState.groups)
+    $summary.inspection_count = $latencyMarkerState.aggregate_count
     $globalDatabase = Join-Path $script:ColayHome 'state/state.db'
     $summary.zero_writable_rows = Assert-ZeroWritableRows -Database $globalDatabase -Environment $environment
     Assert-DatabaseHealth -Database $globalDatabase -Environment $environment
@@ -5076,8 +5364,16 @@ try {
     }
     $auditEnvironment = New-IsolatedEnvironment -ColayHomePath $auditColayHome -Root $auditRuntimeRoot `
         -FakeProvider $resolvedFake -InspectionMarker $auditMarkerFile `
-        -InspectionMarkerDirectory $auditMarkerDirectory
+        -InspectionMarkerDirectory $auditMarkerDirectory -MarkerPhase CorrectnessAttributedOn
     New-Item -ItemType Directory -Path $auditMarkerDirectory -ErrorAction Stop | Out-Null
+    $summary.inspection_markers.correctness_phase.aggregate_file = $auditMarkerFile
+    $summary.inspection_markers.correctness_phase.attributed_environment_key_present = `
+        $auditEnvironment.Contains('COLAY_TEST_LEGACY_INSPECT_MARKER_DIR')
+    $summary.inspection_markers.correctness_phase.attributed_directory = $auditMarkerDirectory
+    if (-not $summary.inspection_markers.correctness_phase.attributed_environment_key_present -or
+        [string]$auditEnvironment['COLAY_TEST_LEGACY_INSPECT_MARKER_DIR'] -cne $auditMarkerDirectory) {
+        throw 'correctness environment omitted the exact attributed marker directory'
+    }
     New-FakeProviderConfig -ColayHomePath $auditColayHome -FakeProvider $resolvedFake
     $auditGlobalDatabase = Join-Path $auditColayHome 'state/state.db'
     if (Test-Path -LiteralPath $auditGlobalDatabase) {
@@ -5085,7 +5381,9 @@ try {
     }
     $auditSeed = New-LegacyWorkspace -Index 10 -Root $auditWorkspaceRoot -Environment $auditEnvironment
     $auditGroupsBefore = Get-AttributedInspectionSnapshot $auditMarkerDirectory
-    if ($auditGroupsBefore.Count -ne 0) { throw 'process audit marker root was not empty before DEBUG_PROCESS launch' }
+    if ($auditGroupsBefore.Count -ne 0 -or (Get-InspectionCount $auditMarkerFile) -ne 0) {
+        throw 'process audit markers were not empty before DEBUG_PROCESS launch'
+    }
 
     $auditChildArguments = @(
         '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $auditChildScript,
@@ -5161,13 +5459,18 @@ try {
         'process audit source SQLite family'
     $auditDurableState = Assert-DurableState -Seeds @($auditSeed) -ExpectedWorkspaceCount 2 `
         -Environment $auditEnvironment -ColayHomePath $auditColayHome
-    $auditGroupsAfter = Get-AttributedInspectionSnapshot $auditMarkerDirectory
-    $auditNewGroups = @(Assert-NewAttributedInspectionGroups -Before $auditGroupsBefore `
-        -After $auditGroupsAfter -ExpectedNewCount 1 -Label 'process audit legacy source')
-    if ([string]$auditSeed.inspection_group_id -cne [string]$auditNewGroups[0] -or
-        [string]$auditChildResult.source_root_hash -cne [string]$auditNewGroups[0]) {
+    $correctnessMarkerState = Assert-CorrectnessInspectionMarkers -AggregateMarker $auditMarkerFile `
+        -AttributedDirectory $auditMarkerDirectory -ExpectedGroup $auditSeed.source_root_hash `
+        -Label 'process audit correctness phase'
+    if ([string]$auditChildResult.source_root_hash -cne [string]$auditSeed.source_root_hash) {
         throw 'process audit opaque marker group did not match durable and child source identity'
     }
+    $summary.inspection_markers.correctness_phase.aggregate_count = $correctnessMarkerState.aggregate_count
+    $summary.inspection_markers.correctness_phase.attributed_group_count = $correctnessMarkerState.attributed_group_count
+    $summary.inspection_markers.correctness_phase.attributed_event_count = $correctnessMarkerState.attributed_event_count
+    $summary.inspection_markers.correctness_phase.groups = @($correctnessMarkerState.groups)
+    $summary.inspection_markers.correctness_phase.source_root_hash = $auditSeed.source_root_hash
+    $summary.inspection_markers.correctness_phase.source_root_hash_matches_group = $true
     $auditZeroWritableRows = Assert-ZeroWritableRows -Database $auditGlobalDatabase -Environment $auditEnvironment
     Assert-DatabaseHealth -Database $auditGlobalDatabase -Environment $auditEnvironment
     $auditLiveRows = Invoke-Sqlite -Database $auditGlobalDatabase `
@@ -5191,10 +5494,8 @@ try {
             database = $auditSeed.database
             sqlite_family_hashes = $auditSeed.source_hashes
             config_sha256 = $auditSeed.config_sha256
-            inspection_group_id = $auditSeed.inspection_group_id
+            source_root_hash = $auditSeed.source_root_hash
         }
-        attributed_marker = @($auditGroupsAfter.Values)[0]
-        legacy_aggregate_count = Get-InspectionCount $auditMarkerFile
         zero_writable_rows = $auditZeroWritableRows
         live_lease_count = [int]$auditLiveRows[0].row_count
     }
