@@ -371,11 +371,14 @@ try {
         }
     }
 
-    $mainReadinessReady = @(
+    $requiredMainReadinessFunctions = @(
         'ConvertTo-StressDaemonDocumentIdentity',
         'Assert-StressDaemonReadinessDeadline',
         'Wait-MainDaemonReadiness'
-    | Where-Object { $availableStressFunctions -cnotcontains $_ }).Count -eq 0
+    )
+    $mainReadinessReady = @($requiredMainReadinessFunctions | Where-Object {
+        $availableStressFunctions -cnotcontains $_
+    }).Count -eq 0
     if ($mainReadinessReady) {
         $expectedMainColay = Join-Path $tempRoot 'main-bin/colay.exe'
         $mainRepository = Join-Path $tempRoot 'main-repository'
@@ -396,6 +399,7 @@ try {
         $script:ProcessExitTimeFailureForTest = $false
         $script:ProcessFinalizeFailureForTest = $null
         $script:HarnessProcessIdentity = [pscustomobject]@{ identity_key = 'focused-test-parent' }
+        $script:processObservationCalls = 0
 
         function Assert-FreeDisk { return @() }
         function Register-OwnedProcessIdentity {
@@ -417,7 +421,7 @@ try {
             }
         }
         function Set-OwnedProcessIdentityExit { param($Identity, [datetime]$ExitTimeUtc) }
-        function Update-ProcessObservation { }
+        function Update-ProcessObservation { $script:processObservationCalls++ }
 
         function Invoke-Colay {
             param(
@@ -654,6 +658,7 @@ try {
                 PATH = (Split-Path -Parent $script:mainPortablePowerShell)
             }
             $script:CommandEvidence.Clear()
+            $script:processObservationCalls = 0
             $result = Invoke-HarnessProcess -Executable $script:mainPortablePowerShell `
                 -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "'default-ok'") `
                 -WorkingDirectory $mainRepository -Environment $defaultEnvironment `
@@ -661,6 +666,11 @@ try {
             Assert-Equal 0 $result.exit_code 'generic default success exit code'
             Assert-True ($null -eq $result.deadline) 'generic default success unexpectedly used deadline evidence'
             Assert-True (-not $result.observer_deferred) 'generic default success unexpectedly deferred observation'
+            Assert-Equal os-process-lifetime $result.measurement_method `
+                'generic default success changed OS-lifetime measurement'
+            Assert-Equal 1 $script:processObservationCalls `
+                'generic default success changed process-observation behavior'
+            $script:processObservationCalls = 0
             $failure = Get-ThrownFailure -Action {
                 Invoke-HarnessProcess -Executable $script:mainPortablePowerShell `
                     -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') `
@@ -679,6 +689,391 @@ try {
                 'generic default cleanup unexpectedly became deadline-aware'
             Assert-Equal 0 @($timeoutRow[0].failure_cleanup.cleanup_errors).Count `
                 'generic default timeout cleanup error count'
+            Assert-Equal 1 $script:processObservationCalls `
+                'generic default timeout changed process-observation behavior'
+            $waitFunctionText = (Get-FunctionAst -Ast $stressAst -Name 'Wait-HarnessProcess').Extent.Text
+            Assert-True ($waitFunctionText -match '\.WaitForExit\(10\)') `
+                'generic default wait polling is not exactly 10ms'
+        }
+
+        Invoke-TestCase 'deadline contract rejects partial cleanup limits before process launch' {
+            Assert-Throws -Action {
+                Assert-HarnessDeadlineContract -OverallDeadlineStopwatch $null -OverallDeadlineMs 0 `
+                    -ExitWaitLimitMs 17 -OutputDrainLimitMs 19 -RequestedExecutionTimeoutMs 100
+            } -MessagePattern 'atomic|partial|deadline contract' `
+                -Message 'partial cleanup-only deadline contract was accepted'
+            Assert-Throws -Action {
+                Assert-HarnessDeadlineContract -OverallDeadlineStopwatch $null -OverallDeadlineMs 0 `
+                    -ExitWaitLimitMs 5000 -OutputDrainLimitMs 2000 -RequestedExecutionTimeoutMs 100
+            } -MessagePattern 'atomic|invalid|deadline contract' `
+                -Message 'explicit null/default deadline quartet silently downgraded to non-deadline mode'
+            $deadlineEnvironment = [ordered]@{
+                SystemRoot = $env:SystemRoot
+                WINDIR = $env:WINDIR
+                TEMP = [System.IO.Path]::GetTempPath()
+                TMP = [System.IO.Path]::GetTempPath()
+                PATH = (Split-Path -Parent $script:mainPortablePowerShell)
+            }
+            $script:partialDeadlineRecord = $null
+            $partialLaunchMarker = Join-Path $tempRoot 'partial-deadline-launch.marker'
+            $escapedPartialLaunchMarker = $partialLaunchMarker.Replace("'", "''")
+            $partialLaunchCommand = "[System.IO.File]::WriteAllText('$escapedPartialLaunchMarker', 'launched'); Start-Sleep -Seconds 30"
+            $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                Assert-Throws -Action {
+                    $script:partialDeadlineRecord = Start-HarnessProcess `
+                        -Executable $script:mainPortablePowerShell `
+                        -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $partialLaunchCommand) `
+                        -WorkingDirectory $mainRepository -Environment $deadlineEnvironment `
+                        -Label 'partial-prelaunch-deadline' -StandardInputText $null `
+                        -OverallDeadlineStopwatch $stopwatch -OverallDeadlineMs 10000 `
+                        -RequestedExecutionTimeoutMs 1000 -DeferObservation
+                } -MessagePattern 'atomic|partial|deadline contract' `
+                    -Message 'partial stopwatch/overall deadline contract reached process launch'
+            } finally {
+                if ($null -ne $script:partialDeadlineRecord -and
+                    $null -ne $script:partialDeadlineRecord.Process) {
+                    try { $script:partialDeadlineRecord.Process.Kill($true) } catch { }
+                    try { [void]$script:partialDeadlineRecord.Process.WaitForExit(1000) } catch { }
+                    try { $script:partialDeadlineRecord.Process.Dispose() } catch { }
+                    $script:partialDeadlineRecord.Process = $null
+                }
+            }
+            Assert-True (-not (Test-Path -LiteralPath $partialLaunchMarker)) `
+                'partial stopwatch/overall deadline contract launched a child before rejection'
+
+            $nullDeadlineMarker = Join-Path $tempRoot 'null-deadline-launch.marker'
+            $escapedNullDeadlineMarker = $nullDeadlineMarker.Replace("'", "''")
+            $nullDeadlineCommand = "[System.IO.File]::WriteAllText('$escapedNullDeadlineMarker', 'launched'); Start-Sleep -Seconds 30"
+            $script:nullDeadlineRecord = $null
+            try {
+                Assert-Throws -Action {
+                    $script:nullDeadlineRecord = Start-HarnessProcess `
+                        -Executable $script:mainPortablePowerShell `
+                        -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $nullDeadlineCommand) `
+                        -WorkingDirectory $mainRepository -Environment $deadlineEnvironment `
+                        -Label 'null-prelaunch-deadline' -StandardInputText $null `
+                        -OverallDeadlineStopwatch $null -OverallDeadlineMs 0 `
+                        -ExitWaitLimitMs 5000 -OutputDrainLimitMs 2000 `
+                        -RequestedExecutionTimeoutMs 100 -DeferObservation
+                } -MessagePattern 'atomic|invalid|deadline contract' `
+                    -Message 'explicit null/default deadline quartet reached process launch'
+            } finally {
+                if ($null -ne $script:nullDeadlineRecord -and
+                    $null -ne $script:nullDeadlineRecord.Process) {
+                    try { $script:nullDeadlineRecord.Process.Kill($true) } catch { }
+                    try { [void]$script:nullDeadlineRecord.Process.WaitForExit(1000) } catch { }
+                    try { $script:nullDeadlineRecord.Process.Dispose() } catch { }
+                    $script:nullDeadlineRecord.Process = $null
+                }
+            }
+            Assert-True (-not (Test-Path -LiteralPath $nullDeadlineMarker)) `
+                'explicit null/default deadline quartet launched a child before rejection'
+
+            $partialWrapperMarker = Join-Path $tempRoot 'partial-wrapper-launch.marker'
+            $escapedPartialWrapperMarker = $partialWrapperMarker.Replace("'", "''")
+            $partialWrapperCommand = "[System.IO.File]::WriteAllText('$escapedPartialWrapperMarker', 'launched'); Start-Sleep -Seconds 30"
+            $wrapperStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws -Action {
+                Invoke-HarnessProcess -Executable $script:mainPortablePowerShell `
+                    -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $partialWrapperCommand) `
+                    -WorkingDirectory $mainRepository -Environment $deadlineEnvironment `
+                    -Label 'partial-wrapper-deadline' -TimeoutMs 1000 -StandardInputText $null `
+                    -OverallDeadlineStopwatch $wrapperStopwatch -OverallDeadlineMs 10000 `
+                    -DeferObservation
+            } -MessagePattern 'atomic|partial|deadline contract' `
+                -Message 'partial wrapper deadline contract reached process launch'
+            Assert-True (-not (Test-Path -LiteralPath $partialWrapperMarker)) `
+                'partial wrapper deadline contract launched a child before rejection'
+
+            $nullWrapperMarker = Join-Path $tempRoot 'null-wrapper-launch.marker'
+            $escapedNullWrapperMarker = $nullWrapperMarker.Replace("'", "''")
+            $nullWrapperCommand = "[System.IO.File]::WriteAllText('$escapedNullWrapperMarker', 'launched'); Start-Sleep -Seconds 30"
+            Assert-Throws -Action {
+                Invoke-HarnessProcess -Executable $script:mainPortablePowerShell `
+                    -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $nullWrapperCommand) `
+                    -WorkingDirectory $mainRepository -Environment $deadlineEnvironment `
+                    -Label 'null-wrapper-deadline' -TimeoutMs 100 -StandardInputText $null `
+                    -OverallDeadlineStopwatch $null -OverallDeadlineMs 0 `
+                    -ExitWaitLimitMs 5000 -OutputDrainLimitMs 2000 -DeferObservation
+            } -MessagePattern 'atomic|invalid|deadline contract' `
+                -Message 'explicit null/default wrapper deadline quartet reached process launch'
+            Assert-True (-not (Test-Path -LiteralPath $nullWrapperMarker)) `
+                'explicit null/default wrapper deadline quartet launched a child before rejection'
+        }
+
+        Invoke-TestCase 'deadline cleanup uses only launch-sealed absolute endpoints' {
+            $startText = (Get-FunctionAst -Ast $stressAst -Name 'Start-HarnessProcess').Extent.Text
+            $startContractOffset = $startText.IndexOf('$boundDeadlineParameterCount', [StringComparison]::Ordinal)
+            $processStartOffset = $startText.IndexOf('$process.Start()', [StringComparison]::Ordinal)
+            Assert-True ($startContractOffset -ge 0 -and $processStartOffset -gt $startContractOffset) `
+                'parent atomic deadline validation does not dominate Process.Start'
+            foreach ($wrapperContract in @(
+                    [pscustomobject]@{ name = 'Invoke-HarnessProcess'; downstream = 'Start-HarnessProcess' },
+                    [pscustomobject]@{ name = 'Invoke-Colay'; downstream = 'Invoke-HarnessProcess' }
+                )) {
+                $wrapperText = (Get-FunctionAst -Ast $stressAst -Name $wrapperContract.name).Extent.Text
+                $wrapperContractOffset = $wrapperText.IndexOf(
+                    '$boundDeadlineParameterCount',
+                    [StringComparison]::Ordinal
+                )
+                $downstreamOffset = $wrapperText.IndexOf(
+                    [string]$wrapperContract.downstream,
+                    [StringComparison]::Ordinal
+                )
+                Assert-True ($wrapperContractOffset -ge 0 -and $downstreamOffset -gt $wrapperContractOffset) `
+                    "$($wrapperContract.name) atomic deadline validation does not dominate its downstream launch"
+            }
+            $cleanupText = (Get-FunctionAst -Ast $stressAst `
+                    -Name 'Complete-FailedHarnessProcess').Extent.Text
+            Assert-True ($cleanupText -match '\$Record\.DeadlineExitEndMs') `
+                'failure cleanup does not use the launch-sealed exit endpoint'
+            Assert-True ($cleanupText -match '\$Record\.DeadlineDrainEndMs') `
+                'failure cleanup does not use the launch-sealed drain endpoint'
+            Assert-True ($cleanupText -notmatch `
+                    'Get-MonotonicElapsedCeilingMs[\s\S]{0,160}\+\s*\$(?:ExitWaitLimitMs|OutputDrainLimitMs)') `
+                'failure cleanup can synthesize a new elapsed-plus-limit endpoint'
+            $batchText = (Get-FunctionAst -Ast $stressAst `
+                    -Name 'Start-OwnedHarnessProcessBatch').Extent.Text
+            Assert-True ($batchText -match `
+                    '-DeferObservation:\(\[bool\]\$request\.defer_observation\)') `
+                'batch launch does not seal the request observation policy'
+            Assert-True ($batchText -match `
+                    '-DeferObservation:\(\[bool\]\$record\.DeferObservation\)') `
+                'batch rollback cleanup does not reuse the sealed observation policy'
+            Assert-True ($stressAst.Extent.Text -match 'defer_observation\s*=\s*\$true') `
+                'batch request fixtures omit their explicit observation policy'
+        }
+
+        Invoke-TestCase 'deadline-aware continuations fail closed and clean their exact process generation' {
+            $deadlineEnvironment = [ordered]@{
+                SystemRoot = $env:SystemRoot
+                WINDIR = $env:WINDIR
+                TEMP = [System.IO.Path]::GetTempPath()
+                TMP = [System.IO.Path]::GetTempPath()
+                PATH = (Split-Path -Parent $script:mainPortablePowerShell)
+            }
+            $cases = @(
+                [pscustomobject]@{ name = 'omitted'; defer = $true; invoke = {
+                        param($record, $sealedStopwatch)
+                        Wait-HarnessProcess -Record $record -TimeoutMs 900 -DeferObservation
+                    } },
+                [pscustomobject]@{ name = 'partial'; defer = $true; invoke = {
+                        param($record, $sealedStopwatch)
+                        Wait-HarnessProcess -Record $record -TimeoutMs 900 -DeferObservation `
+                            -OverallDeadlineStopwatch $sealedStopwatch
+                    } },
+                [pscustomobject]@{ name = 'mismatched'; defer = $true; invoke = {
+                        param($record, $sealedStopwatch)
+                        $differentStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                        Wait-HarnessProcess -Record $record -TimeoutMs 900 -DeferObservation `
+                            -OverallDeadlineStopwatch $differentStopwatch -OverallDeadlineMs 1200 `
+                            -ExitWaitLimitMs 150 -OutputDrainLimitMs 50
+                    } },
+                [pscustomobject]@{ name = 'mismatched-nondeferred'; defer = $false; invoke = {
+                        param($record, $sealedStopwatch)
+                        $differentStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                        Wait-HarnessProcess -Record $record -TimeoutMs 900 `
+                            -OverallDeadlineStopwatch $differentStopwatch -OverallDeadlineMs 1200 `
+                            -ExitWaitLimitMs 150 -OutputDrainLimitMs 50
+                    } }
+            )
+            foreach ($case in $cases) {
+                $script:processObservationCalls = 0
+                $sealedStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $record = Start-HarnessProcess -Executable $script:mainPortablePowerShell `
+                    -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') `
+                    -WorkingDirectory $mainRepository -Environment $deadlineEnvironment `
+                    -Label "deadline-continuation-$($case.name)" -StandardInputText $null `
+                    -OverallDeadlineStopwatch $sealedStopwatch -OverallDeadlineMs 1200 `
+                    -ExitWaitLimitMs 150 -OutputDrainLimitMs 50 -RequestedExecutionTimeoutMs 900 `
+                    -DeferObservation:$case.defer
+                $processId = [int]$record.ProcessId
+                $processStartedAt = [datetime]$record.ProcessStartedAt
+                $wall = [System.Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $failure = Get-ThrownFailure -Action {
+                        & $case.invoke $record $sealedStopwatch
+                    } -MessagePattern 'deadline contract|exact shared launch deadline' `
+                        -Message "deadline continuation $($case.name) did not fail closed"
+                    Assert-True ($failure.Exception.Data.Contains('ColayHarnessDeadlineContractCleanup')) `
+                        "deadline continuation $($case.name) omitted cleanup evidence"
+                    $cleanup = $failure.Exception.Data['ColayHarnessDeadlineContractCleanup']
+                    Assert-True $cleanup.deadline_aware `
+                        "deadline continuation $($case.name) cleanup lost deadline mode"
+                    Assert-Equal 1200 $cleanup.overall_deadline_ms `
+                        "deadline continuation $($case.name) cleanup overall deadline"
+                    Assert-True ($cleanup.exit_wait_consumed_ms -le $cleanup.exit_wait_limit_ms) `
+                        "deadline continuation $($case.name) reused its exit budget"
+                    Assert-True ($cleanup.output_drain_consumed_ms -le $cleanup.output_drain_limit_ms) `
+                        "deadline continuation $($case.name) reused its drain budget"
+                    Assert-True $cleanup.exit_confirmed `
+                        "deadline continuation $($case.name) did not confirm exit"
+                    Assert-True $cleanup.stdout_completed `
+                        "deadline continuation $($case.name) did not drain stdout"
+                    Assert-True $cleanup.stderr_completed `
+                        "deadline continuation $($case.name) did not drain stderr"
+                    Assert-True $cleanup.process_disposed `
+                        "deadline continuation $($case.name) did not dispose the process"
+                    Assert-Equal 0 @($cleanup.cleanup_errors).Count `
+                        "deadline continuation $($case.name) cleanup error count"
+                    Assert-Equal ([bool]$case.defer) ([bool]$cleanup.observer_deferred) `
+                        "deadline continuation $($case.name) changed sealed observation policy"
+                    Assert-True ($null -eq $record.Process) `
+                        "deadline continuation $($case.name) retained its process object"
+                    $expectedObservationCalls = if ($case.defer) { 0 } else { 1 }
+                    Assert-Equal $expectedObservationCalls $script:processObservationCalls `
+                        "deadline continuation $($case.name) changed sealed process observation"
+                } finally {
+                    $wall.Stop()
+                    if ($null -ne $record.Process) {
+                        try { $record.Process.Kill($true) } catch { }
+                        try { [void]$record.Process.WaitForExit(1000) } catch { }
+                        try { $record.Process.Dispose() } catch { }
+                        $record.Process = $null
+                    }
+                }
+                Assert-True ($wall.ElapsedMilliseconds -lt 1275) `
+                    "deadline continuation $($case.name) exceeded original budget plus tolerance"
+                Assert-True ($sealedStopwatch.ElapsedMilliseconds -lt 1200) `
+                    "deadline continuation $($case.name) exceeded its original absolute endpoint"
+                $candidate = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                if ($null -ne $candidate) {
+                    try {
+                        $sameGeneration = $candidate.StartTime.ToUniversalTime() -eq $processStartedAt -and
+                            ([System.IO.Path]::GetFullPath($candidate.Path)).Equals(
+                                $script:mainPortablePowerShell,
+                                [System.StringComparison]::OrdinalIgnoreCase
+                            )
+                        Assert-True (-not $sameGeneration) `
+                            "deadline continuation $($case.name) left exact process residue"
+                    } finally {
+                        $candidate.Dispose()
+                    }
+                }
+            }
+        }
+
+        Invoke-TestCase 'deadline-aware direct cleanup rejects omitted partial and mismatched contracts after cleanup' {
+            $deadlineEnvironment = [ordered]@{
+                SystemRoot = $env:SystemRoot
+                WINDIR = $env:WINDIR
+                TEMP = [System.IO.Path]::GetTempPath()
+                TMP = [System.IO.Path]::GetTempPath()
+                PATH = (Split-Path -Parent $script:mainPortablePowerShell)
+            }
+            foreach ($caseName in @('omitted', 'partial', 'mismatched', 'mismatched-nondeferred')) {
+                $script:processObservationCalls = 0
+                $sealedStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $deferObservation = $caseName -cne 'mismatched-nondeferred'
+                $record = Start-HarnessProcess -Executable $script:mainPortablePowerShell `
+                    -ArgumentValues @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') `
+                    -WorkingDirectory $mainRepository -Environment $deadlineEnvironment `
+                    -Label "deadline-direct-cleanup-$caseName" -StandardInputText $null `
+                    -OverallDeadlineStopwatch $sealedStopwatch -OverallDeadlineMs 1200 `
+                    -ExitWaitLimitMs 150 -OutputDrainLimitMs 50 -RequestedExecutionTimeoutMs 900 `
+                    -DeferObservation:$deferObservation
+                $processId = [int]$record.ProcessId
+                $processStartedAt = [datetime]$record.ProcessStartedAt
+                $wall = [System.Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $failure = Get-ThrownFailure -Action {
+                        if ($caseName -ceq 'omitted') {
+                            Complete-FailedHarnessProcess -Record $record `
+                                -FailureStage 'focused-contract-omission' -Terminate -DeferObservation
+                        } elseif ($caseName -ceq 'partial') {
+                            Complete-FailedHarnessProcess -Record $record `
+                                -FailureStage 'focused-contract-partial' -Terminate -DeferObservation `
+                                -OverallDeadlineStopwatch $sealedStopwatch
+                        } elseif ($caseName -ceq 'mismatched') {
+                            $differentStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                            Complete-FailedHarnessProcess -Record $record `
+                                -FailureStage 'focused-contract-mismatch' -Terminate -DeferObservation `
+                                -OverallDeadlineStopwatch $differentStopwatch -OverallDeadlineMs 1200 `
+                                -ExitWaitLimitMs 150 -OutputDrainLimitMs 50
+                        } else {
+                            $differentStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                            Complete-FailedHarnessProcess -Record $record `
+                                -FailureStage 'focused-contract-mismatch-nondeferred' `
+                                -OverallDeadlineStopwatch $differentStopwatch -OverallDeadlineMs 1200 `
+                                -ExitWaitLimitMs 150 -OutputDrainLimitMs 50
+                        }
+                    } -MessagePattern 'deadline contract|exact shared launch deadline' `
+                        -Message "direct cleanup accepted a $caseName deadline contract"
+                    Assert-True ($failure.Exception.Data.Contains('ColayHarnessDeadlineContractCleanup')) `
+                        "direct cleanup $caseName did not return cleanup evidence"
+                    $cleanup = $failure.Exception.Data['ColayHarnessDeadlineContractCleanup']
+                    Assert-True $cleanup.exit_confirmed "direct cleanup $caseName did not confirm exit"
+                    Assert-True $cleanup.stdout_completed "direct cleanup $caseName did not drain stdout"
+                    Assert-True $cleanup.stderr_completed "direct cleanup $caseName did not drain stderr"
+                    Assert-True $cleanup.process_disposed "direct cleanup $caseName did not dispose process"
+                    Assert-True $cleanup.deadline_aware "direct cleanup $caseName lost deadline mode"
+                    Assert-Equal 1200 $cleanup.overall_deadline_ms `
+                        "direct cleanup $caseName overall deadline"
+                    Assert-True ($cleanup.exit_wait_consumed_ms -le $cleanup.exit_wait_limit_ms) `
+                        "direct cleanup $caseName reused its exit budget"
+                    Assert-True ($cleanup.output_drain_consumed_ms -le $cleanup.output_drain_limit_ms) `
+                        "direct cleanup $caseName reused its drain budget"
+                    Assert-Equal 0 @($cleanup.cleanup_errors).Count `
+                        "direct cleanup $caseName cleanup error count"
+                    Assert-Equal $deferObservation ([bool]$cleanup.observer_deferred) `
+                        "direct cleanup $caseName changed sealed observation policy"
+                    Assert-True ($null -eq $record.Process) `
+                        "direct cleanup $caseName retained process object"
+                    $expectedObservationCalls = if ($deferObservation) { 0 } else { 1 }
+                    Assert-Equal $expectedObservationCalls $script:processObservationCalls `
+                        "direct cleanup $caseName changed sealed process observation"
+                    Assert-True (-not $record.Stopwatch.IsRunning) `
+                        "direct cleanup $caseName observed before stopping OS-lifetime timing"
+                } finally {
+                    $wall.Stop()
+                    if ($null -ne $record.Process) {
+                        try { $record.Process.Kill($true) } catch { }
+                        try { [void]$record.Process.WaitForExit(1000) } catch { }
+                        try { $record.Process.Dispose() } catch { }
+                        $record.Process = $null
+                    }
+                    $safetyCandidate = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                    if ($null -ne $safetyCandidate) {
+                        try {
+                            $sameSafetyGeneration = $safetyCandidate.StartTime.ToUniversalTime() -eq
+                                $processStartedAt -and
+                                ([System.IO.Path]::GetFullPath($safetyCandidate.Path)).Equals(
+                                    $script:mainPortablePowerShell,
+                                    [System.StringComparison]::OrdinalIgnoreCase
+                                )
+                            if ($sameSafetyGeneration) {
+                                try { $safetyCandidate.Kill($true) } catch { }
+                                try { [void]$safetyCandidate.WaitForExit(1000) } catch { }
+                            }
+                        } finally {
+                            $safetyCandidate.Dispose()
+                        }
+                    }
+                }
+                Assert-True ($wall.ElapsedMilliseconds -lt 1275) `
+                    "direct cleanup $caseName exceeded original budget plus tolerance"
+                Assert-True ($sealedStopwatch.ElapsedMilliseconds -lt 1200) `
+                    "direct cleanup $caseName exceeded its original absolute endpoint"
+                $candidate = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                if ($null -ne $candidate) {
+                    try {
+                        $sameGeneration = $candidate.StartTime.ToUniversalTime() -eq $processStartedAt -and
+                            ([System.IO.Path]::GetFullPath($candidate.Path)).Equals(
+                                $script:mainPortablePowerShell,
+                                [System.StringComparison]::OrdinalIgnoreCase
+                            )
+                        if ($sameGeneration) {
+                            try { $candidate.Kill($true) } catch { }
+                            try { [void]$candidate.WaitForExit(1000) } catch { }
+                        }
+                        Assert-True (-not $sameGeneration) `
+                            "direct cleanup $caseName left exact process residue"
+                    } finally {
+                        $candidate.Dispose()
+                    }
+                }
+            }
         }
 
         Invoke-TestCase 'main immediate online cannot bypass a slow initial parser deadline' {
@@ -729,6 +1124,7 @@ try {
         'Get-AuditPhaseWaitMs',
         'Get-ProcessGenerationObservation',
         'Invoke-ChildProcessLine',
+        'Invoke-ColayDocument',
         'ConvertTo-AuditDaemonDocumentIdentity',
         'Assert-AuditDaemonReadinessDeadline',
         'Wait-AuditDaemonReadiness',
@@ -750,6 +1146,36 @@ try {
             'generated audit child failure output bypasses the deep serializer'
         Assert-True ($childText -match 'ConvertTo-AuditChildJson\s+-Value\s+\$successEvidence') `
             'generated audit child success output bypasses the deep serializer'
+        $childRunner = Get-FunctionAst -Ast $childAst -Name 'Invoke-ChildProcessLine'
+        $childContractOffset = $childRunner.Extent.Text.IndexOf(
+            '$boundDeadlineParameterCount',
+            [StringComparison]::Ordinal
+        )
+        $childProcessStartOffset = $childRunner.Extent.Text.IndexOf(
+            '$process.Start()',
+            [StringComparison]::Ordinal
+        )
+        Assert-True ($childContractOffset -ge 0 -and $childProcessStartOffset -gt $childContractOffset) `
+            'generated audit child atomic deadline validation does not dominate Process.Start'
+        $childDocumentWrapper = Get-FunctionAst -Ast $childAst -Name 'Invoke-ColayDocument'
+        $childDocumentContractOffset = $childDocumentWrapper.Extent.Text.IndexOf(
+            '$boundDeadlineParameterCount',
+            [StringComparison]::Ordinal
+        )
+        $childDocumentDownstreamOffset = $childDocumentWrapper.Extent.Text.IndexOf(
+            'Invoke-ChildProcessLine',
+            [StringComparison]::Ordinal
+        )
+        Assert-True (
+            $childDocumentContractOffset -ge 0 -and
+            $childDocumentDownstreamOffset -gt $childDocumentContractOffset
+        ) 'generated audit child document wrapper deadline validation does not dominate its downstream launch'
+        Assert-True ($childRunner.Extent.Text -notmatch `
+                'Get-AuditElapsedCeilingMs[\s\S]{0,160}\+\s*\$(?:ExitWaitLimitMs|OutputDrainLimitMs)') `
+            'generated audit child can synthesize a new elapsed-plus-limit endpoint'
+        Assert-True ($childRunner.Extent.Text -match `
+                'redirected stdout did not drain within the \$\{OutputDrainLimitMs\}ms cleanup limit') `
+            'generated audit child drain failure message does not report its configured limit'
     }
 
     if ($null -ne $childAst) {
@@ -811,6 +1237,40 @@ try {
         $script:readinessDocuments = [System.Collections.Generic.Queue[object]]::new()
         $script:readinessCalls = [System.Collections.Generic.List[object]]::new()
 
+        Invoke-TestCase 'generated audit child document wrapper rejects a partial deadline before launch' {
+            $script:ColayExe = $script:auditPortablePowerShell
+            $script:LastChildProcessCleanup = $null
+            $partialDocumentMarker = Join-Path $tempRoot 'audit-partial-document-wrapper-launch.marker'
+            $escapedPartialDocumentMarker = $partialDocumentMarker.Replace("'", "''")
+            $partialDocumentCommand = "[System.IO.File]::WriteAllText('$escapedPartialDocumentMarker', 'launched'); [Console]::WriteLine('{`"ok`":true}')"
+            $documentStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws -Action {
+                Invoke-ColayDocument -Repository $repository `
+                    -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $partialDocumentCommand) `
+                    -Label 'audit-partial-document-wrapper' -TimeoutMs 100 `
+                    -OverallDeadlineStopwatch $documentStopwatch -OverallDeadlineMs 10000
+            } -MessagePattern 'atomic|partial|deadline contract' `
+                -Message 'generated audit child document wrapper accepted a partial deadline contract'
+            Assert-True ($null -eq $script:LastChildProcessCleanup) `
+                'generated audit child document wrapper reached process cleanup after prelaunch rejection'
+            Assert-True (-not (Test-Path -LiteralPath $partialDocumentMarker)) `
+                'generated audit child document wrapper launched before partial deadline rejection'
+
+            $nullDocumentMarker = Join-Path $tempRoot 'audit-null-document-wrapper-launch.marker'
+            $escapedNullDocumentMarker = $nullDocumentMarker.Replace("'", "''")
+            $nullDocumentCommand = "[System.IO.File]::WriteAllText('$escapedNullDocumentMarker', 'launched'); [Console]::WriteLine('{`"ok`":true}')"
+            Assert-Throws -Action {
+                Invoke-ColayDocument -Repository $repository `
+                    -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $nullDocumentCommand) `
+                    -Label 'audit-null-document-wrapper' -TimeoutMs 100 `
+                    -OverallDeadlineStopwatch $null -OverallDeadlineMs 0 `
+                    -ExitWaitLimitMs 5000 -OutputDrainLimitMs 2000
+            } -MessagePattern 'atomic|invalid|deadline contract' `
+                -Message 'generated audit child document wrapper accepted a null/default deadline quartet'
+            Assert-True (-not (Test-Path -LiteralPath $nullDocumentMarker)) `
+                'generated audit child document wrapper launched after a null/default deadline quartet'
+        }
+
         function Invoke-ColayDocument {
             param(
                 [string]$Repository,
@@ -850,6 +1310,38 @@ try {
                 return $next.document
             }
             return $next
+        }
+
+        Invoke-TestCase 'generated audit child rejects partial cleanup-only deadline contracts' {
+            $script:LastChildProcessCleanup = $null
+            $partialChildMarker = Join-Path $tempRoot 'audit-partial-deadline-launch.marker'
+            $escapedPartialChildMarker = $partialChildMarker.Replace("'", "''")
+            $partialChildCommand = "[System.IO.File]::WriteAllText('$escapedPartialChildMarker', 'launched')"
+            Assert-Throws -Action {
+                Invoke-ChildProcessLine -Executable $script:auditPortablePowerShell `
+                    -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $partialChildCommand) `
+                    -WorkingDirectory $repository -Label 'audit-partial-deadline' -TimeoutMs 100 `
+                    -ExitWaitLimitMs 17 -OutputDrainLimitMs 19
+            } -MessagePattern 'atomic|invalid bounded deadline contract' `
+                -Message 'generated audit child accepted partial cleanup-only deadline limits'
+            Assert-True ($null -eq $script:LastChildProcessCleanup) `
+                'generated audit child reached process cleanup after prelaunch contract rejection'
+            Assert-True (-not (Test-Path -LiteralPath $partialChildMarker)) `
+                'generated audit child launched before partial deadline rejection'
+
+            $nullChildMarker = Join-Path $tempRoot 'audit-null-deadline-launch.marker'
+            $escapedNullChildMarker = $nullChildMarker.Replace("'", "''")
+            $nullChildCommand = "[System.IO.File]::WriteAllText('$escapedNullChildMarker', 'launched')"
+            Assert-Throws -Action {
+                Invoke-ChildProcessLine -Executable $script:auditPortablePowerShell `
+                    -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $nullChildCommand) `
+                    -WorkingDirectory $repository -Label 'audit-null-deadline' -TimeoutMs 100 `
+                    -OverallDeadlineStopwatch $null -OverallDeadlineMs 0 `
+                    -ExitWaitLimitMs 5000 -OutputDrainLimitMs 2000
+            } -MessagePattern 'atomic|invalid|deadline contract' `
+                -Message 'generated audit child accepted a null/default deadline quartet'
+            Assert-True (-not (Test-Path -LiteralPath $nullChildMarker)) `
+                'generated audit child launched after a null/default deadline quartet'
         }
 
         Invoke-TestCase 'audit readiness accepts immediate exact online without polling' {
@@ -1119,7 +1611,9 @@ try {
             Assert-True ($immediateParsed.daemon_readiness.online_document.data.status.instance -isnot [string]) `
                 'immediate audit readiness online identity was truncated to a string'
             [void](Assert-AuditDaemonReadinessEvidence -ReadinessEvidence $immediateParsed.daemon_readiness `
-                    -ExpectedExecutable $expectedColay -ExpectedOverallTimeoutMs 250)
+                    -ExpectedExecutable $expectedColay -ExpectedLabel 'audit-round-trip-immediate' `
+                    -ExpectedOverallTimeoutMs 250 `
+                    -ExpectedPollIntervalMs 1 -ExpectedExitWaitLimitMs 15 -ExpectedOutputDrainLimitMs 5)
 
             $script:readinessCalls.Clear()
             $script:readinessDocuments.Clear()
@@ -1143,7 +1637,9 @@ try {
             Assert-True ($parsed.daemon_readiness.online_document.data.status.instance -isnot [string]) `
                 'audit readiness online identity was truncated to a string'
             [void](Assert-AuditDaemonReadinessEvidence -ReadinessEvidence $parsed.daemon_readiness `
-                    -ExpectedExecutable $expectedColay -ExpectedOverallTimeoutMs 250)
+                    -ExpectedExecutable $expectedColay -ExpectedLabel 'audit-round-trip' `
+                    -ExpectedOverallTimeoutMs 250 `
+                    -ExpectedPollIntervalMs 1 -ExpectedExitWaitLimitMs 15 -ExpectedOutputDrainLimitMs 5)
 
             $invalidEvidence = [System.Collections.Generic.List[object]]::new()
             $invalidEvidence.Add('System.Management.Automation.PSCustomObject')
@@ -1156,11 +1652,50 @@ try {
             $truncatedOnline = $json | ConvertFrom-Json -Depth 30
             $truncatedOnline.daemon_readiness.online_document.data = 'System.Management.Automation.PSCustomObject'
             $invalidEvidence.Add($truncatedOnline.daemon_readiness)
+            $missingPollInterval = $json | ConvertFrom-Json -Depth 30
+            $missingPollInterval.daemon_readiness.PSObject.Properties.Remove('poll_interval_ms')
+            $invalidEvidence.Add($missingPollInterval.daemon_readiness)
+            $objectPolls = $json | ConvertFrom-Json -Depth 30
+            $objectPolls.daemon_readiness.polls = $objectPolls.daemon_readiness.polls[0]
+            $invalidEvidence.Add($objectPolls.daemon_readiness)
+            $objectStatusCommand = $json | ConvertFrom-Json -Depth 30
+            $objectStatusCommand.daemon_readiness.status_command = [pscustomobject]@{ command = 'daemon status' }
+            $invalidEvidence.Add($objectStatusCommand.daemon_readiness)
+            $wrongStatusCommand = $json | ConvertFrom-Json -Depth 30
+            $wrongStatusCommand.daemon_readiness.status_command = @('--json', 'daemon', 'start')
+            $invalidEvidence.Add($wrongStatusCommand.daemon_readiness)
+            $wrongIntegerType = $json | ConvertFrom-Json -Depth 30
+            $wrongIntegerType.daemon_readiness.poll_interval_ms = '1'
+            $invalidEvidence.Add($wrongIntegerType.daemon_readiness)
+            $wrongConstants = $json | ConvertFrom-Json -Depth 30
+            $wrongConstants.daemon_readiness.exit_wait_limit_ms = 16
+            $wrongConstants.daemon_readiness.cleanup_reserve_ms = 21
+            $invalidEvidence.Add($wrongConstants.daemon_readiness)
+            $wrongCleanupArithmetic = $json | ConvertFrom-Json -Depth 30
+            $wrongCleanupArithmetic.daemon_readiness.cleanup_reserve_ms = 19
+            $invalidEvidence.Add($wrongCleanupArithmetic.daemon_readiness)
+            $reversedElapsed = $json | ConvertFrom-Json -Depth 30
+            $reversedElapsed.daemon_readiness.elapsed_ms = 1
+            $reversedElapsed.daemon_readiness.polls[0].observed_elapsed_ms = 2
+            $invalidEvidence.Add($reversedElapsed.daemon_readiness)
+            $reversedPollSequence = $json | ConvertFrom-Json -Depth 30
+            $reversedPollSequence.daemon_readiness.polls[0].observed_elapsed_ms = 2
+            $reversedPollSequence.daemon_readiness.polls[1].observed_elapsed_ms = 1
+            $reversedPollSequence.daemon_readiness.elapsed_ms = 3
+            $invalidEvidence.Add($reversedPollSequence.daemon_readiness)
+            $nonSequentialLabel = $json | ConvertFrom-Json -Depth 30
+            $nonSequentialLabel.daemon_readiness.polls[0].command_label = 'audit-round-trip-daemon-readiness-999'
+            $invalidEvidence.Add($nonSequentialLabel.daemon_readiness)
+            $wrongLabelPrefix = $json | ConvertFrom-Json -Depth 30
+            $wrongLabelPrefix.daemon_readiness.polls[0].command_label = 'forged-daemon-readiness-001'
+            $invalidEvidence.Add($wrongLabelPrefix.daemon_readiness)
             foreach ($invalid in $invalidEvidence) {
                 Assert-Throws -Action {
                     Assert-AuditDaemonReadinessEvidence -ReadinessEvidence $invalid `
-                        -ExpectedExecutable $expectedColay -ExpectedOverallTimeoutMs 250
-                } -MessagePattern 'readiness|missing|truncated|schema-v1|status identity' `
+                        -ExpectedExecutable $expectedColay -ExpectedLabel 'audit-round-trip' `
+                        -ExpectedOverallTimeoutMs 250 `
+                        -ExpectedPollIntervalMs 1 -ExpectedExitWaitLimitMs 15 -ExpectedOutputDrainLimitMs 5
+                } -MessagePattern 'readiness|missing|truncated|schema-v1|status identity|array|elapsed|sequence|command' `
                     -Message 'parent validator accepted missing or truncated readiness evidence'
             }
         }
@@ -1190,6 +1725,81 @@ try {
         Assert-True ($memberNames -ccontains 'source_root_hash') 'durable seed evidence omitted source_root_hash'
         Assert-True ($memberNames -cnotcontains 'inspection_group_id') `
             'durable seed evidence still conflates source_root_hash with an inspection group id'
+    }
+
+    Invoke-TestCase 'marker diagnostic imports the amended stress closure under its static contract' {
+        $diagnosticPath = (Resolve-Path (Join-Path $scriptRoot `
+                    '../../artifacts/qa/windows-state-acl/marker-attribution-ab-diagnostic.ps1')).Path
+        $diagnosticTokens = $null
+        $diagnosticParseErrors = $null
+        $diagnosticAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $diagnosticPath,
+            [ref]$diagnosticTokens,
+            [ref]$diagnosticParseErrors
+        )
+        Assert-Equal 0 $diagnosticParseErrors.Count 'marker diagnostic parser error count'
+        $mainStart = @($diagnosticAst.EndBlock.Statements | Where-Object {
+            $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -ceq '$script:ResolvedColay' -and
+                $_.Right.Extent.Text -match '^Resolve-AbFile\b'
+        })
+        Assert-Equal 1 $mainStart.Count 'marker diagnostic main entry assignment count'
+        $diagnosticText = Get-Content -Raw -LiteralPath $diagnosticPath
+        $prefix = $diagnosticText.Substring(0, $mainStart[0].Extent.StartOffset)
+        $escapedDiagnosticPath = $diagnosticPath.Replace("'", "''")
+        $escapedStressPath = $stressPath.Replace("'", "''")
+        $contractTail = @"
+`$staticContract = Assert-AbStaticContract -DiagnosticPath '$escapedDiagnosticPath'
+`$importContract = Import-StressHarnessFunctions '$escapedStressPath'
+return [pscustomobject]@{ static = `$staticContract; import = `$importContract }
+"@
+        $contractFixture = [scriptblock]::Create($prefix + $contractTail)
+        $stressHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stressPath).Hash.ToLowerInvariant()
+        $diagnosticHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $diagnosticPath).Hash.ToLowerInvariant()
+        $contract = & $contractFixture -ColayExe 'unused-colay.exe' `
+            -FakeProviderExe 'unused-fake-provider.exe' -StressHarness $stressPath `
+            -EvidenceRoot $tempRoot -ExpectedColaySha256 ('0' * 64) `
+            -ExpectedFakeProviderSha256 ('0' * 64) -ExpectedStressHarnessSha256 $stressHash `
+            -ExpectedDiagnosticSha256 $diagnosticHash
+        Assert-Equal 0 @($contract.import.unqualified_free_variables).Count `
+            'marker stress import unqualified free variable count'
+        Assert-Equal 0 @($contract.import.ast_contract_violations).Count `
+            'marker stress import AST violation count'
+        Assert-Equal 0 $contract.import.wait_active_timing_cim_command_count `
+            'marker stress import pre-stop timing CIM count'
+        Assert-True ($contract.import.function_count -gt 0) `
+            'marker stress import closure was empty'
+
+        $mutatedStressPath = Join-Path $tempRoot 'unapproved-free-variable-stress.ps1'
+        $stressSource = Get-Content -Raw -LiteralPath $stressPath
+        $deadlineFunctionNeedle = '    $deadlineParameterNames = @('
+        $mutatedStressSource = $stressSource.Replace(
+            $deadlineFunctionNeedle,
+            "    [void]`$unapprovedDeadlineGlobal`n$deadlineFunctionNeedle"
+        )
+        Assert-True ($mutatedStressSource -cne $stressSource) `
+            'marker negative fixture did not mutate the imported stress closure'
+        [System.IO.File]::WriteAllText(
+            $mutatedStressPath,
+            $mutatedStressSource,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        $mutatedStressHash = (Get-FileHash -Algorithm SHA256 `
+                -LiteralPath $mutatedStressPath).Hash.ToLowerInvariant()
+        $escapedMutatedStressPath = $mutatedStressPath.Replace("'", "''")
+        $negativeTail = @"
+[void](Import-StressHarnessFunctions '$escapedMutatedStressPath')
+"@
+        $negativeFixture = [scriptblock]::Create($prefix + $negativeTail)
+        Assert-Throws -Action {
+            & $negativeFixture -ColayExe 'unused-colay.exe' `
+                -FakeProviderExe 'unused-fake-provider.exe' -StressHarness $mutatedStressPath `
+                -EvidenceRoot $tempRoot -ExpectedColaySha256 ('0' * 64) `
+                -ExpectedFakeProviderSha256 ('0' * 64) `
+                -ExpectedStressHarnessSha256 $mutatedStressHash `
+                -ExpectedDiagnosticSha256 $diagnosticHash
+        } -MessagePattern 'unqualified free variables.*unapprovedDeadlineGlobal' `
+            -Message 'marker import allowed an arbitrary unqualified variable'
     }
 }
 finally {

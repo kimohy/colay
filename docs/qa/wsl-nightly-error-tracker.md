@@ -942,6 +942,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
+| `WIN-010` | high | fix-in-progress (focused static/import matrix passed; exact A/B, stress, CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -2266,6 +2267,81 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   correction. `WIN-005` remains
   `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`;
   `WIN-006`, `WSL-022`, and `WSL-023` also remain open/pending and unchanged.
+
+### 2026-08-07 second deadline/evidence review correction — focused only
+
+- A second independent review reproduced two remaining fail-open contracts. A
+  deadline-aware process record could be passed to `Wait-HarnessProcess` without
+  its launch deadline and silently fall back to the ordinary timeout/cleanup path;
+  a mismatched stopwatch threw before cleanup and left the 30-second child alive.
+  The generated-child runner also accepted cleanup-only partial deadline values
+  and both cleanup implementations could synthesize a new endpoint as
+  `current elapsed + limit`.
+- Launch now seals deadline mode, stopwatch identity, overall and requested
+  execution limits, absolute exit/drain endpoints, cleanup limits, and observation
+  policy. Deadline parameters are atomic. Omitted, partial, or mismatched
+  continuations terminate, confirm exit, drain both pipes, dispose the process,
+  and fail with structured cleanup evidence under the original sealed deadline.
+  The focused fixtures cover omission, partial supply, and stopwatch mismatch and
+  require zero cleanup error, zero exact-generation residue, and preservation of
+  the sealed observation policy (zero calls when deferred, one when nondeferred).
+  Ordinary non-readiness polling, 5,000 ms exit confirmation,
+  2,000 ms drain, observation, and OS-lifetime evidence remain unchanged.
+- The parent readiness validator previously accepted a missing `poll_interval_ms`,
+  a single object in place of the JSON `polls` array, and top-level elapsed time
+  earlier than a poll observation. It now requires exact integer timing/budget
+  fields, real JSON arrays for command and polls, expected poll/exit/drain
+  constants, sequential command labels, monotonic poll elapsed values no later
+  than the top-level elapsed value, and exact cleanup arithmetic. Representative
+  malformed fixtures cover the critical container, timing, and label shapes. The
+  child drain failure message now reports its actual configured limit rather than
+  a hard-coded 2,000 ms.
+- The RED run failed exactly on partial cleanup acceptance, omitted wait/cleanup
+  downgrade, and missing parent-validator parameters. After correction, the
+  portable PowerShell focused suite and parser passed. No authoritative stress,
+  marker A/B, product/provider inference, or Cargo gate was run for this focused
+  correction. `WIN-005` remains open pending the one-shot exact-HEAD stress and
+  published CI/nightly verification; `WIN-006`, `WSL-022`, and `WSL-023` are
+  unchanged.
+
+## WIN-010: amended stress closure rejected by marker static import
+
+### Observation and impact
+
+- The exact portable-PowerShell marker contract replay rejected the amended stress
+  closure before any A/B observation or product/provider command. It reported two
+  CIM-reachable cleanup calls before the OS-process-lifetime stopwatch stop and
+  treated the standard per-function `PSBoundParameters` automatic variable as an
+  undeclared free variable. This would prevent the diagnostic from accepting the
+  hardened readiness helpers even though the focused helper tests passed.
+
+### Correction and current status
+
+- `Wait-HarnessProcess` now stops its measurement stopwatch before contract-failure
+  cleanup. `Complete-FailedHarnessProcess` initializes its local deadline-mode
+  binding before either branch. The marker import contract explicitly recognizes
+  only `PSBoundParameters` in addition to its existing automatic-variable set;
+  arbitrary unqualified or scoped variables remain fail-closed.
+- Only a fully omitted deadline quartet can select ordinary execution. A fully
+  bound null/zero/default quartet, partial quartet, stopped stopwatch, or invalid
+  budget is rejected before process launch. Parent and generated-child wrappers
+  conditionally forward either zero or four values, so an omitted contract is not
+  converted into an explicit downgrade by an intermediate helper.
+- Any post-launch contract failure forces exact-process termination even if the
+  continuation omitted `Terminate`. The launch-sealed observation policy remains
+  unchanged: readiness records defer observation, while a deliberately nondeferred
+  fixture observes only after its OS-lifetime stopwatch has stopped. Batch launch,
+  rollback, wait, and late cleanup now carry the same explicit sealed policy.
+- A new behavioral fixture executes the real marker `Assert-AbStaticContract` and
+  `Import-StressHarnessFunctions` against the amended stress file. The isolated RED
+  reproduced both violations; the GREEN focused suite passed with zero free-variable,
+  AST-contract, and pre-stop timing-CIM violations. The process-audit helper regression
+  also passed. No authoritative stress, marker A/B, Cargo, or provider command was
+  executed during this correction.
+- Status: `fix-in-progress`. Because the tracked diagnostic hash changed, one fresh
+  exact-clean-HEAD marker A/B verification and the one-shot Windows stress remain
+  required before `WIN-010` or `WIN-005` can close. Published CI/nightly and WSL
+  verification remain pending.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 

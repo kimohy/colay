@@ -161,7 +161,17 @@ identity-preserving `booting`/`probing` status transitions until exact `online`.
 This readiness gate uses one cleanup-inclusive monotonic 5,000 ms deadline and
 finishes before any serial or concurrent registration timer starts. Its evidence
 is recorded as `measurement_diagnostics.main_daemon_readiness` and is explicitly
-excluded from the 5,000/8,000 ms latency thresholds.
+excluded from the 5,000/8,000 ms latency thresholds. Process launch seals the
+shared stopwatch identity, overall limit, requested execution timeout, exit and
+drain limits, and observation policy. Split start/wait/cleanup continuations must
+present that atomic contract exactly; omission, partial supply, or mismatch first
+terminates and drains the exact child under the original absolute endpoints and
+then fails. A continuation cannot create a fresh cleanup budget from current time.
+Only an omitted four-parameter deadline set selects ordinary mode; an explicitly
+supplied set must contain a running stopwatch and valid positive overall budget.
+The marker diagnostic recognizes `PSBoundParameters` only as an explicit PowerShell
+automatic variable; arbitrary unqualified variables remain forbidden. Contract-failure
+cleanup must also stop the OS-process-lifetime stopwatch before any CIM-reachable path.
 
 After the latency phase and main-daemon shutdown, a separate fresh state root runs
 the functional `DEBUG_PROCESS` audit with attributed markers enabled. Its time is
@@ -173,8 +183,10 @@ exact PowerShell process launched by the harness; it is neither a host-wide
 process monitor nor evidence against Administrator or `SYSTEM` activity.
 The generated child serializes its complete readiness transition with an explicit
 JSON depth. The parent rejects stderr, missing or truncated nested readiness data,
-identity drift, invalid states, and any command budget that exceeds the actual
-remaining cleanup-inclusive deadline before accepting the child result.
+non-array command/poll containers, non-sequential poll labels or elapsed times,
+identity drift, invalid states, unexpected poll/exit/drain constants, and any
+command budget that exceeds the actual remaining cleanup-inclusive deadline
+before accepting the child result.
 
 The harness compares every source SQLite-family hash before and after import,
 validates workspace/path/import/session and publication-ledger cardinality,

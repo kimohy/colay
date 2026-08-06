@@ -764,20 +764,25 @@ function New-IsolatedEnvironment {
 function Assert-HarnessDeadlineContract {
     param(
         [AllowNull()][System.Diagnostics.Stopwatch]$OverallDeadlineStopwatch,
-        [int]$OverallDeadlineMs,
-        [int]$ExitWaitLimitMs,
-        [int]$OutputDrainLimitMs,
-        [int]$RequestedExecutionTimeoutMs
+        [int]$OverallDeadlineMs = 0,
+        [int]$ExitWaitLimitMs = 5000,
+        [int]$OutputDrainLimitMs = 2000,
+        [int]$RequestedExecutionTimeoutMs = 0
     )
-    $hasStopwatch = $null -ne $OverallDeadlineStopwatch
-    $hasLimit = $OverallDeadlineMs -gt 0
-    if ($hasStopwatch -ne $hasLimit) {
-        throw 'bounded process deadline requires both one shared monotonic stopwatch and one positive overall limit'
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    if ($boundDeadlineParameterCount -notin @(0, $deadlineParameterNames.Count)) {
+        throw 'bounded process deadline requires one atomic deadline contract'
     }
-    if (-not $hasStopwatch) { return $false }
-    if (-not $OverallDeadlineStopwatch.IsRunning -or $ExitWaitLimitMs -lt 0 -or
+    if ($boundDeadlineParameterCount -eq 0) { return $false }
+    if ($null -eq $OverallDeadlineStopwatch -or $OverallDeadlineMs -le 0 -or
+        -not $OverallDeadlineStopwatch.IsRunning -or $ExitWaitLimitMs -lt 0 -or
         $OutputDrainLimitMs -lt 0 -or $RequestedExecutionTimeoutMs -le 0) {
-        throw 'bounded process deadline received an invalid stopwatch or execution/cleanup limit'
+        throw 'bounded process deadline contract received an invalid stopwatch or execution/cleanup limit'
     }
     if (($ExitWaitLimitMs + $OutputDrainLimitMs) -ge $OverallDeadlineMs) {
         throw 'bounded process cleanup limits leave no possible execution budget'
@@ -819,10 +824,23 @@ function Start-HarnessProcess {
         [int]$RequestedExecutionTimeoutMs = 0,
         [switch]$DeferObservation
     )
-    $deadlineAware = Assert-HarnessDeadlineContract `
-        -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-        -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs `
-        -RequestedExecutionTimeoutMs $RequestedExecutionTimeoutMs
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    if ($boundDeadlineParameterCount -notin @(0, $deadlineParameterNames.Count)) {
+        throw 'process launch requires one atomic bounded deadline contract'
+    }
+    $deadlineAware = if ($boundDeadlineParameterCount -eq $deadlineParameterNames.Count) {
+        Assert-HarnessDeadlineContract `
+            -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
+            -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs `
+            -RequestedExecutionTimeoutMs $RequestedExecutionTimeoutMs
+    } else {
+        Assert-HarnessDeadlineContract -RequestedExecutionTimeoutMs $RequestedExecutionTimeoutMs
+    }
     Assert-FreeDisk | Out-Null
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Executable
@@ -955,6 +973,7 @@ function Start-HarnessProcess {
             DeadlineAware = [bool]$deadlineAware
             OverallDeadlineStopwatch = $OverallDeadlineStopwatch
             OverallDeadlineMs = $OverallDeadlineMs
+            RequestedExecutionTimeoutMs = $RequestedExecutionTimeoutMs
             DeadlineLaunchElapsedMs = $deadlineLaunchElapsedMs
             DeadlineRemainingAtLaunchMs = $deadlineRemainingAtLaunchMs
             DeadlineExecutionTimeoutMs = $deadlineExecutionTimeoutMs
@@ -965,6 +984,7 @@ function Start-HarnessProcess {
             OutputDrainLimitMs = $OutputDrainLimitMs
             DeadlineExitWaitConsumedMs = [int64]0
             DeadlineOutputDrainConsumedMs = [int64]0
+            DeferObservation = [bool]$DeferObservation
         }
     } catch {
         $setupFailure = $_.Exception.Message
@@ -986,6 +1006,7 @@ function Start-HarnessProcess {
                 DeadlineAware = [bool]$deadlineAware
                 OverallDeadlineStopwatch = $OverallDeadlineStopwatch
                 OverallDeadlineMs = $OverallDeadlineMs
+                RequestedExecutionTimeoutMs = $RequestedExecutionTimeoutMs
                 DeadlineLaunchElapsedMs = $deadlineLaunchElapsedMs
                 DeadlineRemainingAtLaunchMs = $deadlineRemainingAtLaunchMs
                 DeadlineExecutionTimeoutMs = $deadlineExecutionTimeoutMs
@@ -996,11 +1017,19 @@ function Start-HarnessProcess {
                 OutputDrainLimitMs = $OutputDrainLimitMs
                 DeadlineExitWaitConsumedMs = [int64]0
                 DeadlineOutputDrainConsumedMs = [int64]0
+                DeferObservation = [bool]$DeferObservation
             }
-            $cleanup = Complete-FailedHarnessProcess -Record $partialRecord -FailureStage $setupStage -Terminate `
-                -DeferObservation:$DeferObservation -OverallDeadlineStopwatch $OverallDeadlineStopwatch `
-                -OverallDeadlineMs $OverallDeadlineMs -ExitWaitLimitMs $ExitWaitLimitMs `
-                -OutputDrainLimitMs $OutputDrainLimitMs
+            $cleanupDeadlineArguments = @{}
+            if ($deadlineAware) {
+                $cleanupDeadlineArguments = @{
+                    OverallDeadlineStopwatch = $OverallDeadlineStopwatch
+                    OverallDeadlineMs = $OverallDeadlineMs
+                    ExitWaitLimitMs = $ExitWaitLimitMs
+                    OutputDrainLimitMs = $OutputDrainLimitMs
+                }
+            }
+            $cleanup = Complete-FailedHarnessProcess -Record $partialRecord -FailureStage $setupStage `
+                -Terminate -DeferObservation:$DeferObservation @cleanupDeadlineArguments
         } else {
             $cleanupErrors = [System.Collections.Generic.List[string]]::new()
             $disposed = $false
@@ -1409,10 +1438,62 @@ function Complete-FailedHarnessProcess {
         [int]$ExitWaitLimitMs = 5000,
         [int]$OutputDrainLimitMs = 2000
     )
-    $deadlineAware = $null -ne $OverallDeadlineStopwatch
-    if ($deadlineAware -ne ($OverallDeadlineMs -gt 0) -or $ExitWaitLimitMs -lt 0 -or
-        $OutputDrainLimitMs -lt 0) {
-        throw 'failure cleanup received an invalid bounded deadline contract'
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    $recordDeadlineAware = $Record.PSObject.Properties.Name -contains 'DeadlineAware' -and
+        [bool]$Record.DeadlineAware
+    $recordDeferObservation = $Record.PSObject.Properties.Name -contains 'DeferObservation' -and
+        [bool]$Record.DeferObservation
+    $deadlineContractFailure = $null
+    $deadlineAware = $false
+    if ($recordDeadlineAware) {
+        if ($boundDeadlineParameterCount -ne $deadlineParameterNames.Count) {
+            $deadlineContractFailure = 'deadline-aware failure cleanup omitted or partially supplied its sealed deadline contract'
+        } elseif (-not [object]::ReferenceEquals(
+                $OverallDeadlineStopwatch,
+                $Record.OverallDeadlineStopwatch
+            ) -or $OverallDeadlineMs -ne [int]$Record.OverallDeadlineMs -or
+            $ExitWaitLimitMs -ne [int]$Record.ExitWaitLimitMs -or
+            $OutputDrainLimitMs -ne [int]$Record.OutputDrainLimitMs) {
+            $deadlineContractFailure = 'failure cleanup did not receive the exact shared launch deadline contract'
+        }
+        $OverallDeadlineStopwatch = $Record.OverallDeadlineStopwatch
+        $OverallDeadlineMs = [int]$Record.OverallDeadlineMs
+        $ExitWaitLimitMs = [int]$Record.ExitWaitLimitMs
+        $OutputDrainLimitMs = [int]$Record.OutputDrainLimitMs
+        $deadlineAware = $true
+        try {
+            [void](Assert-HarnessDeadlineContract `
+                -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
+                -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs `
+                -RequestedExecutionTimeoutMs ([int]$Record.RequestedExecutionTimeoutMs))
+        } catch {
+            if ($null -eq $deadlineContractFailure) {
+                $deadlineContractFailure = "sealed failure cleanup deadline contract is invalid: $($_.Exception.Message)"
+            }
+        }
+    } else {
+        if ($boundDeadlineParameterCount -ne 0) {
+            $deadlineContractFailure = 'non-deadline failure cleanup cannot add or explicitly downgrade a deadline after launch'
+        }
+        $OverallDeadlineStopwatch = $null
+        $OverallDeadlineMs = 0
+        $ExitWaitLimitMs = 5000
+        $OutputDrainLimitMs = 2000
+        $deadlineAware = $false
+    }
+    if ($PSBoundParameters.ContainsKey('DeferObservation') -and
+        [bool]$DeferObservation -ne $recordDeferObservation) {
+        $deadlineContractFailure = 'failure cleanup changed the sealed process-observation policy'
+    }
+    $DeferObservation = $recordDeferObservation
+    if ($null -ne $deadlineContractFailure) {
+        $Record.Stopwatch.Stop()
+        $Terminate = $true
     }
     $cleanupErrors = [System.Collections.Generic.List[string]]::new()
     $cleanup = [pscustomobject][ordered]@{
@@ -1491,12 +1572,7 @@ function Complete-FailedHarnessProcess {
             if ($deadlineAware) {
                 $exitWaitRemainingLimitMs = $ExitWaitLimitMs -
                     [int]$Record.DeadlineExitWaitConsumedMs
-                $phaseDeadlineMs = if ($Record.PSObject.Properties.Name -contains 'DeadlineExitEndMs' -and
-                    $null -ne $Record.DeadlineExitEndMs) {
-                    [int64]$Record.DeadlineExitEndMs
-                } else {
-                    (Get-MonotonicElapsedCeilingMs -Stopwatch $OverallDeadlineStopwatch) + $ExitWaitLimitMs
-                }
+                $phaseDeadlineMs = [int64]$Record.DeadlineExitEndMs
                 $exitWaitMs = Get-BoundedPhaseWaitMs -Stopwatch $OverallDeadlineStopwatch `
                     -OverallDeadlineMs $OverallDeadlineMs -PhaseDeadlineElapsedMs $phaseDeadlineMs `
                     -MaximumWaitMs $exitWaitRemainingLimitMs
@@ -1558,12 +1634,7 @@ function Complete-FailedHarnessProcess {
         while (($null -ne $stdoutTask -and -not $stdoutTask.IsCompleted) -or
             ($null -ne $stderrTask -and -not $stderrTask.IsCompleted)) {
             $drainRemainingMs = if ($deadlineAware) {
-                $phaseDeadlineMs = if ($Record.PSObject.Properties.Name -contains 'DeadlineDrainEndMs' -and
-                    $null -ne $Record.DeadlineDrainEndMs) {
-                    [int64]$Record.DeadlineDrainEndMs
-                } else {
-                    (Get-MonotonicElapsedCeilingMs -Stopwatch $OverallDeadlineStopwatch) + $OutputDrainLimitMs
-                }
+                $phaseDeadlineMs = [int64]$Record.DeadlineDrainEndMs
                 Get-BoundedPhaseWaitMs -Stopwatch $OverallDeadlineStopwatch `
                     -OverallDeadlineMs $OverallDeadlineMs -PhaseDeadlineElapsedMs $phaseDeadlineMs `
                     -MaximumWaitMs ($OutputDrainLimitMs - [int]$Record.DeadlineOutputDrainConsumedMs -
@@ -1629,6 +1700,13 @@ function Complete-FailedHarnessProcess {
         } else { $null }
         $cleanup.cleanup_errors = $cleanupErrors.ToArray()
     }
+    if ($null -ne $deadlineContractFailure) {
+        $exception = [System.InvalidOperationException]::new(
+            "failure cleanup deadline contract violation: $deadlineContractFailure"
+        )
+        $exception.Data['ColayHarnessDeadlineContractCleanup'] = $cleanup
+        throw $exception
+    }
     return $cleanup
 }
 
@@ -1654,7 +1732,8 @@ function Start-OwnedHarnessProcessBatch {
                     -WorkingDirectory ([string]$request.working_directory) `
                     -Environment $request.environment -Label ([string]$request.label) `
                     -StandardInputText $request.standard_input_text `
-                    -CaptureFirstStdoutLine:([bool]$request.capture_first_stdout_line)
+                    -CaptureFirstStdoutLine:([bool]$request.capture_first_stdout_line) `
+                    -DeferObservation:([bool]$request.defer_observation)
             } finally {
                 $script:ProcessSetupFailureForTest = $savedSetupFailure
             }
@@ -1675,7 +1754,8 @@ function Start-OwnedHarnessProcessBatch {
                 $stdoutTask = $record.StdoutTask
                 $stderrTask = $record.StderrTask
                 $cleanup = Complete-FailedHarnessProcess -Record $record `
-                    -FailureStage 'batch-start' -Terminate -DeferObservation
+                    -FailureStage 'batch-start' -Terminate `
+                    -DeferObservation:([bool]$record.DeferObservation)
                 $identityStillRunning = $false
                 if ($null -ne $processId) {
                     $candidate = $null
@@ -1743,16 +1823,70 @@ function Wait-HarnessProcess {
         [int]$ExitWaitLimitMs = 5000,
         [int]$OutputDrainLimitMs = 2000
     )
-    $deadlineAware = Assert-HarnessDeadlineContract `
-        -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-        -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs `
-        -RequestedExecutionTimeoutMs $TimeoutMs
-    if ($deadlineAware -and (-not [bool]$Record.DeadlineAware -or
-        -not [object]::ReferenceEquals($OverallDeadlineStopwatch, $Record.OverallDeadlineStopwatch) -or
-        $OverallDeadlineMs -ne [int]$Record.OverallDeadlineMs)) {
-        throw 'process wait did not receive the exact shared launch deadline'
-    }
     $label = [string]$Record.Label
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    $recordDeadlineAware = $Record.PSObject.Properties.Name -contains 'DeadlineAware' -and
+        [bool]$Record.DeadlineAware
+    $recordDeferObservation = $Record.PSObject.Properties.Name -contains 'DeferObservation' -and
+        [bool]$Record.DeferObservation
+    $deadlineContractFailure = $null
+    $deadlineAware = $false
+    $sealedDeadlineArguments = @{}
+    if ($recordDeadlineAware) {
+        $sealedDeadlineArguments = @{
+            OverallDeadlineStopwatch = $Record.OverallDeadlineStopwatch
+            OverallDeadlineMs = [int]$Record.OverallDeadlineMs
+            ExitWaitLimitMs = [int]$Record.ExitWaitLimitMs
+            OutputDrainLimitMs = [int]$Record.OutputDrainLimitMs
+        }
+    }
+    if ($recordDeadlineAware) {
+        if ($boundDeadlineParameterCount -ne $deadlineParameterNames.Count) {
+            $deadlineContractFailure = 'deadline-aware process wait omitted or partially supplied its sealed deadline contract'
+        } elseif (-not [object]::ReferenceEquals(
+                $OverallDeadlineStopwatch,
+                $Record.OverallDeadlineStopwatch
+            ) -or $OverallDeadlineMs -ne [int]$Record.OverallDeadlineMs -or
+            $ExitWaitLimitMs -ne [int]$Record.ExitWaitLimitMs -or
+            $OutputDrainLimitMs -ne [int]$Record.OutputDrainLimitMs -or
+            $TimeoutMs -ne [int]$Record.RequestedExecutionTimeoutMs) {
+            $deadlineContractFailure = 'process wait did not receive the exact shared launch deadline contract'
+        }
+        if ($null -eq $deadlineContractFailure) {
+            try {
+                $deadlineAware = Assert-HarnessDeadlineContract `
+                    -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
+                    -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs `
+                    -RequestedExecutionTimeoutMs $TimeoutMs
+            } catch {
+                $deadlineContractFailure = $_.Exception.Message
+            }
+        }
+    } else {
+        if ($boundDeadlineParameterCount -ne 0) {
+            $deadlineContractFailure = 'non-deadline process wait cannot add or explicitly downgrade a deadline after launch'
+        }
+    }
+    if ($PSBoundParameters.ContainsKey('DeferObservation') -and
+        [bool]$DeferObservation -ne $recordDeferObservation) {
+        $deadlineContractFailure = 'process wait changed the sealed process-observation policy'
+    }
+    $DeferObservation = $recordDeferObservation
+    if ($null -ne $deadlineContractFailure) {
+        $Record.Stopwatch.Stop()
+        $cleanup = Complete-FailedHarnessProcess -Record $Record -FailureStage 'deadline-contract' `
+            -Terminate -DeferObservation:$recordDeferObservation @sealedDeadlineArguments
+        $exception = [System.InvalidOperationException]::new(
+            "process wait deadline contract violation: $deadlineContractFailure"
+        )
+        $exception.Data['ColayHarnessDeadlineContractCleanup'] = $cleanup
+        throw $exception
+    }
     $executableName = [string]$Record.ExecutableName
     $argumentCount = [int]$Record.ArgumentCount
     $launchRequestedAt = [datetime]$Record.LaunchRequestedAt
@@ -1802,9 +1936,7 @@ function Wait-HarnessProcess {
             $Record.Stopwatch.Stop()
             $timeoutElapsedMs = [int64]$Record.Stopwatch.ElapsedMilliseconds
             $failureCleanup = Complete-FailedHarnessProcess -Record $Record -FailureStage 'hard-timeout' `
-                -Terminate -DeferObservation:$DeferObservation `
-                -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-                -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs
+                -Terminate -DeferObservation:$DeferObservation @sealedDeadlineArguments
             $timeoutResult = [pscustomobject]@{
                 label = $label
                 executable = $executableName
@@ -1849,9 +1981,7 @@ function Wait-HarnessProcess {
         $Record.Stopwatch.Stop()
         $exitDetectionWallMs = [int64]$Record.Stopwatch.ElapsedMilliseconds
         $failureCleanup = Complete-FailedHarnessProcess -Record $Record -FailureStage 'exit-time-read' `
-            -Terminate -DeferObservation:$DeferObservation `
-            -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-            -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs
+            -Terminate -DeferObservation:$DeferObservation @sealedDeadlineArguments
         $failureResult = [pscustomobject]@{
             label = $label
             executable = $executableName
@@ -1888,9 +2018,7 @@ function Wait-HarnessProcess {
     $rawLifetimeMs = ($processExitAt - $Record.ProcessStartedAt).TotalMilliseconds
     if ([double]::IsNaN($rawLifetimeMs) -or [double]::IsInfinity($rawLifetimeMs) -or $rawLifetimeMs -lt 0) {
         $failureCleanup = Complete-FailedHarnessProcess -Record $Record -FailureStage 'invalid-os-process-lifetime' `
-            -Terminate -DeferObservation:$DeferObservation `
-            -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-            -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs
+            -Terminate -DeferObservation:$DeferObservation @sealedDeadlineArguments
         $failureResult = [pscustomobject]@{
             label = $label
             executable = $executableName
@@ -2013,9 +2141,7 @@ function Wait-HarnessProcess {
         if ($null -ne $observerWall -and $observerWall.IsRunning) { $observerWall.Stop() }
         if ($postExitTotal.IsRunning) { $postExitTotal.Stop() }
         $failureCleanup = Complete-FailedHarnessProcess -Record $Record -FailureStage $finalizationStage `
-            -Terminate -DeferObservation:$DeferObservation `
-            -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-            -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs
+            -Terminate -DeferObservation:$DeferObservation @sealedDeadlineArguments
         $failureResult = [pscustomobject]@{
             label = $label
             executable = $executableName
@@ -2115,16 +2241,30 @@ function Invoke-HarnessProcess {
         [int]$ExitWaitLimitMs = 5000,
         [int]$OutputDrainLimitMs = 2000
     )
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    if ($boundDeadlineParameterCount -notin @(0, $deadlineParameterNames.Count)) {
+        throw 'process invocation requires one atomic bounded deadline contract'
+    }
+    $deadlineArguments = @{}
+    if ($boundDeadlineParameterCount -eq $deadlineParameterNames.Count) {
+        $deadlineArguments = @{
+            OverallDeadlineStopwatch = $OverallDeadlineStopwatch
+            OverallDeadlineMs = $OverallDeadlineMs
+            ExitWaitLimitMs = $ExitWaitLimitMs
+            OutputDrainLimitMs = $OutputDrainLimitMs
+        }
+    }
     $record = Start-HarnessProcess -Executable $Executable -ArgumentValues $ArgumentValues `
         -WorkingDirectory $WorkingDirectory -Environment $Environment -Label $Label `
         -StandardInputText $StandardInputText -CaptureFirstStdoutLine:$CaptureFirstStdoutLine `
-        -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-        -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs `
-        -RequestedExecutionTimeoutMs $TimeoutMs -DeferObservation:$DeferObservation
+        -RequestedExecutionTimeoutMs $TimeoutMs -DeferObservation:$DeferObservation @deadlineArguments
     return Wait-HarnessProcess -Record $record -TimeoutMs $TimeoutMs -AllowFailure:$AllowFailure `
-        -DeferObservation:$DeferObservation -OverallDeadlineStopwatch $OverallDeadlineStopwatch `
-        -OverallDeadlineMs $OverallDeadlineMs -ExitWaitLimitMs $ExitWaitLimitMs `
-        -OutputDrainLimitMs $OutputDrainLimitMs
+        -DeferObservation:$DeferObservation @deadlineArguments
 }
 
 function Invoke-ProcessLifetimeMeasurementSelfTest {
@@ -2384,6 +2524,7 @@ function Invoke-HarnessFailureCleanupSelfTest {
             label = "batch-start-ownership-self-test-$index"
             standard_input_text = $null
             capture_first_stdout_line = $false
+            defer_observation = $true
         })
     }
     $batchFailureMessage = $null
@@ -3511,12 +3652,28 @@ function Invoke-Colay {
         [int]$ExitWaitLimitMs = 5000,
         [int]$OutputDrainLimitMs = 2000
     )
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    if ($boundDeadlineParameterCount -notin @(0, $deadlineParameterNames.Count)) {
+        throw 'Colay invocation requires one atomic bounded deadline contract'
+    }
+    $deadlineArguments = @{}
+    if ($boundDeadlineParameterCount -eq $deadlineParameterNames.Count) {
+        $deadlineArguments = @{
+            OverallDeadlineStopwatch = $OverallDeadlineStopwatch
+            OverallDeadlineMs = $OverallDeadlineMs
+            ExitWaitLimitMs = $ExitWaitLimitMs
+            OutputDrainLimitMs = $OutputDrainLimitMs
+        }
+    }
     return Invoke-HarnessProcess -Executable $script:ResolvedColay -ArgumentValues $ArgumentValues `
         -WorkingDirectory $Repository -Environment $Environment -Label $Label -TimeoutMs $TimeoutMs `
         -StandardInputText $null -CaptureFirstStdoutLine -AllowFailure:$AllowFailure `
-        -DeferObservation:$DeferObservation -OverallDeadlineStopwatch $OverallDeadlineStopwatch `
-        -OverallDeadlineMs $OverallDeadlineMs -ExitWaitLimitMs $ExitWaitLimitMs `
-        -OutputDrainLimitMs $OutputDrainLimitMs
+        -DeferObservation:$DeferObservation @deadlineArguments
 }
 
 function Assert-StatusJson {
@@ -3783,7 +3940,11 @@ function Assert-AuditDaemonReadinessEvidence {
     param(
         [Parameter(Mandatory = $true)]$ReadinessEvidence,
         [Parameter(Mandatory = $true)][string]$ExpectedExecutable,
-        [ValidateRange(1, [int]::MaxValue)][int]$ExpectedOverallTimeoutMs = 5000
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ExpectedLabel,
+        [ValidateRange(1, [int]::MaxValue)][int]$ExpectedOverallTimeoutMs = 5000,
+        [ValidateRange(1, [int]::MaxValue)][int]$ExpectedPollIntervalMs = 50,
+        [ValidateRange(0, [int]::MaxValue)][int]$ExpectedExitWaitLimitMs = 400,
+        [ValidateRange(0, [int]::MaxValue)][int]$ExpectedOutputDrainLimitMs = 100
     )
     $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
     if ($null -eq $ReadinessEvidence -or $ReadinessEvidence -is [string]) {
@@ -3791,7 +3952,7 @@ function Assert-AuditDaemonReadinessEvidence {
     }
     foreach ($propertyName in @(
             'readiness_status', 'original_state', 'final_state', 'poll_count', 'elapsed_ms',
-            'overall_timeout_ms', 'cleanup_reserve_ms', 'exit_wait_limit_ms',
+            'overall_timeout_ms', 'poll_interval_ms', 'cleanup_reserve_ms', 'exit_wait_limit_ms',
             'output_drain_limit_ms', 'status_command', 'anchored_identity', 'polls',
             'online_document', 'failure'
         )) {
@@ -3809,7 +3970,7 @@ function Assert-AuditDaemonReadinessEvidence {
         throw 'audit child readiness did not prove an exact failure-free online state'
     }
     foreach ($numericProperty in @(
-            'poll_count', 'elapsed_ms', 'overall_timeout_ms', 'cleanup_reserve_ms',
+            'poll_count', 'elapsed_ms', 'overall_timeout_ms', 'poll_interval_ms', 'cleanup_reserve_ms',
             'exit_wait_limit_ms', 'output_drain_limit_ms'
         )) {
         $numericValue = $ReadinessEvidence.$numericProperty
@@ -3820,13 +3981,20 @@ function Assert-AuditDaemonReadinessEvidence {
     $overallTimeoutMs = [int64]$ReadinessEvidence.overall_timeout_ms
     $elapsedMs = [int64]$ReadinessEvidence.elapsed_ms
     $pollCount = [int64]$ReadinessEvidence.poll_count
+    $pollIntervalMs = [int64]$ReadinessEvidence.poll_interval_ms
     $exitWaitLimitMs = [int64]$ReadinessEvidence.exit_wait_limit_ms
     $outputDrainLimitMs = [int64]$ReadinessEvidence.output_drain_limit_ms
     if ($overallTimeoutMs -ne $ExpectedOverallTimeoutMs -or $elapsedMs -lt 0 -or
         $elapsedMs -ge $overallTimeoutMs -or $pollCount -lt 0 -or
-        $exitWaitLimitMs -lt 0 -or $outputDrainLimitMs -lt 0 -or
-        [int64]$ReadinessEvidence.cleanup_reserve_ms -ne ($exitWaitLimitMs + $outputDrainLimitMs)) {
+        $pollIntervalMs -ne $ExpectedPollIntervalMs -or
+        $exitWaitLimitMs -ne $ExpectedExitWaitLimitMs -or
+        $outputDrainLimitMs -ne $ExpectedOutputDrainLimitMs -or
+        [int64]$ReadinessEvidence.cleanup_reserve_ms -ne
+            ($ExpectedExitWaitLimitMs + $ExpectedOutputDrainLimitMs)) {
         throw 'audit child readiness deadline or cleanup evidence is out of bounds'
+    }
+    if ($ReadinessEvidence.status_command -isnot [array]) {
+        throw 'audit child readiness status command is not an exact JSON array'
     }
     $statusCommand = @($ReadinessEvidence.status_command)
     if ($statusCommand.Count -ne 3 -or [string]$statusCommand[0] -cne '--json' -or
@@ -3861,6 +4029,9 @@ function Assert-AuditDaemonReadinessEvidence {
     if (-not $anchorPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'audit child readiness anchored executable path mismatch'
     }
+    if ($ReadinessEvidence.polls -isnot [array]) {
+        throw 'audit child readiness polls are not an exact JSON array'
+    }
     $polls = @($ReadinessEvidence.polls)
     if ($polls.Count -ne $pollCount) {
         throw 'audit child readiness poll_count does not match polls cardinality'
@@ -3869,6 +4040,7 @@ function Assert-AuditDaemonReadinessEvidence {
         ($pollCount -gt 0 -and [string]$ReadinessEvidence.original_state -cnotin @('booting', 'probing'))) {
         throw 'audit child readiness original state does not match its poll transition'
     }
+    [int64]$previousObservedElapsedMs = -1
     for ($index = 0; $index -lt $polls.Count; $index++) {
         $poll = $polls[$index]
         if ($null -eq $poll -or $poll -is [string]) {
@@ -3897,17 +4069,20 @@ function Assert-AuditDaemonReadinessEvidence {
         $pollExitMs = [int64]$poll.exit_wait_limit_ms
         $pollDrainMs = [int64]$poll.output_drain_limit_ms
         $totalOperationBudgetMs = [int64]$poll.total_operation_budget_ms
+        $observedElapsedMs = [int64]$poll.observed_elapsed_ms
         if ([int64]$poll.poll -ne ($index + 1) -or $remainingAtLaunchMs -le 0 -or
             $remainingAtLaunchMs -gt $overallTimeoutMs -or $commandTimeoutMs -le 0 -or
             $pollExitMs -ne $exitWaitLimitMs -or $pollDrainMs -ne $outputDrainLimitMs -or
             $totalOperationBudgetMs -ne ($commandTimeoutMs + $pollExitMs + $pollDrainMs) -or
             $totalOperationBudgetMs -gt $remainingAtLaunchMs -or
-            [int64]$poll.observed_elapsed_ms -lt 0 -or
-            [int64]$poll.observed_elapsed_ms -ge $overallTimeoutMs) {
+            $observedElapsedMs -lt 0 -or $observedElapsedMs -ge $overallTimeoutMs -or
+            $observedElapsedMs -lt $previousObservedElapsedMs -or $observedElapsedMs -gt $elapsedMs) {
             throw "audit child readiness poll $($index + 1) exceeded its launch or cleanup budget"
         }
+        $previousObservedElapsedMs = $observedElapsedMs
         if ($poll.command_label -isnot [string] -or
-            [string]::IsNullOrWhiteSpace([string]$poll.command_label) -or
+            [string]$poll.command_label -cne
+                ("$ExpectedLabel-daemon-readiness-{0:D3}" -f ($index + 1)) -or
             $poll.state -isnot [string] -or $poll.phase -isnot [string] -or
             [string]$poll.state -cne [string]$poll.phase -or
             @('booting', 'probing', 'online') -cnotcontains [string]$poll.state) {
@@ -4726,11 +4901,20 @@ function Invoke-ChildProcessLine {
         [int]$ExitWaitLimitMs = 5000,
         [int]$OutputDrainLimitMs = 2000
     )
-    $deadlineAware = $null -ne $OverallDeadlineStopwatch
-    if ($deadlineAware -ne ($OverallDeadlineMs -gt 0) -or
-        ($deadlineAware -and (-not $OverallDeadlineStopwatch.IsRunning -or $ExitWaitLimitMs -lt 0 -or
-            $OutputDrainLimitMs -lt 0 -or $TimeoutMs -le 0 -or
-            ($ExitWaitLimitMs + $OutputDrainLimitMs) -ge $OverallDeadlineMs))) {
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    if ($boundDeadlineParameterCount -notin @(0, $deadlineParameterNames.Count)) {
+        throw 'child process runner requires one atomic bounded deadline contract'
+    }
+    $deadlineAware = $boundDeadlineParameterCount -eq $deadlineParameterNames.Count
+    if ($deadlineAware -and ($null -eq $OverallDeadlineStopwatch -or
+        $OverallDeadlineMs -le 0 -or -not $OverallDeadlineStopwatch.IsRunning -or
+        $ExitWaitLimitMs -lt 0 -or $OutputDrainLimitMs -lt 0 -or $TimeoutMs -le 0 -or
+        ($ExitWaitLimitMs + $OutputDrainLimitMs) -ge $OverallDeadlineMs)) {
         throw 'child process runner received an invalid bounded deadline contract'
     }
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -4907,9 +5091,7 @@ function Invoke-ChildProcessLine {
                 }
             }
             $cleanupExitWaitMs = if ($deadlineAware) {
-                $phaseEndMs = if ($null -eq $deadlineExitEndMs) {
-                    (Get-AuditElapsedCeilingMs -Stopwatch $OverallDeadlineStopwatch) + $ExitWaitLimitMs
-                } else { $deadlineExitEndMs }
+                $phaseEndMs = $deadlineExitEndMs
                 Get-AuditPhaseWaitMs -Stopwatch $OverallDeadlineStopwatch `
                     -OverallDeadlineMs $OverallDeadlineMs -PhaseDeadlineElapsedMs $phaseEndMs `
                     -MaximumWaitMs ($ExitWaitLimitMs - [int]$deadlineExitWaitConsumedMs)
@@ -4936,9 +5118,7 @@ function Invoke-ChildProcessLine {
             $cleanupDrainStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             while (-not $stdoutTask.IsCompleted) {
                 $drainRemainingMs = if ($deadlineAware) {
-                    $phaseEndMs = if ($null -eq $deadlineDrainEndMs) {
-                        (Get-AuditElapsedCeilingMs -Stopwatch $OverallDeadlineStopwatch) + $OutputDrainLimitMs
-                    } else { $deadlineDrainEndMs }
+                    $phaseEndMs = $deadlineDrainEndMs
                     Get-AuditPhaseWaitMs -Stopwatch $OverallDeadlineStopwatch `
                         -OverallDeadlineMs $OverallDeadlineMs -PhaseDeadlineElapsedMs $phaseEndMs `
                         -MaximumWaitMs ($OutputDrainLimitMs - [int]$deadlineOutputDrainConsumedMs -
@@ -4957,7 +5137,7 @@ function Invoke-ChildProcessLine {
             }
             $cleanup.stdout_completed = [bool]$stdoutTask.IsCompleted
             if (-not $cleanup.stdout_completed) {
-                $cleanupErrors.Add('redirected stdout did not drain within the 2000ms cleanup limit')
+                $cleanupErrors.Add("redirected stdout did not drain within the ${OutputDrainLimitMs}ms cleanup limit")
             }
         }
         try {
@@ -5143,10 +5323,26 @@ function Invoke-ColayDocument {
         [int]$ExitWaitLimitMs = 5000,
         [int]$OutputDrainLimitMs = 2000
     )
+    $deadlineParameterNames = @(
+        'OverallDeadlineStopwatch', 'OverallDeadlineMs', 'ExitWaitLimitMs', 'OutputDrainLimitMs'
+    )
+    $boundDeadlineParameterCount = @($deadlineParameterNames | Where-Object {
+        $PSBoundParameters.ContainsKey($_)
+    }).Count
+    if ($boundDeadlineParameterCount -notin @(0, $deadlineParameterNames.Count)) {
+        throw 'Colay document invocation requires one atomic bounded deadline contract'
+    }
+    $deadlineArguments = @{}
+    if ($boundDeadlineParameterCount -eq $deadlineParameterNames.Count) {
+        $deadlineArguments = @{
+            OverallDeadlineStopwatch = $OverallDeadlineStopwatch
+            OverallDeadlineMs = $OverallDeadlineMs
+            ExitWaitLimitMs = $ExitWaitLimitMs
+            OutputDrainLimitMs = $OutputDrainLimitMs
+        }
+    }
     $line = Invoke-ChildProcessLine -Executable $ColayExe -Arguments $Arguments `
-        -WorkingDirectory $Repository -Label $Label -TimeoutMs $TimeoutMs `
-        -OverallDeadlineStopwatch $OverallDeadlineStopwatch -OverallDeadlineMs $OverallDeadlineMs `
-        -ExitWaitLimitMs $ExitWaitLimitMs -OutputDrainLimitMs $OutputDrainLimitMs
+        -WorkingDirectory $Repository -Label $Label -TimeoutMs $TimeoutMs @deadlineArguments
     try { return $line | ConvertFrom-Json -Depth 30 }
     catch { throw "$Label did not emit valid JSON: $($_.Exception.Message)" }
 }
@@ -6092,6 +6288,7 @@ try {
             label = "concurrent-register-$($seed.index)"
             standard_input_text = $null
             capture_first_stdout_line = $true
+            defer_observation = $true
         })
     }
     $running = @(Start-OwnedHarnessProcessBatch -Requests $concurrentRequests.ToArray())
@@ -6350,7 +6547,10 @@ try {
     }
     [void](Assert-AuditDaemonReadinessEvidence `
         -ReadinessEvidence $auditChildResult.daemon_readiness `
-        -ExpectedExecutable $script:ResolvedColay -ExpectedOverallTimeoutMs 5000)
+        -ExpectedExecutable $script:ResolvedColay -ExpectedLabel 'audit' `
+        -ExpectedOverallTimeoutMs 5000 `
+        -ExpectedPollIntervalMs 50 -ExpectedExitWaitLimitMs 400 `
+        -ExpectedOutputDrainLimitMs 100)
     $processLineSelfTest = $auditChildResult.process_line_failure_self_test
     if ($null -eq $processLineSelfTest -or [string]$processLineSelfTest.status -cne 'passed' -or
         [int]$processLineSelfTest.case_count -ne 3 -or

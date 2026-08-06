@@ -1056,7 +1056,7 @@ function Import-StressHarnessFunctions {
     $automaticVariables = [System.Collections.Generic.HashSet[string]]::new(
         [System.StringComparer]::OrdinalIgnoreCase
     )
-    foreach ($name in @('null', 'true', 'false', 'PID', 'PSItem', '_')) {
+    foreach ($name in @('null', 'true', 'false', 'PID', 'PSItem', '_', 'PSBoundParameters')) {
         [void]$automaticVariables.Add($name)
     }
     $declaredVariableNames = [System.Collections.Generic.HashSet[string]]::new(
