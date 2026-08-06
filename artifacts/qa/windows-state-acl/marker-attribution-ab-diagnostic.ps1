@@ -332,7 +332,7 @@ function New-LegacyWorkspace {
             before = $hashes
             after = $null
         }
-        inspection_group_id = $null
+        source_root_hash = $null
         source_evidence = $null
         config_sha256 = Get-Sha256 $configPath
     }
@@ -2519,7 +2519,7 @@ try {
                         throw "$armLabel attributed group count was $($groups.Count); expected exactly 1"
                     }
                     $group = @($groups.Values)[0]
-                    if ([string]$seed.inspection_group_id -cne [string]$group.group_id -or
+                    if ([string]$seed.source_root_hash -cne [string]$group.group_id -or
                         [int]$group.event_count -ne 2) {
                         throw "$armLabel durable source_root_hash or event count does not match its marker group"
                     }

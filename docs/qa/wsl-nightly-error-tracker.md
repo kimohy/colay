@@ -942,7 +942,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-010` | high | fix-in-progress (focused static/import matrix passed; exact A/B, stress, CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WIN-010` | high | fix-in-progress (first exact A/B preserved; diagnostic seed-schema fix pending exact rerun) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -2342,6 +2342,40 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   exact-clean-HEAD marker A/B verification and the one-shot Windows stress remain
   required before `WIN-010` or `WIN-005` can close. Published CI/nightly and WSL
   verification remain pending.
+
+### 2026-08-06 first exact amended A/B attempt (preserved; no retry)
+
+- Commit `19698ef6c11bbd481cc84f38440733e8f0f7200d` was built from a clean tree and
+  the changed marker diagnostic was invoked exactly once. The pinned SHA-256 inputs
+  were `colay.exe` `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  fake provider `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness `9f64b3ffb7a0b3fb340bbc265d0042d1c5fcbf265ee3e3c873e057f30ecaaaaa`,
+  diagnostic `7dabeb99510c363e1f743644ae6d64c4a248ecd50f6c61673c19ba10559eb224`,
+  and portable PowerShell `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The run failed after about `22.5s` in its first observation, before the
+  authoritative Windows stress, with `Exception setting "source_root_hash": property
+  'source_root_hash' cannot be found`. Evidence is preserved at
+  `artifacts/qa/windows-state-acl/marker-attribution-ab-20260806T193355173Z.json`
+  (`80,822` bytes, SHA-256
+  `6e007e086893df9d92774cd8ba75c3c4cf515d4d2e124b4c6101412a6628c384`).
+  It records one observation, zero completed A/B pairs, zero retries, and three
+  checkpoints (`initial-pre-mutation`, `before-pair-01`, `final`); the exact checkpoint-label gate
+  is false only because the run aborted before the remaining planned checkpoints.
+- Cleanup remained bounded: final residual processes were empty, the host had zero
+  exact candidate processes, the daemon was stopped, retained handles were balanced,
+  live leases were zero, database integrity and foreign keys passed, writable-row
+  count was zero, and source/provider configuration hashes were unchanged. Provider
+  credential-key count was zero and `fake_provider_only` was true. The sole
+  `cleanup_error_count=1` entry says pre-cleanup marker evidence was unavailable after
+  the early abort; it is not process residue.
+- Root cause is diagnostic-only schema drift. The marker override of
+  `New-LegacyWorkspace` still returned obsolete `inspection_group_id`, while imported
+  `Assert-DurableState` now assigns `source_root_hash` on that fixed-shape
+  `PSCustomObject`; the diagnostic's later group comparison also used the obsolete
+  member. A focused RED now covers the diagnostic member contract, and both uses are
+  changed to `source_root_hash`. No blind retry is allowed: the correction must pass
+  the focused suite and independent review, be committed as new exact inputs, then
+  receive one fresh A/B run before the one-shot authoritative stress.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 

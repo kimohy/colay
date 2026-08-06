@@ -1738,6 +1738,20 @@ try {
             [ref]$diagnosticParseErrors
         )
         Assert-Equal 0 $diagnosticParseErrors.Count 'marker diagnostic parser error count'
+        $diagnosticSeedOverride = Get-FunctionAst -Ast $diagnosticAst -Name 'New-LegacyWorkspace'
+        $diagnosticSeedOverrideText = $diagnosticSeedOverride.Extent.Text
+        Assert-True ($diagnosticSeedOverrideText -match '(?m)^\s*source_root_hash\s*=\s*\$null\s*$') `
+            'marker diagnostic seed object omitted its source_root_hash slot'
+        Assert-True ($diagnosticSeedOverrideText -notmatch '(?m)^\s*inspection_group_id\s*=') `
+            'marker diagnostic seed object still exposes obsolete inspection_group_id'
+        $diagnosticMemberNames = @($diagnosticAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.MemberExpressionAst]
+        }, $true) | ForEach-Object { $_.Member.Extent.Text.Trim("'`"") })
+        Assert-True ($diagnosticMemberNames -ccontains 'source_root_hash') `
+            'marker diagnostic seed contract omitted source_root_hash'
+        Assert-True ($diagnosticMemberNames -cnotcontains 'inspection_group_id') `
+            'marker diagnostic still uses the obsolete inspection_group_id seed contract'
         $mainStart = @($diagnosticAst.EndBlock.Statements | Where-Object {
             $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and
                 $_.Left.Extent.Text -ceq '$script:ResolvedColay' -and
