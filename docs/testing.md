@@ -279,9 +279,11 @@ Follow-up characterization identified synchronous `Win32_Process` CIM
 observation inside the timed wait path as measurement interference. That
 observation was removed from latency measurement and the functional process
 audit was separated. This diagnosis does not convert the failed run into a
-pass; current acceptance remains pending. Published Windows CI and nightly
-verification also remain required; neither the historical source checks nor the
-failed attempt close `WIN-005`, `WSL-022`, or `WSL-023`.
+pass. A later clean-HEAD authoritative re-acceptance did pass without changing
+the limits: serial p95/max was `4293` ms and concurrent max was `7674` ms.
+Published Windows CI and nightly verification remain required; the later local
+acceptance closes the source gate for `WIN-005`, but neither it nor the
+historical failed attempt closes `WSL-022` or `WSL-023`.
 
 Run the Linux commands inside WSL with Cargo build output on the Linux-native
 filesystem, not under `/mnt/<drive>`. A native checkout is preferred; when the

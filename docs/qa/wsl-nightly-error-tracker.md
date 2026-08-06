@@ -1792,7 +1792,7 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - 일반 IPC 응답 제한을 30초로 늘리는 timeout-only 수정은 중복 작업과 writer 점유를 그대로
   정상화하므로 거부했다. exact spawned daemon owner가 bootstrap 등록 영수증을 제공한 경우에만
   중복 `workspace.register`를 생략하고, incumbent daemon과 새 workspace 등록 경로는 유지한다.
-- 상태: `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`.
+- 상태: `fix-in-progress (authoritative Windows stress passed; merge and published CI/nightly verification pending)`.
   test-fixtures 전용 content-free inspect marker의 승인된 완료 계약은 plan inspect와
   sealed-plan apply reinspection 합계 2회다. source hash와 import ledger/workspace cardinality는
   유지해야 한다. `WIN-005`, `WSL-022`, `WSL-023`은 published verification 전에는 닫지 않는다.
@@ -2417,10 +2417,11 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   AST-contract, and pre-stop timing-CIM violations. The process-audit helper regression
   also passed. No authoritative stress, marker A/B, Cargo, or provider command was
   executed during this correction.
-- Status: `fix-in-progress`. Because the tracked diagnostic hash changed, one fresh
-  exact-clean-HEAD marker A/B verification and the one-shot Windows stress remain
-  required before `WIN-010` or `WIN-005` can close. Published CI/nightly and WSL
-  verification remain pending.
+- Status at this correction snapshot was `fix-in-progress`: because the tracked
+  diagnostic hash changed, one fresh exact-clean-HEAD marker A/B verification and
+  the one-shot Windows stress were still required. Both subsequently passed in the
+  final evidence sections below. Published CI/nightly and WSL verification remain
+  pending.
 
 ### 2026-08-06 first exact amended A/B attempt (preserved; no retry)
 
@@ -2515,12 +2516,10 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - Focused coverage accepts different PID-map insertion order and rejects an occurrence
   count change, same-cardinality PID substitution, string, Boolean, and fractional
   count values. The complete suite passed `48/48` on official PowerShell 7.2.24 and
-  pinned PowerShell 7.6.4. No authoritative stress retry has been performed for this
-  uncommitted correction.
-- `WIN-011` remains `fix-in-progress` until independent review, a new exact-input
-  commit, and one fresh authoritative stress run. That run
-  must also satisfy the unchanged `WIN-005` 5,000ms serial-p95 and 8,000ms per-command
-  concurrent limits before either issue can close.
+  pinned PowerShell 7.6.4. The later exact-input authoritative stress also passed the
+  structurally compared `43/43` PID multiset and the unchanged `WIN-005` 5,000ms
+  serial-p95 and 8,000ms per-command concurrent limits. `WIN-011` remains
+  `fix-in-progress` only until merge and published CI verification.
 
 ## WIN-012: generic JSON equivalence loses JSON structure
 
@@ -2540,8 +2539,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   suffix key and rejects reversed arrays, singleton-array versus scalar, number/string,
   boolean/string, changed SHA-256, and missing suffix cases. The same comparator covers
   PID multisets without scalar coercion. The complete suite passed `48/48` on official
-  PowerShell 7.2.24 and pinned PowerShell 7.6.4. Exact A/B/stress and published
-  verification are still required before `WIN-012` closes.
+  PowerShell 7.2.24 and pinned PowerShell 7.6.4. The later exact A/B and authoritative
+  stress both passed; merge and published verification remain before `WIN-012` closes.
 
 ## WIN-013: JSON equivalence violated the declared PowerShell 7.2 runtime floor
 
@@ -2567,8 +2566,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   with a valid Microsoft Corporation Authenticode signature.
 - After the separate `WIN-015` residue-probe correction, the complete focused suite
   passed `48/48` on official PowerShell 7.2.24 in `18.8s` and on pinned PowerShell
-  7.6.4 in `21.0s`; all three relevant scripts parsed with zero errors. `WIN-013`
-  remains `fix-in-progress` until fresh exact A/B/stress evidence passes.
+  7.6.4 in `21.0s`; all three relevant scripts parsed with zero errors. The later
+  exact A/B and authoritative stress both passed. `WIN-013` remains
+  `fix-in-progress` only until merge and published CI verification.
 
 ## WIN-014: readiness deadline fixture can expire before its required status poll
 
@@ -2584,8 +2584,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   recorded poll and the exact `timed out after 500ms` failure. No production readiness
   timeout, cleanup reserve, or command implementation changed.
 - The corrected fixture passed in the complete `48/48` suite on both official
-  PowerShell 7.2.24 and pinned PowerShell 7.6.4. `WIN-014` remains `fix-in-progress`
-  until independent review and merge.
+  PowerShell 7.2.24 and pinned PowerShell 7.6.4, independent review returned READY,
+  and the later exact A/B and authoritative stress passed. `WIN-014` remains
+  `fix-in-progress` only until merge and published CI verification.
 
 ## WIN-015: PowerShell 7.2 can enumerate exited processes with empty identity fields
 
@@ -2616,8 +2617,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   A static contract rejects raw self-test liveness checks and direct
   `Process.GetProcessById` rollback inspection. Complete focused suites then passed
   `48/48` concurrently on official PowerShell 7.2.24 in `18.8s` and pinned PowerShell
-  7.6.4 in `21.0s`. `WIN-015` remains
-  `fix-in-progress` until independent review and fresh exact A/B/stress evidence.
+  7.6.4 in `21.0s`. Independent review returned READY, and the later exact A/B and
+  authoritative stress passed. `WIN-015` remains `fix-in-progress` only until merge
+  and published CI verification.
 
 ### 2026-08-07 final reviewed exact-input A/B verification — passed once
 
