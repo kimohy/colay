@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-test-fixtures = ["dep:orchestrator-test-support"]
+test-fixtures = ["dep:orchestrator-test-support", "orchestrator-state/test-fixtures"]
 
 [[bin]]
 name = "colay-e2e-fake-provider"

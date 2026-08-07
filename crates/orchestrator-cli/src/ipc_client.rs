@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "test-fixtures")]
+use std::io::Write as _;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 #[cfg(windows)]
 use chrono::Utc;
@@ -24,6 +27,10 @@ use uuid::Uuid;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "test-fixtures")]
+const MAX_TEST_SPAWN_BARRIER_PARTICIPANTS: usize = 64;
+#[cfg(feature = "test-fixtures")]
+const MAX_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(1);
 
 type ResponseReader = Pin<Box<dyn AsyncBufRead + Send>>;
 
@@ -86,12 +93,20 @@ impl DaemonClient {
     ) -> Result<Self> {
         let paths = GlobalStatePaths::resolve(&StateEnvironment::from_process())?;
         let candidates = ipc_endpoint_candidates(&paths)?;
-        let endpoint = match discover_live_endpoint(&paths, &candidates).await? {
-            Some((endpoint, _)) => endpoint,
-            None => wait_until_ready(&paths, &candidates, repository, explicit_config).await?,
+        let (endpoint, startup_workspace_id) = if let Some((endpoint, _)) =
+            discover_live_endpoint(&paths, &candidates).await?
+        {
+            // An incumbent receipt belongs to the process that originally started it, not to this
+            // invocation. Register so a distinct workspace is still imported/activated.
+            (endpoint, None)
+        } else {
+            let ready = wait_until_ready(&paths, &candidates, repository, explicit_config).await?;
+            (ready.endpoint, ready.startup_workspace_id)
         };
-        let workspace_id =
-            register_workspace(&paths, &endpoint, repository, explicit_config).await?;
+        let workspace_id = match startup_workspace_id {
+            Some(workspace_id) => workspace_id,
+            None => register_workspace(&paths, &endpoint, repository, explicit_config).await?,
+        };
         Ok(Self {
             paths,
             endpoint,
@@ -328,7 +343,10 @@ fn endpoint_is_unavailable(error: &anyhow::Error) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PingReadiness {
     Legacy,
-    Owner(u32),
+    Owner {
+        owner_pid: u32,
+        startup_workspace_id: Option<WorkspaceId>,
+    },
 }
 
 fn ping_readiness(response: &IpcResponse) -> Result<PingReadiness> {
@@ -341,7 +359,23 @@ fn ping_readiness(response: &IpcResponse) -> Result<PingReadiness> {
     {
         bail!("user daemon readiness response was not ready");
     }
+    let startup_workspace_id = response
+        .outcome
+        .pointer("/data/startup_workspace_id")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow!("user daemon returned a non-string startup workspace identifier")
+                })?
+                .parse()
+                .context("user daemon returned an invalid startup workspace identifier")
+        })
+        .transpose()?;
     let Some(owner_pid) = response.outcome.pointer("/data/owner_pid") else {
+        if startup_workspace_id.is_some() {
+            bail!("user daemon returned a startup workspace identifier without an owner PID");
+        }
         return Ok(PingReadiness::Legacy);
     };
     let owner_pid = owner_pid
@@ -352,7 +386,10 @@ fn ping_readiness(response: &IpcResponse) -> Result<PingReadiness> {
     if owner_pid == 0 {
         bail!("user daemon returned an invalid zero owner PID");
     }
-    Ok(PingReadiness::Owner(owner_pid))
+    Ok(PingReadiness::Owner {
+        owner_pid,
+        startup_workspace_id,
+    })
 }
 
 fn legacy_status_identity(response: &IpcResponse) -> Result<LegacyDaemonIdentity> {
@@ -450,6 +487,7 @@ async fn register_workspace(
     repository: &Path,
     explicit_config: Option<&Path>,
 ) -> Result<WorkspaceId> {
+    let response_timeout = workspace_register_response_timeout()?;
     let config = crate::daemon::load_daemon_config(repository, explicit_config)?;
     let request = IpcRequest {
         schema_version: IPC_SCHEMA_VERSION,
@@ -463,7 +501,7 @@ async fn register_workspace(
         }),
     };
     let mut stream = open_response_stream(paths, endpoint, &request).await?;
-    let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+    let response = tokio::time::timeout(response_timeout, stream.next())
         .await
         .context("timed out registering the workspace with the user daemon")??
         .ok_or_else(|| anyhow!("user daemon closed workspace IPC without replying"))?;
@@ -476,6 +514,43 @@ async fn register_workspace(
     workspace_id
         .parse()
         .context("user daemon returned an invalid workspace identifier")
+}
+
+fn workspace_register_response_timeout() -> Result<Duration> {
+    #[cfg(feature = "test-fixtures")]
+    {
+        parse_test_workspace_register_response_timeout(
+            std::env::var_os("COLAY_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT_MS").as_deref(),
+        )
+    }
+    #[cfg(not(feature = "test-fixtures"))]
+    {
+        Ok(RESPONSE_TIMEOUT)
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn parse_test_workspace_register_response_timeout(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(RESPONSE_TIMEOUT);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("workspace register response timeout is not valid UTF-8"))?;
+    let milliseconds = value
+        .parse::<u64>()
+        .context("workspace register response timeout is not a positive integer")?;
+    let timeout = Duration::from_millis(milliseconds);
+    if !(RESPONSE_TIMEOUT..=MAX_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT).contains(&timeout) {
+        bail!(
+            "workspace register response timeout must be between {} and {} milliseconds",
+            RESPONSE_TIMEOUT.as_millis(),
+            MAX_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT.as_millis()
+        );
+    }
+    Ok(timeout)
 }
 
 fn ensure_success(response: &IpcResponse) -> Result<()> {
@@ -495,7 +570,7 @@ async fn wait_until_ready(
     candidates: &IpcEndpointCandidates,
     repository: &Path,
     explicit_config: Option<&Path>,
-) -> Result<DaemonEndpoint> {
+) -> Result<ReadyEndpoint> {
     let started = Instant::now();
     let deadline = started + CONNECT_TIMEOUT;
     let mut child: Option<Child> = None;
@@ -503,19 +578,27 @@ async fn wait_until_ready(
     let mut last_child_exit = None;
     loop {
         if let Some((endpoint, readiness)) = discover_live_endpoint(paths, candidates).await? {
-            match resolve_ready_child(child.as_mut(), readiness, || {
+            let disposition = resolve_ready_child(child.as_mut(), readiness, || {
                 request_legacy_status_owner_pid(paths, &endpoint)
             })
-            .await?
-            {
-                ReadyChildDisposition::NoSpawn => return Ok(endpoint),
+            .await?;
+            match disposition {
+                ReadyChildDisposition::NoSpawn => {
+                    return Ok(ReadyEndpoint {
+                        endpoint,
+                        startup_workspace_id: None,
+                    });
+                }
                 ReadyChildDisposition::LiveOwner => {
                     let owner_pid = child
                         .as_ref()
                         .map(Child::id)
                         .ok_or_else(|| anyhow!("daemon owner child was lost before recording"))?;
                     record_startup_child_resolution("owner", owner_pid)?;
-                    return Ok(endpoint);
+                    return Ok(ReadyEndpoint {
+                        endpoint,
+                        startup_workspace_id: startup_workspace_receipt(readiness, disposition),
+                    });
                 }
                 ReadyChildDisposition::ReapContender => {
                     let process = child
@@ -529,7 +612,10 @@ async fn wait_until_ready(
                             }
                             ReapProgress::Reaped(_) => {
                                 record_startup_child_resolution("reaped", child_pid)?;
-                                return Ok(endpoint);
+                                return Ok(ReadyEndpoint {
+                                    endpoint,
+                                    startup_workspace_id: None,
+                                });
                             }
                         }
                     }
@@ -545,6 +631,10 @@ async fn wait_until_ready(
                     child = None;
                 }
             }
+        }
+        #[cfg(feature = "test-fixtures")]
+        if !spawn_attempted {
+            wait_for_test_spawn_barrier().await?;
         }
         spawn_contender_once(&mut child, &mut spawn_attempted, || {
             spawn_server(repository, explicit_config)
@@ -578,6 +668,109 @@ async fn wait_until_ready(
 }
 
 #[cfg(feature = "test-fixtures")]
+fn parse_test_spawn_barrier_count(value: &std::ffi::OsStr) -> Result<usize> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("daemon spawn barrier count is not valid UTF-8"))?;
+    let count = value
+        .parse::<usize>()
+        .context("daemon spawn barrier count is not a positive integer")?;
+    if !(1..=MAX_TEST_SPAWN_BARRIER_PARTICIPANTS).contains(&count) {
+        bail!(
+            "daemon spawn barrier count must be between 1 and {MAX_TEST_SPAWN_BARRIER_PARTICIPANTS}"
+        );
+    }
+    Ok(count)
+}
+
+#[cfg(feature = "test-fixtures")]
+async fn wait_for_test_spawn_barrier() -> Result<()> {
+    let (barrier, expected) = match (
+        std::env::var_os("COLAY_TEST_DAEMON_SPAWN_BARRIER"),
+        std::env::var_os("COLAY_TEST_DAEMON_SPAWN_BARRIER_COUNT"),
+    ) {
+        (Some(barrier), Some(expected)) => (barrier, expected),
+        (None, None) => return Ok(()),
+        _ => bail!("daemon spawn barrier requires both path and expected count"),
+    };
+    let barrier = PathBuf::from(barrier);
+    if !barrier.is_dir() {
+        bail!(
+            "daemon spawn barrier is not a directory: {}",
+            barrier.display()
+        );
+    }
+    let expected = parse_test_spawn_barrier_count(&expected)?;
+
+    let marker = barrier.join(format!("{}.ready", std::process::id()));
+    let mut marker_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker)
+        .with_context(|| {
+            format!(
+                "cannot create daemon spawn barrier marker {}",
+                marker.display()
+            )
+        })?;
+    marker_file.write_all(b"ready\n").with_context(|| {
+        format!(
+            "cannot write daemon spawn barrier marker {}",
+            marker.display()
+        )
+    })?;
+    marker_file.sync_all().with_context(|| {
+        format!(
+            "cannot sync daemon spawn barrier marker {}",
+            marker.display()
+        )
+    })?;
+
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        let entries = std::fs::read_dir(&barrier)
+            .with_context(|| format!("cannot read daemon spawn barrier {}", barrier.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| {
+                format!(
+                    "cannot enumerate daemon spawn barrier {}",
+                    barrier.display()
+                )
+            })?;
+        let mut arrivals = 0;
+        for entry in entries {
+            let file_type = entry.file_type().with_context(|| {
+                format!(
+                    "cannot inspect daemon spawn barrier entry {}",
+                    entry.path().display()
+                )
+            })?;
+            if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ready")
+            {
+                arrivals += 1;
+            }
+        }
+        if arrivals == expected {
+            return Ok(());
+        }
+        if arrivals > expected {
+            bail!("daemon spawn barrier observed {arrivals} arrivals, expected exactly {expected}");
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "daemon spawn barrier timed out with {arrivals} of {expected} arrivals after {} seconds",
+                CONNECT_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
 fn record_startup_child_resolution(disposition: &str, pid: u32) -> Result<()> {
     let Some(path) = std::env::var_os("COLAY_TEST_DAEMON_CHILD_RESOLUTION") else {
         return Ok(());
@@ -602,6 +795,27 @@ enum ReadyChildDisposition {
     ReapContender,
 }
 
+struct ReadyEndpoint {
+    endpoint: DaemonEndpoint,
+    startup_workspace_id: Option<WorkspaceId>,
+}
+
+fn startup_workspace_receipt(
+    readiness: PingReadiness,
+    disposition: ReadyChildDisposition,
+) -> Option<WorkspaceId> {
+    match (readiness, disposition) {
+        (
+            PingReadiness::Owner {
+                startup_workspace_id,
+                ..
+            },
+            ReadyChildDisposition::LiveOwner,
+        ) => startup_workspace_id,
+        _ => None,
+    }
+}
+
 fn classify_ready_child(child_pid: Option<u32>, owner_pid: u32) -> ReadyChildDisposition {
     match child_pid {
         None => ReadyChildDisposition::NoSpawn,
@@ -624,7 +838,7 @@ where
         return Ok(ReadyChildDisposition::NoSpawn);
     };
     let owner_pid = match readiness {
-        PingReadiness::Owner(owner_pid) => owner_pid,
+        PingReadiness::Owner { owner_pid, .. } => owner_pid,
         PingReadiness::Legacy => match legacy_owner_pid().await {
             Ok(owner_pid) => owner_pid,
             Err(status_error) => {
@@ -916,16 +1130,18 @@ mod tests {
     use std::time::Instant;
     use std::{cell::Cell, collections::VecDeque, future, io};
 
-    use super::{
-        LegacyDaemonIdentity, PingReadiness, ReadyChildDisposition, ReapProgress, StartupChild,
-        classify_ready_child, daemon_contenders_exited_message, doctor_lookup_with,
-        inspect_child_at_startup_deadline, legacy_status_identity, legacy_status_request,
-        ping_readiness, poll_non_owner_contender, resolve_ready_child,
-        response_stream_with_legacy_identity, spawn_contender_once,
-        validate_legacy_daemon_identity,
-    };
     #[cfg(windows)]
-    use super::{RESPONSE_TIMEOUT, open_windows_pipe_with_retry};
+    use super::open_windows_pipe_with_retry;
+    use super::{
+        CONNECT_TIMEOUT, LegacyDaemonIdentity, PingReadiness, RESPONSE_TIMEOUT,
+        ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
+        daemon_contenders_exited_message, doctor_lookup_with, inspect_child_at_startup_deadline,
+        legacy_status_identity, legacy_status_request, ping_readiness, poll_non_owner_contender,
+        resolve_ready_child, response_stream_with_legacy_identity, spawn_contender_once,
+        startup_workspace_receipt, validate_legacy_daemon_identity,
+    };
+    #[cfg(feature = "test-fixtures")]
+    use super::{parse_test_spawn_barrier_count, parse_test_workspace_register_response_timeout};
     use anyhow::Context as _;
     use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse};
     use serde_json::{Value, json};
@@ -1301,12 +1517,38 @@ mod tests {
 
     #[test]
     fn readiness_response_preserves_version_one_legacy_shape() -> anyhow::Result<()> {
+        assert_eq!(CONNECT_TIMEOUT.as_secs(), 30);
+        assert_eq!(RESPONSE_TIMEOUT.as_secs(), 10);
+        let workspace_id = "018f68d2-00f0-7000-8000-000000000099";
         let response = IpcResponse {
+            schema_version: IPC_SCHEMA_VERSION,
+            request_id: "ping".to_owned(),
+            outcome: json!({"status": "ok", "data": {
+                "ready": true,
+                "owner_pid": 42,
+                "startup_workspace_id": workspace_id
+            }}),
+        };
+        assert_eq!(
+            ping_readiness(&response)?,
+            PingReadiness::Owner {
+                owner_pid: 42,
+                startup_workspace_id: Some(workspace_id.parse()?),
+            }
+        );
+
+        let old_modern = IpcResponse {
             schema_version: IPC_SCHEMA_VERSION,
             request_id: "ping".to_owned(),
             outcome: json!({"status": "ok", "data": {"ready": true, "owner_pid": 42}}),
         };
-        assert_eq!(ping_readiness(&response)?, PingReadiness::Owner(42));
+        assert_eq!(
+            ping_readiness(&old_modern)?,
+            PingReadiness::Owner {
+                owner_pid: 42,
+                startup_workspace_id: None,
+            }
+        );
 
         let legacy = IpcResponse {
             schema_version: IPC_SCHEMA_VERSION,
@@ -1315,10 +1557,62 @@ mod tests {
         };
         assert_eq!(ping_readiness(&legacy)?, PingReadiness::Legacy);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn test_spawn_barrier_count_accepts_only_bounded_participants() -> anyhow::Result<()> {
+        for (raw, expected) in [("1", 1), ("4", 4), ("64", 64)] {
+            assert_eq!(
+                parse_test_spawn_barrier_count(std::ffi::OsStr::new(raw))?,
+                expected
+            );
+        }
+        for invalid in ["0", "65", "not-a-number"] {
+            assert!(
+                parse_test_spawn_barrier_count(std::ffi::OsStr::new(invalid)).is_err(),
+                "accepted invalid spawn barrier count {invalid:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn workspace_register_test_timeout_is_scoped_and_bounded() -> anyhow::Result<()> {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            parse_test_workspace_register_response_timeout(None)?,
+            RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            parse_test_workspace_register_response_timeout(Some(OsStr::new("30000")))?,
+            std::time::Duration::from_secs(30)
+        );
+        for invalid in ["9999", "60001", "not-a-number"] {
+            assert!(
+                parse_test_workspace_register_response_timeout(Some(OsStr::new(invalid))).is_err(),
+                "accepted invalid workspace register response timeout {invalid:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_readiness_responses_fail_closed() {
         for invalid in [
             json!({"status": "ok", "data": {"ready": false, "owner_pid": 42}}),
             json!({"status": "ok", "data": {"ready": true, "owner_pid": 0}}),
             json!({"status": "ok", "data": {"ready": true, "owner_pid": "42"}}),
+            json!({"status": "ok", "data": {"ready": true, "startup_workspace_id": "018f68d2-00f0-7000-8000-000000000099"}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 42, "startup_workspace_id": null}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 42, "startup_workspace_id": false}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 42, "startup_workspace_id": 7}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 42, "startup_workspace_id": []}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 42, "startup_workspace_id": {}}}),
+            json!({"status": "ok", "data": {"ready": true, "owner_pid": 42, "startup_workspace_id": "not-a-uuid"}}),
         ] {
             let response = IpcResponse {
                 schema_version: IPC_SCHEMA_VERSION,
@@ -1327,7 +1621,6 @@ mod tests {
             };
             assert!(ping_readiness(&response).is_err());
         }
-        Ok(())
     }
 
     #[test]
@@ -1534,6 +1827,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_receipt_is_reused_only_for_the_exact_live_owner() -> anyhow::Result<()> {
+        let workspace_id = "018f68d2-00f0-7000-8000-000000000099".parse()?;
+        let modern = PingReadiness::Owner {
+            owner_pid: 42,
+            startup_workspace_id: Some(workspace_id),
+        };
+
+        assert_eq!(
+            startup_workspace_receipt(modern, ReadyChildDisposition::LiveOwner),
+            Some(workspace_id)
+        );
+        assert_eq!(
+            startup_workspace_receipt(modern, ReadyChildDisposition::NoSpawn),
+            None,
+            "an incumbent daemon receipt must never bypass workspace.register"
+        );
+        assert_eq!(
+            startup_workspace_receipt(modern, ReadyChildDisposition::ReapContender),
+            None,
+            "another winner's receipt must be discarded"
+        );
+        assert_eq!(
+            startup_workspace_receipt(
+                PingReadiness::Owner {
+                    owner_pid: 42,
+                    startup_workspace_id: None,
+                },
+                ReadyChildDisposition::LiveOwner,
+            ),
+            None,
+            "old modern peers must retain workspace.register"
+        );
+        assert_eq!(
+            startup_workspace_receipt(PingReadiness::Legacy, ReadyChildDisposition::LiveOwner),
+            None,
+            "legacy readiness can validate ownership but cannot carry a receipt"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn legacy_ready_without_spawn_skips_owner_lookup() -> anyhow::Result<()> {
         let status_calls = Cell::new(0_u32);
@@ -1612,10 +1946,17 @@ mod tests {
         let status_calls = Cell::new(0_u32);
         let mut child = FakeStartupChild::new(42, vec![]);
 
-        let disposition = resolve_ready_child(Some(&mut child), PingReadiness::Owner(42), || {
-            status_calls.set(status_calls.get() + 1);
-            future::ready(Ok(41))
-        })
+        let disposition = resolve_ready_child(
+            Some(&mut child),
+            PingReadiness::Owner {
+                owner_pid: 42,
+                startup_workspace_id: None,
+            },
+            || {
+                status_calls.set(status_calls.get() + 1);
+                future::ready(Ok(41))
+            },
+        )
         .await?;
 
         assert_eq!(disposition, ReadyChildDisposition::LiveOwner);

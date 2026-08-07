@@ -800,6 +800,57 @@ before any probe, uniformly for Codex, Claude, Gemini, and Agy.
 - Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
 - Release completion: a newly published nightly passes isolated WSL clean-install QA and the issue status changes to `fixed`.
 
+## WSL-024: fake-provider-only worker guard is an incomplete basename denylist
+
+- Severity: high
+- Status: fix-in-progress (focused RED/GREEN and local full gates passed; CI, merge, and nightly verification pending)
+- Affected scope: tests and CI with `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`
+
+### Observation and risk
+
+`ProcessAdapterRuntime` applies a final fake-only guard before starting a provider
+worker. The guard rejected the default Codex, Claude, and Gemini executable basenames
+on both Unix and Windows, but omitted the configured Agy default `agy`/`agy.exe`.
+It was also a denylist: renamed or wrapped executables such as `agy-real` and
+`codex-nightly` passed, and only the primary invocation was checked, allowing a fake
+primary to carry a real fallback. Consequently a test that accidentally reached the
+production worker runtime could start a real provider even though fake-only mode was
+enabled. The current tests and Windows harnesses use exact compiled fake-provider
+paths, so no real provider invocation was observed; the guard was nevertheless a
+fail-open CI policy inconsistency.
+
+### Correction and verification
+
+- Fake-only worker execution now permits only the exact test-support basename families
+  `fake-provider-cli[.exe]` and `colay-e2e-fake-provider[.exe]`. Every other basename,
+  including all four default real providers, arbitrary renamed/wrapper names, empty
+  names, and unsupported fixture names, fails closed. The flag-off behavior remains
+  unchanged.
+- The guard validates the primary and every prepared fallback before starting the
+  primary, so a successful fake primary cannot defer the policy check until a real
+  fallback is selected.
+- RED first reproduced both independent bypasses: the arbitrary-name rejection matrix
+  and fake-primary/real-fallback case failed. GREEN passed both focused tests plus all
+  27 provider unit tests. The fallback fixture retained a nonexistent primary path but
+  now uses the exact compiled fake basename; all 20 production-runtime provider E2E
+  cases passed with fake-only mode enabled. Workspace-wide formatting, Clippy, and
+  tests then passed with fake-only mode enabled and provider credentials cleared. PR
+  CI and published-nightly WSL validation remain the completion gates.
+- This basename allowlist prevents accidental use of default, renamed, or wrapper
+  provider commands; it is not a cryptographic identity check against a hostile binary
+  deliberately substituted under an allowed test-support filename. E2E tests retain
+  exact Cargo-built fixture paths, and the Windows stress gate additionally pins the
+  fake binary SHA-256. A future canonical-path or content-hash contract can strengthen
+  the generic runtime boundary without broadening this correction's claim.
+
+### Completion conditions
+
+- Source completion: all four default provider identities are rejected by the
+  fake-only production worker guard and fake fixtures remain allowed.
+- Release completion: the change passes the three-platform fake-only CI matrix and a
+  newly published nightly completes isolated WSL QA without unintended provider
+  invocation.
+
 ## WSL-012: 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨
 
 - 심각도: high
@@ -925,7 +976,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-08-03
+- 마지막 갱신: 2026-08-07
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
@@ -942,6 +993,20 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
+| `WIN-022` | low | monitoring (non-code Windows host filesystem anomaly; clean full gate GREEN; final CI pending) | a freshly created `DoctorFixture` repository disappeared before current-schema WAL seeding |
+| `WIN-021` | low | fix-in-progress (identical-tree Windows CI RED/GREEN; scoped bounded fixture timeout and local repeats pass; final CI pending) | cold-start receipt correctness fixture inherits the production registration latency deadline |
+| `WIN-020` | low | fix-in-progress (identical-tree Ubuntu CI RED/GREEN; deterministic gate and local repeats pass; final CI pending) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
+| `WIN-019` | medium | fix-in-progress (exact-`b71f9a9` macOS CI RED; alias RED/GREEN and final local full gates pass; final CI pending) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
+| `WIN-018` | low | fix-in-progress (exact-`b71f9a9` Windows CI RED; bounded-wait and final local full gates pass; final CI pending) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
+| `WIN-017` | medium | fix-in-progress (exact-`b71f9a9` stress failed once; exact-`a05bc02` stress passed once; final CI/nightly pending) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
+| `WIN-016` | medium | fix-in-progress (native mutex RED/GREEN; duplicate state gate removed; final local full gates pass; CI/nightly pending) | read-only ACL verification can race an in-process ACL repair sequence |
+| `WIN-015` | medium | fix-in-progress (reviewed PowerShell 7.2/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
+| `WIN-014` | low | fix-in-progress (reviewed deterministic fixture, exact A/B, and authoritative stress pass; merge/CI pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
+| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
+| `WIN-012` | medium | fix-in-progress (structural matrix, exact A/B, and authoritative stress pass; merge/CI pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
+| `WIN-011` | medium | fix-in-progress (PID matrix, exact A/B, and authoritative stress pass; merge/CI pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
+| `WIN-010` | high | fix-in-progress (fresh exact A/B and authoritative stress passed; CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WSL-024` | high | fix-in-progress (fail-closed allowlist/fallback RED/GREEN and local full gates passed; CI/merge/nightly pending) | fake-provider-only worker guard is an incomplete basename denylist and skips fallbacks |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
@@ -967,6 +1032,11 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
+| `WIN-005` | high | fix-in-progress (unchanged latency limits passed authoritative re-acceptance; merge/CI/nightly pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
+| `WIN-007` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
+| `WIN-008` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |
+| `WIN-009` | medium | fixed (reviewed exact-HEAD A/B passed) | exit-zero `daemon start`가 `booting` 상태를 반환하면 marker A/B가 retained identity를 열기 전에 중단됨 |
 
 ## WSL-010: repository-local 상태 분산과 safe-mode migration 순환
 
@@ -1755,6 +1825,1348 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   반환되고 effective provider report에도 `enabled=false`가 반영됨을 확인했다.
 - 변경 후 workspace 전체 target/feature Clippy `-D warnings`와 전체 Rust suite가 통과했다.
 
+## WIN-005: fresh daemon의 중복 legacy 검사로 `workspace.register` 응답 timeout
+
+### 관찰 및 영향
+
+- Merge-triggered Release run `30866284840`은 성공했지만 main CI run `30866284842`의
+  Windows job `91858756051`에서 `global_doctor` 31개 중 다음 두 테스트가 실패했다.
+  - `live_doctor_fails_corrupt_legacy_import_completion_without_mutation`
+  - `live_doctor_reports_changed_legacy_import_as_pending`
+- 두 실패 모두 daemon에 `workspace.register` 요청을 기록한 뒤 기존 10초 응답 제한 안에
+  완료 응답을 받지 못해 `timed out registering the workspace with the user daemon: deadline has
+  elapsed`를 반환했다. 같은 변경의 pull-request Windows 실행과 로컬 전체 suite는 통과해
+  병렬 Windows 부하에 민감한 경로로 확인됐다.
+
+### 근본 원인과 수정 방향
+
+- fresh daemon은 IPC를 bind하기 전에 startup workspace의 legacy source를 inspect하고 sealed
+  plan을 `apply`하면서 다시 inspect한다. 준비 완료 뒤 daemon을 시작한 클라이언트가 같은
+  workspace를 IPC `workspace.register`로 무조건 등록해 동일 source를 세 번째로 inspect한다.
+- legacy inspect는 SQLite family capture, snapshot migration, event/document 검증, 파일 hash를
+  수행한다. 결함이 관찰된 당시 Windows scratch/private-path 보장은 이 과정에서
+  `whoami.exe`와 `icacls.exe`를 반복 생성해 병렬 CI 부하에서 중복 비용을 증폭했다. 현재
+  source는 retained non-reparse handles의 native DACL repair/verification으로 이 utility 경로를
+  제거했지만, 중복 registration 자체를 생략하는 bootstrap receipt 계약은 계속 필요하다.
+- 일반 IPC 응답 제한을 30초로 늘리는 timeout-only 수정은 중복 작업과 writer 점유를 그대로
+  정상화하므로 거부했다. exact spawned daemon owner가 bootstrap 등록 영수증을 제공한 경우에만
+  중복 `workspace.register`를 생략하고, incumbent daemon과 새 workspace 등록 경로는 유지한다.
+- 상태: `fix-in-progress (authoritative Windows stress passed; merge and published CI/nightly verification pending)`.
+  test-fixtures 전용 content-free inspect marker의 승인된 완료 계약은 plan inspect와
+  sealed-plan apply reinspection 합계 2회다. source hash와 import ledger/workspace cardinality는
+  유지해야 한다. `WIN-005`, `WSL-022`, `WSL-023`은 published verification 전에는 닫지 않는다.
+
+### 2026-08-06 exact-HEAD authoritative stress — failed, not retried
+
+- Clean source commit `7212e5386db7c2c6a6d3f0456e59e0b132500980` was invoked exactly
+  once through portable PowerShell 7.6.4 with separated arguments. The pinned stress
+  harness was `9f64b3ffb7a0b3fb340bbc265d0042d1c5fcbf265ee3e3c873e057f30ecaaaaa`,
+  `colay.exe` was `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  and the fake provider was
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+  The external shell invocation exited `1` after `193.5s` of wall time and was not retried. The
+  artifact interval was `192.2597939s` (`2026-08-06T19:49:44.2558103Z` through
+  `2026-08-06T19:52:56.5156042Z`).
+- Preserved schema-2 evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260806T194944250Z.json`
+  is `465,770` bytes with SHA-256
+  `fd229cbfe2e337b16af985aa1624e638fb909cd265806974234e08881ee53fbb`;
+  its companion `summary.json` is `99,943` bytes with SHA-256
+  `2b4168e19c3417e5d4c2efd8b3c3c860f75d679fff87fd470c1efa233a4918ef`.
+- Registration timing did not meet acceptance: serial OS-process lifetimes were
+  `4928, 5399, 5040, 4941, 4034ms`, so nearest-rank p95 was `5399ms` against
+  `5000ms`; concurrent lifetimes were `6579, 7723, 7800, 8358ms`, with
+  `concurrent-register-9` exceeding the `8000ms` limit by `358ms`. These two
+  acceptance failures remain valid `WIN-005` evidence independently of the later
+  process-audit harness failure. Limits were not relaxed.
+- The latency phase otherwise reached aggregate inspection count `18`, attributed
+  group/event `0/0`, five serial and four concurrent completions, SQLite integrity
+  `ok`, zero foreign-key violations, zero writable rows, and source commit identity
+  `verified_clean`. The correctness helper child exited `0` after `16,316ms`, and its
+  emitted `functional-audit.json` reported status `success`, but `WIN-011` then aborted
+  the parent validator. Consequently
+  `process_audit.functional` and correctness aggregate/group/event/source-hash fields
+  remained null and no authoritative correctness result was published or accepted.
+- Cleanup stopped both main and audit daemons, confirmed stopped endpoints and zero
+  live leases, left zero residual processes, zero cleanup errors, zero forbidden
+  utility launches, and zero ownership refusals. All provider credential names were
+  cleared and `fake_provider_only` was true. This failed run is not authoritative
+  acceptance and cannot close `WIN-005` or `WIN-010`.
+
+### Host-write control and pre-timing fixture separation
+
+- The unchanged Python/SQLite schema-v8 seed control was also materially slower than
+  the accepted `20260805T093708005Z` baseline. Its nine-write median changed from
+  `744ms` (minimum `688ms`, maximum `3670ms`) to `3308ms` (minimum `2448ms`,
+  maximum `3786ms`), about `4.45x`, while read-only Python controls improved from
+  median `157ms` (mean `156ms`) to median `102ms` (mean `101ms`). The corrected A/B
+  immediately before stress likewise
+  recorded seed times from `2994ms` to `12541ms` and registration from `1332ms` to
+  `5926ms`, then rejected combined timing because of seed and order noise.
+- Runtime crate changes since the accepted product baseline are limited to an
+  attributed-marker environment lookup that returns before I/O when its key is absent
+  and LocalSystem principal normalization on the existing ACL path. Neither explains
+  a multi-second normal-user regression. Therefore the observed user-visible threshold
+  failures remain a hard merge failure, but the evidence does not attribute them to a
+  product, marker, or LocalSystem regression. Newly written SQLite/Windows filesystem
+  contention is the stronger current confounder and working hypothesis, not a proven
+  cause. Thresholds remain `5000/8000ms`.
+- The harness now creates and verifies all nine distinct latency sources before the
+  timing self-test and before daemon startup, retains them in an exact index map, and
+  only registers those prepared paths during the measured serial/concurrent phases.
+  It fail-closed validates the exact ordered labels `seed-schema-v8-1..9`, retained
+  integer indexes, OS-process-lifetime method, integral exit `0`, Boolean non-timeout,
+  and nonnegative integral elapsed time. It publishes all nine seed-write times,
+  min/median/max, exact labels and source count as
+  `measurement_diagnostics.latency_source_preparation` with
+  `timing_included_in_latency_thresholds=false`. This uses no sleep and does not
+  subtract setup from a command lifetime. It removes synchronous synthetic fresh-file
+  creation from the measured period and reduces overlap risk from antivirus/indexer
+  work, but does not observe or guarantee that background work has finished.
+- Focused RED proved there were two in-timing fixture creation sites. GREEN requires
+  one exact `1..9` pre-timing call site and passed with the unchanged marker, readiness,
+  cleanup, and threshold contracts. If a fresh exact run still exceeds a product
+  limit, test-fixtures-only inspect/prepare/queue/commit telemetry is required before
+  any product optimization; durability, fsync, ACL, and verification checks must not
+  be weakened speculatively.
+
+### Historical source-fixed baseline — not current acceptance
+
+- Source `a52945d`에는 native ACL commits `c83200d`, `83181f0`, `ab5617e`, `361391a`,
+  `4e5e408`, `d1efe8e`, `3b6b8ec`와 receipt/concurrency commits through `c841b75`,
+  `77936e9`, `a52945d`가 포함된다. `cargo build -p colay --bins --features test-fixtures`는
+  통과했다. exact debug binary SHA-256은 `colay.exe`
+  `2197cef5b4120ce60072b9d657ba42f19f32d2933d9dfc899fc1efcf50724196`, fake-only
+  `colay-e2e-fake-provider.exe`
+  `9b146633d2914023021f695837572c4a5d9c013e887b0c2b1990b67787ddbba3`이다.
+- Native run `20260805T093708005Z`는 distinct non-empty schema-v8 source 5개의 incumbent
+  등록을 `[4273, 4261, 1336, 1343, 1420]` ms에 완료했고 nearest-rank p95는 `4273` ms
+  (`<=5000`)였다. 4개 동시 등록은 `[5844, 5750, 5653, 5579]` ms, 최대 `5844` ms
+  (`<=8000`)였다. source `RESPONSE_TIMEOUT`은 `10000` ms로 유지됐다.
+- Inspect marker는 9개 import에 정확히 18개였다. durable
+  workspace/path/import/session cardinality는 `10/10/9/9`, SQLite integrity는 `ok`, foreign-key
+  violation은 0, tasks/task attempts/worktrees/coordinator leases/worker leases는 모두 0이었다.
+  source SQLite SHA-256은
+  `5ef31365ff98b5ad813874a844f6d58dfe3cfe66f831664d0c978b494744a6fe`,
+  `61c89c13eaaedae9bc97ff26931675ecfd543a1ca2f23e6ece90dcfcb0ca3861`,
+  `460a5a36f40ba61a07350267e1c44c0dd523aa38934a570fd5277007636e46ee`,
+  `48e8c07fdbde2d07f0743dfecd30daf060fdee7ded54409b53bb82802ce95892`,
+  `2d52603dc8d97280c5b02534ad55f140798e8ee5240a04d0e86a1b10b025c75f`,
+  `d05fa9fe8351a01ed0048bc20f2c73df8063ffd966f62418013c105058ba2af8`,
+  `307d8b9e8871c7cda832305d3fc0c81aec5f439712713a36f73bca766f86b200`,
+  `05fa6d8b15123f9a5bb04e16ad23993e6fc7dca1e915ba77fddb6619d08b9f87`,
+  `b1d706bdff8411b89e7c4183e05fc7c7fd36a1a0981d82d91121e3a9cb69951a`로 import 전후
+  동일했다. attributable `whoami.exe`/`icacls.exe` launch와 stop 후 endpoint/live
+  lease/Colay/fake/utility residue는 모두 0이었다.
+- Original failures는 각각 exact serial 10/10 통과했다. `live_doctor_`는 serial 4/4
+  (`42.147s`), default 4/4 (`19.478s`), full `global_doctor`는 serial 33/33
+  (`156.932s`), default 33/33 (`45.997s`) 통과했다. 모든 run은 실제 nonzero test count를
+  보고했고 registration timeout은 없었다. 이 superseded harness 결과는 historical baseline이며
+  현재 source와 현재 harness의 acceptance를 대신하지 않는다.
+
+### 2026-08-05 failed Task 5 evidence — superseded harness, not accepted
+
+- Run `20260805T111210158Z`의 evidence
+  `windows-state-acl-stress-20260805T111210158Z.json` SHA-256은
+  `17c62be3578f4d34ed2500ee757e18380d74a131a71a2b2f44f5e0cd501bd914`이다.
+  Source는 `244ee2b1901a516dcabf56e747f6d78a7abeaaae`, harness SHA-256은
+  `c8c052458aed79317235ae6aba192e1f3589b6b9ac5ec5fbbbeabbcdc5209ce0`였다.
+  Exact binary SHA-256은 `colay.exe`
+  `21563398d0e5c8d658b1c0e1499bb04a22c12621b03d2213be0c4850b4a6913d`, fake-only
+  `colay-e2e-fake-provider.exe`
+  `280fb96d1130f4cb69af5bc3d84053f4c17695a5e2a9ed3d8b2da8767fe5f83d`였다.
+- Serial times는 `[5020, 1963, 2080, 1763, 2029]` ms였다. 5개 표본의 nearest-rank
+  p95는 최댓값 `5020` ms이므로 변경하지 않은 `5000` ms 기준을 초과했다. 당시 harness가
+  즉시 중단했으므로 concurrent registration, durable/marker/SQLite acceptance와 functional
+  process audit은 실행되지 않았고 통과로 추론해서는 안 된다.
+- Cleanup은 완료됐다. daemon과 endpoint는 stopped였고 live lease, residual process,
+  cleanup error는 모두 0, 최소 여유 공간은 `7.537 GiB`였다.
+- 후속 characterization은 timed wait 안의 synchronous `Win32_Process` CIM 관찰이 측정을
+  간섭했음을 확인했다. latency 측정에서 이 관찰을 제거하고 functional process audit을
+  분리했지만, 이 진단이 실패 실행을 통과로 바꾸지는 않는다. 현재 acceptance는 pending이다.
+
+### 2026-08-06 pre-execution harness hardening — reviewed, not yet executed
+
+- 권위 실행을 재시도하기 전에 측정·cleanup·source provenance와 PID 재사용 방어를 정적
+  반례로 검증했다. 최종 stress harness SHA-256은
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`
+  (`282943` bytes)이며 보안/프로세스와 측정/증거 독립 리뷰가 모두
+  Critical/Important/Minor 0으로 Ready 판정했다.
+- 최종 marker A/B diagnostic SHA-256은
+  `dc25a9a39ffdd3d3159a6d1d4bb021dbf6fa7e609f06d4db2f8568af66e28d55`
+  (`117379` bytes)이다. alias mutation, custom Alias-backed PSDrive, parameter alias/축약,
+  dynamic invocation/member, stop-dominance, lexical scope, daemon identity/handle cleanup 반례를
+  fail-closed로 고정했고 독립 결합 리뷰가 Ready 판정했다.
+- 두 스크립트는 실제 A/B, stress, 제품 또는 provider를 실행하지 않았다. stress는 전체 Git
+  worktree가 clean이고 caller가 넘긴 exact commit과 HEAD가 일치할 때만 self-test/product를
+  시작한다. 따라서 검토된 tracked 변경을 커밋하고 exact HEAD 바이너리를 재빌드하기 전에는
+  권위 실행하지 않는다.
+
+### 2026-08-07 marker phase split and audit readiness source fix — focused verification passed
+
+- Reviewed exact-HEAD marker A/B의 결정
+  `split-latency-marker-off-and-correctness-marker-on-phases`를 stress harness에 반영했다.
+  main latency 환경은 aggregate marker만 설정하고 attributed marker 환경 키를 완전히 생략한다.
+  빈 sentinel directory를 유지하면서 startup `0`, serial 누적 `2/4/6/8/10`, concurrent 완료 후
+  aggregate `18`과 attributed group/event `0/0`을 fail-closed로 검증한다. 기존 response deadline,
+  OS-process-lifetime timing, durable publication/source immutability, SQLite, zero-writable-row,
+  process ownership 및 cleanup gate는 변경하지 않았다.
+- threshold에서 제외된 별도 process-audit 환경만 attributed marker를 켠다. 이 phase는 aggregate
+  `2`, durable `source_root_hash`와 같은 64-hex group 한 개, 서로 다른 빈 event file 두 개를
+  검증한다. top-level stress evidence만 schema `2`로 올리고 exact phase policy 및
+  `inspection_markers.latency_phase`/`correctness_phase`를 분리했다. 호환 scalar
+  `inspection_count`는 latency aggregate `18`이며 product IPC/status, generated audit child,
+  C# audit-helper의 schema-v1 계약은 그대로다. source evidence의 opaque durable 값은 더 이상
+  latency marker group을 암시하지 않도록 `source_root_hash`로 기록한다.
+- Generated audit child는 exit-zero `daemon_start`의 canonical UUID, safe integral PID, exact
+  `colay.exe` path를 고정한다. 즉시 online이 아니면 separated `--json daemon status`만 monotonic
+  `5000ms` 전체 deadline 안에서 poll하며 booting/probing만 허용한다. 모든 응답에서
+  `state == phase` 및 동일 identity를 요구하고 terminal/malformed/drift/timeout은 registration 전에
+  거부하며 readiness transition을 child evidence에 남긴다.
+- Portable PowerShell `7.6.4` focused RED는 기존 환경이 mode 없이 attributed key를 항상 넣고,
+  main latency 경로가 attributed group을 요구하며, phase evidence/readiness helper가 없는 상태를
+  exit `1`로 재현했다. 구현 후 focused marker-phase matrix와 두 PowerShell parser 검증은 통과했다.
+  기존 process-audit helper 회귀와 active-database/readiness marker static-contract fixture도
+  각각 통과했다.
+  이 source 검증에서는 authoritative stress, marker A/B, 제품/provider inference 및 Cargo gate를
+  실행하지 않았다. 따라서 `WIN-005`는
+  `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`를
+  유지하며 `WIN-006`, `WSL-022`, `WSL-023`도 닫지 않는다.
+
+## WIN-007: marker A/B zero-candidate preflight strict-mode failure
+
+### First invocation and isolated RED
+
+- The first marker A/B invocation exited `1` in `8.9s`, before producing any
+  observation (`0` observations) or marker evidence JSON. The exact rebuilt
+  inputs were `colay.exe` SHA-256
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  fake-provider SHA-256
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness SHA-256
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`,
+  and marker diagnostic SHA-256
+  `dc25a9a39ffdd3d3159a6d1d4bb021dbf6fa7e609f06d4db2f8568af66e28d55`.
+- Isolated portable PowerShell `7.6.4` RED using the committed marker
+  function-definition prefix and those exact no-residue executable paths
+  confirmed `is_null=True`, then exited `1` with
+  `The property 'Count' cannot be found on this object.` No product command,
+  A/B observation, stress run, provider, or marker evidence JSON was created.
+
+### Root cause, selected fix, and closure gate
+
+- `Get-AbExactCandidateProcesses` correctly emits a pipeline. Assigning its
+  zero-item output directly to `$preexisting` unwraps it to `$null`; under
+  `Set-StrictMode -Version Latest`, the existing `$preexisting.Count` residue
+  check therefore throws before the diagnostic can begin.
+- The selected minimal caller-side fix wraps only the main preflight assignment
+  in `@(...)`, so `$preexisting` is an `Object[]` for zero, one, or many
+  candidates. The strict-mode residue failure remains unchanged for nonzero
+  candidates, and the two cleanup callers already use the same normalization.
+- At that point, status remained `fix-in-progress`. `WIN-007` could close only
+  after independent review
+  and one reviewed exact-HEAD, fake-only marker A/B run confirms the required
+  observations, cleanup, provenance, and evidence JSON; this preflight fix
+  does not change the status of `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`.
+
+### 2026-08-07 reviewed exact-HEAD A/B attempt — failed, not retried
+
+- The worktree was clean at exact source HEAD
+  `9567f55091abaa46a2bb3a369f9bcfe9afb439e0`. A fresh
+  `cargo build -p colay --bins --features test-fixtures` with
+  `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` exited zero. The rebuilt
+  `colay.exe` SHA-256 was
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6` and the
+  rebuilt fake-provider SHA-256 was
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+  The reviewed stress harness remained
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`
+  (`282943` bytes), and the amended marker diagnostic remained
+  `ae1096e03d7b37ebbf1162df9bd84e411ed33309f644b42a2e823ea32905c761`
+  (`117388` bytes). Exact-path CIM checks found zero candidate processes before
+  the invocation.
+- The amended diagnostic was invoked exactly once through the verified portable
+  PowerShell 7.6.4 binary with separated arguments and all four exact hashes.
+  It exited `1` after `21.080141s` wall time; the JSON interval was `14.4527341s`
+  (`2026-08-06T15:24:53.1494952Z` through
+  `2026-08-06T15:25:07.6022293Z`). Evidence
+  `marker-attribution-ab-20260806T152453147Z.json` is `82691` bytes with SHA-256
+  `72be48777e1532d7a5a962f51747b6b6a9f4140b38f24589e659de8aefc74baa`.
+- The evidence status is `failed`: `1/8` observations (pair 1, order 1,
+  `aggregate_only`), `0/4` completed pairs, `0` retries, and `3/10` exact input
+  hash checkpoints (`initial-pre-mutation`, `before-pair-01`, `final`). All
+  recorded checkpoints contain the four expected hashes. The run remained
+  fake-provider-only with `0` provider credential keys. The failure was a
+  `ReadError` at stress-harness `Get-Sha256` line 2513 while hashing the runtime
+  `state.db`: Windows reported that another process was using the file.
+- Failure cleanup stopped the daemon and left zero final or independently
+  queried exact candidate processes, but recorded one cleanup error because
+  pre-cleanup marker evidence was unavailable. Consequently the JSON has no
+  retain/split decision. Per the one-run rule the diagnostic was not retried,
+  authoritative stress was not run, and `WIN-007` remains `fix-in-progress`.
+  The amended zero-candidate collection preflight itself passed and entered the
+  first arm; the distinct database-hash blocker is tracked as `WIN-008`.
+  `WIN-005`, `WIN-006`, `WSL-022`, and `WSL-023` are unchanged.
+
+## WIN-008: marker A/B hashes the active daemon's global database
+
+### Observation and impact
+
+- The one reviewed exact-HEAD, fake-only marker A/B attempt recorded one
+  `aggregate_only` observation, then failed while `Get-AbDatabaseHealthEvidence`
+  called the stress harness's `Get-SqliteFamilyHashes` against the runtime
+  global `colay-home/state/state.db` before the active daemon had been stopped.
+  `Get-FileHash` at stress line 2513 received a Windows sharing violation because
+  another process was using the database.
+- Failure cleanup subsequently stopped the daemon and left zero residual exact
+  candidate processes, but the run could not provide the required pre-cleanup
+  marker evidence. It therefore recorded one cleanup error, only `3/10` hash
+  checkpoints, `0/4` completed pairs, and no retain/split decision. This is a
+  diagnostic-harness acceptance blocker; the evidence does not establish a
+  product latency or correctness regression.
+
+### Evidence and closure gate
+
+- Evidence `marker-attribution-ab-20260806T152453147Z.json` (`82691` bytes) has
+  SHA-256 `72be48777e1532d7a5a962f51747b6b6a9f4140b38f24589e659de8aefc74baa`
+  and status `failed`. The run was fake-provider-only, passed zero provider
+  credentials, used all four reviewed exact hashes, and was not retried.
+- At that point, status remained `fix-in-progress`. The approved design is
+  `docs/superpowers/specs/2026-08-07-windows-marker-active-db-hash-design.md`.
+  `Get-AbDatabaseHealthEvidence` now requires an explicit `ActiveDaemon` or
+  `PostStopStable` phase plus an explicit post-stop-quiescence boolean. Active
+  health preserves the exact integrity and foreign-key checks but reports
+  `intentionally-omitted-active-daemon` with null family hashes. Stable health
+  rejects a false gate before raw hashing and hashes exactly once only when the
+  gate is true. `Get-Sha256` and `Get-SqliteFamilyHashes` remain unchanged.
+- The post-stop caller derives its gate only after an exact successful
+  `daemon_stop` document, a signaled retained-handle initial or final wait with
+  zero retained-handle errors, an exact stopped `daemon_status` document, and a
+  zero live-lease result. Endpoint state or a delay alone is not accepted.
+- Focused RED under the verified portable PowerShell `7.6.4` opened a temporary
+  file read/write with `FileShare.ReadWrite`; `Get-FileHash` still failed with
+  `The process cannot access the file ... because it is being used by another
+  process.` The extracted old health helper then failed because parameter
+  `Phase` did not exist. Focused GREEN on the amended helper passed: active
+  health made `0` family-hash calls, rejected post-stop health made `0`, and
+  confirmed stable post-stop health made exactly `1`; both active and stable
+  retained the two SQLite health queries.
+- Portable PowerShell `7.6.4` parser and exact AST/call-order checks passed with
+  `parser_errors=0`, `health_calls=2`, and
+  `existing_static_contract=passed`. They verify the active and stable call
+  sites, the fail-before-hash guard, all four quiescence evidence inputs, and
+  that every input precedes the stable hash call. The amended marker is
+  `120674` bytes with SHA-256
+  `d81a7df7380913cbbec239ff23720b29c0d8db27ceb63174dcb5f2c6b7e137b9`;
+  the unchanged stress harness remains
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  No marker, stress, product, Cargo, or provider command was run for this
+  focused correction.
+- Before the later full verification, `WIN-007` and `WIN-008` remained open
+  pending independent review and one newly
+  authorized exact-clean-HEAD A/B invocation. Closure still requires all eight
+  observations, four counterbalanced pairs, ten exact input hash checkpoints,
+  zero retries, zero credentials, zero cleanup errors/residual processes,
+  active health with intentionally omitted hashes, stable post-stop hashes,
+  and an explicit retain/split decision. Authoritative stress remains unrun.
+
+### 2026-08-07 reviewed exact-HEAD A/B attempt — readiness failure, not retried
+
+- The worktree was clean at exact source HEAD
+  `806ac3e76c8eaf4862350875698304d48610fc49`. Exact-path CIM checks found zero
+  candidate processes before the invocation. A fresh
+  `cargo build -p colay --bins --features test-fixtures` with
+  `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` exited zero in `14.15s`.
+- The exact inputs were `colay.exe`
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  fake provider
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  marker
+  `d81a7df7380913cbbec239ff23720b29c0d8db27ceb63174dcb5f2c6b7e137b9`,
+  and stress harness
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  The marker was invoked exactly once through verified portable PowerShell
+  `7.6.4` with separated arguments and all four expected hashes. It exited `1`
+  after `80.266637s`; it was not retried and authoritative stress was not run.
+- Evidence `marker-attribution-ab-20260806T160044318Z.json` is `398026` bytes
+  with SHA-256
+  `a51f3358e3890b78a25cc81718502dda0302d4d2dc44e8173fb2e699c4154fb2`.
+  Its interval is `73.4005223s` (`2026-08-06T16:00:44.3193643Z` through
+  `2026-08-06T16:01:57.7198866Z`) and status is `failed`.
+- Independent PowerShell 7.6.4 parsing confirmed `7/8` recorded observations,
+  `0/4` summary pairs because delta analysis was not reached, `0` retries, and
+  `9/10` exact input-hash checkpoints. The first six observations fully
+  completed pairs 1 through 3. Every recorded checkpoint contains all four
+  expected hashes. Execution remained fake-provider-only with zero provider
+  credential keys.
+- Each of the six completed observations reports active integrity `ok`, zero
+  foreign-key violations, phase `ActiveDaemon`, scope
+  `intentionally-omitted-active-daemon`, and null family hashes. Each cleanup
+  then confirms a stopped daemon and endpoint, a signaled retained handle with
+  zero errors, zero live leases, zero residual processes, and phase
+  `PostStopStable` with confirmed quiescence and all three database-family
+  hashes. This exercises the `WIN-008` correction without satisfying the full
+  closure gate.
+- Observation 7 was pair 4, order 1, variant `attributed`. Its `daemon start`
+  command exited zero and returned an exact schema-v1 `daemon_start` document,
+  but both status state and instance phase were `booting`.
+  `Open-AbDaemonIdentity` therefore refused before opening a retained handle.
+  Cleanup stopped the daemon, observed a stopped endpoint and zero live leases,
+  and left zero final or independently queried exact candidate processes. It
+  recorded two consequential cleanup errors: stable database health correctly
+  refused unconfirmed quiescence, and pre-cleanup marker evidence was
+  unavailable.
+- No retain/split decision was produced. `WIN-007` and `WIN-008` remain
+  `fix-in-progress`; the distinct readiness blocker is `WIN-009`. `WIN-005`,
+  `WIN-006`, `WSL-022`, and `WSL-023` are unchanged.
+
+## WIN-009: marker A/B rejects an exit-zero booting daemon start
+
+### Observation and impact
+
+- The reviewed one-shot A/B completed six arms before an exit-zero
+  `daemon start --json` returned schema-v1 `daemon_start` with state and phase
+  `booting`. The marker requires immediate `online` status before retained
+  identity capture, so it failed closed before registration in the seventh arm.
+- This blocks marker attribution and authoritative Windows stress acceptance,
+  but the preserved evidence does not establish a registration-latency or
+  provider regression. The daemon was stopped cleanly and no exact candidate
+  process remained.
+
+### Status and closure gate
+
+- Before the successful one-shot verification below, status remained
+  `fix-in-progress`. The marker now parses exact schema-v1
+  `daemon_start`/`daemon_status` identity documents, anchors the canonical UUID,
+  integral PID, state/phase, and reviewed `colay.exe` path, and permits only
+  `booting` or `probing` before exact `online`. An immediate online start makes
+  zero status calls. Otherwise a monotonic five-second deadline polls only the
+  separated `--json daemon status` command, gives each child only the remaining
+  budget after a fixed 100ms cleanup reserve, and uses a fixed bounded 50ms
+  interval. Identity drift, terminal/non-progress state, malformed JSON,
+  state/phase mismatch, and timeout all fail before CIM, native handle capture,
+  or registration.
+- Readiness evidence is a separate observation field containing the original
+  and final states, poll count and per-poll bounds, elapsed time, anchored
+  identity, exact online document, and any failure. Only that exact online
+  document reaches the existing retained-handle capture, which still performs
+  its online check before the bounded CIM query and now accepts only exact
+  `daemon_start` or `daemon_status` command variants. The A/B decision continues
+  to read only `registration.elapsed_ms`; readiness elapsed time is not a
+  decision input.
+- This marker-only correction records a contract drift rather than changing the
+  product: the older startup-recovery design says successful `daemon start`
+  should return only after online readiness, while the current daemon and its
+  lifecycle tests intentionally expose `booting -> probing -> online`
+  asynchronously after IPC startup. Product supervision semantics remain
+  unchanged.
+- Verified portable PowerShell `7.6.4` focused RED reproduced
+  `daemon start expected exact state 'online', found 'booting'` and exited `1`.
+  The desired pre-implementation matrix also exited `1` because the strict
+  identity parser did not exist. The amended extracted-function GREEN matrix
+  exited `0` with `focused_readiness_matrix=passed`, covering immediate online,
+  delayed booting/probing/online, UUID/PID/path drift, terminal and malformed
+  status, state/phase mismatch, fractional PID, noncanonical UUID, non-exact
+  state/command case, bounded timeout including a late online subprocess result,
+  and online-before-CIM behavior.
+- The parser/AST check exited `0` with `parser_errors=0`,
+  `readiness_ast_contract=passed`, and `existing_static_contract=passed`. It
+  proves readiness precedes retained identity capture, retained identity
+  precedes registration, the readiness loop contains no CIM/native-handle,
+  SQLite, durable-state, or registration call, and the decision retains exactly
+  two `registration.elapsed_ms` inputs. The existing active-database behavioral
+  and static-contract fixtures also passed after distinguishing their cleanup
+  endpoint-status call from the new readiness status call.
+- Formal controller review of the prior exact hash found that the common
+  monotonic deadline was checked after a status subprocess but not after the
+  initial start-document parse. An injected schema-property/parser delay
+  therefore produced the focused RED
+  `immediate online document parsed after the absolute deadline was accepted`
+  and exit `1`. The correction uses one common deadline assertion after initial
+  parsing/anchoring, after each status subprocess, and again after status
+  parsing/identity comparison. The delayed-immediate-online GREEN case now
+  fails timed out with a null online document, zero polls, zero status calls,
+  and zero CIM; the complete focused matrix and both static fixtures exit zero.
+- The amended marker is `132883` bytes with SHA-256
+  `d2b458e1491d446b2b630afdab4a3a18f8be7c23b1c408c94eac273a92b76e06`.
+  The unchanged stress harness remains
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  No marker A/B, authoritative stress, product, Cargo, or provider command was
+  run for this focused correction. At that stage, exact-hash re-review and the
+  reviewed one-shot invocation were still required.
+- The remaining closure gate required one new exact-clean-HEAD invocation with
+  all eight
+  observations, four counterbalanced pairs, ten checkpoints, zero retries,
+  zero credentials, zero cleanup errors, and zero residual processes, plus an
+  explicit retain/split decision. Do not retry the preserved failed run.
+
+### 2026-08-07 reviewed exact-HEAD A/B verification — passed once
+
+- The worktree was clean at exact source HEAD
+  `2f3910555efca4ef5ff114622931d93c009b8754`. A fresh
+  `cargo build -p colay --bins --features test-fixtures` with process-scoped
+  `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0` exited zero. Exact-path CIM
+  checks found zero candidate processes before the invocation.
+- The rebuilt `colay.exe` was `29926400` bytes with SHA-256
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`; the
+  rebuilt fake provider was `2843648` bytes with SHA-256
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+  The reviewed marker was `132883` bytes with SHA-256
+  `d2b458e1491d446b2b630afdab4a3a18f8be7c23b1c408c94eac273a92b76e06`, and
+  the unchanged stress harness was `282943` bytes with SHA-256
+  `7f9b96642726456557f8076ff6e7b946c7372d5c841047feb36a226ec9a06774`.
+  The eight schema-v8 seed migrations were independently hashed before the
+  run and remained exact across all checkpoints.
+- The marker was invoked exactly once through verified portable PowerShell
+  `7.6.4`, with separated arguments and all four expected hashes. It exited
+  zero without a retry. Evidence
+  `marker-attribution-ab-20260806T165359620Z.json` is `511414` bytes with
+  SHA-256
+  `ff8ec6cc65754b262024b61009b84f37e01f988535fd717af78ca65cef1fb2db`.
+  Its interval is `107.2623837s` (`2026-08-06T16:53:59.6209025Z` through
+  `2026-08-06T16:55:46.8832862Z`) and status is `passed`.
+- Independent parsing confirmed all eight observations, all four
+  counterbalanced pairs, zero retries, and all ten exact input-hash
+  checkpoints. Every checkpoint retained the exact binary, marker, stress,
+  and migration inputs. Execution was fake-provider-only and exposed zero
+  provider credential keys.
+- Every readiness result reached exact `online` with elapsed times
+  `[37, 1, 1, 0, 150, 1, 0, 0]` ms, all strictly below the `5000` ms bound.
+  Seven starts were immediately online. The remaining start was exact
+  `booting` and reached exact online in one status poll: its command budget
+  was `4820` ms, command elapsed time was `53` ms, observed elapsed time was
+  `145` ms, and total readiness time was `150` ms. The anchored UUID, PID,
+  reviewed executable path, state/phase, and every poll identity matched.
+  Each exact online document preceded a verified retained-handle/CIM identity
+  capture with the same UUID, PID, path, and online state.
+- Registration OS-process-lifetime measurements, in pair order, were
+  `[aggregate_only 6946, attributed 4149]`,
+  `[attributed 6665, aggregate_only 5978]`,
+  `[aggregate_only 1314, attributed 5228]`, and
+  `[attributed 3387, aggregate_only 1333]` ms. Independent parsing linked the
+  delta inputs exactly to those registration timings and confirmed readiness
+  timing did not enter delta analysis.
+- All eight active-daemon database checks reported integrity `ok`, zero
+  foreign-key violations, phase `ActiveDaemon`, intentionally omitted/null
+  family hashes, and no sharing violation. After exact stop, every observation
+  reported a signaled retained handle with zero errors, an exact stopped
+  endpoint, zero live leases, phase `PostStopStable`, confirmed quiescence,
+  and hashes for the database, WAL, and SHM family. Source/config hashes and
+  durable cardinalities were unchanged; writable task, attempt, worktree, and
+  lease rows remained zero. Cleanup errors, recorded residual processes, and
+  an independent post-run exact-path CIM query were all zero.
+- The explicit decision is
+  `split-latency-marker-off-and-correctness-marker-on-phases`: three of four
+  registration pairs exceeded the allowed attribution delta, the median delta
+  was `1370.5` ms against a `183` ms limit, and order bias was `812` ms against
+  the same limit. Seed timing also exceeded its confounder limits. Therefore
+  the current attributable marker must be disabled during the authoritative
+  latency phase and enabled only during the separate correctness phase; this
+  non-authoritative A/B is not a product latency acceptance result.
+- These gates close `WIN-007`, `WIN-008`, and `WIN-009`. Authoritative Windows
+  stress was intentionally not run. `WIN-005`, `WIN-006`, `WSL-022`, and
+  `WSL-023` remain unchanged.
+
+### 2026-08-07 independent stress-readiness review corrections — focused only
+
+- Independent review found five separate fail-open or evidence-integrity gaps in
+  the phase-split stress source: marker phase values were case-insensitive; the
+  main latency path could register while its daemon was still booting; readiness
+  subprocess cleanup could extend beyond the advertised 5,000 ms bound; the
+  generated child success JSON used the default shallow serialization depth and
+  the parent did not validate its nested readiness evidence; and focused tests
+  omitted status-side malformed, command-failure, hanging, late-online, and slow
+  initial-parse paths.
+- The focused correction accepts only exact-case `LatencyAttributedOff` and
+  `CorrectnessAttributedOn`. Main latency now anchors canonical UUID, safe integral
+  PID, and the exact resolved Colay path immediately after `daemon start`, permits
+  only identity-stable `booting`/`probing` transitions to exact `online`, and stores
+  this pre-measurement gate under
+  `measurement_diagnostics.main_daemon_readiness` with threshold inclusion set to
+  false.
+- Main and generated-child status runners now share one monotonic overall deadline.
+  At process launch they recompute the actual remaining time and require command
+  execution plus explicit exit-confirmation and output-drain maxima to fit within
+  it; every process wait and drain is capped by that same deadline. Focused real
+  30-second hanging-process fixtures prove bounded failure, status-only invocation,
+  exit confirmation, completed pipes, disposal, zero exact-generation residue,
+  and zero cleanup errors on both paths.
+- Generated-child success and failure output now uses explicit depth-30 JSON with
+  serialization warnings promoted to failure. The parent rejects any stderr and
+  validates the full online transition, canonical anchored/online/poll identity,
+  poll cardinality and states, elapsed bound, and every launch budget. Round-trip
+  fixtures preserve `polls` and `online_document.data.status.instance` as objects
+  and reject missing, scalar, or truncated evidence.
+- Portable PowerShell 7.6.4 focused tests cover immediate and delayed online,
+  UUID/PID/path drift, state/phase mismatch, terminal/unknown states, malformed
+  schema/command/UUID/PID/path, command failure, late online, slow initial parsing,
+  cleanup-inclusive hangs, and nested JSON validation. No marker A/B,
+  authoritative stress, product/provider inference, or Cargo gate was run for this
+  correction. `WIN-005` remains
+  `fix-in-progress (current Windows stress acceptance and published CI/nightly verification pending)`;
+  `WIN-006`, `WSL-022`, and `WSL-023` also remain open/pending and unchanged.
+
+### 2026-08-07 second deadline/evidence review correction — focused only
+
+- A second independent review reproduced two remaining fail-open contracts. A
+  deadline-aware process record could be passed to `Wait-HarnessProcess` without
+  its launch deadline and silently fall back to the ordinary timeout/cleanup path;
+  a mismatched stopwatch threw before cleanup and left the 30-second child alive.
+  The generated-child runner also accepted cleanup-only partial deadline values
+  and both cleanup implementations could synthesize a new endpoint as
+  `current elapsed + limit`.
+- Launch now seals deadline mode, stopwatch identity, overall and requested
+  execution limits, absolute exit/drain endpoints, cleanup limits, and observation
+  policy. Deadline parameters are atomic. Omitted, partial, or mismatched
+  continuations terminate, confirm exit, drain both pipes, dispose the process,
+  and fail with structured cleanup evidence under the original sealed deadline.
+  The focused fixtures cover omission, partial supply, and stopwatch mismatch and
+  require zero cleanup error, zero exact-generation residue, and preservation of
+  the sealed observation policy (zero calls when deferred, one when nondeferred).
+  Ordinary non-readiness polling, 5,000 ms exit confirmation,
+  2,000 ms drain, observation, and OS-lifetime evidence remain unchanged.
+- The parent readiness validator previously accepted a missing `poll_interval_ms`,
+  a single object in place of the JSON `polls` array, and top-level elapsed time
+  earlier than a poll observation. It now requires exact integer timing/budget
+  fields, real JSON arrays for command and polls, expected poll/exit/drain
+  constants, sequential command labels, monotonic poll elapsed values no later
+  than the top-level elapsed value, and exact cleanup arithmetic. Representative
+  malformed fixtures cover the critical container, timing, and label shapes. The
+  child drain failure message now reports its actual configured limit rather than
+  a hard-coded 2,000 ms.
+- The RED run failed exactly on partial cleanup acceptance, omitted wait/cleanup
+  downgrade, and missing parent-validator parameters. After correction, the
+  portable PowerShell focused suite and parser passed. No authoritative stress,
+  marker A/B, product/provider inference, or Cargo gate was run for this focused
+  correction. `WIN-005` remains open pending the one-shot exact-HEAD stress and
+  published CI/nightly verification; `WIN-006`, `WSL-022`, and `WSL-023` are
+  unchanged.
+
+## WIN-010: amended stress closure rejected by marker static import
+
+### Observation and impact
+
+- The exact portable-PowerShell marker contract replay rejected the amended stress
+  closure before any A/B observation or product/provider command. It reported two
+  CIM-reachable cleanup calls before the OS-process-lifetime stopwatch stop and
+  treated the standard per-function `PSBoundParameters` automatic variable as an
+  undeclared free variable. This would prevent the diagnostic from accepting the
+  hardened readiness helpers even though the focused helper tests passed.
+
+### Correction and current status
+
+- `Wait-HarnessProcess` now stops its measurement stopwatch before contract-failure
+  cleanup. `Complete-FailedHarnessProcess` initializes its local deadline-mode
+  binding before either branch. The marker import contract explicitly recognizes
+  only `PSBoundParameters` in addition to its existing automatic-variable set;
+  arbitrary unqualified or scoped variables remain fail-closed.
+- Only a fully omitted deadline quartet can select ordinary execution. A fully
+  bound null/zero/default quartet, partial quartet, stopped stopwatch, or invalid
+  budget is rejected before process launch. Parent and generated-child wrappers
+  conditionally forward either zero or four values, so an omitted contract is not
+  converted into an explicit downgrade by an intermediate helper.
+- Any post-launch contract failure forces exact-process termination even if the
+  continuation omitted `Terminate`. The launch-sealed observation policy remains
+  unchanged: readiness records defer observation, while a deliberately nondeferred
+  fixture observes only after its OS-lifetime stopwatch has stopped. Batch launch,
+  rollback, wait, and late cleanup now carry the same explicit sealed policy.
+- A new behavioral fixture executes the real marker `Assert-AbStaticContract` and
+  `Import-StressHarnessFunctions` against the amended stress file. The isolated RED
+  reproduced both violations; the GREEN focused suite passed with zero free-variable,
+  AST-contract, and pre-stop timing-CIM violations. The process-audit helper regression
+  also passed. No authoritative stress, marker A/B, Cargo, or provider command was
+  executed during this correction.
+- Status at this correction snapshot was `fix-in-progress`: because the tracked
+  diagnostic hash changed, one fresh exact-clean-HEAD marker A/B verification and
+  the one-shot Windows stress were still required. Both subsequently passed in the
+  final evidence sections below. Published CI/nightly and WSL verification remain
+  pending.
+
+### 2026-08-06 first exact amended A/B attempt (preserved; no retry)
+
+- Commit `19698ef6c11bbd481cc84f38440733e8f0f7200d` was built from a clean tree and
+  the changed marker diagnostic was invoked exactly once. The pinned SHA-256 inputs
+  were `colay.exe` `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  fake provider `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness `9f64b3ffb7a0b3fb340bbc265d0042d1c5fcbf265ee3e3c873e057f30ecaaaaa`,
+  diagnostic `7dabeb99510c363e1f743644ae6d64c4a248ecd50f6c61673c19ba10559eb224`,
+  and portable PowerShell `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The run failed after about `22.5s` in its first observation, before the
+  authoritative Windows stress, with `Exception setting "source_root_hash": property
+  'source_root_hash' cannot be found`. Evidence is preserved at
+  `artifacts/qa/windows-state-acl/marker-attribution-ab-20260806T193355173Z.json`
+  (`80,822` bytes, SHA-256
+  `6e007e086893df9d92774cd8ba75c3c4cf515d4d2e124b4c6101412a6628c384`).
+  It records one observation, zero completed A/B pairs, zero retries, and three
+  checkpoints (`initial-pre-mutation`, `before-pair-01`, `final`); the exact checkpoint-label gate
+  is false only because the run aborted before the remaining planned checkpoints.
+- Cleanup remained bounded: final residual processes were empty, the host had zero
+  exact candidate processes, the daemon was stopped, retained handles were balanced,
+  live leases were zero, database integrity and foreign keys passed, writable-row
+  count was zero, and source/provider configuration hashes were unchanged. Provider
+  credential-key count was zero and `fake_provider_only` was true. The sole
+  `cleanup_error_count=1` entry says pre-cleanup marker evidence was unavailable after
+  the early abort; it is not process residue.
+- Root cause is diagnostic-only schema drift. The marker override of
+  `New-LegacyWorkspace` still returned obsolete `inspection_group_id`, while imported
+  `Assert-DurableState` now assigns `source_root_hash` on that fixed-shape
+  `PSCustomObject`; the diagnostic's later group comparison also used the obsolete
+  member. A focused RED now covers the diagnostic member contract, and both uses are
+  changed to `source_root_hash`. No blind retry is allowed: the correction must pass
+  the focused suite and independent review, be committed as new exact inputs, then
+  receive one fresh A/B run before the one-shot authoritative stress.
+
+### 2026-08-06 corrected exact A/B closure run
+
+- After the focused RED/GREEN cycle and two independent READY reviews, the correction
+  was committed as `ae1ef4496e0370ac44e5f184b23c8aeec847c4a4`. A clean exact-HEAD
+  build pinned `colay.exe`
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`, fake
+  provider `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness `9f64b3ffb7a0b3fb340bbc265d0042d1c5fcbf265ee3e3c873e057f30ecaaaaa`,
+  corrected diagnostic `f1997a51cae6ad81fb22160ca6528875e21df32deb219c711e56be8f779cdd55`,
+  and portable PowerShell
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+  Candidate-process and dirty-tree counts were both zero before launch.
+- The corrected diagnostic was invoked exactly once with separated arguments and all
+  four expected hashes. It exited `0` after `114.8s`; no retry was used. Evidence
+  `artifacts/qa/windows-state-acl/marker-attribution-ab-20260806T194629005Z.json`
+  is `521,592` bytes with SHA-256
+  `a1858abb9b12ea3f1f7247ff3bc05be3672565bf0ba9db79eadd01d63675e2b1`.
+  The stored result is schema `2`, status `passed`, with exactly eight observations,
+  four completed pairs, zero retries, eight fresh equal-length runtime roots, a
+  variant-neutral environment shape, OS-process-lifetime measurement, and no
+  synchronous wait-loop CIM.
+- All ten exact input checkpoints matched in order: `initial-pre-mutation`, each
+  `before-pair-NN`/`after-pair-NN` for pairs 01 through 04, and `final`. Provider
+  credential-key count was zero, `fake_provider_only` was true, and every observation
+  had null failure, online readiness, cleanup error count zero, residual-process count
+  zero, live-lease count zero, SQLite integrity `ok`, zero foreign-key violations, and
+  zero writable rows. All observations recorded aggregate marker count `2`; the four
+  aggregate-only arms had attributed group/event `0/0`, while the four attributed
+  arms had exactly one durable `source_root_hash` group and two distinct events.
+  Final host candidate-process count was independently zero.
+- The non-authoritative result retains
+  `split-latency-marker-off-and-correctness-marker-on-phases`: registration pair
+  exceedances were zero, but order bias and seed timing remain too noisy to combine
+  attribution with latency acceptance. `WIN-010` therefore remains open only for the
+  one-shot authoritative stress plus published CI/nightly verification; that stress
+  had not yet been run when this evidence was committed.
+
+## WIN-011: process-audit PID multiset comparison is insertion-order sensitive
+
+### Observation and root cause
+
+- The one-shot authoritative stress reached the strong process-audit evidence check
+  and then reported `process audit start/exit PID multiset changed`. Direct parsing of
+  the preserved failure payload found exactly `45` start keys and `45` exit keys with
+  zero missing, extra, or changed counts. Only the JSON property order differed.
+- `Assert-EquivalentJson` serialized two ordinary PowerShell hashtables and compared
+  their compressed JSON strings. Hashtable enumeration order is not a semantic part
+  of a PID multiset, so equal start/exit evidence could fail nondeterministically.
+
+### Focused correction and remaining gate
+
+- An interim dedicated PID comparator removed insertion-order sensitivity, but review
+  found its `[int64]` casts would also accept string, Boolean, or fractional count
+  values. It was therefore removed rather than retained as a second, weaker contract.
+  The strong audit now uses the shared structural JSON comparator, which compares PID
+  property names ordinally and preserves each count's JSON scalar type and value.
+- Focused coverage accepts different PID-map insertion order and rejects an occurrence
+  count change, same-cardinality PID substitution, string, Boolean, and fractional
+  count values. The complete suite passed `48/48` on official PowerShell 7.2.24 and
+  pinned PowerShell 7.6.4. The later exact-input authoritative stress also passed the
+  structurally compared `43/43` PID multiset and the unchanged `WIN-005` 5,000ms
+  serial-p95 and 8,000ms per-command concurrent limits. `WIN-011` remains
+  `fix-in-progress` only until merge and published CI verification.
+
+## WIN-012: generic JSON equivalence loses JSON structure
+
+### Observation and correction
+
+- The same review found that `Assert-EquivalentJson` used pipeline serialization and
+  raw string equality. Besides treating object insertion order as data, PowerShell
+  pipeline enumeration converts a singleton array such as `@('PATH')` into scalar
+  JSON `"PATH"`, so an array/scalar contract violation could compare equal.
+- The focused RED rejected a root and nested SQLite-family object with identical
+  values in different property order. The correction serializes with explicit
+  `ConvertTo-Json -InputObject`, parses both values with `JsonDocument`, and performs
+  a recursive `JsonElement` comparison. Object property names are compared ordinally
+  independent of insertion order; arrays retain order and shape, and scalar JSON
+  type/value remains significant.
+- GREEN accepts reordered root/nested objects including the empty SQLite primary-file
+  suffix key and rejects reversed arrays, singleton-array versus scalar, number/string,
+  boolean/string, changed SHA-256, and missing suffix cases. The same comparator covers
+  PID multisets without scalar coercion. The complete suite passed `48/48` on official
+  PowerShell 7.2.24 and pinned PowerShell 7.6.4. The later exact A/B and authoritative
+  stress both passed; merge and published verification remain before `WIN-012` closes.
+
+## WIN-013: JSON equivalence violated the declared PowerShell 7.2 runtime floor
+
+### Observation and correction
+
+- Independent review found that the interim `JsonNode.DeepEquals` implementation was
+  introduced while the stress, focused-test, and diagnostic scripts still declare
+  `#requires -Version 7.2`. That API is absent from the .NET 6 and .NET 7
+  `System.Text.Json` assemblies used by PowerShell 7.2/7.3. A first recursive rewrite
+  also used `JsonElement.GetPropertyCount()`, another API absent before .NET 8.
+- The final implementation uses only the .NET 6-compatible `JsonDocument.Parse`,
+  `JsonElement.EnumerateObject`, `EnumerateArray`, `GetArrayLength`, `GetRawText`, and
+  scalar accessors. Both expected and actual objects are materialized into ordinal
+  dictionaries with duplicate-name rejection before cardinality and recursive value
+  comparison. The focused static contract forbids `JsonNode.DeepEquals` from returning.
+- The final official 7.2 release, PowerShell `7.2.24` on `.NET 6.0.35`, was downloaded
+  from its GitHub release with its published `hashes.sha256`. The manifest SHA-256 is
+  `934fca92dd10e7ca324f69240881b3789c3927b8691818ea9484bf1002bca9aa`;
+  the 107,886,044-byte ZIP's published and local SHA-256 both equal
+  `a1ccb6d8ad52f917470a136c3752af4465f261bcbe570cf44f52aa69ae6e867e`.
+  Extracted `pwsh.exe` is 289,824 bytes, SHA-256
+  `689a44bf484cef719bf5022396c2bd82ee81860029eb1152f06c4771d9b032b6`,
+  with a valid Microsoft Corporation Authenticode signature.
+- After the separate `WIN-015` residue-probe correction, the complete focused suite
+  passed `48/48` on official PowerShell 7.2.24 in `18.8s` and on pinned PowerShell
+  7.6.4 in `21.0s`; all three relevant scripts parsed with zero errors. The later
+  exact A/B and authoritative stress both passed. `WIN-013` remains
+  `fix-in-progress` only until merge and published CI verification.
+
+## WIN-014: readiness deadline fixture can expire before its required status poll
+
+### Observation and correction
+
+- A latest-snapshot focused run executed beside the process-audit helper and reached
+  the expected `timed out after 35ms` failure, but the fixture then failed because its
+  mock status-call list was still empty. Host scheduling had consumed the deliberately
+  tiny deadline before the first poll, so the test did not deterministically exercise
+  the post-command monotonic deadline path it claimed to cover.
+- The fixture now uses a 500ms overall budget and enqueues one mock status response
+  that records the call, waits 600ms, and returns `booting`. It requires exactly one
+  recorded poll and the exact `timed out after 500ms` failure. No production readiness
+  timeout, cleanup reserve, or command implementation changed.
+- The corrected fixture passed in the complete `48/48` suite on both official
+  PowerShell 7.2.24 and pinned PowerShell 7.6.4, independent review returned READY,
+  and the later exact A/B and authoritative stress passed. `WIN-014` remains
+  `fix-in-progress` only until merge and published CI verification.
+
+## WIN-015: PowerShell 7.2 can enumerate exited processes with empty identity fields
+
+### Observation and correction
+
+- The first official PowerShell 7.2.24 compatibility run passed `43/46` focused cases.
+  Three deadline-cleanup cases failed after successful termination because
+  `Get-Process -Id` briefly returned the already exited candidate with
+  `HasExited=true` and null `StartTime`/`Path`. PowerShell 7.6.4 returned no candidate
+  for the same state. Direct `GetFullPath($candidate.Path)` therefore raised a test
+  error unrelated to a live process leak.
+- Both stress-harness process-generation observers now check `HasExited` before
+  reading identity fields and recheck it if an identity read races with termination.
+  An exited candidate is reported as non-live with no observation error. A live
+  candidate with an unreadable creation time or executable path remains
+  `process_exists=true`, `identity_verified=false`, and fail-closed. The focused
+  manual residue checks use the shared observer; the emergency cleanup path performs
+  the same exit-first check before any identity-bound kill.
+- Review then found two full-harness failure-cleanup self-test checks that still
+  equated a non-null `Get-Process` result with a live process, plus a batch rollback
+  catch that converted every identity-read failure to `not running`. The self-tests
+  now use a shared exit-aware liveness observer, and batch rollback uses the exact
+  generation observer. A live unverified rollback candidate is recorded as a cleanup
+  failure and treated as still running; neither path performs an unbound kill.
+- A deterministic mock covers both sides: exited/null identity is accepted as
+  non-live, while live/null identity produces an observation error. The generated
+  audit-child observer is also required to reject a live unverified candidate.
+  A static contract rejects raw self-test liveness checks and direct
+  `Process.GetProcessById` rollback inspection. Complete focused suites then passed
+  `48/48` concurrently on official PowerShell 7.2.24 in `18.8s` and pinned PowerShell
+  7.6.4 in `21.0s`. Independent review returned READY, and the later exact A/B and
+  authoritative stress passed. `WIN-015` remains `fix-in-progress` only until merge
+  and published CI verification.
+
+## WIN-016: read-only ACL verification can race an in-process ACL repair sequence
+
+### Observation and correction
+
+- The Windows native artifact API serialized `ensure_private_state_artifact` with
+  `STATE_ARTIFACT_REPAIR`, but `verify_private_state_artifact` bypassed that mutex.
+  A concurrent doctor or verifier could therefore enter the native descriptor read
+  while a same-process repair sequence was in progress and report a transient
+  permissions failure.
+- Native verification now acquires the same repair mutex as native ensure. This native
+  boundary is authoritative for both the state facade and direct native callers: it
+  serializes non-reparse target pinning, descriptor read, optional complete-DACL write,
+  and post-write verification. The state facade performs fail-closed component,
+  canonical-path, and link checks without a second global mutex. A verifier that wins
+  the native mutex before repair may still report the pre-repair ACL; it cannot observe
+  a partial in-process repair.
+- The final regression avoids scheduler timing: a thread-local acquisition counter in
+  `ensure_and_verify_acquire_the_shared_in_process_acl_gate` asserts that native ensure
+  and verify each enter the same mutex helper. The earlier state-gate counter was
+  removed with the redundant state gate. In the final single-gate form, the complete
+  Windows IPC suite passed `47/47`, the focused Windows state permission suite passed
+  `8/8`, and the distinct-workspace concurrent import regression passed `1/1`. Related
+  package Clippy passed with warnings denied. Workspace-wide formatting, Clippy, and
+  tests then passed with fake-only mode enabled and provider credentials cleared,
+  followed by three-platform CI, merge, and published-nightly QA still pending.
+
+### Completion conditions
+
+- Source completion: read-only verification and ensure/repair serialize their complete
+  native descriptor sequences through the same fail-closed gate, with retained-handle
+  identity checks and focused regression coverage. State path validation remains
+  independent for disjoint artifacts.
+- Release completion: the exact source revision passes the three-platform CI matrix
+  and the published nightly passes isolated WSL and Windows-facing doctor QA.
+
+### 2026-08-07 final reviewed exact-input A/B verification — passed once
+
+- The independently reviewed correction was committed as clean source commit
+  `c33c2b0cf512e34a7b5790646999c063465fac24`. Immediately before the run the
+  worktree and exact candidate-process set were both clean. The one authorized A/B
+  invocation exited `0` after `108.7s`; it was not retried. Its stored interval is
+  `100.9648368s`.
+- Evidence
+  `artifacts/qa/windows-state-acl/marker-attribution-ab-20260806T205047199Z.json`
+  is `515,993` bytes with SHA-256
+  `f519c51bfb11a99baf996e1a410a9edc74818a1ba8463813ac9d7c710e0e9305`.
+  It pins `colay.exe`
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`, fake
+  provider `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`,
+  stress harness `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  marker diagnostic `f1997a51cae6ad81fb22160ca6528875e21df32deb219c711e56be8f779cdd55`,
+  and portable PowerShell 7.6.4
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The stored schema-2 result is `passed` with decision
+  `split-latency-marker-off-and-correctness-marker-on-phases`: exactly four pairs,
+  eight observations, zero retries, and eight fresh equal-length runtime roots. All
+  ten input checkpoints were present in exact order from `initial-pre-mutation`
+  through pair 01..04 before/after checkpoints to `final`, with every input hash
+  unchanged. Measurement was OS-process-lifetime, synchronous wait-loop CIM was
+  false, the environment shape was variant-neutral, provider credential-key count
+  was zero, and `fake_provider_only` was true.
+- Every observation reached online readiness with null failure, unchanged source DB
+  family, unchanged source config, unchanged generated provider config, SQLite
+  integrity `ok`, zero foreign-key violations, and zero writable rows before and
+  after cleanup. Every observation recorded aggregate marker count `2`; each of the
+  four aggregate-only arms recorded attributed group/event `0/0`, while each of the
+  four attributed arms recorded exactly `1/2`. All cleanup-error, residual-process,
+  live-lease, process-setup-failure, and final host-residual counts were zero.
+- This result closes the pending A/B prerequisite for `WIN-010` through `WIN-015` but
+  is intentionally non-authoritative for latency. The unchanged 5,000ms serial-p95
+  and 8,000ms per-concurrent-command gates still require one clean-HEAD authoritative
+  stress run; no A/B retry will be used to replace this evidence.
+
+### 2026-08-07 authoritative Windows stress re-acceptance — passed once
+
+- The A/B record was committed as documentation-only commit
+  `471fe9ae3ee387c1d3d0681f50545ee9949463b9`. With that exact source commit,
+  a clean worktree, and zero live `colay` or fake-provider candidate processes, the
+  frozen stress harness was invoked exactly once through verified portable
+  PowerShell 7.6.4. It exited `0` after `185.8s`; it was not retried. The stored run
+  interval is `184.5972696s`.
+- Evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260806T205955735Z.json`
+  is `495,117` bytes with SHA-256
+  `2b4230584d839c0d2fa064b2b9f22743518dfb2c09c270e6c6008cc10d8ff418`.
+  It records schema `2`, status `passed`, null failure, no acceptance failures, exact
+  clean source identity, stress SHA-256
+  `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  `colay.exe` SHA-256
+  `6b24c065dc189e84edf4698797b917cfe59e7b69f713db24e27c1a9a01cd4cd6`,
+  and fake-provider SHA-256
+  `d4202a5537c205eda013a007b30f4dbac20df97d3f06565940b18e3e757f4274`.
+- The unchanged OS-process-lifetime gates passed. Serial measurements were
+  `[3564, 4293, 3555, 3055, 4117]ms`, so both nearest-rank p95 and maximum were
+  `4293ms` against `5000ms`. Concurrent measurements were
+  `[4216, 6538, 7674, 7572]ms`, with maximum `7674ms` against the per-command
+  `8000ms` limit.
+- All nine schema-v8 sources were created and retained before the timing self-test
+  and daemon start, using the exact ordered labels `seed-schema-v8-1` through
+  `seed-schema-v8-9`. Every command used OS-process-lifetime measurement, integral
+  exit `0`, Boolean `timed_out=false`, and nonnegative integral elapsed time. Fixture
+  write measurements were `[3947, 746, 737, 762, 751, 762, 771, 3070, 4459]ms`
+  (minimum/median/maximum `737/762/4459ms`) and were explicitly excluded from the
+  product latency thresholds.
+- The latency phase omitted the attributed environment key and recorded aggregate
+  marker `18`, attributed groups/events `0/0`. The threshold-excluded correctness
+  phase recorded aggregate `2`, exactly one `source_root_hash` group and two events,
+  with the group matching the durable source. Global durable cardinalities were
+  workspace paths/workspaces `10/10` and imports/sessions `9/9`; publication roots,
+  imports, and locks matched expected counts `10/9/9`, with no staging or unexpected
+  items. All nine source SQLite families were unchanged.
+- SQLite integrity was `ok`, foreign-key violations were zero, and all task,
+  attempt, worktree, worker-lease, and coordinator-lease counts were zero. The
+  threshold-excluded functional process audit passed: its observer recorded `43`
+  starts and `43` exits with structurally identical PID/count maps, no active PID at
+  finish, and no forbidden utility or ownership refusal. The seven top-level process
+  setup failures were intentional failure-injection evidence from six setup cases
+  plus one batch-start case; all 15 cleanup self-test cases passed with one expected
+  injected cleanup error and zero unexpected errors or residue.
+- Provider isolation remained intact: `fake_provider_only=true`, provider credential
+  names were absent from both timing and failure-cleanup environments, and the
+  self-tests invoked no provider. Both main and audit daemons ended stopped; live
+  leases, cleanup errors, residual processes before/after force, forced cleanup, and
+  the independent post-run host candidate-process count were all zero.
+- This closes the local authoritative Windows source re-acceptance for `WIN-005` and
+  `WIN-010` through `WIN-015`. Their index entries remain `fix-in-progress` until the
+  reviewed commits are merged and published CI/nightly verification completes.
+
+## WIN-017: redundant state ACL serialization reduces registration latency headroom
+
+### 2026-08-07 exact-`b71f9a9` authoritative stress — failed once
+
+- Clean source commit `b71f9a972942e3e0d072f2bcaeedde41c7589c2e` was built and
+  invoked exactly once through the verified portable PowerShell 7.6.4 binary. The
+  worktree and candidate-process preflight were clean, and the evidence recorded a
+  minimum `14.099GiB` free, above its `5GiB` floor. The invocation exited `1` after
+  `200.4s`; it was not retried. The stored run
+  interval is `198.9200996s`, from `2026-08-06T22:49:24.696597Z` through
+  `2026-08-06T22:52:43.6166966Z`.
+- Evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260806T224924688Z.json`
+  is `492,354` bytes with SHA-256
+  `550fd38b0410759ca806fb394e7fc15702546d5a20ce69f1483ff0e54a61347d`.
+  It pins the unchanged harness SHA-256
+  `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  `colay.exe` SHA-256
+  `430285ea52698394da28ec29c060c0d693cf1875f19bc83c8625d813e0d27439`,
+  fake-provider SHA-256
+  `674455deea7cee91aacde7df7687fb854c87fa94828324ae3a2f2a75059f84c2`,
+  and portable PowerShell SHA-256
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The unchanged latency contract failed in three places. Serial measurements were
+  `[4924, 4516, 5590, 1244, 3609]ms`, making nearest-rank p95 and maximum `5590ms`
+  against `5000ms`. Concurrent measurements were
+  `[6830, 7958, 8037, 8674]ms`; `concurrent-register-8` exceeded `8000ms` by `37ms`
+  and `concurrent-register-9` exceeded it by `674ms`. This acceptance failure is not
+  replaced by the earlier passing revision and will not be hidden by a retry.
+- Functional evidence remained clean: all 18 latency inspections and the attributed
+  correctness `2/1/2` aggregate/group/event contract passed; durable workspace,
+  workspace-path, import, and session counts were `10/10/9/9`; publication and lock
+  counts matched `10/9/9`; SQLite integrity was `ok` with zero foreign-key violations;
+  and all writable task, attempt, worktree, worker-lease, and coordinator-lease counts
+  were zero. Process audit, daemon/endpoint shutdown, observer teardown, and residue
+  checks passed with no forbidden utility launch, ownership refusal, cleanup error,
+  active process, or final host candidate process. Provider credentials were cleared
+  and `fake_provider_only=true`.
+- Fixture-only seed writes, excluded from product thresholds, were
+  `[2941, 6649, 4374, 748, 732, 753, 4151, 750, 760]ms` with total `21,858ms`, versus
+  `16,005ms` in the preceding passing run. This is evidence of host I/O variability,
+  but it does not invalidate the product-threshold failure or establish a sole cause.
+  The preserved runtime root is
+  `C:\Users\kimoh\AppData\Local\Temp\colay-acl-20260806T224924688Z`.
+
+### Correction and exact-head validation
+
+- Static path tracing confirmed that registration repeatedly invokes the state ensure
+  path throughout inspection, preparation, and commit for a non-empty legacy import.
+  The state-layer
+  `WINDOWS_ACL_LOCK` serialized two component walks, canonicalization, metadata, and
+  the complete native ACL call for every artifact, including disjoint workspaces. It
+  duplicated the native `STATE_ARTIFACT_REPAIR` gate and did not coordinate direct
+  native callers or external processes.
+- The redundant state gate is removed from both ensure and verify. Fail-closed path,
+  symlink/junction, and canonical-target validation remains intact and can overlap for
+  disjoint artifacts; the native gate still serializes target pinning and the complete
+  descriptor read/repair/post-write verification sequence. Independent code and test
+  reviews found no production safety blocker. The exact-head result below supplies the
+  required quantitative acceptance evidence.
+- Final-form focused source checks passed: Windows IPC `47/47`, Windows state permission
+  tests `8/8`, the exact distinct-workspace concurrent import regression `1/1`, and
+  Clippy for both affected packages with warnings denied. Independent code and test
+  reviews returned READY for production safety. `cargo fmt --all -- --check`, full
+  workspace Clippy with warnings denied, and the complete workspace test suite then
+  passed on the final combined source; the latest full test command exited `0` after
+  `651.7s`.
+- The new exact-head run retains the unchanged thresholds, durability, ACL strictness,
+  and cleanup requirements. Any future regression will be preserved as a failure rather
+  than hidden by a retry; native descriptor-gate granularity remains the next diagnostic
+  boundary if the latency limits regress.
+
+### 2026-08-07 exact-`a05bc02` authoritative stress — passed once
+
+- Clean source commit `a05bc0277353475021503f6e1e26f922dc357078` was built and
+  invoked exactly once through verified portable PowerShell 7.6.4. The source identity
+  was `verified_clean`, the worktree and candidate-process preflight were clean, and
+  the run was not retried. The invocation exited `0` after `198.4s`; the stored interval
+  is `196.5646049s`, from `2026-08-07T00:08:55.6887241Z` through
+  `2026-08-07T00:12:12.2533290Z`. Minimum free space remained `12.979GiB`.
+- Evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260807T000855679Z.json`
+  is `490,683` bytes with SHA-256
+  `c1fb1932d0d07a6df9dc149ed94e714e9ab86f3ef5cf9f432cfb781010897b68`.
+  It records schema `2`, status `passed`, null failure, and no acceptance failures. It
+  pins the unchanged harness SHA-256
+  `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  `colay.exe` SHA-256
+  `8fd405f914e1b34486593c209249d91256dc4d236b0ec5b57bc029f4f12bdfdf`,
+  fake-provider SHA-256
+  `905591ebe6f42b118bd6bd5cff37a7a58fdd5766e9926c345a048b52f6627097`,
+  and PowerShell SHA-256
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The unchanged OS-process-lifetime gates passed. Serial measurements were
+  `[4631, 3765, 3692, 3182, 3688]ms`, so nearest-rank p95 and maximum were both
+  `4631ms` against `5000ms`. Concurrent measurements were
+  `[5726, 5817, 5927, 5942]ms`, with maximum `5942ms` against the per-command
+  `8000ms` limit.
+- Fixture-only schema-v8 seed writes were
+  `[4269, 4378, 4617, 750, 4348, 4475, 749, 4266, 762]ms`, total `28,614ms`, with
+  minimum/median/maximum `749/4269/4617ms`. They completed before the timing self-test
+  and daemon start and were excluded from product latency thresholds.
+- The latency phase recorded aggregate marker `18` with attributed group/event `0/0`.
+  The threshold-excluded correctness phase recorded aggregate/group/event `2/1/2`,
+  and its source-root hash matched the durable group. Durable workspace,
+  workspace-path, import, and session counts were `10/10/9/9`; publication roots,
+  imports, and locks matched `10/9/9`, with no staging directory or unexpected item.
+- SQLite integrity was `ok`, foreign-key violations were zero, and all task, attempt,
+  worktree, worker-lease, and coordinator-lease counts were zero. The functional audit
+  passed with `43` starts and `43` exits, exact expected executable basenames, no active
+  PID at finish, no forbidden utility start, and no ownership refusal. Both daemons and
+  endpoints ended stopped; live leases, cleanup errors, residual processes, and forced
+  cleanup were zero, and observer teardown passed.
+- Provider isolation remained intact: `fake_provider_only=true`, all seven provider
+  credential names were cleared, and the run used only the pinned fake-provider binary.
+  This closes local Windows latency acceptance for `WIN-017`. The issue remains
+  `fix-in-progress` until the final documentation head passes fresh three-platform CI
+  and the merged nightly completes isolated WSL validation.
+
+## WIN-018: Windows pipe-security test races the daemon's semantic online phase
+
+### Observation and correction
+
+- Exact source `b71f9a972942e3e0d072f2bcaeedde41c7589c2e` reached GitHub Actions
+  CI run `31129898165`. Ubuntu passed, while the Windows job failed in
+  `windows_primary_and_legacy_pipes_serve_v1_with_current_user_only_dacls` at
+  `global_daemon.rs:397`: the raw v1 `daemon.status` response was `probing`, not the
+  test's expected `online`. The preceding Windows suites, including global concurrency
+  `8/8`, passed.
+- The initial top-level `colay status` proves that IPC is ready but does not promise
+  that the daemon's consecutive persisted `probing -> online` transitions have both
+  completed. The security test immediately queried both the primary and legacy
+  endpoints and therefore encoded a scheduler-speed assumption unrelated to its pipe
+  DACL contract.
+- The correction must wait on the persisted daemon phase with a bounded deadline
+  before issuing raw requests to both endpoints. It must retain the exact one-current-
+  user-ACE, no-broad-principal, v1 response, and final `online` assertions; accepting
+  `probing`, adding an unbounded sleep, or weakening pipe security is not acceptable.
+- The fixture now reads the active daemon row every `25ms` for at most `5s` and includes
+  the last observed phase in its timeout diagnostic. Its dedicated read connection
+  disables SQLite's default busy wait; transient `BUSY`/`LOCKED` results re-enter the
+  deadline loop instead of extending it. It does not launch a status subprocess whose
+  pipe-open and response deadlines could exceed the outer bound. Only after the
+  persisted phase is `online` does the test query both raw endpoints. The exact test
+  passed `1/1`, the complete `global_daemon` integration target passed `7/7`, and
+  targeted Clippy, formatting, and diff checks passed. The final combined workspace
+  Clippy and test suite also passed, with the latter exiting `0` after `651.7s`. Fresh
+  three-platform CI remains required.
+
+## WIN-019: macOS scheduler fixtures use a symlink-aliased temp root
+
+### Observation and correction
+
+- In the same exact-source CI run `31129898165`, the macOS job failed 15 daemon
+  scheduler tests with the common root error `SymlinkEscape("/var")`; 40 tests in that
+  crate passed before the suite stopped. GitHub Actions was also reporting a major
+  outage, but these source-level failures are retained and handled rather than
+  dismissed as infrastructure noise.
+- On macOS, `tempfile::tempdir()` commonly returns a path below `/var/folders`, while
+  `/var` aliases `/private/var`. Production state validation correctly rejects a link
+  component before opening or hardening persisted state. The scheduler fixtures passed
+  the raw temporary path into `GlobalStatePaths`, unlike other tests that canonicalize
+  their owned temporary root first.
+- The correction is test-only: retain ownership of each `TempDir`, canonicalize its
+  root once, and build all state and repository paths below that canonical root. The
+  production symlink/junction/reparse rejection policy must remain unchanged. Local
+  focused/full tests and a fresh macOS CI job are required before closure.
+- The 15 affected fixtures now use a local owned `CanonicalTempDir` wrapper and never
+  pass the raw alias into state resolution. A Windows junction-backed `TEMP`/`TMP`
+  reproduced the same failure before the correction (`SymlinkEscape`), then passed the
+  representative test `1/1` and the complete scheduler group `16/16` with the fix.
+  The daemon library passed `60/60`; targeted Clippy with warnings denied, formatting,
+  and diff checks also passed. The final combined full workspace gates passed, including
+  the `651.7s` test run with zero failures. Production path validation was not changed.
+  Fresh macOS CI remains required.
+
+## WIN-020: scheduler fixture assumes the successor has not committed yet
+
+### Observation and root cause
+
+- Exact source `a05bc0277353475021503f6e1e26f922dc357078` failed the Ubuntu job in
+  pull-request CI run `31133515062`. Test
+  `preparation_error_drops_guards_advances_lane_and_success_waits_for_commit_activation`
+  received the expected predecessor failure and guard-drop evidence, then failed at
+  `committed.try_recv().is_err()`. The exact same tree SHA
+  `010f82b3cb9193260c040d3181eaa1e59f339f19` passed push CI run `31133509680`,
+  and both later exact-`6970f5b` push/PR runs passed Ubuntu. Those GREEN runs confirm
+  the failure is scheduling-sensitive but do not erase the preserved RED.
+- Production finalizes the failed generation, advances its workspace lane, and sends
+  the failed response. The successor's preparation and commit may therefore complete
+  before the async test task is scheduled after receiving that response. The old
+  negative `try_recv` assertion was not a scheduler contract and raced a valid fast
+  successor.
+
+### Deterministic correction and validation
+
+- The test backend now emits an explicit successor-preparation-started signal and
+  blocks that preparation on the existing `ReleaseGate`. The test collects the failed
+  response, guard drop, and successor start with bounded two-second waits, snapshots
+  commit, activation, and success response as `Empty` while the gate is closed, then
+  releases the gate and retains the original commit-before-activation-before-response
+  assertions. No production scheduler code changed.
+- The uncorrected exact test reproduced RED `0/1`. After correction, the exact test
+  passed, ten consecutive exact repetitions passed `10/10`, the scheduler group passed
+  `16/16`, and the daemon library passed `60/60`. Targeted Clippy with warnings denied,
+  formatting, and diff checks passed. Fresh final-head three-platform CI remains the
+  closure gate.
+
+## WIN-021: cold-start correctness fixture inherits the production latency deadline
+
+### Observation and root cause
+
+- The Windows job in the same pull-request CI run `31133515062` timed out one of four
+  simultaneous synthetic legacy-workspace clients after the unchanged ten-second
+  `workspace.register` response deadline. Daemon diagnostics still showed one online
+  owner and only the three exact expected contender-ownership messages; earlier tests
+  in that job passed.
+- The identical source tree passed push CI run `31133509680`. Clean local exact runs on
+  the pre-correction head also passed in `20.19s` and `16.62s`, and exact-`6970f5b`
+  push/PR runs `31134120605` and `31134123881` subsequently passed all three operating
+  systems. This proves host-I/O sensitivity, not a merge-tree difference. The test's
+  purpose is receipt ownership, four-way contender resolution, import-once durability,
+  source immutability, and zero writable residue; the dedicated Windows stress gate
+  separately owns the unchanged product latency thresholds.
+
+### Scoped correction and validation
+
+- Builds with `test-fixtures` may now set
+  `COLAY_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT_MS` only for the
+  `workspace.register` response wait. The parser fails closed outside the bounded
+  inclusive `10,000..=60,000ms` range and defaults to the production `10,000ms` when
+  absent. The four-contender cold-start fixture alone sets `30,000ms`; contender count,
+  spawn barrier, owner-bound receipt handling, real SQLite imports, and all durability
+  assertions remain unchanged. Default/release builds retain the exact ten-second
+  constant and cannot read the fixture override.
+- The parser test first failed to compile before the implementation, then passed `1/1`.
+  The exact four-contender integration passed three consecutive runs in
+  `22.37s`, `17.26s`, and `17.22s`; the complete global-concurrency target passed
+  `8/8`, and the default-feature production-timeout contract passed `1/1`. Targeted
+  Clippy with warnings denied, formatting, and diff checks passed. Fresh final-head
+  three-platform CI remains the closure gate.
+
+## WIN-022: current-schema WAL doctor fixture temporarily loses its repository
+
+### Preserved full-gate failure
+
+- The first final combined `cargo test --workspace --all-features` run after the
+  `WIN-020`/`WIN-021` corrections exited `1` after `595.9s`. Test
+  `doctor_preserves_current_schema_wal_database_and_sidecars` returned
+  `StateError::Io` for the freshly created path
+  `C:\Users\kimoh\AppData\Local\Temp\.tmpJbNVaf\repository`, with Windows
+  `os error 2` (`The system cannot find the file specified`). The error shape maps to
+  `WorkspacePathIdentity::resolve` canonicalizing the repository during
+  `seed_current_schema_in_wal_mode`, before the doctor child command is launched.
+- The failure occurred while independent review commands were also using the shared
+  Cargo target and the run reported an artifact-directory lock wait. That concurrency
+  is recorded as context, not accepted as the cause: Cargo artifact locking does not
+  itself explain disappearance of an unrelated owned temporary repository.
+- A subsequent isolated exact diagnostic passed `1/1` in `7.52s`, and the complete
+  `global_doctor` target passed `33/33` with its normal parallel test threads in
+  `43.25s`. These GREEN diagnostics established intermittency but did not replace the
+  preserved full-gate RED.
+
+### Independent classification and clean closure gate
+
+- `DoctorFixture` owns its `TempDir` for the full test lifetime, its custom `Drop` runs
+  before owned fields are dropped, and neither `global_doctor` nor the relevant product
+  path can remove the fixture root or repository. The fixture and failing WAL test had
+  been unchanged since July 26, and the branch changes do not reach this setup path.
+- The failing test binary passed eight concurrent exact invocations, the current binary
+  passed another 24 concurrent exact invocations, and an independent bounded exact loop
+  passed `10/10`. Together with the isolated and full-target diagnostics, no source-level
+  deletion or timing condition reproduced.
+- The system temporary directory was a normal NTFS directory rather than a reparse
+  point, the volume reported `Healthy/OK`, and the estimated failure interval contained
+  no Storage Sense, SilentCleanup, temporary-file cleanup, or Defender detection event.
+  The bounded USN journal had already rotated the original `.tmpJbNVaf` record, so the
+  external deletion actor cannot be attributed after the fact.
+- No canonicalization retry, repository recreation, or alternate temporary root was
+  added: each would mask a real namespace loss without evidence of a product defect.
+  After all diagnostic children were stopped and no other Cargo job was active, the
+  required `cargo test --workspace --all-features` gate passed with zero failures in
+  `632.6s`, including `global_doctor` `33/33` and global concurrency `8/8`.
+- `WIN-022` is therefore classified as a non-code Windows host filesystem anomaly and
+  retained for monitoring. Recurrence requires stage-boundary metadata capture and a
+  ProcMon/USN trace before any code change. Fresh final-head three-platform CI remains
+  the release closure gate.
+
+## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
+
+### 관찰 및 영향
+
+- current process user가 LocalSystem이면 current-user SID와 well-known SYSTEM SID가 모두
+  `S-1-5-18`이다. 현재 builder는 `[SYSTEM, SYSTEM, Administrators]` 세 ACE를 만들지만
+  verifier는 duplicate trustee를 거부한다.
+- 그 결과 LocalSystem 기반 Windows service 또는 scheduled task에서는 기존 state artifact를
+  검증할 수 없고 repair가 만든 ACL도 post-build self-verification에서 실패한다. 일반 사용자
+  SID가 SYSTEM과 다른 대화형 실행은 이 결함의 영향을 받지 않는다.
+
+### 승인된 설계와 검증 상태
+
+- 2026-08-06 사용자가 구현 진행을 승인했다. 설계는 current-user, SYSTEM, Administrators 역할을
+  검증된 binary SID의 고유 집합으로 정규화하는 것이다. 일반 사용자는 기존의 정확한 3 ACE,
+  LocalSystem은 `[SYSTEM, Administrators]`의 정확한 2 ACE를 사용하며 실제 중복·미지·광범위
+  trustee와 잘못된 mask/flag/type은 계속 거부한다.
+- 허용되는 역할 중복은 current-user와 SYSTEM이 같은 경우뿐이다. current-user와
+  Administrators 또는 SYSTEM과 Administrators가 같은 synthetic 입력은 fail-closed로
+  거부한다. 구현은 synthetic `user == SYSTEM` RED 테스트, native
+  ensure/verify/idempotence, 일반 사용자 3-ACE 회귀와 state 통합 검증을 수행한다.
+
+### 2026-08-06 구현 및 source 검증
+
+- 구현 commit은 `24cd2743398affd74bc74d0edab8590022f0dbd0`
+  (`fix: normalize LocalSystem state ACL principals`)이다. validated binary SID 역할을
+  정규화하여 normal user에는 정확히 3 ACE, LocalSystem에는 정확히 2 ACE
+  (`SYSTEM`, `Administrators`)만 요구한다. `current user == SYSTEM`만 허용하고 그 밖의
+  역할 충돌과 on-disk duplicate trustee는 fail-closed로 거부한다.
+- Focused source commands passed: `cargo test -p orchestrator-windows-ipc
+  state_artifact::tests::required_principals_ -- --nocapture --test-threads=1` (2/2),
+  `cargo test -p orchestrator-windows-ipc state_artifact::tests::bounded_localsystem_ --
+  --nocapture --test-threads=1` (1/1), `cargo test -p orchestrator-windows-ipc state_artifact
+  --all-features -- --nocapture --test-threads=1` (28/28), `cargo test -p orchestrator-state
+  permissions::tests::windows_ --all-features -- --nocapture --test-threads=1` (8/8), and
+  `cargo fmt --all -- --check`.
+- Conditional native `retained_handle_localsystem_file_and_directory_fast_paths_when_applicable`
+  skipped its LocalSystem branch on the normal-user Windows host. `WIN-006` remains
+  `fix-in-progress (source tests passed; LocalSystem native/nightly verification pending)` until
+  bounded native LocalSystem release QA and nightly verification are recorded. Do not mark it fixed
+  or close `WIN-005`, `WIN-006`, `WSL-022`, or `WSL-023`. Downgrading a LocalSystem state directory
+  to an unpatched binary is unsupported and must fail closed unless the correction is backported.
+
+### 2026-08-06 post-review fresh Windows source gates
+
+- Independent security/correctness review initially raised three Important findings. Their fixes
+  are `7a1cb38bb14ad09318c95f1f5735c24b8af2aadf`
+  (`fix: close LocalSystem ACL review findings`),
+  `c1e4951dc1cf6c560a5be172b41c6a8d78a3ae01`
+  (`test: gate retained-handle ACL repair identity`), and
+  `7f2e3e755009c02e826c7075d898e3555c16114a`
+  (`docs: scope LocalSystem ACL rollback`). Each scoped re-review is Ready, with no open
+  Critical, Important, or Minor finding. The subsequent Clippy-only correction is
+  `0351c55a5938dd905be0f34128b0b34fd97c8605`
+  (`fix: remove redundant ACL principal borrow`); this is the exact source HEAD used below.
+- With process-scoped `CARGO_BUILD_JOBS=1` and `CARGO_INCREMENTAL=0`, fresh commands on that HEAD
+  exited zero: `cargo test -p orchestrator-windows-ipc state_artifact --all-features --
+  --nocapture --test-threads=1` (28 passed, 0 failed, 18 filtered), `cargo test -p
+  orchestrator-state permissions::tests --all-features -- --nocapture --test-threads=1`
+  (8 passed, 0 failed, 113 filtered; the remaining selected integration binaries ran zero tests),
+  `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`, and `cargo test --workspace --all-features` (exit zero; 912.6 seconds). The suite
+  uses the repository fake-provider support; no real provider inference was invoked.
+- The unconditional normal-user owner/same-handle native gate
+  `retained_handle_repair_preserves_owner_and_uses_one_handle` executed and passed. The conditional
+  `retained_handle_localsystem_file_and_directory_fast_paths_when_applicable` test executed on
+  this normal-user host, but its LocalSystem assertion body correctly skipped because the process
+  is not LocalSystem. Therefore bounded native LocalSystem release QA and published-nightly
+  verification remain pending. `WIN-005`, `WIN-006`, `WSL-022`, and `WSL-023` stay open; this
+  source evidence does not close any of them.
+
 ## WSL-009: config 없는 기존 DB의 migration 진입 실패 (WSL/Windows 공통)
 
 ### 재현 및 영향
@@ -1846,6 +3258,25 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
     `0.1.1-nightly.20260803.95cf4d3`).
 
 ## Update log
+
+### 2026-08-07
+
+- Exact clean HEAD `2f39105`에서 reviewed marker A/B를 단 한 번 실행해 8개 observation,
+  4개 counterbalanced pair, 10개 input-hash checkpoint, 0 retry, 0 credential key,
+  0 cleanup error/residual process를 확인했다. `WIN-007`, `WIN-008`, `WIN-009`를 `fixed`로
+  전환했다.
+- Attribution marker가 latency를 유의하게 교란하므로 결정은
+  `split-latency-marker-off-and-correctness-marker-on-phases`이다. 권위 latency stress는 marker를
+  끈 phase, correctness는 marker를 켠 별도 phase로 수행해야 하며 아직 실행하지 않았다.
+  `WIN-005`, `WIN-006`, `WSL-022`, `WSL-023`은 변경하지 않았다.
+
+### 2026-08-06
+
+- `WIN-005`의 실패 증거는 그대로 not accepted로 보존했다. 권위 재실행 전 stress/marker
+  스크립트를 독립 리뷰 가능한 exact hash로 동결했고 실제 A/B/stress/provider 실행은 하지 않았다.
+- LocalSystem의 역할 SID 중복으로 native state ACL이 자체 실패하는 `WIN-006`을 추가했다.
+  사용자는 고유-SID 정책의 구현을 승인했다. source/native/nightly 검증 전에는 fixed로
+  전환하지 않는다.
 
 ### 2026-08-04
 

@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fs::{self, OpenOptions},
+    io::Write as _,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -18,8 +19,9 @@ use orchestrator_domain::{
     WorkerResult, task_graph_proposal_hash,
 };
 use orchestrator_state::{
-    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig,
-    StateEnvironment, StateError, StoredArtifact, TaskListFilter,
+    ArtifactStore, Database, GlobalStatePaths, LegacyImporter, MigrationManager,
+    PreparedLegacyImport, PreparedLegacyInspection, RepositoryStatePaths, RootConfig,
+    STATE_SCHEMA_VERSION, StateEnvironment, StateError, StoredArtifact, TaskListFilter,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -44,6 +46,805 @@ const DURABLE_SESSIONS_MIGRATION: &str =
     include_str!("../../../migrations/0004_durable_sessions.sql");
 const NONCANONICAL_INVALID_VALIDATION_JSON: &str = "{ \"errors\" : [ \"cycle\" ] }";
 static LEGACY_IMPORT_COMPLETION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn prepared_legacy_import_is_send() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<PreparedLegacyImport>();
+}
+
+#[test]
+fn prepared_legacy_inspection_is_send() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<PreparedLegacyInspection>();
+}
+
+#[test]
+fn dropping_prepared_inspection_cleans_its_owned_attempt() -> TestResult {
+    let fixture = ImportFixture::new()?;
+
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 1);
+    drop(inspection);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_is_consumed_by_one_preparation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let before_source = fixture.source_evidence_hashes()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+
+    let prepared = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )?;
+    let result = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)?;
+
+    assert!(result.imported);
+    assert_eq!(fixture.source_evidence_hashes()?, before_source);
+    let published_database = result.published_path.join("legacy.db");
+    assert!(published_database.is_file());
+    assert!(!published_database.with_file_name("legacy.db-wal").exists());
+    assert!(!published_database.with_file_name("legacy.db-shm").exists());
+    let published = Connection::open_with_flags(
+        published_database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    assert_eq!(MigrationManager::status(&published)?.current_version, 3);
+    assert_eq!(
+        fixture.global.migration_status()?.current_version,
+        STATE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        published.query_row("SELECT count(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn daemon_style_inspect_and_prepare_migrates_once_but_records_two_inspections() -> TestResult {
+    LegacyImporter::reset_inspection_counts_for_test();
+    let fixture = ImportFixture::new()?;
+
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    assert_eq!(LegacyImporter::inspection_counts_for_test(), (1, 1));
+
+    let prepared = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )?;
+    assert_eq!(LegacyImporter::inspection_counts_for_test(), (2, 1));
+    drop(prepared);
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn attributed_legacy_inspection_marker_child() -> TestResult {
+    if std::env::var_os("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS").is_none() {
+        return Ok(());
+    }
+
+    for _ in 0..2 {
+        let fixture = ImportFixture::new()?;
+        let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+            .ok_or("legacy source was not found")?;
+        let prepared = LegacyImporter::prepare_inspection(
+            &fixture.global,
+            fixture.workspace_id,
+            inspection,
+            &fixture.paths,
+        )?;
+        LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn attributed_legacy_inspection_marker_records_two_passes_per_distinct_source() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let isolated_temporary_root = fs::canonicalize(temporary.path())?;
+    let marker = isolated_temporary_root.join("attributed-inspections");
+    fs::create_dir(&marker)?;
+    let test_executable = std::env::current_exe()?;
+
+    let mut absent_command = std::process::Command::new(&test_executable);
+    absent_command
+        .args([
+            "--exact",
+            "attributed_legacy_inspection_marker_child",
+            "--test-threads=1",
+        ])
+        .env("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS", "1")
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER")
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR");
+    configure_isolated_temporary_environment(&mut absent_command, &isolated_temporary_root);
+    let absent_status = absent_command.status()?;
+    assert!(absent_status.success());
+    assert!(fs::read_dir(&marker)?.next().is_none());
+
+    let mut attributed_command = std::process::Command::new(test_executable);
+    attributed_command
+        .args([
+            "--exact",
+            "attributed_legacy_inspection_marker_child",
+            "--test-threads=1",
+        ])
+        .env("COLAY_TEST_RUN_ATTRIBUTED_LEGACY_INSPECTIONS", "1")
+        .env_remove("COLAY_TEST_LEGACY_INSPECT_MARKER")
+        .env("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR", &marker);
+    configure_isolated_temporary_environment(&mut attributed_command, &isolated_temporary_root);
+    let attributed_status = attributed_command.status()?;
+    assert!(attributed_status.success());
+
+    let source_directories = fs::read_dir(&marker)?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(source_directories.len(), 2);
+    let mut aggregate = 0;
+    for source in source_directories {
+        let source_key = source.file_name().to_string_lossy().into_owned();
+        assert_eq!(source_key.len(), 64);
+        assert!(
+            source_key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        );
+        let events = fs::read_dir(source.path())?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert!(event.file_type()?.is_file());
+            assert_eq!(fs::metadata(event.path())?.len(), 0);
+            aggregate += 1;
+        }
+    }
+    assert_eq!(aggregate, 4);
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+fn configure_isolated_temporary_environment(command: &mut std::process::Command, root: &Path) {
+    command.env("TEMP", root).env("TMP", root);
+    #[cfg(unix)]
+    command.env("TMPDIR", root);
+}
+
+#[test]
+fn prepared_inspection_rejects_logical_database_mutation_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE tasks SET objective = 'mutated after inspection'",
+        [],
+    )?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("logical database mutation was accepted")?;
+
+    assert!(error.to_string().contains("artifact") || error.to_string().contains("changed"));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_same_logical_vacuum_bytes_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    Connection::open(&fixture.source.database)?.execute_batch("VACUUM;")?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("same-logical physical database mutation was accepted")?;
+
+    assert!(error.to_string().contains("artifact") || error.to_string().contains("changed"));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_added_monitored_file_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    fs::write(
+        fixture.source.tasks.join("added-after-inspection.txt"),
+        b"added",
+    )?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("added monitored source file was accepted")?;
+
+    assert!(error.to_string().contains("file set"));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn prepared_inspection_rejects_file_added_after_initial_manifest_enumeration() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let added = fixture.source.tasks.join("added-after-enumeration.txt");
+    let added_for_hook = added.clone();
+    LegacyImporter::set_manifest_enumeration_hook_for_test(move || {
+        fs::write(&added_for_hook, b"late addition")
+    });
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("file added after initial manifest enumeration escaped the sealed path set")?;
+
+    assert!(added.is_file());
+    assert!(error.to_string().contains("file set"));
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn prepared_inspection_rejects_post_read_artifact_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let original = fixture
+        .source
+        .root
+        .join(format!("tasks/{}/evidence.txt", fixture.task_id));
+    let artifact = fixture.source.root.join("reports/evidence.txt");
+    fs::create_dir_all(artifact.parent().ok_or("artifact path has no parent")?)?;
+    fs::rename(&original, &artifact)?;
+    Connection::open(&fixture.source.database)?.execute(
+        "UPDATE artifacts SET relative_path = 'reports/evidence.txt'",
+        [],
+    )?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    let artifact_for_hook = artifact.clone();
+    LegacyImporter::set_manifest_post_read_hook_for_test(move || {
+        #[cfg(unix)]
+        {
+            fs::remove_file(&artifact_for_hook)
+        }
+        #[cfg(windows)]
+        {
+            fs::write(&artifact_for_hook, b"changed after retained read")
+        }
+    });
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("artifact mutation after its retained read escaped final verification")?;
+
+    assert!(
+        matches!(
+            error,
+            StateError::ArtifactConflict(_) | StateError::Io { .. }
+        ) || error.to_string().contains("source file")
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_changed_monitored_file_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    fs::write(
+        fixture
+            .source
+            .root
+            .join(format!("tasks/{}/evidence.txt", fixture.task_id)),
+        b"changed after retained inspection",
+    )?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("changed monitored source file was accepted")?;
+
+    assert!(matches!(error, StateError::ArtifactConflict(_)));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_deleted_monitored_file_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    fs::remove_file(
+        fixture
+            .source
+            .root
+            .join(format!("tasks/{}/evidence.txt", fixture.task_id)),
+    )?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("deleted monitored source file was accepted")?;
+
+    assert!(
+        matches!(error, StateError::Io { .. }) || error.to_string().contains("file set"),
+        "unexpected deleted-file error: {error}"
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_monitored_tree_link_substitution() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let saved_tasks = fixture.source.root.join("tasks-saved");
+    fs::rename(&fixture.source.tasks, &saved_tasks)?;
+    create_directory_link(&saved_tasks, &fixture.source.tasks)?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("monitored tree link substitution was accepted")?;
+
+    assert!(matches!(
+        error,
+        StateError::SymlinkEscape(_) | StateError::InvalidRecord(_)
+    ));
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_dangling_link_on_absent_monitored_directory() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    assert!(!fixture.source.checkpoints.exists());
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let target = fixture.root.path().join("removed-checkpoint-target");
+    fs::create_dir(&target)?;
+    create_directory_link(&target, &fixture.source.checkpoints)?;
+    fs::remove_dir(&target)?;
+    assert!(!fixture.source.checkpoints.exists());
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("dangling monitored-directory link was treated as absent")?;
+
+    assert!(matches!(
+        error,
+        StateError::SymlinkEscape(_) | StateError::InvalidRecord(_)
+    ));
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_absent_to_created_event_log_before_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    assert!(!fixture.source.events.exists());
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    fs::write(&fixture.source.events, b"")?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("newly created event log was accepted")?;
+
+    assert!(error.to_string().contains("file set"));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_retained_migrated_snapshot_tampering() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let migrated = only_scratch_file(&fixture, "migrated.db")?;
+    OpenOptions::new()
+        .append(true)
+        .open(&migrated)?
+        .write_all(b"tamper")?;
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("tampered retained migrated snapshot was accepted")?;
+
+    assert!(matches!(error, StateError::ArtifactConflict(path) if path == migrated));
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_inspection_rejects_a_different_durability_context() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let inspection = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let alternate_root = fixture.root.path().join("alternate-inspection-context");
+    let alternate_paths = GlobalStatePaths {
+        root: alternate_root.clone(),
+        database: fixture.paths.database.clone(),
+        backups: alternate_root.join("backups"),
+        workspaces: alternate_root.join("workspaces"),
+        runtime: alternate_root.join("runtime"),
+        config: alternate_root.join("config.toml"),
+    };
+
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        inspection,
+        &alternate_paths,
+    )
+    .err()
+    .ok_or("prepared inspection accepted a different durability context")?;
+
+    assert!(error.to_string().contains("inspected durability context"));
+    assert_eq!(regular_file_count(&alternate_root)?, 0);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn identical_relocated_inspections_serialize_on_the_final_fingerprint_and_retry_cleanly()
+-> TestResult {
+    let fixture = ImportFixture::new()?;
+    let relocated_repository = fixture.root.path().join("relocated-for-locking");
+    fs::create_dir_all(&relocated_repository)?;
+    let relocated =
+        RepositoryStatePaths::from_config(&relocated_repository, &RootConfig::default())?;
+    copy_tree(&fixture.source.root, &relocated.root)?;
+    let original_plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("original legacy source was not found")?;
+    let relocated_plan = LegacyImporter::inspect(&relocated, &fixture.paths)?
+        .ok_or("relocated legacy source was not found")?;
+    assert_eq!(
+        original_plan.source_fingerprint,
+        relocated_plan.source_fingerprint
+    );
+
+    let first = LegacyImporter::inspect_for_prepare(&fixture.source, &fixture.paths)?
+        .ok_or("original legacy source was not found")?;
+    let second = LegacyImporter::inspect_for_prepare(&relocated, &fixture.paths)?
+        .ok_or("relocated legacy source was not found")?;
+    let prepared = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        first,
+        &fixture.paths,
+    )?;
+    let error = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        second,
+        &fixture.paths,
+    )
+    .err()
+    .ok_or("identical relocated source bypassed the final fingerprint lock")?;
+    assert!(error.to_string().contains("already active"));
+    drop(prepared);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+
+    let retry = LegacyImporter::inspect_for_prepare(&relocated, &fixture.paths)?
+        .ok_or("relocated legacy source disappeared before retry")?;
+    let retry = LegacyImporter::prepare_inspection(
+        &fixture.global,
+        fixture.workspace_id,
+        retry,
+        &fixture.paths,
+    )?;
+    drop(retry);
+    assert_eq!(all_scratch_attempt_count(&fixture)?, 0);
+    Ok(())
+}
+
+#[test]
+fn dropping_prepared_import_cleans_owned_scratch_and_staging_without_target_mutation() -> TestResult
+{
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+
+    let imports = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports");
+    assert!(
+        imports
+            .join(format!("{}.staging", plan.source_fingerprint))
+            .is_dir()
+    );
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        1
+    );
+
+    drop(prepared);
+
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    Ok(())
+}
+
+#[test]
+fn prepared_commit_rejects_a_different_durability_context_before_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let before = target_mutation_counts(&fixture)?;
+    let alternate_root = fixture.root.path().join("alternate-global-context");
+    let alternate_paths = GlobalStatePaths {
+        root: alternate_root.clone(),
+        database: fixture.paths.database.clone(),
+        backups: alternate_root.join("backups"),
+        workspaces: alternate_root.join("workspaces"),
+        runtime: alternate_root.join("runtime"),
+        config: alternate_root.join("config.toml"),
+    };
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &alternate_paths)
+        .err()
+        .ok_or("prepared import committed under a different durability context")?;
+
+    assert!(error.to_string().contains("prepared durability context"));
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_eq!(regular_file_count(&alternate_paths.backups)?, 0);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn preparation_rejects_source_mutation_after_inspection_without_target_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let before = target_mutation_counts(&fixture)?;
+    fs::write(
+        fixture
+            .source
+            .root
+            .join(format!("tasks/{}/evidence.txt", fixture.task_id)),
+        b"mutated after sealed inspection",
+    )?;
+
+    let error =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)
+            .err()
+            .ok_or("source mutation after inspection was accepted")?;
+
+    assert!(
+        error.to_string().contains("artifact") || error.to_string().contains("source changed"),
+        "unexpected source mutation error: {error}"
+    );
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    Ok(())
+}
+
+#[test]
+fn prepared_commit_rechecks_and_replays_existing_durable_import() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let first =
+        LegacyImporter::apply(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let replay = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)?;
+
+    assert!(!replay.imported);
+    assert_eq!(replay.source_fingerprint, first.source_fingerprint);
+    assert_eq!(replay.published_path, first.published_path);
+    assert_eq!(target_mutation_counts(&fixture)?, before);
+    Ok(())
+}
+
+#[test]
+fn prepared_publish_failure_rolls_back_rows_and_cleans_owned_staging() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let before = target_mutation_counts(&fixture)?;
+    let published = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports")
+        .join(&plan.source_fingerprint);
+    fs::create_dir(&published)?;
+    let sentinel = published.join("external-sentinel");
+    fs::write(&sentinel, b"must survive failed publication")?;
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)
+        .err()
+        .ok_or("publication over an occupied destination succeeded")?;
+
+    match error {
+        StateError::Io { path, .. } => assert_eq!(path, published),
+        other => return Err(format!("unexpected publication error: {other}").into()),
+    }
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
+    assert!(sentinel.is_file());
+    assert!(
+        !published
+            .with_file_name(format!("{}.staging", plan.source_fingerprint))
+            .exists()
+    );
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn prepared_post_publish_precommit_failure_rolls_back_and_cleans_publication() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let mut prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    prepared.inject_post_publish_precommit_failure_for_test()?;
+    let before = target_mutation_counts(&fixture)?;
+    let imports = fixture
+        .paths
+        .for_workspace(fixture.workspace_id)
+        .root
+        .join("imports");
+    let sentinel = imports.join("unrelated-external-sentinel");
+    fs::write(&sentinel, b"must survive prepared import rollback")?;
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)
+        .err()
+        .ok_or("injected post-publish/pre-commit failure did not fire")?;
+
+    assert!(error.to_string().contains("post-publish/pre-commit"));
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    assert_eq!(
+        fs::read(&sentinel)?,
+        b"must survive prepared import rollback"
+    );
+    Ok(())
+}
+
+#[test]
+fn prepared_commit_failure_rechecks_target_and_rolls_back_import_mutation() -> TestResult {
+    let fixture = ImportFixture::new()?;
+    let plan = LegacyImporter::inspect(&fixture.source, &fixture.paths)?
+        .ok_or("legacy source was not found")?;
+    let prepared =
+        LegacyImporter::prepare(&fixture.global, fixture.workspace_id, &plan, &fixture.paths)?;
+    let workspace = fixture.global.workspace(fixture.workspace_id);
+    workspace.append_event(audit_event(None, "target event one"))?;
+    workspace.append_event(audit_event(None, "target event two"))?;
+    Connection::open(fixture.global.path())?.execute(
+        "DELETE FROM task_events WHERE workspace_id = ?1 AND sequence = 1",
+        [fixture.workspace_id.to_string()],
+    )?;
+    let before = target_mutation_counts(&fixture)?;
+
+    let error = LegacyImporter::commit(&fixture.global, prepared, &fixture.paths)
+        .err()
+        .ok_or("prepared commit accepted a target event-chain gap")?;
+
+    assert!(error.to_string().contains("audit event chain is invalid"));
+    assert_only_pretransaction_backup_added(before, target_mutation_counts(&fixture)?);
+    assert_no_published_import(&fixture, &plan.source_fingerprint);
+    assert_eq!(
+        scratch_attempt_count(&fixture, &plan.source_fingerprint)?,
+        0
+    );
+    Ok(())
+}
 
 #[test]
 fn legacy_import_completion_preserves_durable_truth_and_accepts_a_read_only_snapshot() -> TestResult
@@ -2520,6 +3321,80 @@ fn assert_no_published_import(fixture: &ImportFixture, fingerprint: &str) {
         .join("imports");
     assert!(!imports.join(fingerprint).exists());
     assert!(!imports.join(format!("{fingerprint}.staging")).exists());
+}
+
+fn scratch_attempt_count(fixture: &ImportFixture, fingerprint: &str) -> TestResult<usize> {
+    let fingerprint_root = fixture
+        .paths
+        .database
+        .parent()
+        .ok_or("global database has no parent")?
+        .join("import-scratch")
+        .join(fingerprint);
+    if !fingerprint_root.exists() {
+        return Ok(0);
+    }
+    Ok(fs::read_dir(fingerprint_root)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("attempt-"))
+        .count())
+}
+
+fn all_scratch_attempt_count(fixture: &ImportFixture) -> TestResult<usize> {
+    let scratch_root = fixture
+        .paths
+        .database
+        .parent()
+        .ok_or("global database has no parent")?
+        .join("import-scratch");
+    if !scratch_root.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for fingerprint in fs::read_dir(scratch_root)? {
+        let fingerprint = fingerprint?;
+        if !fingerprint.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(fingerprint.path())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry.file_name().to_string_lossy().starts_with("attempt-")
+            {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn only_scratch_file(fixture: &ImportFixture, file_name: &str) -> TestResult<PathBuf> {
+    let scratch_root = fixture
+        .paths
+        .database
+        .parent()
+        .ok_or("global database has no parent")?
+        .join("import-scratch");
+    let mut matches = Vec::new();
+    if scratch_root.exists() {
+        for fingerprint in fs::read_dir(scratch_root)? {
+            let fingerprint = fingerprint?;
+            if !fingerprint.file_type()?.is_dir() {
+                continue;
+            }
+            for attempt in fs::read_dir(fingerprint.path())? {
+                let candidate = attempt?.path().join(file_name);
+                if candidate.is_file() {
+                    matches.push(candidate);
+                }
+            }
+        }
+    }
+    if matches.len() != 1 {
+        return Err(format!("expected one scratch {file_name}, found {}", matches.len()).into());
+    }
+    Ok(matches.remove(0))
 }
 
 #[cfg(unix)]

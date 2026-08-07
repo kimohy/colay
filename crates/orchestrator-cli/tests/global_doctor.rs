@@ -12,8 +12,8 @@ use std::{
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use orchestrator_state::{
-    Database, GlobalStatePaths, LegacyImporter, RepositoryStatePaths, RootConfig,
-    STATE_SCHEMA_VERSION, StateEnvironment,
+    Database, GlobalStatePaths, LegacyImportResult, LegacyImporter, RepositoryStatePaths,
+    RootConfig, STATE_SCHEMA_VERSION, StateEnvironment,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
@@ -156,7 +156,11 @@ impl DoctorFixture {
     }
 
     fn seed_repository_legacy_schema_v8(&self) -> Result<PathBuf> {
-        let state = self.repository.join(".colay");
+        Self::seed_repository_legacy_schema_v8_at(&self.repository)
+    }
+
+    fn seed_repository_legacy_schema_v8_at(repository: &Path) -> Result<PathBuf> {
+        let state = repository.join(".colay");
         fs::create_dir_all(&state)?;
         fs::write(state.join("config.toml"), "config_version = 4\n")?;
         let database = state.join("orchestrator.db");
@@ -172,7 +176,14 @@ impl DoctorFixture {
         &self,
         proposal_hash: Option<&str>,
     ) -> Result<PathBuf> {
-        let database = self.seed_repository_legacy_schema_v8()?;
+        Self::seed_repository_legacy_invalid_graph_schema_v8_at(&self.repository, proposal_hash)
+    }
+
+    fn seed_repository_legacy_invalid_graph_schema_v8_at(
+        repository: &Path,
+        proposal_hash: Option<&str>,
+    ) -> Result<PathBuf> {
+        let database = Self::seed_repository_legacy_schema_v8_at(repository)?;
         let connection = Connection::open(&database)?;
         let created_at = "2026-08-02T00:00:00Z";
         connection.execute(
@@ -296,13 +307,31 @@ impl DoctorFixture {
     }
 
     fn colay_in<const N: usize>(&self, repository: &Path, args: [&str; N]) -> Result<Output> {
+        self.colay_in_with_legacy_inspect_marker(repository, args, None)
+    }
+
+    fn colay_with_legacy_inspect_marker<const N: usize>(
+        &self,
+        args: [&str; N],
+        marker: &Path,
+    ) -> Result<Output> {
+        self.colay_in_with_legacy_inspect_marker(&self.repository, args, Some(marker))
+    }
+
+    fn colay_in_with_legacy_inspect_marker<const N: usize>(
+        &self,
+        repository: &Path,
+        args: [&str; N],
+        marker: Option<&Path>,
+    ) -> Result<Output> {
         let mut stdout = tempfile::tempfile()?;
         let mut stderr = tempfile::tempfile()?;
         #[cfg(windows)]
         let system_root = env::var_os("SystemRoot").context("SystemRoot is not set")?;
         #[cfg(not(windows))]
         let system_root = "/";
-        let status = Command::new(env!("CARGO_BIN_EXE_colay"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_colay"));
+        command
             .args(args)
             .current_dir(repository)
             .env_clear()
@@ -319,9 +348,11 @@ impl DoctorFixture {
             .env("TEMP", &self.root)
             .env("TMP", &self.root)
             .stdout(Stdio::from(stdout.try_clone()?))
-            .stderr(Stdio::from(stderr.try_clone()?))
-            .status()
-            .context("failed to invoke colay")?;
+            .stderr(Stdio::from(stderr.try_clone()?));
+        if let Some(marker) = marker {
+            command.env("COLAY_TEST_LEGACY_INSPECT_MARKER", marker);
+        }
+        let status = command.status().context("failed to invoke colay")?;
         stdout.seek(SeekFrom::Start(0))?;
         stderr.seek(SeekFrom::Start(0))?;
         let mut stdout_bytes = Vec::new();
@@ -579,6 +610,29 @@ fn file_content_snapshot(path: &Path) -> Result<FileContentSnapshot> {
         sha256: format!("{:x}", Sha256::digest(&bytes)),
         bytes,
     })
+}
+
+fn sqlite_family_content_snapshot(database: &Path) -> Result<BTreeMap<String, String>> {
+    let mut snapshot = BTreeMap::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = if suffix.is_empty() {
+            database.to_path_buf()
+        } else {
+            sqlite_sidecar(database, suffix)
+        };
+        if path.try_exists()? {
+            snapshot.insert(
+                suffix.to_owned(),
+                format!("{:x}", Sha256::digest(fs::read(path)?)),
+            );
+        }
+    }
+    anyhow::ensure!(
+        snapshot.contains_key(""),
+        "legacy SQLite database is missing at {}",
+        database.display()
+    );
+    Ok(snapshot)
 }
 
 fn directory_entries(directory: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -1555,6 +1609,155 @@ fn doctor_deep_checks_a_workspace_through_the_live_daemon() -> Result<()> {
     assert_eq!(
         LegacyDoctorMutationSnapshot::capture(&fixture, None)?,
         before
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_legacy_daemon_start_inspects_the_source_exactly_twice() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let legacy_database = fixture.seed_repository_legacy_invalid_graph_schema_v8()?;
+    let copied_schema_fixture = fixture.root.join("legacy-schema-v8-fixture.db");
+    fs::copy(&legacy_database, &copied_schema_fixture)?;
+    fs::remove_file(&legacy_database)?;
+    fs::copy(&copied_schema_fixture, &legacy_database)?;
+    let source_before = sqlite_family_content_snapshot(&legacy_database)?;
+    let marker = fixture.root.join("legacy-inspections.log");
+
+    let started = fixture.colay_with_legacy_inspect_marker(["daemon", "start"], &marker)?;
+
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(
+        sqlite_family_content_snapshot(&legacy_database)?,
+        source_before
+    );
+    let connection = Connection::open_with_flags(
+        fixture.global_database(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM legacy_imports", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM workspaces", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM workspace_paths", [], |row| row
+            .get::<_, i64>(0))?,
+        1
+    );
+    let inspections = fs::read_to_string(marker)?
+        .lines()
+        .filter(|line| *line == "legacy-inspect")
+        .count();
+    assert_eq!(
+        inspections, 2,
+        "cold daemon bootstrap must inspect once for planning and once for sealed-plan apply"
+    );
+    Ok(())
+}
+
+#[test]
+fn incumbent_daemon_imports_a_distinct_second_workspace_before_returning() -> Result<()> {
+    let fixture = DoctorFixture::new()?;
+    fixture.configure_fake_providers()?;
+    let marker = fixture.root.join("legacy-inspections.log");
+    let started = fixture.colay_with_legacy_inspect_marker(["daemon", "start"], &marker)?;
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let second_repository = fixture.root.join("repository-two");
+    fs::create_dir_all(&second_repository)?;
+    let legacy_database = DoctorFixture::seed_repository_legacy_schema_v8_at(&second_repository)?;
+    Connection::open(&legacy_database)?.execute(
+        "INSERT INTO sessions(\
+             session_id, schema_version, revision, title, state, created_at, updated_at\
+         ) VALUES (?1, '1.0', 0, 'second workspace', 'planning', ?2, ?2)",
+        params![
+            "01987d4e-2a54-7000-8000-000000000101",
+            "2026-08-02T00:00:00Z"
+        ],
+    )?;
+    let source_before = sqlite_family_content_snapshot(&legacy_database)?;
+
+    let status = fixture.colay_in(&second_repository, ["--json", "status"])?;
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(
+        sqlite_family_content_snapshot(&legacy_database)?,
+        source_before
+    );
+
+    let connection = Connection::open_with_flags(
+        fixture.global_database(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM legacy_imports", [], |row| row
+            .get::<_, i64>(0))?,
+        1,
+        "workspace.register must durably finish the second workspace import before replying"
+    );
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM workspaces", [], |row| row
+            .get::<_, i64>(0))?,
+        2
+    );
+    assert_eq!(
+        connection.query_row("SELECT count(*) FROM workspace_paths", [], |row| row
+            .get::<_, i64>(0))?,
+        2
+    );
+    let (workspace_id, source_fingerprint, manifest_hash, result_json): (
+        String,
+        String,
+        String,
+        String,
+    ) = connection.query_row(
+        "SELECT workspace_id, source_fingerprint, manifest_hash, result_json \
+         FROM legacy_imports LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let result: LegacyImportResult = serde_json::from_str(&result_json)?;
+    assert!(result.imported);
+    assert_eq!(result.workspace_id.to_string(), workspace_id);
+    assert_eq!(result.source_fingerprint, source_fingerprint);
+    assert_eq!(result.manifest_hash, manifest_hash);
+    let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
+        fixture.colay_home.clone(),
+    )?)?;
+    assert_eq!(
+        result.published_path,
+        paths
+            .for_workspace(result.workspace_id)
+            .root
+            .join("imports")
+            .join(&source_fingerprint)
+    );
+    assert!(result.published_path.join("legacy.db").is_file());
+    let inspections = fs::read_to_string(marker)?
+        .lines()
+        .filter(|line| *line == "legacy-inspect")
+        .count();
+    assert_eq!(
+        inspections, 2,
+        "an incumbent registration must inspect once for planning and once for sealed-plan apply"
     );
     Ok(())
 }

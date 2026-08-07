@@ -70,7 +70,10 @@ pub use leases::{
     WorkerLeaseMode, WorkerLeaseRequest,
 };
 /// Legacy repository import inspection, application, and completion-query types.
-pub use legacy_import::{LegacyImportPlan, LegacyImportResult, LegacyImporter};
+pub use legacy_import::{
+    LegacyImportPlan, LegacyImportResult, LegacyImporter, PreparedLegacyImport,
+    PreparedLegacyInspection,
+};
 pub use migrations::{
     AppliedMigration, MigrationManager, MigrationPlan, MigrationStatus,
     ROLLBACK_PLAN_SCHEMA_VERSION, RollbackApplyResult, RollbackPlan, STATE_SCHEMA_VERSION,

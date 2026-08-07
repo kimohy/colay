@@ -6,6 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-fixtures = []
+
 [dependencies]
 chrono.workspace = true
 chrono-tz.workspace = true
@@ -23,8 +27,14 @@ thiserror.workspace = true
 toml_edit.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+orchestrator-windows-ipc = { path = "../orchestrator-windows-ipc" }
+
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+orchestrator-windows-ipc = { path = "../orchestrator-windows-ipc", features = ["test-support"] }
 
 [lints]
 workspace = true

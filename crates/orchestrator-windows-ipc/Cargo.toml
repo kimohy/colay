@@ -6,6 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 tokio.workspace = true
 windows-sys = { workspace = true, features = [

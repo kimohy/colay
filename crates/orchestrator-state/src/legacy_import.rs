@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -17,6 +18,7 @@ use orchestrator_domain::{
     canonical_sha256, task_graph_proposal_hash,
 };
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension as _, Transaction, params};
+use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -31,6 +33,28 @@ use crate::{
 const LAST_LEGACY_SCHEMA_VERSION: u32 = 13;
 const RESERVED_LEGACY_WORKSPACE: &str = "00000000-0000-0000-0000-000000000001";
 const SOURCE_SNAPSHOT_NAME: &str = "legacy.db";
+
+#[cfg(feature = "test-fixtures")]
+thread_local! {
+    static TEST_INSPECTION_COUNTS: std::cell::Cell<(u32, u32)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[cfg(feature = "test-fixtures")]
+static TEST_INSPECTION_EVENT_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "test-fixtures")]
+type ManifestHook = Box<dyn FnOnce() -> std::io::Result<()> + 'static>;
+
+#[cfg(feature = "test-fixtures")]
+thread_local! {
+    static MANIFEST_ENUMERATION_HOOK: std::cell::RefCell<Option<ManifestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static MANIFEST_POST_READ_HOOK: std::cell::RefCell<Option<ManifestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 const REWRITE_TRIGGERS: &[(&str, &str)] = &[
     (
@@ -168,6 +192,29 @@ struct ManifestFile {
     byte_length: u64,
 }
 
+struct GuardedManifestFile {
+    relative_path: PathBuf,
+    guard: SourceOpenGuard,
+}
+
+struct GuardedManifestDirectory {
+    path: PathBuf,
+    handle: Handle,
+}
+
+struct GuardedManifestSource {
+    directories: Vec<GuardedManifestDirectory>,
+    directory_paths: BTreeSet<PathBuf>,
+    absent_paths: BTreeSet<PathBuf>,
+    artifact_paths: BTreeSet<PathBuf>,
+    file_paths: BTreeSet<PathBuf>,
+}
+
+struct GuardedManifestFiles {
+    source: GuardedManifestSource,
+    files: Vec<GuardedManifestFile>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LegacyEventEvidence {
     count: u64,
@@ -222,21 +269,151 @@ pub struct LegacyImportResult {
     pub imported_at: DateTime<Utc>,
 }
 
+/// Owns one fully validated legacy inspection and its sealed private snapshots.
+///
+/// The value is intentionally opaque, non-cloneable, and non-serializable. It must be consumed by
+/// [`LegacyImporter::prepare_inspection`] or dropped, which releases only its owned inspection
+/// attempt.
+#[must_use = "a prepared legacy inspection must be prepared or explicitly dropped"]
+pub struct PreparedLegacyInspection {
+    plan: LegacyImportPlan,
+    expected_paths: GlobalStatePaths,
+    scratch_fingerprint: String,
+    scratch: LegacyImportScratch,
+    canonical_root: PathBuf,
+    canonical_database: PathBuf,
+    source_identity_hash: String,
+    validated_path: PathBuf,
+    migrated_path: PathBuf,
+    migrated_sha256: String,
+    migrated_length: u64,
+}
+
+/// Owns a sealed legacy import's private scratch and staging until authoritative commit or drop.
+///
+/// The value is intentionally opaque and non-cloneable. It contains no live `SQLite` connection;
+/// dropping an uncommitted value releases its file locks and removes only its owned temporary
+/// artifacts.
+#[must_use = "a prepared legacy import must be committed or explicitly dropped"]
+pub struct PreparedLegacyImport {
+    target: WorkspaceId,
+    plan: LegacyImportPlan,
+    expected_paths: GlobalStatePaths,
+    state: PreparedLegacyImportState,
+}
+
+impl PreparedLegacyImport {
+    /// Injects a deterministic failure after atomic publication and before `SQLite` commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this value represents only a completed-import replay.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn inject_post_publish_precommit_failure_for_test(&mut self) -> StateResult<()> {
+        let PreparedLegacyImportState::Pending(pending) = &mut self.state else {
+            return Err(StateError::InvalidRecord(
+                "cannot inject a commit failure into a replayed legacy import".to_owned(),
+            ));
+        };
+        pending.fail_after_publish_before_commit = true;
+        Ok(())
+    }
+}
+
+enum PreparedLegacyImportState {
+    Replay,
+    Pending(Box<PendingLegacyImport>),
+}
+
+struct PendingLegacyImport {
+    _scratch: PreparedLegacyScratch,
+    staging: LegacyImportStaging,
+    rewrite_path: PathBuf,
+    published_path: PathBuf,
+    #[cfg(feature = "test-fixtures")]
+    fail_after_publish_before_commit: bool,
+}
+
+enum PreparedLegacyScratch {
+    Shared(LegacyImportScratch),
+    Distinct {
+        _inspection: LegacyImportScratch,
+        preparation: LegacyImportScratch,
+    },
+}
+
+impl PreparedLegacyScratch {
+    fn preparation_path(&self) -> &Path {
+        match self {
+            Self::Shared(scratch) => scratch.path(),
+            Self::Distinct { preparation, .. } => preparation.path(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LegacyImporter;
 
 impl LegacyImporter {
+    /// Resets the current thread's inspection/migration counters.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn reset_inspection_counts_for_test() {
+        TEST_INSPECTION_COUNTS.with(|counts| counts.set((0, 0)));
+    }
+
+    /// Returns `(genuine inspections, full migrations)` for the current thread.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inspection_counts_for_test() -> (u32, u32) {
+        TEST_INSPECTION_COUNTS.with(std::cell::Cell::get)
+    }
+
+    /// Installs a one-shot hook immediately after the initial pass-2 manifest enumeration.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn set_manifest_enumeration_hook_for_test(
+        hook: impl FnOnce() -> std::io::Result<()> + 'static,
+    ) {
+        MANIFEST_ENUMERATION_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Installs a one-shot hook immediately after all pass-2 manifest source reads.
+    #[cfg(feature = "test-fixtures")]
+    #[doc(hidden)]
+    pub fn set_manifest_post_read_hook_for_test(
+        hook: impl FnOnce() -> std::io::Result<()> + 'static,
+    ) {
+        MANIFEST_POST_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
     /// Inspects only the explicitly supplied repository-local state store. The source connection
     /// is read-only; migration and validation operate against online-backup copies.
     pub fn inspect(
         source: &RepositoryStatePaths,
         paths: &GlobalStatePaths,
     ) -> StateResult<Option<LegacyImportPlan>> {
-        if !source.database.exists() {
-            return Ok(None);
+        Ok(Self::inspect_for_prepare(source, paths)?.map(|inspection| inspection.plan.clone()))
+    }
+
+    /// Performs one full semantic inspection and retains its sealed private snapshots for
+    /// [`Self::prepare_inspection`].
+    pub fn inspect_for_prepare(
+        source: &RepositoryStatePaths,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<Option<PreparedLegacyInspection>> {
+        match fs::symlink_metadata(&source.database) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StateError::io(&source.database, error)),
         }
+        #[cfg(feature = "test-fixtures")]
+        record_legacy_inspection_marker()?;
         let family = GuardedSqliteFamily::open(&source.root, &source.database)?;
         let canonical_root = family.canonical_root().to_path_buf();
+        let canonical_database = family.canonical_database().to_path_buf();
         let scratch_fingerprint =
             inspection_scratch_fingerprint(family.canonical_root(), family.canonical_database());
         let scratch = LegacyImportScratch::acquire(paths, &scratch_fingerprint)?;
@@ -287,13 +464,18 @@ impl LegacyImporter {
             b"colay/legacy-source-root/v1\0",
             canonical_root.to_string_lossy().as_bytes(),
         );
+        #[cfg(feature = "test-fixtures")]
+        record_attributed_legacy_inspection_marker(&source_root_hash)?;
         let source_fingerprint = source_fingerprint(
             status.current_version,
             &source_identity_hash,
             &logical_content_hash,
             &files,
         );
-        Ok(Some(LegacyImportPlan {
+        drop(migrated);
+        let migrated_sha256 = sha256_file(&migrated_path)?;
+        let migrated_length = file_length(&migrated_path)?;
+        let plan = LegacyImportPlan {
             source: source.clone(),
             source_schema_version: status.current_version,
             source_fingerprint,
@@ -305,6 +487,19 @@ impl LegacyImporter {
             files,
             copied_imported_rows,
             merged_imported_rows,
+        };
+        Ok(Some(PreparedLegacyInspection {
+            plan,
+            expected_paths: paths.clone(),
+            scratch_fingerprint,
+            scratch,
+            canonical_root,
+            canonical_database,
+            source_identity_hash,
+            validated_path: validated_snapshot,
+            migrated_path,
+            migrated_sha256,
+            migrated_length,
         }))
     }
 
@@ -326,15 +521,17 @@ impl LegacyImporter {
         Ok(result)
     }
 
-    /// Imports a sealed plan into one registry-selected workspace. All database rows and the
-    /// ledger entry share one transaction; staged files are atomically renamed before commit and
-    /// removed automatically if that commit fails.
-    pub fn apply(
+    /// Performs source-local reinspection, capture, validation, migration, rewrite, and staging.
+    ///
+    /// The returned opaque value owns every cleanup guard required by [`Self::commit`]. Shared
+    /// target state is read only for an early replay check; commit repeats every authoritative
+    /// target, schema, and ledger check before mutation.
+    pub fn prepare(
         global: &Database,
         target: WorkspaceId,
         plan: &LegacyImportPlan,
         paths: &GlobalStatePaths,
-    ) -> StateResult<LegacyImportResult> {
+    ) -> StateResult<PreparedLegacyImport> {
         if global.path() != paths.database {
             return Err(StateError::InvalidRecord(
                 "legacy import database does not match the supplied global state paths".to_owned(),
@@ -343,54 +540,160 @@ impl LegacyImporter {
         ensure_target_database(global, target)?;
         if let Some(existing) = load_existing_result(global, target, plan)? {
             validate_published_import(&existing, target, paths)?;
-            return Ok(replayed_apply_result(existing));
+            return Ok(PreparedLegacyImport {
+                target,
+                plan: plan.clone(),
+                expected_paths: paths.clone(),
+                state: PreparedLegacyImportState::Replay,
+            });
         }
-        let inspected = Self::inspect(&plan.source, paths)?.ok_or_else(|| {
+        let inspection = Self::inspect_for_prepare(&plan.source, paths)?.ok_or_else(|| {
             StateError::InvalidRecord("legacy source disappeared before import".to_owned())
         })?;
-        ensure_plan_unchanged(plan, &inspected)?;
-        let scratch = LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?;
+        ensure_plan_unchanged(plan, &inspection.plan)?;
+        Self::prepare_inspection(global, target, inspection, paths)
+    }
+
+    /// Consumes a retained semantic inspection, performs a fresh byte-exact source inspection,
+    /// and prepares private rewrite and publication staging for authoritative commit.
+    pub fn prepare_inspection(
+        global: &Database,
+        target: WorkspaceId,
+        inspection: PreparedLegacyInspection,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<PreparedLegacyImport> {
+        if global.path() != paths.database || inspection.expected_paths != *paths {
+            return Err(StateError::InvalidRecord(
+                "legacy import global state paths do not match the inspected durability context"
+                    .to_owned(),
+            ));
+        }
+        ensure_target_database(global, target)?;
+        if let Some(existing) = load_existing_result(global, target, &inspection.plan)? {
+            validate_published_import(&existing, target, paths)?;
+            return Ok(PreparedLegacyImport {
+                target,
+                plan: inspection.plan.clone(),
+                expected_paths: paths.clone(),
+                state: PreparedLegacyImportState::Replay,
+            });
+        }
+
+        let PreparedLegacyInspection {
+            plan,
+            expected_paths: _,
+            scratch_fingerprint,
+            scratch: inspection_scratch,
+            canonical_root,
+            canonical_database,
+            source_identity_hash,
+            validated_path,
+            migrated_path,
+            migrated_sha256,
+            migrated_length,
+        } = inspection;
+        verify_file(&validated_path, &plan.database_sha256, plan.database_length)?;
+        verify_file(&migrated_path, &migrated_sha256, migrated_length)?;
+        let scratch = if scratch_fingerprint == plan.source_fingerprint {
+            PreparedLegacyScratch::Shared(inspection_scratch)
+        } else {
+            PreparedLegacyScratch::Distinct {
+                _inspection: inspection_scratch,
+                preparation: LegacyImportScratch::acquire(paths, &plan.source_fingerprint)?,
+            }
+        };
 
         let workspace_paths = paths.for_workspace(target);
-        let mut staging =
+        let staging =
             LegacyImportStaging::acquire(&workspace_paths.root, &plan.source_fingerprint)?;
-        if let Some(existing) = load_existing_result(global, target, plan)? {
+        if let Some(existing) = load_existing_result(global, target, &plan)? {
+            validate_published_import(&existing, target, paths)?;
+            return Ok(PreparedLegacyImport {
+                target,
+                plan,
+                expected_paths: paths.clone(),
+                state: PreparedLegacyImportState::Replay,
+            });
+        }
+        staging.prepare()?;
+        capture_staged_database(
+            &plan,
+            scratch.preparation_path(),
+            &staging,
+            &canonical_root,
+            &canonical_database,
+            &source_identity_hash,
+        )?;
+        verify_file(&migrated_path, &migrated_sha256, migrated_length)?;
+        stage_guarded_source_files(&plan, &migrated_path, &staging)?;
+
+        verify_file(&migrated_path, &migrated_sha256, migrated_length)?;
+        let rewrite_path = scratch.preparation_path().join("rewrite.db");
+        prepare_rewrite_scratch(
+            &migrated_path,
+            &rewrite_path,
+            &migrated_sha256,
+            migrated_length,
+        )?;
+        let published_path = staging.published_path().to_path_buf();
+
+        Ok(PreparedLegacyImport {
+            target,
+            plan,
+            expected_paths: paths.clone(),
+            state: PreparedLegacyImportState::Pending(Box::new(PendingLegacyImport {
+                _scratch: scratch,
+                staging,
+                rewrite_path,
+                published_path,
+                #[cfg(feature = "test-fixtures")]
+                fail_after_publish_before_commit: false,
+            })),
+        })
+    }
+
+    /// Authoritatively rechecks and consumes a prepared import under the shared-state writer.
+    ///
+    /// All database rows, append-only audit evidence, the import ledger, and atomic publication
+    /// share the existing transaction and rollback behavior.
+    pub fn commit(
+        global: &Database,
+        prepared: PreparedLegacyImport,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<LegacyImportResult> {
+        let PreparedLegacyImport {
+            target,
+            plan,
+            expected_paths,
+            state,
+        } = prepared;
+        if global.path() != paths.database || expected_paths != *paths {
+            return Err(StateError::InvalidRecord(
+                "legacy import global state paths do not match the prepared durability context"
+                    .to_owned(),
+            ));
+        }
+        ensure_target_database(global, target)?;
+        if let Some(existing) = load_existing_result(global, target, &plan)? {
             validate_published_import(&existing, target, paths)?;
             return Ok(replayed_apply_result(existing));
         }
-        staging.prepare()?;
-        let staged_database = capture_staged_database(plan, &scratch, &staging)?;
-        for file in &plan.files {
-            let source_file = SourceOpenGuard::open(
-                &plan.source.root,
-                &plan.source.root.join(&file.relative_path),
-            )?;
-            let bytes = source_file.read_all()?;
-            staging.stage_verified_bytes(
-                &file.relative_path,
-                &bytes,
-                &file.sha256,
-                file.byte_length,
-            )?;
-        }
-        let staged_files = manifest_files_below(staging.root(), Some(SOURCE_SNAPSHOT_NAME))?;
-        let staged_manifest =
-            manifest_hash(&plan.database_sha256, plan.database_length, &staged_files);
-        if staged_manifest != plan.manifest_hash {
+        let PreparedLegacyImportState::Pending(pending) = state else {
             return Err(StateError::InvalidRecord(
-                "legacy import staging manifest differs from inspected source".to_owned(),
+                "prepared legacy import replay disappeared before authoritative commit".to_owned(),
             ));
-        }
+        };
+        let PendingLegacyImport {
+            _scratch,
+            mut staging,
+            rewrite_path,
+            published_path,
+            #[cfg(feature = "test-fixtures")]
+            fail_after_publish_before_commit,
+        } = *pending;
+        #[cfg(not(feature = "test-fixtures"))]
+        let fail_after_publish_before_commit = false;
 
-        let migrated_path = scratch.path().join("migrated.db");
-        let migrated = migrate_snapshot(&staged_database, &migrated_path)?;
-        validate_event_chain(&migrated)?;
-        validate_source_documents(&migrated)?;
-        drop(migrated);
-        let rewrite_path = scratch.path().join("rewrite.db");
-        prepare_rewrite_scratch(&migrated_path, &rewrite_path)?;
-
-        let published_path = staging.published_path().to_path_buf();
         let imported_at = Utc::now();
         let mut connection = global.raw_lock()?;
         let rewrite_path_text = rewrite_path.to_str().ok_or_else(|| {
@@ -406,10 +709,11 @@ impl LegacyImporter {
         let transaction_result = apply_transaction(
             &mut connection,
             target,
-            plan,
+            &plan,
             &published_path,
             imported_at,
             &mut staging,
+            fail_after_publish_before_commit,
         );
         let detach_result = connection.execute_batch("DETACH DATABASE legacy_import_source;");
         let result = transaction_result?;
@@ -419,6 +723,57 @@ impl LegacyImporter {
         detach_result?;
         Ok(result)
     }
+
+    /// Imports a sealed plan into one registry-selected workspace. This compatibility wrapper
+    /// preserves the original synchronous bootstrap behavior.
+    pub fn apply(
+        global: &Database,
+        target: WorkspaceId,
+        plan: &LegacyImportPlan,
+        paths: &GlobalStatePaths,
+    ) -> StateResult<LegacyImportResult> {
+        let prepared = Self::prepare(global, target, plan, paths)?;
+        Self::commit(global, prepared, paths)
+    }
+}
+
+fn stage_guarded_source_files(
+    plan: &LegacyImportPlan,
+    migrated_path: &Path,
+    staging: &LegacyImportStaging,
+) -> StateResult<()> {
+    let migrated = open_snapshot_read_only(migrated_path)?;
+    validate_integrity(&migrated, "retained migrated legacy snapshot")?;
+    let events = validate_event_chain(&migrated)?;
+    if event_evidence(&events)? != plan.event_evidence {
+        return Err(StateError::InvalidRecord(
+            "retained migrated legacy event evidence differs from its inspection seal".to_owned(),
+        ));
+    }
+    validate_source_documents(&migrated)?;
+    let guarded_files = guard_manifest_files(&plan.source, &migrated, &plan.files)?;
+    drop(migrated);
+    verify_manifest_files_unchanged(&plan.source, &guarded_files, &plan.files)?;
+    for (guarded, file) in guarded_files.files.iter().zip(&plan.files) {
+        let bytes = guarded.guard.read_all()?;
+        staging.stage_verified_bytes(
+            &guarded.relative_path,
+            &bytes,
+            &file.sha256,
+            file.byte_length,
+        )?;
+    }
+    #[cfg(feature = "test-fixtures")]
+    run_manifest_post_read_hook(&plan.source.root)?;
+    verify_manifest_files_unchanged(&plan.source, &guarded_files, &plan.files)?;
+    let staged_files = manifest_files_below(staging.root(), Some(SOURCE_SNAPSHOT_NAME))?;
+    let staged_manifest = manifest_hash(&plan.database_sha256, plan.database_length, &staged_files);
+    if staged_manifest != plan.manifest_hash {
+        return Err(StateError::InvalidRecord(
+            "legacy import staging manifest differs from inspected source".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn backup_import_target(
@@ -446,7 +801,10 @@ fn apply_transaction(
     published_path: &Path,
     imported_at: DateTime<Utc>,
     staging: &mut LegacyImportStaging,
+    fail_after_publish_before_commit: bool,
 ) -> StateResult<LegacyImportResult> {
+    #[cfg(not(feature = "test-fixtures"))]
+    let _ = fail_after_publish_before_commit;
     let transaction = connection.transaction()?;
     if let Some(existing) = load_existing_result_in(&transaction, target, plan)? {
         return Ok(replayed_apply_result(existing));
@@ -500,6 +858,12 @@ fn apply_transaction(
     };
     record_import_ledger(&transaction, target, plan, &result, id_mappings)?;
     staging.publish()?;
+    #[cfg(feature = "test-fixtures")]
+    if fail_after_publish_before_commit {
+        return Err(StateError::RollbackGuard(
+            "injected legacy import post-publish/pre-commit failure".to_owned(),
+        ));
+    }
     transaction.commit()?;
     Ok(result)
 }
@@ -2524,11 +2888,32 @@ fn ensure_plan_unchanged(
 
 fn capture_staged_database(
     plan: &LegacyImportPlan,
-    scratch: &LegacyImportScratch,
+    scratch: &Path,
     staging: &LegacyImportStaging,
+    expected_canonical_root: &Path,
+    expected_canonical_database: &Path,
+    expected_source_identity_hash: &str,
 ) -> StateResult<PathBuf> {
     let family = GuardedSqliteFamily::open(&plan.source.root, &plan.source.database)?;
-    let captured_source = scratch.path().join("source.db");
+    let canonical_root = family.canonical_root().to_path_buf();
+    let canonical_database = family.canonical_database().to_path_buf();
+    let source_root_hash = hash_domain(
+        b"colay/legacy-source-root/v1\0",
+        canonical_root.to_string_lossy().as_bytes(),
+    );
+    if canonical_root != expected_canonical_root
+        || canonical_database != expected_canonical_database
+        || source_root_hash != plan.source_root_hash
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source canonical context changed after inspection".to_owned(),
+        ));
+    }
+    #[cfg(feature = "test-fixtures")]
+    record_legacy_inspection_marker()?;
+    #[cfg(feature = "test-fixtures")]
+    record_attributed_legacy_inspection_marker(&plan.source_root_hash)?;
+    let captured_source = scratch.join("fresh-source.db");
     family.capture(&captured_source)?;
     drop(family);
 
@@ -2547,7 +2932,13 @@ fn capture_staged_database(
     }
     validate_integrity(&source, "legacy source")?;
     reject_live_legacy_daemon(&source, status.current_version)?;
-    let _ = source_identity_hash(&source)?;
+    if status.current_version != plan.source_schema_version
+        || source_identity_hash(&source)? != expected_source_identity_hash
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source identity changed after inspection".to_owned(),
+        ));
+    }
 
     let staged_database = staging.root().join(SOURCE_SNAPSHOT_NAME);
     backup_stable_source(&source, &staged_database)?;
@@ -2634,6 +3025,11 @@ fn backup_stable_source(source: &Connection, destination: &Path) -> StateResult<
 }
 
 fn migrate_snapshot(source: &Path, destination: &Path) -> StateResult<Connection> {
+    #[cfg(feature = "test-fixtures")]
+    TEST_INSPECTION_COUNTS.with(|counts| {
+        let (inspections, migrations) = counts.get();
+        counts.set((inspections, migrations.saturating_add(1)));
+    });
     fs::copy(source, destination).map_err(|error| StateError::io(destination, error))?;
     ensure_private_file(destination)?;
     let mut connection = Connection::open(destination)?;
@@ -2644,12 +3040,18 @@ fn migrate_snapshot(source: &Path, destination: &Path) -> StateResult<Connection
     Ok(connection)
 }
 
-fn prepare_rewrite_scratch(validated: &Path, scratch: &Path) -> StateResult<()> {
+fn prepare_rewrite_scratch(
+    validated: &Path,
+    scratch: &Path,
+    expected_sha256: &str,
+    expected_length: u64,
+) -> StateResult<()> {
     if scratch.exists() {
         return Err(StateError::ArtifactConflict(scratch.to_path_buf()));
     }
     fs::copy(validated, scratch).map_err(|error| StateError::io(scratch, error))?;
     ensure_private_file(scratch)?;
+    verify_file(scratch, expected_sha256, expected_length)?;
     let connection = Connection::open(scratch)?;
     connection.execute_batch("PRAGMA journal_mode = DELETE;")?;
     validate_integrity(&connection, "legacy rewrite scratch before trigger removal")?;
@@ -2931,12 +3333,18 @@ fn collect_manifest_files(
 ) -> StateResult<Vec<ManifestFile>> {
     let mut relative_paths = BTreeSet::new();
     for directory in [&source.tasks, &source.checkpoints, &source.handovers] {
-        if directory.exists() {
-            collect_relative_files(&source.root, directory, &mut relative_paths)?;
+        match fs::symlink_metadata(directory) {
+            Ok(_) => collect_relative_files(&source.root, directory, &mut relative_paths)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(StateError::io(directory, error)),
         }
     }
-    if source.events.exists() {
-        relative_paths.insert(relative_from_root(&source.root, &source.events)?);
+    match fs::symlink_metadata(&source.events) {
+        Ok(_) => {
+            relative_paths.insert(relative_from_root(&source.root, &source.events)?);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(StateError::io(&source.events, error)),
     }
     let mut statement = migrated.prepare(
         "SELECT relative_path, sha256, byte_length FROM artifacts \
@@ -2977,6 +3385,365 @@ fn collect_manifest_files(
         .into_iter()
         .map(|relative_path| manifest_file(&source.root, relative_path))
         .collect()
+}
+
+fn guard_manifest_files(
+    source: &RepositoryStatePaths,
+    migrated: &Connection,
+    expected: &[ManifestFile],
+) -> StateResult<GuardedManifestFiles> {
+    let mut guarded_source = GuardedManifestSource::enumerate(source)?;
+    let mut statement = migrated.prepare(
+        "SELECT relative_path, sha256, byte_length FROM artifacts \
+         WHERE workspace_id = ?1 ORDER BY relative_path",
+    )?;
+    let rows = statement.query_map([RESERVED_LEGACY_WORKSPACE], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let expected_by_path = expected
+        .iter()
+        .map(|file| (file.relative_path.clone(), file))
+        .collect::<BTreeMap<_, _>>();
+    for row in rows {
+        let (path, stored_sha256, stored_length) = row?;
+        let path = RepoPath::try_from(path).map_err(|error| {
+            StateError::InvalidRecord(format!("legacy artifact path is unsafe: {error}"))
+        })?;
+        let relative_path = PathBuf::from(path.to_string());
+        let stored_length = u64::try_from(stored_length).map_err(|_| {
+            StateError::InvalidRecord(format!(
+                "legacy artifact metadata has a negative byte length: {path}"
+            ))
+        })?;
+        let expected_file = expected_by_path.get(&relative_path).ok_or_else(|| {
+            StateError::InvalidRecord("legacy source file set changed after inspection".to_owned())
+        })?;
+        if expected_file.sha256 != stored_sha256 || expected_file.byte_length != stored_length {
+            return Err(StateError::InvalidRecord(format!(
+                "legacy artifact metadata changed after inspection: {path}"
+            )));
+        }
+        guarded_source.artifact_paths.insert(relative_path.clone());
+        guarded_source.file_paths.insert(relative_path);
+    }
+    if guarded_source
+        .file_paths
+        .contains(Path::new(SOURCE_SNAPSHOT_NAME))
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy artifact path collides with reserved import snapshot name".to_owned(),
+        ));
+    }
+    let expected_paths = expected
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    if guarded_source.file_paths != expected_paths || expected_paths.len() != expected.len() {
+        return Err(StateError::InvalidRecord(
+            "legacy source file set changed after inspection".to_owned(),
+        ));
+    }
+    #[cfg(feature = "test-fixtures")]
+    run_manifest_enumeration_hook(&source.root)?;
+    let files = expected
+        .iter()
+        .map(|relative_path| {
+            let relative_path = relative_path.relative_path.clone();
+            let guard = SourceOpenGuard::open(&source.root, &source.root.join(&relative_path))?;
+            Ok(GuardedManifestFile {
+                relative_path,
+                guard,
+            })
+        })
+        .collect::<StateResult<Vec<_>>>()?;
+    let guarded_files = GuardedManifestFiles {
+        source: guarded_source,
+        files,
+    };
+    verify_manifest_files_unchanged(source, &guarded_files, expected)?;
+    Ok(guarded_files)
+}
+
+impl GuardedManifestDirectory {
+    fn open(path: &Path) -> StateResult<Self> {
+        validate_manifest_directory(path)?;
+        let before = manifest_directory_identity(path)?;
+        let handle = manifest_directory_identity(path)?;
+        validate_manifest_directory(path)?;
+        let after = manifest_directory_identity(path)?;
+        if before != handle || handle != after {
+            return Err(StateError::SymlinkEscape(path.to_path_buf()));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            handle,
+        })
+    }
+
+    fn revalidate(&self) -> StateResult<()> {
+        validate_manifest_directory(&self.path)?;
+        if manifest_directory_identity(&self.path)? != self.handle {
+            return Err(StateError::SymlinkEscape(self.path.clone()));
+        }
+        Ok(())
+    }
+}
+
+impl GuardedManifestSource {
+    fn enumerate(source: &RepositoryStatePaths) -> StateResult<Self> {
+        let mut guarded = Self {
+            directories: Vec::new(),
+            directory_paths: BTreeSet::new(),
+            absent_paths: BTreeSet::new(),
+            artifact_paths: BTreeSet::new(),
+            file_paths: BTreeSet::new(),
+        };
+        guarded.guard_directory(&source.root)?;
+        for directory in [&source.tasks, &source.checkpoints, &source.handovers] {
+            guarded.enumerate_optional_directory(&source.root, directory)?;
+        }
+        guarded.enumerate_optional_file(&source.root, &source.events)?;
+        guarded.revalidate()?;
+        Ok(guarded)
+    }
+
+    fn enumerate_optional_directory(&mut self, root: &Path, path: &Path) -> StateResult<()> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => self.collect_directory(root, path),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.absent_paths.insert(path.to_path_buf());
+                Ok(())
+            }
+            Err(error) => Err(StateError::io(path, error)),
+        }
+    }
+
+    fn enumerate_optional_file(&mut self, root: &Path, path: &Path) -> StateResult<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                reject_symlink_components(path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(StateError::InvalidRecord(format!(
+                        "legacy monitored source has an unexpected file type: {}",
+                        path.display()
+                    )));
+                }
+                self.file_paths.insert(relative_from_root(root, path)?);
+                Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.absent_paths.insert(path.to_path_buf());
+                Ok(())
+            }
+            Err(error) => Err(StateError::io(path, error)),
+        }
+    }
+
+    fn collect_directory(&mut self, root: &Path, directory: &Path) -> StateResult<()> {
+        self.guard_directory(directory)?;
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| StateError::io(directory, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StateError::io(directory, error))?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            reject_symlink_components(&path)?;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| StateError::io(&path, error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(StateError::SymlinkEscape(path));
+            }
+            if metadata.is_dir() {
+                self.collect_directory(root, &path)?;
+            } else if metadata.is_file() {
+                self.file_paths.insert(relative_from_root(root, &path)?);
+            } else {
+                return Err(StateError::InvalidRecord(format!(
+                    "legacy import encountered a non-regular file: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn guard_directory(&mut self, path: &Path) -> StateResult<()> {
+        self.directories.push(GuardedManifestDirectory::open(path)?);
+        self.directory_paths.insert(path.to_path_buf());
+        Ok(())
+    }
+
+    fn revalidate(&self) -> StateResult<()> {
+        for directory in &self.directories {
+            directory.revalidate()?;
+        }
+        for path in &self.absent_paths {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Ok(_) => {
+                    reject_symlink_components(path)?;
+                    return Err(StateError::InvalidRecord(format!(
+                        "legacy monitored source path appeared after inspection: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) => return Err(StateError::io(path, error)),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn verify_manifest_files_unchanged(
+    source: &RepositoryStatePaths,
+    guarded: &GuardedManifestFiles,
+    expected: &[ManifestFile],
+) -> StateResult<()> {
+    guarded.source.revalidate()?;
+    let guarded_by_path = guarded
+        .files
+        .iter()
+        .map(|file| (file.relative_path.as_path(), file))
+        .collect::<BTreeMap<_, _>>();
+    let expected_by_path = expected
+        .iter()
+        .map(|file| (file.relative_path.as_path(), file))
+        .collect::<BTreeMap<_, _>>();
+    if guarded_by_path.len() != guarded.files.len()
+        || expected_by_path.len() != expected.len()
+        || guarded_by_path.keys().ne(expected_by_path.keys())
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source file set changed after inspection".to_owned(),
+        ));
+    }
+    let mut observed = GuardedManifestSource::enumerate(source)?;
+    for artifact_path in &guarded.source.artifact_paths {
+        let guarded_file = guarded_by_path
+            .get(artifact_path.as_path())
+            .ok_or_else(|| {
+                StateError::InvalidRecord(
+                    "legacy source file set changed after inspection".to_owned(),
+                )
+            })?;
+        revalidate_guarded_manifest_file(source, guarded_file)?;
+        observed.artifact_paths.insert(artifact_path.clone());
+        observed.file_paths.insert(artifact_path.clone());
+    }
+    if observed.directory_paths != guarded.source.directory_paths
+        || observed.absent_paths != guarded.source.absent_paths
+        || observed.file_paths != guarded.source.file_paths
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy source file set changed after inspection".to_owned(),
+        ));
+    }
+    observed.revalidate()?;
+    guarded.source.revalidate()?;
+    for guarded_file in &guarded.files {
+        revalidate_guarded_manifest_file(source, guarded_file)?;
+        let expected_file = expected_by_path
+            .get(guarded_file.relative_path.as_path())
+            .ok_or_else(|| {
+                StateError::InvalidRecord(
+                    "legacy source file set changed after inspection".to_owned(),
+                )
+            })?;
+        let bytes = guarded_file.guard.read_all()?;
+        let byte_length = u64::try_from(bytes.len()).map_err(|_| {
+            StateError::InvalidRecord(format!(
+                "legacy source file is too large: {}",
+                guarded_file.relative_path.display()
+            ))
+        })?;
+        if byte_length != expected_file.byte_length
+            || hex::encode(Sha256::digest(&bytes)) != expected_file.sha256
+        {
+            return Err(StateError::ArtifactConflict(
+                source.root.join(&guarded_file.relative_path),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn revalidate_guarded_manifest_file(
+    source: &RepositoryStatePaths,
+    guarded: &GuardedManifestFile,
+) -> StateResult<()> {
+    let path = source.root.join(&guarded.relative_path);
+    reject_symlink_components(&path)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| StateError::io(&path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StateError::InvalidRecord(format!(
+            "legacy monitored source has an unexpected file type: {}",
+            path.display()
+        )));
+    }
+    guarded.guard.revalidate()
+}
+
+fn validate_manifest_directory(path: &Path) -> StateResult<()> {
+    reject_symlink_components(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| StateError::io(path, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StateError::InvalidRecord(format!(
+            "legacy monitored source is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn manifest_directory_identity(path: &Path) -> StateResult<Handle> {
+    let file = open_manifest_directory(path).map_err(|error| StateError::io(path, error))?;
+    Handle::from_file(file).map_err(|error| StateError::io(path, error))
+}
+
+#[cfg(not(windows))]
+fn open_manifest_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(windows)]
+fn open_manifest_directory(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options.open(path)
+}
+
+#[cfg(feature = "test-fixtures")]
+fn run_manifest_enumeration_hook(path: &Path) -> StateResult<()> {
+    MANIFEST_ENUMERATION_HOOK.with(|slot| {
+        let Some(hook) = slot.borrow_mut().take() else {
+            return Ok(());
+        };
+        hook().map_err(|error| StateError::io(path, error))
+    })
+}
+
+#[cfg(feature = "test-fixtures")]
+fn run_manifest_post_read_hook(path: &Path) -> StateResult<()> {
+    MANIFEST_POST_READ_HOOK.with(|slot| {
+        let Some(hook) = slot.borrow_mut().take() else {
+            return Ok(());
+        };
+        hook().map_err(|error| StateError::io(path, error))
+    })
 }
 
 fn collect_relative_files(
@@ -3261,6 +4028,507 @@ fn table_exists(connection: &Connection, name: &str) -> StateResult<bool> {
             |row| row.get(0),
         )
         .map_err(StateError::from)
+}
+
+#[cfg(feature = "test-fixtures")]
+fn record_legacy_inspection_marker() -> StateResult<()> {
+    TEST_INSPECTION_COUNTS.with(|counts| {
+        let (inspections, migrations) = counts.get();
+        counts.set((inspections.saturating_add(1), migrations));
+    });
+    let Some(marker) = std::env::var_os("COLAY_TEST_LEGACY_INSPECT_MARKER") else {
+        return Ok(());
+    };
+    let temporary_root = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .ok_or_else(|| {
+            StateError::InvalidRecord(
+                "legacy inspection test marker requires a temporary root".to_owned(),
+            )
+        })?;
+    append_legacy_inspection_marker(&PathBuf::from(marker), &PathBuf::from(temporary_root))
+}
+
+#[cfg(feature = "test-fixtures")]
+fn append_legacy_inspection_marker(marker: &Path, temporary_root: &Path) -> StateResult<()> {
+    if !marker.is_absolute() {
+        return Err(StateError::InvalidRecord(
+            "legacy inspection test marker path must be absolute".to_owned(),
+        ));
+    }
+    let canonical_root =
+        fs::canonicalize(temporary_root).map_err(|error| StateError::io(temporary_root, error))?;
+    let parent = marker.parent().ok_or_else(|| {
+        StateError::InvalidRecord("legacy inspection test marker has no parent".to_owned())
+    })?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| StateError::io(parent, error))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(StateError::InvalidRecord(
+            "legacy inspection test marker is outside the temporary root".to_owned(),
+        ));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(marker)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(StateError::InvalidRecord(
+            "legacy inspection test marker must be a regular file".to_owned(),
+        ));
+    }
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+        .map_err(|error| StateError::io(marker, error))?;
+    std::io::Write::write_all(&mut output, b"legacy-inspect\n")
+        .map_err(|error| StateError::io(marker, error))
+}
+
+#[cfg(feature = "test-fixtures")]
+fn record_attributed_legacy_inspection_marker(source_root_hash: &str) -> StateResult<()> {
+    let marker = std::env::var_os("COLAY_TEST_LEGACY_INSPECT_MARKER_DIR");
+    if marker.is_none() {
+        return Ok(());
+    }
+    let temporary_root = attributed_legacy_inspection_temporary_root();
+    append_attributed_legacy_inspection_marker(
+        marker.as_deref().map(Path::new),
+        &temporary_root,
+        source_root_hash,
+    )
+}
+
+#[cfg(feature = "test-fixtures")]
+fn attributed_legacy_inspection_temporary_root() -> PathBuf {
+    for variable in ["TEMP", "TMP"] {
+        if let Some(root) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            return PathBuf::from(root);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(root) = std::env::var_os("TMPDIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(root);
+    }
+    std::env::temp_dir()
+}
+
+#[cfg(feature = "test-fixtures")]
+fn append_attributed_legacy_inspection_marker(
+    marker: Option<&Path>,
+    temporary_root: &Path,
+    source_root_hash: &str,
+) -> StateResult<()> {
+    let Some(marker) = marker else {
+        return Ok(());
+    };
+    if source_root_hash.len() != 64
+        || !source_root_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection source identity must be an opaque SHA-256".to_owned(),
+        ));
+    }
+    if !marker.is_absolute() {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection test marker directory must be absolute".to_owned(),
+        ));
+    }
+    let canonical_root =
+        fs::canonicalize(temporary_root).map_err(|error| StateError::io(temporary_root, error))?;
+    let marker_suffix = marker.strip_prefix(temporary_root).map_err(|_| {
+        StateError::InvalidRecord(
+            "attributed legacy inspection test marker directory is outside the temporary root"
+                .to_owned(),
+        )
+    })?;
+    validate_marker_descendant(marker_suffix)?;
+    let rebased_marker = canonical_root.join(marker_suffix);
+    reject_marker_descendant_links(&canonical_root, &rebased_marker)?;
+    let canonical_marker = fs::canonicalize(&rebased_marker)
+        .map_err(|error| StateError::io(&rebased_marker, error))?;
+    if canonical_marker == canonical_root || !canonical_marker.starts_with(&canonical_root) {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection test marker directory is outside the temporary root"
+                .to_owned(),
+        ));
+    }
+    if !fs::metadata(&canonical_marker)
+        .map_err(|error| StateError::io(&canonical_marker, error))?
+        .is_dir()
+    {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection test marker must be a directory".to_owned(),
+        ));
+    }
+
+    let source_directory = canonical_marker.join(source_root_hash);
+    reject_marker_descendant_links(&canonical_root, &source_directory)?;
+    match fs::create_dir(&source_directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(StateError::io(&source_directory, error)),
+    }
+    reject_marker_descendant_links(&canonical_root, &source_directory)?;
+    if !fs::metadata(&source_directory)
+        .map_err(|error| StateError::io(&source_directory, error))?
+        .is_dir()
+    {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection source marker must be a directory".to_owned(),
+        ));
+    }
+    let canonical_source = fs::canonicalize(&source_directory)
+        .map_err(|error| StateError::io(&source_directory, error))?;
+    if canonical_source.parent() != Some(canonical_marker.as_path()) {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection source marker escaped its marker directory".to_owned(),
+        ));
+    }
+
+    loop {
+        let sequence =
+            TEST_INSPECTION_EVENT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let event = canonical_source.join(format!("event-{}-{sequence}", std::process::id()));
+        reject_marker_descendant_links(&canonical_root, &event)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&event)
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(StateError::io(event, error)),
+        }
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn validate_marker_descendant(path: &Path) -> StateResult<()> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(StateError::InvalidRecord(
+            "attributed legacy inspection test marker has an unsafe relative path".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-fixtures")]
+fn reject_marker_descendant_links(canonical_root: &Path, path: &Path) -> StateResult<()> {
+    let relative = path.strip_prefix(canonical_root).map_err(|_| {
+        StateError::InvalidRecord(
+            "attributed legacy inspection test marker escaped the temporary root".to_owned(),
+        )
+    })?;
+    validate_marker_descendant(relative)?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(StateError::InvalidRecord(
+                "attributed legacy inspection test marker has an unsafe relative path".to_owned(),
+            ));
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if marker_metadata_is_link_like(&metadata) => {
+                return Err(StateError::InvalidRecord(
+                    "attributed legacy inspection test marker contains a symbolic link or reparse point"
+                        .to_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(StateError::io(&current, error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "test-fixtures", not(windows)))]
+fn marker_metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(all(feature = "test-fixtures", windows))]
+fn marker_metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(all(test, feature = "test-fixtures"))]
+mod legacy_inspection_marker_tests {
+    use std::{fs, thread};
+
+    use super::{
+        append_attributed_legacy_inspection_marker, append_legacy_inspection_marker,
+        attributed_legacy_inspection_temporary_root,
+    };
+
+    #[test]
+    fn legacy_inspection_marker_appends_only_the_fixed_token_below_temp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let marker = root.join("legacy-inspections.log");
+
+        append_legacy_inspection_marker(&marker, &root)?;
+        append_legacy_inspection_marker(&marker, &root)?;
+
+        assert_eq!(
+            fs::read_to_string(marker)?,
+            "legacy-inspect\nlegacy-inspect\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_inspection_marker_rejects_paths_outside_temp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let allowed = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let allowed_root = fs::canonicalize(allowed.path())?;
+        let marker = fs::canonicalize(outside.path())?.join("legacy-inspections.log");
+
+        let Err(error) = append_legacy_inspection_marker(&marker, &allowed_root) else {
+            return Err("marker outside the bounded temporary root was accepted".into());
+        };
+
+        assert!(error.to_string().contains("outside the temporary root"));
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_marker_absence_creates_no_fixture_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+
+        append_attributed_legacy_inspection_marker(None, &root, &"a".repeat(64))?;
+
+        assert!(fs::read_dir(root)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_marker_uses_supported_fallback_when_temp_and_tmp_are_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(unix)]
+        let fallback = tempfile::tempdir()?;
+        let test_executable = std::env::current_exe()?;
+        let mut command = std::process::Command::new(test_executable);
+        command
+            .args([
+                "--exact",
+                "legacy_import::legacy_inspection_marker_tests::attributed_marker_fallback_child",
+                "--test-threads=1",
+            ])
+            .env("COLAY_TEST_RUN_ATTRIBUTED_MARKER_FALLBACK", "1")
+            .env_remove("TEMP")
+            .env_remove("TMP");
+        #[cfg(unix)]
+        command.env("TMPDIR", fallback.path());
+        #[cfg(not(unix))]
+        command.env_remove("TMPDIR");
+
+        let status = command.status()?;
+
+        assert!(status.success());
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_marker_fallback_child() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("COLAY_TEST_RUN_ATTRIBUTED_MARKER_FALLBACK").is_none() {
+            return Ok(());
+        }
+        assert!(std::env::var_os("TEMP").is_none());
+        assert!(std::env::var_os("TMP").is_none());
+        let temporary_root = attributed_legacy_inspection_temporary_root();
+        #[cfg(unix)]
+        assert_eq!(
+            fs::canonicalize(&temporary_root)?,
+            fs::canonicalize(std::env::var_os("TMPDIR").ok_or("TMPDIR was not set")?)?
+        );
+        let marker = tempfile::Builder::new()
+            .prefix("colay-attributed-marker-")
+            .tempdir_in(&temporary_root)?;
+        let source = "e".repeat(64);
+
+        append_attributed_legacy_inspection_marker(Some(marker.path()), &temporary_root, &source)?;
+
+        let events = fs::read_dir(marker.path().join(source))?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(fs::metadata(events[0].path())?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn attributed_marker_accepts_symlink_aliased_temporary_root_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let container = tempfile::tempdir()?;
+        let actual_parent = container.path().join("actual-parent");
+        let actual_root = actual_parent.join("temporary-root");
+        let aliased_parent = container.path().join("aliased-parent");
+        fs::create_dir_all(&actual_root)?;
+        create_directory_link(&actual_parent, &aliased_parent)?;
+        let aliased_root = aliased_parent.join("temporary-root");
+        let marker = aliased_root.join("attributed-markers");
+        fs::create_dir(&marker)?;
+        let source = "f".repeat(64);
+
+        append_attributed_legacy_inspection_marker(Some(&marker), &aliased_root, &source)?;
+
+        let events = fs::read_dir(actual_root.join("attributed-markers").join(source))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(fs::metadata(events[0].path())?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_markers_group_concurrent_empty_events_by_opaque_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let marker = root.join("attributed-legacy-inspections");
+        fs::create_dir(&marker)?;
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+
+        thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let mut handles = Vec::new();
+            for source in [&first, &second, &first, &second] {
+                let marker = &marker;
+                let root = &root;
+                handles.push(scope.spawn(move || {
+                    append_attributed_legacy_inspection_marker(Some(marker), root, source)
+                }));
+            }
+            for handle in handles {
+                match handle.join() {
+                    Ok(result) => result?,
+                    Err(_) => return Err("attributed marker thread panicked".into()),
+                }
+            }
+            Ok(())
+        })?;
+
+        let mut aggregate = 0;
+        for source in [&first, &second] {
+            let events = fs::read_dir(marker.join(source))?.collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(events.len(), 2);
+            for event in events {
+                assert!(event.file_type()?.is_file());
+                assert_eq!(fs::metadata(event.path())?.len(), 0);
+                aggregate += 1;
+            }
+        }
+        assert_eq!(aggregate, 4);
+        assert_eq!(fs::read_dir(marker)?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn attributed_marker_rejects_traversal_and_paths_outside_temp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let allowed = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let allowed_root = allowed.path().to_path_buf();
+        let outside_marker = outside.path().to_path_buf();
+        let traversing_marker = allowed_root.join("nested").join("..").join("marker");
+
+        let Err(traversal) = append_attributed_legacy_inspection_marker(
+            Some(&allowed_root),
+            &allowed_root,
+            "../source",
+        ) else {
+            return Err("attributed marker accepted a traversal source identity".into());
+        };
+        let Err(outside) = append_attributed_legacy_inspection_marker(
+            Some(&outside_marker),
+            &allowed_root,
+            &"c".repeat(64),
+        ) else {
+            return Err("attributed marker outside the bounded temporary root was accepted".into());
+        };
+        let Err(marker_traversal) = append_attributed_legacy_inspection_marker(
+            Some(&traversing_marker),
+            &allowed_root,
+            &"d".repeat(64),
+        ) else {
+            return Err(
+                "attributed marker accepted parent traversal below the temporary root".into(),
+            );
+        };
+
+        assert!(traversal.to_string().contains("opaque SHA-256"));
+        assert!(outside.to_string().contains("outside the temporary root"));
+        assert!(
+            marker_traversal
+                .to_string()
+                .contains("unsafe relative path"),
+            "unexpected marker traversal error: {marker_traversal}"
+        );
+        assert!(fs::read_dir(allowed_root)?.next().is_none());
+        assert!(fs::read_dir(outside_marker)?.next().is_none());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn attributed_marker_rejects_linked_marker_directory() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let root = fs::canonicalize(temporary.path())?;
+        let target = root.join("target");
+        let marker = root.join("marker-link");
+        fs::create_dir(&target)?;
+        create_directory_link(&target, &marker)?;
+
+        let Err(error) =
+            append_attributed_legacy_inspection_marker(Some(&marker), &root, &"d".repeat(64))
+        else {
+            return Err("attributed marker accepted a linked directory".into());
+        };
+
+        assert!(error.to_string().contains("symbolic link or reparse point"));
+        assert!(fs::read_dir(target)?.next().is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()?;
+        if !status.success() {
+            return Err(format!("could not create test junction: {status}").into());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

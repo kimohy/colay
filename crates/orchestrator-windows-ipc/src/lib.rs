@@ -2,6 +2,16 @@
 #![cfg(windows)]
 #![allow(clippy::missing_errors_doc)]
 
+mod process_identity;
+mod state_artifact;
+
+pub use process_identity::current_process_user_sid;
+#[cfg(feature = "test-support")]
+pub use state_artifact::test_support;
+pub use state_artifact::{
+    StateArtifactKind, ensure_private_state_artifact, verify_private_state_artifact,
+};
+
 use std::{
     ffi::{OsStr, OsString, c_void},
     io, iter,
@@ -43,6 +53,29 @@ use windows_sys::Win32::{
         CreateMutexW, INFINITE, MUTEX_ALL_ACCESS, ReleaseMutex, WaitForSingleObject,
     },
 };
+
+#[derive(Debug)]
+struct StagedIoError {
+    stage: &'static str,
+    source: io::Error,
+}
+
+impl std::fmt::Display for StagedIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl std::error::Error for StagedIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn stage_error(stage: &'static str, source: io::Error) -> io::Error {
+    let kind = source.kind();
+    io::Error::new(kind, StagedIoError { stage, source })
+}
 
 struct LocalAllocation(*mut c_void);
 
