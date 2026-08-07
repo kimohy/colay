@@ -995,7 +995,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | --- | --- | --- | --- |
 | `WIN-019` | medium | fix-in-progress (exact-`b71f9a9` macOS CI RED; alias RED/GREEN and final local full gates pass; final CI pending) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
 | `WIN-018` | low | fix-in-progress (exact-`b71f9a9` Windows CI RED; bounded-wait and final local full gates pass; final CI pending) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
-| `WIN-017` | medium | fix-in-progress (exact-`b71f9a9` stress failed once; redundant state serialization removed; final local full gates pass; new exact-head stress pending) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
+| `WIN-017` | medium | fix-in-progress (exact-`b71f9a9` stress failed once; exact-`a05bc02` stress passed once; final CI/nightly pending) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
 | `WIN-016` | medium | fix-in-progress (native mutex RED/GREEN; duplicate state gate removed; final local full gates pass; CI/nightly pending) | read-only ACL verification can race an in-process ACL repair sequence |
 | `WIN-015` | medium | fix-in-progress (reviewed PowerShell 7.2/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
 | `WIN-014` | low | fix-in-progress (reviewed deterministic fixture, exact A/B, and authoritative stress pass; merge/CI pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
@@ -2850,7 +2850,7 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   The preserved runtime root is
   `C:\Users\kimoh\AppData\Local\Temp\colay-acl-20260806T224924688Z`.
 
-### Correction in progress
+### Correction and exact-head validation
 
 - Static path tracing confirmed that registration repeatedly invokes the state ensure
   path throughout inspection, preparation, and commit for a non-empty legacy import.
@@ -2863,19 +2863,66 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   symlink/junction, and canonical-target validation remains intact and can overlap for
   disjoint artifacts; the native gate still serializes target pinning and the complete
   descriptor read/repair/post-write verification sequence. Independent code and test
-  reviews found no production safety blocker. No quantitative improvement is claimed
-  until one new clean exact-head authoritative stress run passes.
+  reviews found no production safety blocker. The exact-head result below supplies the
+  required quantitative acceptance evidence.
 - Final-form focused source checks passed: Windows IPC `47/47`, Windows state permission
   tests `8/8`, the exact distinct-workspace concurrent import regression `1/1`, and
   Clippy for both affected packages with warnings denied. Independent code and test
   reviews returned READY for production safety. `cargo fmt --all -- --check`, full
   workspace Clippy with warnings denied, and the complete workspace test suite then
   passed on the final combined source; the latest full test command exited `0` after
-  `651.7s`. Exact-head latency acceptance remains pending.
-- If the new exact-head run still exceeds either unchanged limit, it will be preserved
-  as another failure rather than retried. The next design investigation will focus on
-  native descriptor-gate granularity; thresholds, durability, ACL strictness, and
-  cleanup requirements remain unchanged.
+  `651.7s`.
+- The new exact-head run retains the unchanged thresholds, durability, ACL strictness,
+  and cleanup requirements. Any future regression will be preserved as a failure rather
+  than hidden by a retry; native descriptor-gate granularity remains the next diagnostic
+  boundary if the latency limits regress.
+
+### 2026-08-07 exact-`a05bc02` authoritative stress — passed once
+
+- Clean source commit `a05bc0277353475021503f6e1e26f922dc357078` was built and
+  invoked exactly once through verified portable PowerShell 7.6.4. The source identity
+  was `verified_clean`, the worktree and candidate-process preflight were clean, and
+  the run was not retried. The invocation exited `0` after `198.4s`; the stored interval
+  is `196.5646049s`, from `2026-08-07T00:08:55.6887241Z` through
+  `2026-08-07T00:12:12.2533290Z`. Minimum free space remained `12.979GiB`.
+- Evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260807T000855679Z.json`
+  is `490,683` bytes with SHA-256
+  `c1fb1932d0d07a6df9dc149ed94e714e9ab86f3ef5cf9f432cfb781010897b68`.
+  It records schema `2`, status `passed`, null failure, and no acceptance failures. It
+  pins the unchanged harness SHA-256
+  `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  `colay.exe` SHA-256
+  `8fd405f914e1b34486593c209249d91256dc4d236b0ec5b57bc029f4f12bdfdf`,
+  fake-provider SHA-256
+  `905591ebe6f42b118bd6bd5cff37a7a58fdd5766e9926c345a048b52f6627097`,
+  and PowerShell SHA-256
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The unchanged OS-process-lifetime gates passed. Serial measurements were
+  `[4631, 3765, 3692, 3182, 3688]ms`, so nearest-rank p95 and maximum were both
+  `4631ms` against `5000ms`. Concurrent measurements were
+  `[5726, 5817, 5927, 5942]ms`, with maximum `5942ms` against the per-command
+  `8000ms` limit.
+- Fixture-only schema-v8 seed writes were
+  `[4269, 4378, 4617, 750, 4348, 4475, 749, 4266, 762]ms`, total `28,614ms`, with
+  minimum/median/maximum `749/4269/4617ms`. They completed before the timing self-test
+  and daemon start and were excluded from product latency thresholds.
+- The latency phase recorded aggregate marker `18` with attributed group/event `0/0`.
+  The threshold-excluded correctness phase recorded aggregate/group/event `2/1/2`,
+  and its source-root hash matched the durable group. Durable workspace,
+  workspace-path, import, and session counts were `10/10/9/9`; publication roots,
+  imports, and locks matched `10/9/9`, with no staging directory or unexpected item.
+- SQLite integrity was `ok`, foreign-key violations were zero, and all task, attempt,
+  worktree, worker-lease, and coordinator-lease counts were zero. The functional audit
+  passed with `43` starts and `43` exits, exact expected executable basenames, no active
+  PID at finish, no forbidden utility start, and no ownership refusal. Both daemons and
+  endpoints ended stopped; live leases, cleanup errors, residual processes, and forced
+  cleanup were zero, and observer teardown passed.
+- Provider isolation remained intact: `fake_provider_only=true`, all seven provider
+  credential names were cleared, and the run used only the pinned fake-provider binary.
+  This closes local Windows latency acceptance for `WIN-017`. The issue remains
+  `fix-in-progress` until the final documentation head passes fresh three-platform CI
+  and the merged nightly completes isolated WSL validation.
 
 ## WIN-018: Windows pipe-security test races the daemon's semantic online phase
 
