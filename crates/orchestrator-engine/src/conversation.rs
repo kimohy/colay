@@ -307,7 +307,7 @@ pub fn collect_conversation_response_with_evidence(
         })?;
     Ok(CollectedConversationResponse {
         outcome,
-        evidence_redacted,
+        evidence_redacted: bound_redacted_text(&response.evidence_redacted),
     })
 }
 
@@ -403,7 +403,7 @@ fn classify_redacted_evidence(evidence: &str) -> ConversationFailureKind {
         ],
     ) {
         ConversationFailureKind::UnsupportedClientOrAccount
-    } else if contains_any(&evidence, &["timed out", "timeout", "deadline exceeded"]) {
+    } else if contains_any(&evidence, &["timed out", "deadline exceeded"]) {
         ConversationFailureKind::Timeout
     } else if contains_any(&evidence, &["cancelled", "canceled"]) {
         ConversationFailureKind::Cancelled
@@ -590,5 +590,65 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[test]
+    fn strict_collector_never_scans_embedded_or_multiple_envelopes() {
+        let request = request();
+        let valid = r#"{"outcome":"answer_complete","response_redacted":"done"}"#;
+        for output in [
+            format!("progress\n{valid}"),
+            format!("{valid}\n{valid}"),
+            format!("```json\n{valid}\n```"),
+        ] {
+            assert!(matches!(
+                collect_conversation_response(
+                    &request,
+                    successful_response(&request, output.into_bytes()),
+                ),
+                Err(ConversationFailure::MalformedOutput { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_help_option_does_not_turn_a_usage_error_into_a_timeout() {
+        let failure = ConversationFailure::Lifecycle {
+            exit: ConversationExit::Crashed { exit_code: Some(2) },
+            evidence_redacted: "flag needs an argument: -print\n\
+                --print-timeout  Timeout for print mode wait"
+                .to_owned(),
+        };
+
+        let diagnostic = diagnose_conversation_failure(ProviderId::Agy, &failure);
+
+        assert_eq!(diagnostic.kind, ConversationFailureKind::ProcessFailure);
+        assert!(!diagnostic.response_redacted.contains("timed out"));
+    }
+
+    #[test]
+    fn genuine_timeout_signals_remain_timeout_diagnostics() {
+        let explicit = diagnose_conversation_failure(
+            ProviderId::Codex,
+            &ConversationFailure::Lifecycle {
+                exit: ConversationExit::TimedOut,
+                evidence_redacted: "provider deadline elapsed".to_owned(),
+            },
+        );
+        assert_eq!(explicit.kind, ConversationFailureKind::Timeout);
+
+        for evidence in [
+            "provider request timed out while waiting for a response",
+            "provider deadline exceeded",
+        ] {
+            let inferred = diagnose_conversation_failure(
+                ProviderId::Codex,
+                &ConversationFailure::Lifecycle {
+                    exit: ConversationExit::Crashed { exit_code: Some(1) },
+                    evidence_redacted: evidence.to_owned(),
+                },
+            );
+            assert_eq!(inferred.kind, ConversationFailureKind::Timeout);
+        }
     }
 }

@@ -358,7 +358,7 @@ fn fake_probe_output(args: &[String], codex_version: Option<&str>) -> String {
     {
         r#"{"definitions":{"initialize":{"method":"initialize"},"initialized":{"method":"initialized"},"threadStart":{"method":"thread/start","sandbox":["read-only","workspace-write"]},"threadResume":{"method":"thread/resume"},"turnStart":{"method":"turn/start"},"itemStarted":{"method":"item/started"},"itemCompleted":{"method":"item/completed"},"turnCompleted":{"method":"turn/completed","tokenUsage":{}}}}"#.to_owned()
     } else {
-        "Commands: exec app-server\n--print --prompt --output-format stream-json --permission-mode plan acceptEdits --approval-mode auto_edit --resume --effort --mode accept-edits --sandbox --conversation\n".to_owned()
+        "Commands: exec app-server\n--print --prompt --output-format stream-json --permission-mode plan acceptEdits --approval-mode auto_edit --resume --effort --mode accept-edits --sandbox --conversation\nRead a piped prompt from stdin.\n".to_owned()
     }
 }
 
@@ -459,6 +459,14 @@ fn codex_conversation_lines(text: &str, scenario: FakeRuntimeScenario) -> Vec<se
         scenario,
         FakeRuntimeScenario::ReadOnlyCommand | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
     ) {
+        lines.push(serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "read-only-progress",
+                "type": "agent_message",
+                "text": "I'll verify that with a read-only command."
+            }
+        }));
         lines.push(serde_json::json!({
             "type": "item.started",
             "item": {
@@ -601,25 +609,38 @@ where
         ProviderId::Codex
     } else if args.iter().any(|arg| arg == "--permission-mode") {
         ProviderId::Claude
-    } else if args.iter().any(|arg| arg == "--print") && args.iter().any(|arg| arg == "--mode") {
+    } else if args.iter().any(|arg| arg == "--mode") && args.iter().any(|arg| arg == "--sandbox") {
         ProviderId::Agy
     } else {
         ProviderId::Gemini
     };
+    let provider_input = if provider == ProviderId::Agy {
+        if args.iter().any(|arg| arg == "--print") {
+            let Some(prompt) = argument_value(&args, "--print") else {
+                eprintln!("flag needs an argument: -print");
+                std::process::exit(2);
+            };
+            prompt
+        } else {
+            &stdin
+        }
+    } else {
+        &stdin
+    };
 
-    if let Some(prompt) = planning_prompt(&stdin) {
+    if let Some(prompt) = planning_prompt(provider_input) {
         emit_planner_fixture(provider, &args, &prompt);
         return;
     }
-    if emit_conversation_fixture(provider, &stdin) {
+    if emit_conversation_fixture(provider, provider_input) {
         return;
     }
-    if is_handover_acknowledgement(&stdin) {
-        emit_handover_acknowledgement(provider, &stdin);
+    if is_handover_acknowledgement(provider_input) {
+        emit_handover_acknowledgement(provider, provider_input);
         return;
     }
 
-    if stdin.contains("scenario:codex-quota") {
+    if provider_input.contains("scenario:codex-quota") {
         if provider == ProviderId::Codex {
             write_partial_handover_fixture();
             for line in scenario_lines(provider, FakeRuntimeScenario::QuotaExceeded) {
@@ -636,17 +657,17 @@ where
         }
     }
     let scenario = argument_value(&args, "--scenario").unwrap_or_else(|| {
-        if stdin.contains("scenario:quota") {
+        if provider_input.contains("scenario:quota") {
             "quota"
-        } else if stdin.contains("scenario:malformed") {
+        } else if provider_input.contains("scenario:malformed") {
             "malformed"
-        } else if stdin.contains("scenario:timeout") {
+        } else if provider_input.contains("scenario:timeout") {
             "timeout"
-        } else if stdin.contains("scenario:crash") {
+        } else if provider_input.contains("scenario:crash") {
             "crash"
-        } else if stdin.contains("scenario:unknown") {
+        } else if provider_input.contains("scenario:unknown") {
             "unknown"
-        } else if stdin.contains("scenario:secret") {
+        } else if provider_input.contains("scenario:secret") {
             "secret"
         } else {
             "success"
@@ -656,7 +677,7 @@ where
         std::thread::sleep(Duration::from_mins(5));
         return;
     }
-    if stdin.contains("scenario:delayed-success") {
+    if provider_input.contains("scenario:delayed-success") {
         std::thread::sleep(Duration::from_millis(1_200));
     }
     if scenario == "crash" {

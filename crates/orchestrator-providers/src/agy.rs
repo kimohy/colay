@@ -8,6 +8,7 @@ use orchestrator_domain::{
     ProviderId, QuotaScope, RawEvent, RawEventChannel, SandboxMode, UntrustedWorkerClaim,
     UsageSnapshot, WorkerEvent, WorkerHandle, WorkerRequest,
 };
+use semver::Version;
 
 use crate::adapter::{SharedRuntime, ensure_provider, output_limits, prompt_payload};
 use crate::{
@@ -220,7 +221,6 @@ fn parse_exit_event(bytes: &[u8]) -> Result<WorkerEvent, ProviderError> {
 
 fn invocation_args(request: &WorkerRequest, allow_resume: bool) -> Vec<OsString> {
     let mut args = vec![
-        OsString::from("--print"),
         OsString::from("--mode"),
         OsString::from(match request.sandbox {
             SandboxMode::ReadOnly => "plan",
@@ -247,7 +247,9 @@ fn capabilities_from_probe(
 ) -> ProviderCapabilities {
     let mut result = ProviderCapabilities::unsupported(ProviderId::Agy);
     result.version = version_succeeded.then(|| version_text.trim().to_owned());
-    result.non_interactive = advertised(help_succeeded && help_text.contains("--print"));
+    let piped_prompt =
+        supports_piped_prompt(version_succeeded, version_text, help_succeeded, help_text);
+    result.non_interactive = advertised(piped_prompt);
     result.read_only =
         verified(help_succeeded && help_text.contains("--mode") && help_text.contains("plan"));
     result.writable = advertised(help_succeeded && help_text.contains("accept-edits"));
@@ -260,8 +262,143 @@ fn capabilities_from_probe(
     } else {
         CapabilitySupport::Unsupported
     };
-    result.evidence = vec!["agy --version".to_owned(), "agy --help".to_owned()];
+    result.evidence = vec![
+        "agy --version".to_owned(),
+        "agy --help".to_owned(),
+        format!(
+            "piped stdin prompt: minimum version 1.1.2 or explicit public help; supported={piped_prompt}"
+        ),
+    ];
     result
+}
+
+fn supports_piped_prompt(
+    version_succeeded: bool,
+    version_text: &str,
+    help_succeeded: bool,
+    help_text: &str,
+) -> bool {
+    let version_supported = version_succeeded
+        && parse_agy_version(version_text).is_some_and(|version| version >= Version::new(1, 1, 2));
+    let help_supported = help_succeeded && help_explicitly_supports_piped_prompt(help_text);
+    version_supported || help_supported
+}
+
+fn parse_agy_version(version_text: &str) -> Option<Version> {
+    let trimmed = version_text.trim();
+    if let Some(version) = parse_version_token(trimmed) {
+        return Some(version);
+    }
+
+    version_text.lines().find_map(|line| {
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let provider_index = tokens.iter().position(|token| {
+            let label = normalized_version_label(token);
+            label.eq_ignore_ascii_case("agy")
+                || label.eq_ignore_ascii_case("agy-cli")
+                || label.eq_ignore_ascii_case("antigravity")
+                || label.eq_ignore_ascii_case("antigravity-cli")
+        })?;
+        let provider_fields = &tokens[provider_index + 1..];
+        provider_fields
+            .first()
+            .and_then(|token| parse_version_token(token))
+            .or_else(|| {
+                let [label, version, ..] = provider_fields else {
+                    return None;
+                };
+                normalized_version_label(label)
+                    .eq_ignore_ascii_case("version")
+                    .then(|| parse_version_token(version))
+                    .flatten()
+            })
+    })
+}
+
+fn normalized_version_label(token: &str) -> &str {
+    token.trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+}
+
+fn parse_version_token(token: &str) -> Option<Version> {
+    let token = token.trim_matches(|character: char| {
+        matches!(character, ',' | ';' | ':' | '(' | ')' | '[' | ']')
+    });
+    let token = token
+        .strip_prefix('v')
+        .or_else(|| token.strip_prefix('V'))
+        .unwrap_or(token);
+    Version::parse(token).ok()
+}
+
+fn help_explicitly_supports_piped_prompt(help_text: &str) -> bool {
+    help_text.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        let words = line
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let negative = line.contains("n't")
+            || words.iter().any(|word| {
+                matches!(
+                    *word,
+                    "no" | "not"
+                        | "cannot"
+                        | "cant"
+                        | "unsupported"
+                        | "disabled"
+                        | "unavailable"
+                        | "never"
+                        | "without"
+                        | "false"
+                        | "deny"
+                        | "denies"
+                        | "denied"
+                        | "refuse"
+                        | "refuses"
+                        | "refused"
+                        | "fail"
+                        | "fails"
+                        | "failed"
+                        | "ignore"
+                        | "ignores"
+                        | "ignored"
+                        | "interactive"
+                        | "off"
+                        | "absent"
+                        | "remove"
+                        | "removes"
+                        | "removed"
+                        | "prohibit"
+                        | "prohibits"
+                        | "prohibited"
+                )
+            });
+        let normalized = words.join(" ");
+        let affirmative = [
+            "read a piped prompt from stdin",
+            "read piped prompt from stdin",
+            "reads a piped prompt from stdin",
+            "reads piped prompt from stdin",
+            "accept a piped prompt from stdin",
+            "accepts a piped prompt from stdin",
+            "consume a piped prompt from stdin",
+            "consumes a piped prompt from stdin",
+            "read a piped stdin prompt",
+            "reads a piped stdin prompt",
+            "accept a piped stdin prompt",
+            "accepts a piped stdin prompt",
+            "supports piped stdin prompt",
+            "supports piped stdin prompts",
+            "piped stdin prompt is supported",
+            "piped stdin prompts are supported",
+            "piped stdin prompt support true",
+            "piped stdin prompts support true",
+            "piped prompt from stdin is supported",
+        ]
+        .iter()
+        .any(|phrase| normalized.starts_with(phrase));
+        !negative && affirmative
+    })
 }
 
 const fn advertised(value: bool) -> CapabilitySupport {
@@ -325,7 +462,6 @@ mod tests {
         assert_eq!(
             read_only,
             [
-                "--print",
                 "--mode",
                 "plan",
                 "--sandbox",
@@ -347,6 +483,38 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "--dangerously-skip-permissions")
         );
+        assert!(
+            !writable
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--print" | "-p" | "--prompt"))
+        );
+    }
+
+    #[test]
+    fn prompt_stays_on_stdin_without_prompt_valued_flags() -> Result<(), ProviderError> {
+        let adapter = AgyAdapter::new(
+            AgyAdapterConfig {
+                executable: PathBuf::from("agy"),
+                usage_probe: UsageProbeConfig::ManualOrLedger,
+                usage_scope: QuotaScope::new(
+                    "agy_daily",
+                    QuotaPeriod::CalendarDay,
+                    UsageUnit::Custom("provider_defined".to_owned()),
+                ),
+            },
+            Arc::new(ProcessAdapterRuntime::default()),
+        );
+        let invocation = adapter.prepare(&request(SandboxMode::ReadOnly))?;
+        let args = invocation.args_lossy();
+
+        assert!(
+            !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--print" | "-p" | "--prompt"))
+        );
+        assert!(!args.iter().any(|arg| arg.contains("perform the task")));
+        assert!(String::from_utf8_lossy(&invocation.stdin).contains("perform the task"));
+        Ok(())
     }
 
     #[test]
@@ -360,6 +528,11 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--conversation", "conversation-7"])
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--print" | "-p" | "--prompt"))
         );
     }
 
@@ -378,6 +551,75 @@ mod tests {
         assert_eq!(capabilities.session_resume, CapabilitySupport::Advertised);
         assert_eq!(capabilities.structured_output, CapabilitySupport::Degraded);
         assert_eq!(capabilities.output_schema, CapabilitySupport::Unsupported);
+    }
+
+    #[test]
+    fn piped_prompt_requires_minimum_version_or_explicit_help() {
+        let options = "--print --mode plan accept-edits --sandbox --model --conversation";
+        let too_old = capabilities_from_probe(true, "agy 1.1.1", true, options);
+        assert_eq!(too_old.non_interactive, CapabilitySupport::Unsupported);
+        assert_eq!(too_old.structured_output, CapabilitySupport::Unsupported);
+
+        let future = capabilities_from_probe(true, "agy 1.1.10", true, options);
+        assert_eq!(future.non_interactive, CapabilitySupport::Advertised);
+
+        let observed = capabilities_from_probe(
+            true,
+            "agy development build",
+            true,
+            &format!("{options}\nRead a piped prompt from stdin and print the response."),
+        );
+        assert_eq!(observed.non_interactive, CapabilitySupport::Advertised);
+
+        let unrelated_runtime_version =
+            capabilities_from_probe(true, "runtime 9.9.9\nagy 1.1.1", true, options);
+        assert_eq!(
+            unrelated_runtime_version.non_interactive,
+            CapabilitySupport::Unsupported
+        );
+
+        let provider_runtime_before_version =
+            capabilities_from_probe(true, "agy runtime 9.9.9 version 1.1.1", true, options);
+        assert_eq!(
+            provider_runtime_before_version.non_interactive,
+            CapabilitySupport::Unsupported
+        );
+
+        let multiple_labeled_versions = capabilities_from_probe(
+            true,
+            "agy runtime version 9.9.9 cli version 1.1.1",
+            true,
+            options,
+        );
+        assert_eq!(
+            multiple_labeled_versions.non_interactive,
+            CapabilitySupport::Unsupported
+        );
+
+        for line in [
+            "Prompt cannot be read from stdin; piped input is unsupported.",
+            "Prompt is not read from stdin.",
+            "No stdin prompt support.",
+            "stdin prompt support: false",
+            "Interactive prompts read answers from stdin.",
+            "stdin accepts answers to interactive prompts.",
+            "Support for piped stdin prompts: off",
+            "Support for piped stdin prompts is absent",
+            "Support for piped stdin prompts was removed",
+            "Piped stdin prompts are prohibited",
+        ] {
+            let negative_help = capabilities_from_probe(
+                true,
+                "agy development build",
+                true,
+                &format!("{options}\n{line}"),
+            );
+            assert_eq!(
+                negative_help.non_interactive,
+                CapabilitySupport::Unsupported,
+                "help line: {line}"
+            );
+        }
     }
 
     #[test]

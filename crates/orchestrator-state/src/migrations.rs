@@ -236,11 +236,19 @@ impl MigrationManager {
     /// Executes all pending migrations against an online-backup copy and verifies `SQLite`
     /// integrity. The live database is not changed.
     pub fn dry_run(connection: &Connection) -> StateResult<MigrationStatus> {
+        Ok(Self::dry_run_observed(connection)?.0)
+    }
+
+    fn dry_run_observed(
+        connection: &Connection,
+    ) -> StateResult<(MigrationStatus, ConnectionPolicy)> {
         let temporary = crate::CanonicalTempDir::new("migration-dry-run")?;
         let path = temporary.path().join("dry-run.db");
         connection.backup(MAIN_DB, &path, None)?;
         let mut copy = Connection::open(&path)?;
-        configure_connection(&copy)?;
+        configure_dry_run_connection(&copy)?;
+        let policy = ConnectionPolicy::read(&copy)?;
+        policy.validate_disposable()?;
         let status = Self::apply(&mut copy)?;
         let integrity: String = copy.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if integrity != "ok" {
@@ -257,7 +265,7 @@ impl MigrationManager {
                 "dry-run found {foreign_key_failures} foreign-key violations"
             )));
         }
-        Ok(status)
+        Ok((status, policy))
     }
 
     pub fn backup(connection: &Connection, destination: &Path) -> StateResult<PathBuf> {
@@ -775,6 +783,57 @@ pub(crate) fn configure_connection(connection: &Connection) -> StateResult<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ConnectionPolicy {
+    journal_mode: String,
+    synchronous: i64,
+    foreign_keys: i64,
+    temp_store: i64,
+    busy_timeout: i64,
+}
+
+impl ConnectionPolicy {
+    fn read(connection: &Connection) -> StateResult<Self> {
+        Ok(Self {
+            journal_mode: connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?,
+            synchronous: connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?,
+            foreign_keys: connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?,
+            temp_store: connection.query_row("PRAGMA temp_store", [], |row| row.get(0))?,
+            busy_timeout: connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?,
+        })
+    }
+
+    fn validate_disposable(&self) -> StateResult<()> {
+        if self.journal_mode.eq_ignore_ascii_case("delete")
+            && self.synchronous == 0
+            && self.foreign_keys == 1
+            && self.temp_store == 2
+            && self.busy_timeout == 5_000
+        {
+            return Ok(());
+        }
+        Err(StateError::RollbackGuard(format!(
+            "dry-run database rejected the disposable connection policy: {self:?}"
+        )))
+    }
+}
+
+fn configure_dry_run_connection(connection: &Connection) -> StateResult<()> {
+    crate::database::register_workspace_function(connection)?;
+    // This database is an owner-private disposable copy used only for logical migration,
+    // integrity, and foreign-key validation. It is never adopted or recovered as live state, so
+    // durable journal flushes add latency without strengthening that contract.
+    // Keep the rollback journal file-backed so its size scales on disk rather than consuming RAM.
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;\
+         PRAGMA synchronous = OFF;\
+         PRAGMA journal_mode = DELETE;\
+         PRAGMA temp_store = MEMORY;\
+         PRAGMA busy_timeout = 5000;",
+    )?;
+    Ok(())
+}
+
 fn load_applied(connection: &Connection) -> StateResult<Vec<AppliedMigration>> {
     if !table_exists(connection, "schema_migrations")? {
         return Ok(Vec::new());
@@ -875,10 +934,10 @@ mod tests {
     use rusqlite::{Connection, params};
 
     use super::{
-        MigrationManager, ROLLBACK_PLAN_SCHEMA_VERSION, RollbackPlan, STATE_SCHEMA_VERSION,
-        apply_rollback_with_target_verifier, configure_connection,
+        ConnectionPolicy, MigrationManager, ROLLBACK_PLAN_SCHEMA_VERSION, RollbackPlan,
+        STATE_SCHEMA_VERSION, apply_rollback_with_target_verifier, configure_connection,
     };
-    use crate::{StateError, StateResult};
+    use crate::{Database, StateError, StateResult};
 
     #[test]
     fn applies_all_migrations_in_order_and_is_idempotent() {
@@ -895,16 +954,36 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_does_not_mutate_source() {
+    fn dry_run_uses_file_backed_non_durable_policy_without_mutating_source() -> StateResult<()> {
         let connection =
             Connection::open_in_memory().unwrap_or_else(|error| panic!("in-memory db: {error}"));
         configure_connection(&connection).unwrap_or_else(|error| panic!("configure: {error}"));
-        let status = MigrationManager::dry_run(&connection)
-            .unwrap_or_else(|error| panic!("dry-run: {error}"));
+        let (status, policy) = MigrationManager::dry_run_observed(&connection)?;
         assert_eq!(status.current_version, STATE_SCHEMA_VERSION);
         let live =
             MigrationManager::status(&connection).unwrap_or_else(|error| panic!("status: {error}"));
         assert_eq!(live.current_version, 0);
+        assert_eq!(policy.journal_mode, "delete");
+        assert_eq!(policy.synchronous, 0);
+        assert_eq!(policy.foreign_keys, 1);
+        assert_eq!(policy.temp_store, 2);
+        assert_eq!(policy.busy_timeout, 5_000);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_connections_keep_wal_full_policy() -> StateResult<()> {
+        let temporary = crate::CanonicalTempDir::new("durable-policy-test")?;
+        let database = Database::open(temporary.path().join("durable.db"))?;
+        let connection = database.raw_lock()?;
+        let policy = ConnectionPolicy::read(&connection)?;
+
+        assert_eq!(policy.journal_mode, "wal");
+        assert_eq!(policy.synchronous, 2);
+        assert_eq!(policy.foreign_keys, 1);
+        assert_eq!(policy.temp_store, 2);
+        assert_eq!(policy.busy_timeout, 5_000);
+        Ok(())
     }
 
     #[test]
