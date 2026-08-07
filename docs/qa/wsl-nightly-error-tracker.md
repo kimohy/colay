@@ -1,5 +1,99 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## 2026-08-07 PR #22 merge and deployed-nightly QA
+
+- PR #22 merged reviewed head `e002cc285ce092acac198041056253362a58c5ad` as
+  `a090a92cfd5c0bdde0aceacc865a8523a6ee700a`. Both commits have tree
+  `9288f52291ea037b906f854bed2297fbb771a504`. The exact-head push and pull-request
+  CI runs `31177992880` and `31177996145` passed all six Ubuntu, macOS, and Windows
+  jobs. The exact merge-triggered [CI run 31179092802](https://github.com/kimohy/colay/actions/runs/31179092802)
+  then passed the complete fake-provider workspace suite on all three platforms without a rerun.
+- The matching [release run 31179092785](https://github.com/kimohy/colay/actions/runs/31179092785)
+  passed classification, all three native builds, immutable bundle validation, Linux/macOS/Windows
+  smoke tests, attestation, and npm publication. `publish-github` was skipped by the expected
+  nightly artifact policy. Artifact `8994320523` is the unexpired
+  `release-0.1.1-nightly.20260807.a090a92` bundle for the exact merge SHA. Its manifest reports
+  state schema 17 and config schema 4. The Darwin, Windows, and Linux archives independently
+  matched SHA-256 `1e6f8e2155aeca19a11108a53e8bf6724202bb948695d1d7200f6d68d8f5d57e`,
+  `a8299ab00c7ba85028f5e5fcfb92ab0e93fbf175d417440e2ba5f25019045830`, and
+  `9b161b8260cb18ebfdaf3763f182139ee04a2a9351a9007e569edb5f7d081f73`.
+  GitHub provenance verification passed for those three archives, `SHA256SUMS`, the manifest, and
+  all four npm tarballs, with the signer workflow, source ref, signer digest, and source digest
+  fixed to the merge.
+- npm `@kimohy/colay@nightly` resolved to the exact immutable version. The root, Darwin, Linux, and
+  Windows packages all exposed matching versions, registry attestations, and artifact-identical
+  integrity values. The root integrity is
+  `sha512-myBqRnNst4NpWXuBGjXNYqgUC8/lV93szIBEl10t2/vxmesWqwODEC8B/62JZDXQVFsW2ovgv6ShgphUElMxSw==`;
+  Linux is
+  `sha512-I8I8Cxyvav7F3GtmqCLsBhmS27r4tiGPHCoK/7I2R72kYQ5z2vGyTd07bu2M7Fo4SV6a1qhulnpWz38lmHMqvg==`.
+  The root optional dependencies named only the three exact-version native packages. An isolated
+  four-package `npm audit signatures --include-attestations` reported zero invalid or missing
+  signatures.
+- WSL 2 Ubuntu 24.04.3 clean-installed that exact nightly under Node `22.23.1` and npm `10.9.8`
+  into `/home/kimohy/.cache/colay-deployed-a090a92.LmYfv1/prefix`. The user's global executable and
+  `0.1.1-nightly.20260803.28d0d5f` installation remained unchanged. The installed Linux x86-64
+  static PIE has SHA-256
+  `c8e63c84ccced6aa614cb299196da7af795b19d5ed5af96e0fc9b585d2c8d1bb` and byte-matches the
+  validated public Linux archive. A non-login harness initially selected the WSL system Node
+  `18.19.1`; the wrapper correctly refused it with the Node-22 remediation before any native Colay
+  or provider operation. The final clean run explicitly selected the same WSL-native NVM Node used by
+  the user. This is a verified recurrence of the already documented `WSL-001` environment boundary,
+  not a release regression.
+- Deployed fake-only QA used `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`, empty provider credential variables,
+  and the exact merge tree's Linux `colay-e2e-fake-provider`. That binary is an x86-64 ELF with
+  SHA-256 `10f2eb0cb3474dec16c1cb127b5c4147cd9e3ce3d77db8d27cd13a0b6a4d8721`.
+  In one fresh user-global database, migration reached schema 17, compatibility and doctor made zero
+  inference requests, daemon start/restart/stop changed the instance ID correctly, and 32 concurrent
+  status clients completed without SQLite busy/locked evidence. Codex's verified read-only-command
+  path plus ordinary Claude, Gemini, and Agy turns succeeded; an earlier standalone `null` then
+  failed closed once for each provider. The marker recorded exactly eight provider starts.
+- Fake-state inspection reported integrity `ok`, zero foreign-key violations, migrations 1 through
+  17, eight attempts in eight distinct workspace IDs, four `answer_complete` successes, and four
+  `needs_attention` protocol failures. Every provider had exactly two attempts. The four ambiguous
+  rows retained the progress line, standalone scalar, and later envelope as bounded evidence.
+  Tasks, task attempts, worktrees, coordinator leases, and worker leases totaled zero. All eight
+  non-Git workspaces stayed empty, the daemon released its row and socket, and state/database modes
+  were `0700`/`0600`.
+- Manual actual-provider QA reused only the deployed binary and the user's existing Linux-native
+  provider login stores. Codex, Claude, Gemini, and Agy each received the identical prompt whose
+  SHA-256 is `3d6dd9c20acb88d13463bae55f4ed297fff2e5818be476c215bf6eb525ae9b4a`.
+  Each provider had a separate fresh `COLAY_HOME`, the other three providers disabled, one empty
+  non-Git workspace, a 180-second outer bound, and exactly one plan-only turn with no retry.
+  Compatibility and doctor made zero inference requests and accepted only WSL-native `/home`
+  executables: Codex `0.146.0`, Claude `2.1.220`, Gemini `0.53.1`, and Agy/Antigravity `1.1.11`.
+- Codex returned canonical `COLAY_REAL_PROVIDER_OK` in 37.954 seconds and Agy returned it in 22.776
+  seconds. Claude returned its existing external credit/billing failure in 6.378 seconds; Gemini
+  returned its existing external authentication failure in 12.693 seconds. Neither external
+  failure was retried. Every database contained exactly one attempt bound to the requested provider,
+  schema 17, integrity `ok`, zero foreign-key violations, zero writable rows or leases, and no live
+  daemon after stop. All four workspaces remained empty. Product, unknown, and timeout failure
+  counts were all zero, and the user's global Colay remained unchanged.
+- These exact merge-CI and deployed-nightly results close `WSL-030`, `WSL-033`, `WSL-034`,
+  `WSL-037` through `WSL-039`, and the `WIN-018`, `WIN-019`, and `WIN-023` recurrences. `WSL-035` and
+  `WSL-036` are fixed in exact-merge CI but still require their targeted deployed stress and
+  redaction gates. `WIN-024` remains an independent performance follow-up: the real
+  compatibility/doctor timings were 6.4-17.9 seconds and 8.7-9.1 seconds because fresh public
+  capability probes are intentionally repeated. The much larger WSL startup delay is separately
+  tracked as `WSL-040`.
+
+## WSL-040: WSL cold-start delay precedes Colay while systemd and Docker are degraded
+
+- Severity: medium (host environment latency; not a Colay release blocker)
+- Status: open external host remediation
+- Observed during: `0.1.1-nightly.20260807.a090a92` preflight and clean-install QA
+
+The latency reproduced before Node, Colay, SQLite, or a provider started. A cold `/bin/true` took
+21.147 seconds, the first read-only Bash entry exceeded 24 seconds, isolated root creation took
+28.309 seconds, and the isolated source clone took 29.7 seconds while WSL printed
+`Failed to start the systemd user session`. The distribution's systemd state was simultaneously
+degraded: `docker.service` and `docker.socket` failed, and the Docker daemon retried a conflicting
+`docker0` bridge name three times. Those failures likely contribute, but no disable/repair A/B was
+performed, so they are not established as the sole cause. The evidence does establish that the
+user's 20-30 second baseline exists independently of Colay. Colay QA must report this host latency
+separately from `WIN-024` provider-probe time and must not classify it as daemon IPC or SQLite
+locking. Host remediation should diagnose or repair the failing WSL Docker/systemd units before a
+causal product change is considered.
+
 ## 2026-08-07 PR #21 merge and deployed-nightly QA
 
 - PR #21 merged reviewed head `19453142b7a3996815773861e58a501e5b0ca008` as
@@ -426,9 +520,9 @@ contained bounded evidence without a copy of `outcome_json`, satisfying the rele
 ## WSL-030: prose-prefixed structured output can bypass terminal-envelope ambiguity checks
 
 - Severity: medium (fail-closed contract)
-- Status: fixed in follow-up source; PR, CI, and nightly verification pending
+- Status: fixed (PR #22 exact merge CI and deployed four-provider fail-closed QA GREEN)
 - Found by: independent pre-PR diff review
-- Incomplete nightly: `0.1.1-nightly.20260807.10acacc`
+- Verified nightly: `0.1.1-nightly.20260807.a090a92`
 
 The terminal-envelope selector rejects earlier messages that begin with a JSON object, array, or
 code fence. It initially treated `Earlier answer: {"outcome":...}` and prose followed by a fenced
@@ -522,9 +616,9 @@ platforms, and deployed fake Agy completed through the same stdin contract.
 ## WSL-033: Claude partial stream deltas are treated as complete semantic messages
 
 - Severity: medium (provider compatibility and fail-closed availability)
-- Status: fixed in follow-up source; PR, CI, and nightly verification pending
+- Status: fixed (PR #22 exact merge CI and deployed provider-boundary QA GREEN)
 - Found by: post-merge adversarial boundary review
-- Incomplete nightly: `0.1.1-nightly.20260807.10acacc`
+- Verified nightly: `0.1.1-nightly.20260807.a090a92`
 
 Colay invokes Claude with `--output-format stream-json` but does not enable
 `--include-partial-messages`. The normalizer nevertheless converted any unexpected `stream_event`
@@ -547,9 +641,9 @@ boundaries.
 ## WSL-034: Gemini stream chunks are newline-joined with the echoed user prompt
 
 - Severity: high (provider compatibility, output integrity, and redaction)
-- Status: fixed in follow-up source; PR, CI, and nightly verification pending
+- Status: fixed (PR #22 exact merge CI and deployed production-shape fake QA GREEN)
 - Found by: official-provider contract review after deployed-nightly QA
-- Incomplete nightly/provider: `0.1.1-nightly.20260807.10acacc`, Gemini `0.53.1`
+- Verified nightly/provider: `0.1.1-nightly.20260807.a090a92`, Gemini `0.53.1`
 
 Gemini CLI's official `stream-json` contract emits the original input first as a `role:user`
 message. Assistant content observed from the current CLI arrives as one or more `delta:true` chunks,
@@ -591,9 +685,9 @@ deployable production-shape fake regression.
 ## WSL-035: paced provider streams can exceed semantic and audit bounds
 
 - Severity: high (availability and durable-state growth)
-- Status: fixed in follow-up source; PR, CI, and nightly verification pending
+- Status: fixed in exact merge CI; targeted deployed boundary-stress verification pending
 - Found by: independent stream/redaction security review
-- Incomplete nightly: `0.1.1-nightly.20260807.10acacc`
+- Deployed smoke nightly: `0.1.1-nightly.20260807.a090a92` (targeted gate pending)
 
 The process runner bounded retained stdout and stderr, but continued emitting every complete frame
 while draining the child pipes. A provider emitting small paced frames could avoid channel lag and
@@ -623,15 +717,18 @@ exits zero, before an offending event can be audited. Incomplete delta output is
 message, event, or runtime-loss boundaries rather than being flushed into failure evidence. Focused
 process, runtime, collector, audit, executor, scheduler, and eight-case App Server transport
 regressions cover paced output, receiver-close ordering, cancellation, bounded assembly, exact
-fallback boundaries, and content-free delta/unknown audit metadata. Closure requires exact-head CI
-and bounded deployed-nightly WSL fake-provider verification.
+fallback boundaries, and content-free delta/unknown audit metadata. Exact merge CI passed those
+byte, frame, event, cancellation, audit, and fallback regressions. The deployed nightly passed
+ordinary and ambiguity smoke turns only; it did not cross a configured output or event boundary.
+Release closure still requires one deployed fake-provider boundary-stress turn that fails boundedly,
+starts the provider once, and persists no over-bound content.
 
 ## WSL-036: split or decoded provider credentials can leave a suffix in evidence
 
 - Severity: high (credential redaction)
-- Status: fixed in follow-up source; PR, CI, and nightly verification pending
+- Status: fixed in exact merge CI; deployed redaction-canary verification pending
 - Found by: independent stream/redaction security review
-- Incomplete nightly: `0.1.1-nightly.20260807.10acacc`
+- Deployed smoke nightly: `0.1.1-nightly.20260807.a090a92` (targeted gate pending)
 
 Frame-level redaction could replace a credential prefix in one frame while leaving an unrecognized
 suffix in the next delta. Reassembling `[REDACTED]` plus that suffix no longer contained the original
@@ -668,13 +765,17 @@ views before App Server parsing and fails with a fixed, content-free protocol di
 the process boundary changed the frame. A production-shape split-PEM fake proves that both key
 fragments and the BEGIN marker are absent from raw events, final captured output, and diagnostics;
 the turn is cancelled, is non-retryable after dispatch, and cannot fall back to another transport.
-Closure requires exact-head CI and deployed-nightly WSL fake-provider verification with inspection
-showing no secret bytes in CLI output, SQLite, JSONL, or artifacts.
+Exact merge CI passed the split-token, decoded-secret, cross-delta, and PEM redaction regressions,
+and the merge artifact provenance passed. Deployed QA used empty provider credential variables and
+performed only ordinary and ambiguity turns, so it was a release smoke rather than a secret-canary
+test. Release closure still requires a deployed fake canary with negative inspection of CLI output,
+SQLite, JSONL, and artifacts.
 
 ## WSL-039: shipped plan-only and state-location guidance contradicts the implementation
 
 - Severity: medium (first-run usability and operator expectations)
-- Status: fixed in follow-up source; PR/CI/nightly verification pending
+- Status: fixed (PR #22 exact merge CI and deployed non-Git help/behavior GREEN)
+- Verified nightly: `0.1.1-nightly.20260807.a090a92`
 
 The current CLI routes `run --plan-only` through one bounded read-only provider conversation and
 persists conversation, requirement, and planning evidence in the user-global database partition.
@@ -689,13 +790,15 @@ The shipped guidance now describes the provider conversation, global `workspace_
 non-Git eligibility, and no-task/no-worktree promotion fence. A focused documentation contract was
 first observed failing against the old text and then passed 1/1 after the correction; it normalizes
 Markdown whitespace and rejects the obsolete static/non-provider phrases in both documents.
-Closure requires the complete workspace gates, exact-head CI, and deployed-nightly help/behavior
-verification.
+The complete workspace gates, exact-head CI, and deployed non-Git behavior passed. A subsequent
+deployed WSL capture of `colay run --help` exited zero and described `--plan-only` as persisting a
+promotion fence that prevents writable-task creation, completing the help/behavior closure gate.
 
 ## WSL-038: late evidence conflict leaves an unfinished attempt on a terminal task
 
 - Severity: high (append-only execution evidence and scheduler lifecycle consistency)
-- Status: fixed in follow-up source; PR/CI/nightly verification pending
+- Status: fixed (targeted rollback regression GREEN in exact merge CI; deployed schema/integrity smoke GREEN)
+- Verified nightly: `0.1.1-nightly.20260807.a090a92`
 
 The daemon previously called attempt start, checkpoint/artifact persistence, verification
 persistence, and attempt finish as separate transactions. If a later immutable identifier collided,
@@ -715,15 +818,19 @@ or checkpoint rows, unchanged pre-existing verification, and retained worktree t
 state regression stores a real content-addressed diff and injects the verification collision after
 the artifact/checkpoint path; attempt, checkpoint, and artifact rows all roll back. The focused
 daemon execution suite passed 5/5, state records passed 13/13 plus the new artifact rollback test,
-focused state/daemon Clippy passed with warnings denied, and format/diff checks passed. Closure
-requires the complete workspace gates, exact-head CI, and deployed-nightly QA.
+focused state/daemon Clippy passed with warnings denied, and format/diff checks passed. Exact merge
+CI verifies the injected collision and atomic rollback path. The deployed plan-only smoke verified
+schema 17, integrity, foreign keys, released daemon state, and zero writable rows; it did not
+reproduce the collision path. The targeted correctness gate is the exact-merge CI regression;
+deployed-nightly validation is an artifact/schema smoke and is not represented as a collision
+reproduction.
 
 ## WSL-037: planner rejects verified read-only provider commands before approval
 
 - Severity: high (real-provider planning and approval availability)
-- Status: fixed in follow-up source; PR, CI, and nightly verification pending
+- Status: fixed (PR #22 exact merge CI and deployed read-only-command QA GREEN)
 - Found by: final conversation-boundary review
-- Incomplete nightly: `0.1.1-nightly.20260807.10acacc`
+- Verified nightly: `0.1.1-nightly.20260807.a090a92`
 
 The conversation path permits a provider command only when the request sandbox is read-only and
 the provider capability is Advertised or Verified. The planner used the same read-only sandbox and
@@ -1757,28 +1864,29 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WSL-039` | medium | source + full local gates GREEN; PR/CI/nightly pending | shipped docs describe plan-only as static and state as repository-local |
-| `WSL-038` | high | source + full local gates GREEN; PR/CI/nightly pending | late evidence conflict can leave an unfinished attempt on a terminal failed task |
-| `WSL-037` | high | source + full local gates GREEN; PR/CI/nightly pending | planner rejects verified read-only provider commands before approval |
-| `WSL-036` | high | source + full local gates GREEN; PR/CI/nightly pending | split or decoded provider credentials can leave a suffix in evidence |
-| `WSL-035` | high | source + full local gates GREEN; PR/CI/nightly pending | paced provider streams can exceed semantic-memory and append-only audit bounds |
-| `WSL-034` | high | source + full local gates GREEN; PR/CI/nightly pending | Gemini user echo and assistant delta chunks are newline-joined as complete messages |
-| `WSL-033` | medium | source + full local gates GREEN; PR/CI/nightly pending | Claude partial stream deltas are treated as complete semantic messages |
+| `WSL-040` | medium | open external host remediation; not a release blocker | WSL cold-start delay precedes Colay while systemd/Docker failures are present |
+| `WSL-039` | medium | fixed (PR #22 exact merge CI and deployed help/behavior GREEN) | shipped docs describe plan-only as static and state as repository-local |
+| `WSL-038` | high | fixed (CI rollback regression + deployed schema/integrity smoke GREEN) | late evidence conflict can leave an unfinished attempt on a terminal failed task |
+| `WSL-037` | high | fixed (PR #22 exact merge CI and deployed read-only command GREEN) | planner rejects verified read-only provider commands before approval |
+| `WSL-036` | high | fixed in exact merge CI; deployed redaction canary pending | split or decoded provider credentials can leave a suffix in evidence |
+| `WSL-035` | high | fixed in exact merge CI; targeted deployed boundary stress pending | paced provider streams can exceed semantic-memory and append-only audit bounds |
+| `WSL-034` | high | fixed (PR #22 exact merge CI and deployed fake QA GREEN) | Gemini user echo and assistant delta chunks are newline-joined as complete messages |
+| `WSL-033` | medium | fixed (PR #22 exact merge CI and deployed provider QA GREEN) | Claude partial stream deltas are treated as complete semantic messages |
 | `WSL-032` | low | fixed (exact merge CI and deployed fake Agy GREEN) | an older Agy planner integration still requires the removed prompt-valued `--print` flag |
 | `WSL-031` | medium | fixed (exact merge CI and deployed Agy 1.1.11 GREEN) | Agy stdin capability accepts an unrelated semver or negative help sentence as support |
-| `WSL-030` | medium | source + full local gates GREEN; PR/CI/nightly pending | prose-prefixed structured output can bypass terminal-envelope ambiguity checks, including standalone scalars |
+| `WSL-030` | medium | fixed (deployed four-provider ambiguity QA GREEN) | prose-prefixed structured output can bypass terminal-envelope ambiguity checks, including standalone scalars |
 | `WSL-029` | low | fixed (deployed-nightly success evidence deduplicated) | successful evidence redundantly appends a second copy of the canonical outcome |
 | `WSL-028` | medium | fixed (deployed-nightly Agy completed without false timeout) | Agy help's `--print-timeout` text misclassifies an immediate usage error as a runtime timeout |
 | `WSL-027` | high | fixed (deployed-nightly Agy stdin conversation GREEN) | Agy's prompt-valued `--print` first consumed `--mode`, then rejected a terminal flag without an argument |
 | `WSL-026` | medium | fixed (deployed-nightly fresh schema-17 migration GREEN) | fresh migration performs 17 disposable plus 17 live `synchronous=FULL` commits |
 | `WSL-025` | high | fixed (deployed-nightly Codex canonical outcome GREEN) | the shared provider prompt omits mandatory `outcome` from every required-field list |
 | `WIN-024` | medium | open follow-up; non-blocking for provider-boundary correctness PR | provider capability probes are repeated at daemon startup and every worker start |
-| `WIN-023` | medium | source + full local gates GREEN; CI/nightly pending | named-pipe instance-gap retry initially failed clients, then delayed empty cold-start discovery |
+| `WIN-023` | medium | fixed (exact merge CI and deployed 32-client QA GREEN) | named-pipe instance-gap retry initially failed clients, then delayed empty cold-start discovery |
 | `WIN-022` | low | monitoring (non-code Windows host filesystem anomaly; exact merge CI GREEN) | a freshly created `DoctorFixture` repository disappeared before current-schema WAL seeding |
 | `WIN-021` | low | fixed (exact merge CI and nightly smoke GREEN) | cold-start receipt correctness fixture inherits the production registration latency deadline |
 | `WIN-020` | low | fixed (exact merge CI and nightly smoke GREEN) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
-| `WIN-019` | medium | regression recurrence fixed in PR #22 source; fresh macOS CI pending | test fixtures pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
-| `WIN-018` | low | regression recurrence fixed in PR #22 source; fresh CI pending | daemon tests assume IPC readiness means the persisted daemon phase has already reached `online` |
+| `WIN-019` | medium | fixed (PR #22 macOS push/PR and exact merge CI GREEN) | test fixtures pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
+| `WIN-018` | low | fixed (PR #22 exact-head and exact merge CI GREEN) | daemon tests assume IPC readiness means the persisted daemon phase has already reached `online` |
 | `WIN-017` | medium | fixed (authoritative stress and exact merge CI GREEN) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
 | `WIN-016` | medium | fixed (native mutex regression and exact merge CI GREEN) | read-only ACL verification can race an in-process ACL repair sequence |
 | `WIN-015` | medium | fixed (PowerShell 7.2/7.6 A/B, stress, and exact merge CI GREEN) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
@@ -3745,6 +3853,9 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   the last status in its bounded timeout diagnostic. Production startup behavior is unchanged. The
   focused test passed three consecutive runs, the full daemon lifecycle target passed 5/5, and
   targeted Clippy, format, and diff checks passed. Fresh exact-head CI is required.
+- Closure: both PR #22 exact-head CI runs and merge CI run `31179092802` passed the daemon
+  lifecycle on all three platforms. The deployed nightly also completed start, online polling,
+  restart with a new instance ID, 32 concurrent status reads, stop, and released-row/socket checks.
 
 ## WIN-019: macOS scheduler fixtures use a symlink-aliased temp root
 
@@ -3780,6 +3891,8 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   canonicalizes that owned root before deriving either path. Production validation is unchanged;
   focused fake Agy tests passed 2/2 on Windows, and targeted Clippy, format, and diff checks passed.
   Fresh macOS CI on the follow-up commit is the closure condition.
+- Closure: both corrected macOS PR #22 jobs passed at exact head `e002cc2`, and the exact merge CI
+  macOS job passed again at `a090a92`. Production fail-closed path validation remained unchanged.
 
 ## WIN-020: scheduler fixture assumes the successor has not committed yet
 
@@ -3896,7 +4009,7 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 ## WIN-023: a transient named-pipe instance gap fails cold-start clients immediately
 
 - Severity: medium (Windows daemon cold-start reliability and CI flakiness)
-- Status: fixed in follow-up source; full CI and nightly verification pending
+- Status: fixed (exact merge CI and deployed 32-client QA GREEN)
 - Found by: final all-feature Windows CLI verification
 
 The all-feature CLI suite timed out after five minutes in
@@ -3925,6 +4038,11 @@ seconds to the fake provider's startup and per-turn capability probes, 0.299 sec
 and 0.495 seconds to shutdown. The 32-client regression then passed three consecutive runs in
 27.79, 30.74, and 32.44 seconds, with no test-owned process left behind. Closure requires the
 complete Windows workspace suite, exact-head CI, and nightly WSL verification.
+
+PR #22's complete Windows workspace job and exact merge Windows job passed. The deployed WSL
+nightly then served 32 simultaneous status clients with zero command failures, SQLite busy/locked
+evidence, duplicate daemon ownership, residual socket, or unreleased daemon row. This supplies the
+remaining release closure evidence without changing the IPC deadlines.
 
 ## WIN-024: provider capability probes are repeated before every worker start
 
