@@ -634,7 +634,8 @@ mod tests {
         Box<dyn std::error::Error>,
     > {
         let (temporary, repository, base) = repository()?;
-        let fake_executable = temporary.path().join(if cfg!(windows) {
+        let temporary_root = fs::canonicalize(temporary.path())?;
+        let fake_executable = temporary_root.join(if cfg!(windows) {
             "fake-provider-cli.exe"
         } else {
             "fake-provider-cli"
@@ -679,7 +680,7 @@ mod tests {
                         expires_at: now + TimeDelta::minutes(5),
                     },
                     repository_root: repository,
-                    state_root: temporary.path().join("state"),
+                    state_root: temporary_root.join("state"),
                     instructions: Vec::new(),
                     existing_worktree: None,
                 },

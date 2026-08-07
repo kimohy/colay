@@ -162,6 +162,13 @@
   Codex App Server transport 9/9, provider E2E 25/25, Windows IPC/ACL suites, and all doc-tests.
   Automated verification used fake providers only. Commit, PR, exact-head CI, nightly publication,
   and isolated deployed WSL QA remain pending.
+- PR #22 push/PR CI exposed a `WIN-019` regression recurrence on both macOS jobs. The two new fake
+  Agy executor tests canonicalized the repository to `/private/var/...` but still derived their fake
+  executable and state root from `TempDir`'s `/var/...` alias, so production path safety correctly
+  returned `UnsafePath("/var")`. The test-only fixture now canonicalizes the owned temp root once and
+  derives every path from it; production symlink rejection is unchanged. Focused fake Agy tests
+  passed 2/2 on Windows with targeted Clippy, format, and diff checks GREEN. A follow-up macOS CI run
+  is required before merge.
 
 ## 2026-08-07 PR #20 merge and deployed-nightly QA
 
@@ -1764,7 +1771,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-022` | low | monitoring (non-code Windows host filesystem anomaly; exact merge CI GREEN) | a freshly created `DoctorFixture` repository disappeared before current-schema WAL seeding |
 | `WIN-021` | low | fixed (exact merge CI and nightly smoke GREEN) | cold-start receipt correctness fixture inherits the production registration latency deadline |
 | `WIN-020` | low | fixed (exact merge CI and nightly smoke GREEN) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
-| `WIN-019` | medium | fixed (exact merge CI and nightly smoke GREEN) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
+| `WIN-019` | medium | regression recurrence fixed in PR #22 source; fresh macOS CI pending | test fixtures pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
 | `WIN-018` | low | fixed (exact merge CI and nightly smoke GREEN) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
 | `WIN-017` | medium | fixed (authoritative stress and exact merge CI GREEN) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
 | `WIN-016` | medium | fixed (native mutex regression and exact merge CI GREEN) | read-only ACL verification can race an in-process ACL repair sequence |
@@ -3751,6 +3758,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   and diff checks also passed. The final combined full workspace gates passed, including
   the `651.7s` test run with zero failures. Production path validation was not changed.
   Fresh macOS CI remains required.
+- Regression recurrence on 2026-08-07: both macOS jobs for PR #22 failed only
+  `task_executor::tests::fake_agy_success_has_no_lifecycle_failure` and
+  `task_executor::tests::fake_agy_process_crash_preserves_non_retryable_failure_in_checkpoint`
+  with `UnsafePath("/var")`. Their repository helper returned a canonical path, but the newly added
+  fake executable and `state_root` still came from raw `TempDir::path()`. The fixture now
+  canonicalizes that owned root before deriving either path. Production validation is unchanged;
+  focused fake Agy tests passed 2/2 on Windows, and targeted Clippy, format, and diff checks passed.
+  Fresh macOS CI on the follow-up commit is the closure condition.
 
 ## WIN-020: scheduler fixture assumes the successor has not committed yet
 
