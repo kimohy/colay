@@ -89,6 +89,57 @@ fn successful_collection_returns_bounded_evidence_separate_from_canonical_outcom
 }
 
 #[test]
+fn successful_evidence_does_not_duplicate_the_canonical_outcome()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = request();
+    let output = serde_json::to_vec(&json!({
+        "outcome": "answer_complete",
+        "response_redacted": "canonical answer"
+    }))?;
+    let mut response = response(&request, output);
+    response.evidence_redacted = "read-only command evidence".to_owned();
+
+    let collected = collect_conversation_response_with_evidence(&request, response)?;
+
+    assert_eq!(collected.evidence_redacted, "read-only command evidence");
+    assert!(!collected.evidence_redacted.contains("canonical answer"));
+    Ok(())
+}
+
+#[test]
+fn failure_evidence_retains_bounded_provider_output() {
+    let request = request();
+    let output = b"unique malformed provider output".to_vec();
+
+    let malformed =
+        collect_conversation_response_with_evidence(&request, response(&request, output.clone()));
+    assert!(matches!(
+        &malformed,
+        Err(ConversationFailure::MalformedOutput { .. })
+    ));
+    if let Err(ConversationFailure::MalformedOutput {
+        evidence_redacted, ..
+    }) = malformed
+    {
+        assert!(evidence_redacted.contains("unique malformed provider output"));
+    }
+
+    let mut lifecycle = response(&request, output);
+    lifecycle.exit = ConversationExit::TimedOut;
+    let lifecycle = collect_conversation_response_with_evidence(&request, lifecycle);
+    assert!(matches!(
+        &lifecycle,
+        Err(ConversationFailure::Lifecycle { .. })
+    ));
+    if let Err(ConversationFailure::Lifecycle {
+        evidence_redacted, ..
+    }) = lifecycle
+    {
+        assert!(evidence_redacted.contains("unique malformed provider output"));
+    }
+}
+
+#[test]
 fn multibyte_success_evidence_is_valid_utf8_and_strictly_byte_bounded()
 -> Result<(), Box<dyn std::error::Error>> {
     let request = request();

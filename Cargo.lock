@@ -912,6 +912,7 @@ dependencies = [
  "codex-compat",
  "orchestrator-domain",
  "orchestrator-process",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

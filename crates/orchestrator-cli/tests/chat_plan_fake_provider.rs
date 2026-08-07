@@ -233,7 +233,11 @@ async fn plans_through_agy_plain_text_without_disabling_gemini_support()
         repository.join(".colay/fake-planner-invocation.json"),
     )?)?;
     let args = log["args"].as_array().ok_or("missing args")?;
-    assert!(args.iter().any(|arg| arg == "--print"));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), Some("--print" | "-p" | "--prompt")))
+    );
     assert!(
         args.windows(2)
             .any(|pair| pair[0] == "--mode" && pair[1] == "plan")

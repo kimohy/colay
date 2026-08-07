@@ -1,5 +1,297 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## 2026-08-07 PR #20 merge and deployed-nightly QA
+
+- PR #20 merged as `d3ad1af80569b42a974130350e0d8b2ffc3c08b2`. Its exact merge-triggered
+  [CI run 31138349593](https://github.com/kimohy/colay/actions/runs/31138349593) passed Ubuntu,
+  macOS, and Windows. Windows completed its final test in 13 minutes. The matching
+  [release run 31138349651](https://github.com/kimohy/colay/actions/runs/31138349651) passed all
+  three native builds and smoke jobs, immutable validation, attestation, and npm publication;
+  GitHub publication was intentionally skipped by the nightly artifact policy.
+- npm `nightly` resolved to exact version `0.1.1-nightly.20260807.d3ad1af`. The wrapper and all
+  three native optional packages exposed that version and npm provenance. Registry integrity was
+  present for the wrapper and Linux, Windows, and Darwin packages. WSL 2 Ubuntu 24.04 installed
+  the exact package into fresh prefix
+  `/home/kimohy/.cache/colay-nightly-d3ad1af-qa-20260807-v2/prefix`, without replacing the user's
+  existing global installation. Node was `22.23.1`, npm was `10.9.8`, `colay --version` matched,
+  and the selected Linux x86-64 static PIE had SHA-256
+  `86ae1c226f6c3c2f5d265d35e65f45848e97025f4ffce7428834709d67121a51`.
+- Fake-only deployed-binary QA used the exact merge source's compiled
+  `colay-e2e-fake-provider` (SHA-256
+  `6895ea658c77d328ad13ebbea29d6186c7fa06025302ee10371a33242ae6fe9c`) and an isolated
+  `COLAY_HOME`. Migration reached schema 17 without a repository-local database. Doctor and
+  compatibility made zero inference requests. Daemon start/status/restart/stop passed, and 32
+  concurrent status clients completed with no `SQLITE_BUSY`, `SQLITE_LOCKED`, database-busy, or
+  database-locked result. Codex, Claude, Gemini, and Agy each completed one requested plan-only
+  conversation in a distinct non-Git workspace. SQLite reported `integrity_check = ok`, zero
+  foreign-key violations, four succeeded attempts, four workspace IDs and paths, and zero tasks,
+  task attempts, worktrees, coordinator leases, or worker leases. Neither a `.git` nor `.colay`
+  directory was created in any workspace.
+- Actual-provider QA used a second fresh `COLAY_HOME` and four distinct non-Git workspaces under
+  the same WSL-native root. All accepted executables and resolved targets were Linux-native paths:
+  Codex `0.146.0`, Claude `2.1.220`, Gemini `0.53.1`, and Agy/Antigravity `1.1.9`. Doctor and
+  compatibility again reported `inference_requests = 0`. The same bounded read-only prompt was
+  sent once to every provider. Claude returned the existing quota/billing-unavailable category;
+  Gemini required interactive authentication. Codex returned the requested token but omitted the
+  mandatory outcome discriminator, exposing `WSL-025`. A non-conflicting ordinary Codex greeting
+  then completed successfully with `Hello!`, confirming account and transport readiness. Agy
+  answered the literal token after its prompt-valued `--print` option instead of reading stdin,
+  exposing the argv-order defect `WSL-027`.
+- Final actual-state inspection found schema 17, `integrity_check = ok`, zero foreign-key
+  violations, no workspace files, and zero tasks, task attempts, worktrees, coordinator leases,
+  or worker leases. The isolated state directory and database modes were `0700` and `0600`; its
+  config file remained absent before and after migration. Every daemon was stopped after QA.
+- Fresh migration timings were 24,281 ms and 23,490 ms in fake homes and 9,743 ms in the actual
+  home. Warm controlled trials isolated 34 `synchronous=FULL` commits: 17 disposable dry-run
+  commits plus 17 live commits. A healthy current-schema reapply was 0.53-0.64 seconds, while an
+  unhealthy WSL host amplified fresh migration beyond 20 seconds. This product-side amplification
+  is `WSL-026`; the simultaneously observed systemd user-session timeout, corrupted-journal
+  recovery, and failing Docker retries remain a separate host baseline rather than a Colay defect.
+
+### 2026-08-07 source-candidate follow-up
+
+- The uncommitted source candidate was built natively in WSL from exact merge `d3ad1af` plus the
+  six reviewed changes. The Linux binary SHA-256 was
+  `23cab25636faac44a0b753e93238afd8cb267a4ca4de0f62df02cd4e8befb1db`. Copying the Windows
+  worktree initially retained CRLF bytes, so the six exact candidate files were normalized to LF
+  in the disposable Linux checkout before `git diff --check` and the release build.
+- Ten fresh schema 0→17 migrations completed with `integrity_check = ok`, zero foreign-key
+  violations, no config creation, and timings of 17,096/8,017/7,178/4,795/8,873 ms and
+  16,322/5,964/5,727/3,696/5,266 ms. The first trial in each set retained the known WSL host
+  startup/recovery outlier. The median across all trials was 6,571 ms. Deterministic source tests
+  separately verified that only the disposable copy uses file-backed `DELETE` journaling with
+  `synchronous=OFF`, while the live database remains `WAL` plus `FULL`.
+- A first fake daemon start used an excessively long QA-only `COLAY_HOME` and was rejected with
+  the explicit Unix `SUN_LEN` path error. The retained database was intact. The rerun used a short
+  WSL-native root and completed schema migration, doctor, compatibility, daemon lifecycle, and
+  four provider conversations. Codex, Claude, Gemini, and Agy each produced one succeeded attempt
+  in four workspaces; the only workspace files were the fake binary's four intentional invocation
+  records. Writable task, task-attempt, worktree, and lease counts remained zero.
+- Actual-provider doctor resolved only native paths under `/home/kimohy`: Codex `0.146.0`, Claude
+  `2.1.220`, Gemini `0.53.1`, and Agy `1.1.10`; `inference_requests` remained zero. The corrected
+  non-conflicting Codex turn succeeded with canonical
+  `{"outcome":"answer_complete","response_redacted":"COLAY_QA_OK"}`, verifying the `WSL-025`
+  source fix. Claude remained blocked by billing and Gemini by interactive authentication.
+- Agy 1.1.10 rejected terminal `--print` because the flag requires a prompt argument, so the
+  initial ordering correction is incomplete. Its help text contains `--print-timeout`, which also
+  caused the generic diagnostic classifier to mislabel the immediate exit-code-2 usage failure as
+  a timeout; this additional classification defect is `WSL-028`.
+- A separate Codex turn safely ran only `/bin/bash -lc pwd` under the established read-only
+  capability and then emitted one prose progress message followed by the valid canonical outcome.
+  Colay joined both provider messages and rejected the combined bytes as one JSON object. No file
+  or writable state changed, but this reopens `WSL-022` at the provider-message collection layer.
+  Final actual-state inspection found schema 17, `integrity_check = ok`, zero foreign-key
+  violations, five workspaces/sessions/attempts, and zero tasks, task attempts, worktrees, or
+  leases. The daemon stopped, its socket was removed, and every actual workspace remained empty.
+- The corrected source candidate then passed fake-provider QA for Codex, Claude, Gemini, and Agy in
+  four isolated workspaces with four succeeded attempts and zero writable rows. Actual-provider QA
+  resolved Codex `0.146.0`, Claude `2.1.220`, Gemini `0.53.1`, and Agy `1.1.10` from Linux-native
+  paths. Codex completed both an ordinary canonical turn and the `/bin/bash -lc pwd` read-only turn;
+  Agy completed through its official piped-stdin path. Claude retained its external billing failure
+  and Gemini retained its external interactive-authentication requirement. Three attempts succeeded,
+  two failed for those external reasons, all five workspaces remained empty, and tasks, task
+  attempts, worktrees, and leases remained zero. This verifies the source corrections for
+  `WSL-022`, `WSL-027`, and `WSL-028`; newly published nightly verification remains pending.
+- That successful run also exposed a low-severity persistence defect: canonical output was appended
+  directly to already bounded successful evidence, duplicating the answer without a separator.
+  This is tracked as `WSL-029`; its source correction and regression are complete, and the final
+  source candidate must be rebuilt before PR publication.
+- The rebuilt review candidate (Linux SHA-256
+  `eaa8ea392c492e38ae83db4aa74809d18f4234a9c46735db482c720436c48105`) passed the complete
+  fake-provider flow and actual-provider flow in a new short WSL-native home. Actual provider
+  versions were Codex `0.146.0`, Claude `2.1.220`, Gemini `0.53.1`, and Agy `1.1.11`. Codex, Agy,
+  and the Codex read-only-command turn succeeded; Claude retained the external billing failure and
+  Gemini retained the external authentication requirement. SQLite reported schema 17, integrity
+  `ok`, zero foreign-key violations, three successes, two expected external failures, and zero
+  writable rows. Successful evidence contained no duplicate canonical output, verifying `WSL-029`.
+- Independent fail-closed review then found two additional ambiguity cases before publication. A
+  prose-prefixed JSON object or code fence could be discarded as progress before a later envelope
+  (`WSL-030`), and Agy stdin capability could be inferred from an unrelated semver or a negative
+  help sentence (`WSL-031`). The review candidate was withheld; both cases now have RED-to-GREEN
+  focused regressions, and another WSL candidate verification is required.
+- The final independently reviewed WSL candidate had Linux SHA-256
+  `721b2ea26de836de181aee20764104633cf329a739bcfdfebf3de7db3149d9ac`; its fake provider
+  SHA-256 was `b431a1ddf9f1525c5b4e8c6287a0e1b7e537f9b8d330519dbd5eb937f55ab565`.
+  In a new v9 home, all four fake providers succeeded in four isolated workspaces with zero
+  writable rows. Actual doctor resolved Linux-native Codex `0.146.0`, Claude `2.1.220`, Gemini
+  `0.53.1`, and Agy `1.1.11` with zero inference requests. Codex, Agy, and a separate Codex
+  `/bin/bash -lc pwd` read-only turn succeeded; Claude retained the external billing failure and
+  Gemini retained the external non-interactive authentication failure. SQLite reported schema 17,
+  integrity `ok`, zero foreign-key violations, three successes, two expected external failures,
+  and zero tasks, task attempts, worktrees, or leases. Every actual workspace was empty, successful
+  evidence contained no canonical output copy, the daemon stopped, and its socket was removed.
+  Independent final diff review found no merge blocker. The ten migration timing trials were not
+  repeated because the migration correction was unchanged; the prior median remains 6,571 ms.
+- Pre-PR Windows gates first found two test-only cleanup items: the new failure-evidence regression
+  used `panic!` under a workspace-wide `clippy::panic` deny, and an older Agy planner integration
+  still required the removed prompt-valued `--print` argument. The first was rewritten with typed
+  assertions. The second is tracked as `WSL-032` and now verifies that `--print`, `-p`, and
+  `--prompt` are absent while the fake planner still parses the stdin bridge. A full test link also
+  exhausted the C: drive because retained Rust build artifacts had consumed all free space. No
+  worktree was deleted: only the reproducible `target` directory in the inactive
+  `wsl-provider-readonly-policy` worktree was cleaned, removing 14.0 GiB. After correction and
+  cleanup, workspace fmt, all-target/all-feature clippy with `-D warnings`, the complete workspace
+  all-feature test suite, npm's 67 tests, release workflow contract, Codex matrix check, and
+  `git diff --check` all passed.
+
+## WSL-025: provider prompt omits the mandatory outcome discriminator
+
+- Severity: high (availability; strict fail-closed and writable safety remained intact)
+- Status: fixed in source candidate; nightly verification pending
+- Observed nightly: `0.1.1-nightly.20260807.d3ad1af`
+
+The shared canonical conversation prompt lists `required_fields` for every outcome but omits the
+top-level `outcome` discriminator itself. Its prose calls only `response_redacted` a required key
+and does not say that transcript formatting requests cannot override the canonical envelope. The
+QA wording `Reply with exactly COLAY_QA_OK` triggered that ambiguity: real Codex returned the
+single strict object `{"response_redacted":"COLAY_QA_OK"}` and the collector correctly rejected
+it for a missing `outcome`. A normal greeting immediately succeeded, so the original wording was
+also a QA-harness conflict, not an account or transport failure.
+
+The correction makes `outcome` mandatory in every advertised shape and states that untrusted
+transcript formatting applies only to response content, never to the envelope. The strict parser,
+unknown-field rejection, one-turn policy, and prohibition on inferring a missing discriminator
+remain unchanged. Focused prompt tests exercise the production `WorkerRequest`, and the WSL source
+candidate completed a non-conflicting fixed-token Codex turn with the required canonical envelope
+and zero writable state. Deployed-nightly closure remains pending.
+
+## WSL-026: fresh migration doubles durable FULL-sync work
+
+- Severity: medium
+- Status: fixed in source candidate; nightly verification pending
+- Observed nightly: `0.1.1-nightly.20260807.d3ad1af`
+
+`migrate apply` safely dry-runs every pending catalog step in a disposable database before applying
+the live migration. Both paths currently use WAL plus `synchronous=FULL`, and each of 17 versions
+commits independently. A fresh home therefore performs 34 durable sync commits. Controlled warm
+WSL measurements put normal fresh apply at 6.56-14.11 seconds and current-schema reapply at
+0.53-0.64 seconds; the unhealthy QA host amplified two fresh applies beyond 23 seconds.
+
+Dry-run validation and live crash durability remain. The correction is limited to the disposable
+scratch database: file-backed `journal_mode=DELETE`, `synchronous=OFF`, foreign keys enabled, and
+the existing busy timeout. It avoids an unbounded memory journal during the schema-13 table
+rewrites. Production-path tests observe the exact disposable policy and source non-mutation;
+durable tests retain `WAL` plus `FULL` for the live database. Live schema ordering,
+one-version-at-a-time commit semantics, backup behavior, and failure rollback are unchanged.
+
+## WSL-027: Agy consumes `--mode` as the print prompt
+
+- Severity: high
+- Status: fixed in source candidate; nightly verification pending
+- Observed nightly: `0.1.1-nightly.20260807.d3ad1af`
+
+Agy 1.1.9 declares `--print/-p` as a prompt-valued option. Colay builds
+`agy --print --mode plan --sandbox ...` and sends the actual canonical prompt on stdin. Agy
+therefore consumes `--mode` as its prompt and returns an explanation of that token; Colay then
+correctly rejects the plain response as incompatible. The account and supported flags were not
+the cause: public help advertised `--print`, `--mode plan`, `--sandbox`, and the configured model,
+and the process completed normally.
+
+Agy's official piped-input contract reads a non-TTY stdin prompt only when no prompt-valued flag is
+present. The correction removes `--print`, `-p`, and `--prompt` entirely while preserving separated
+mode, sandbox, model, and conversation arguments and the canonical stdin payload. Compatibility
+allows this transport for parsed Agy versions at or above `1.1.2`, where piped prompts are supported,
+or when public help explicitly advertises piped/read-stdin prompting; lower or unknown versions
+without that capability fail closed before inference. The production-process fake now models exact
+prompt-valued flag consumption and missing-argument failure. Actual Agy `1.1.10` completed a bounded
+source-candidate conversation through stdin with canonical `answer_complete`, and no private prompt
+was exposed in argv. `--output-format` and `--json-schema` capability support remain separate
+hardening work.
+
+## WSL-028: Agy help text misclassifies an immediate usage error as timeout
+
+- Severity: medium
+- Status: fixed in source candidate; nightly verification pending
+- Observed source candidate provider: Agy `1.1.10`
+
+Agy exited immediately with code 2 and `flag needs an argument: -print`. The bounded evidence also
+included public help containing the option name `--print-timeout` and description `Timeout for
+print mode wait`. The generic failure classifier scans the entire evidence for the bare substring
+`timeout`, so it returned the misleading user message `agy timed out` instead of a compatibility
+or process failure. No timeout occurred.
+
+The correction keeps explicit `ConversationExit::TimedOut` authoritative and retains the genuine
+phrases `timed out` and `deadline exceeded`, but removes the ambiguous bare `timeout` substring from
+unstructured evidence classification. Regressions cover the exact Agy help/error combination and
+the retained genuine signals. The subsequent actual Agy `1.1.10` source-candidate turn completed
+successfully and was not misclassified.
+
+## WSL-029: successful evidence duplicates the canonical outcome
+
+- Severity: low
+- Status: fixed in source candidate; nightly verification pending
+- Observed source candidate provider: Agy `1.1.10`
+
+The successful conversation collector constructed its bounded diagnostic evidence by concatenating
+the provider's already redacted evidence and canonical output. It then returned the parsed canonical
+outcome separately but persisted the concatenated bytes as successful evidence. An actual Agy turn
+therefore produced adjacent content such as `supported=true{"outcome":...}`: redundant, difficult to
+read, and needlessly retaining a second copy of the response. Failure diagnostics still need bounded
+output, but successful evidence does not.
+
+The correction bounds and returns only `response.evidence_redacted` on success while leaving the
+failure-diagnostic path unchanged. A RED-to-GREEN collector regression proves that canonical output
+appears only in the typed outcome and not in successful evidence. Separate malformed-output and
+lifecycle regressions prove that failure evidence still retains bounded provider output. The rebuilt
+WSL candidate persisted no duplicate canonical JSON. Deployed-nightly verification remains pending.
+
+## WSL-030: prose-prefixed structured output can bypass terminal-envelope ambiguity checks
+
+- Severity: medium (fail-closed contract)
+- Status: fixed in source candidate; nightly verification pending
+- Found by: independent pre-PR diff review
+
+The terminal-envelope selector rejects earlier messages that begin with a JSON object, array, or
+code fence. It initially treated `Earlier answer: {"outcome":...}` and prose followed by a fenced
+object as ordinary progress because the structured marker was not at byte zero. It could therefore
+discard an earlier structured-output attempt as evidence and accept a later envelope, contrary to
+the one-object ambiguity contract.
+
+The correction inspects the joined prefix before the terminal envelope, rather than each provider
+frame in isolation. It detects actual line-start fences, embedded valid object/array values, and
+malformed object starts with double-quoted, single-quoted, or unquoted identifier keys. Exact scalar
+JSON and byte-zero container checks remain. Regressions cover prose-prefixed, frame-split, malformed,
+array, and fenced output; all ambiguous bytes remain in the strict parser input and fail closed.
+Ordinary `Processed [1/3]` progress and a sentence that merely mentions a literal triple-backtick
+marker still become bounded evidence instead of false-positive structured output.
+
+## WSL-031: Agy stdin capability accepts unrelated versions and negative help
+
+- Severity: medium (compatibility fail-closed contract)
+- Status: fixed in source candidate; nightly verification pending
+- Found by: independent pre-PR diff review
+
+The first Agy stdin transport correction parsed the first whitespace-delimited semver anywhere in
+`--version` output and searched all help text for the independent words `stdin`, `prompt`, and
+`read`/`pipe`. A runtime banner before an old Agy version could therefore satisfy the `1.1.2` floor,
+and a sentence such as `Prompt cannot be read from stdin; piped input is unsupported` could be
+mistaken for affirmative capability evidence.
+
+The correction accepts a standalone semver, an immediate semver after an explicit `agy`, `agy-cli`,
+`antigravity`, or `antigravity-cli` label, or the immediate `version <semver>` form. It does not scan
+later runtime or dependency versions. Unknown/development versions use a narrow allowlist of
+affirmative piped-prompt-from-stdin help phrases at the start of one normalized help line; broad word
+co-occurrence is not capability evidence. Explicit negative, interactive-answer, false/off, absent,
+removed, prohibited, unsupported, disabled, and unavailable cases fail closed. RED-to-GREEN tests
+cover unrelated and multiply labelled versions, the `1.1.2` floor, affirmative help with a harmless
+response suffix, and the negative/interactive families.
+
+## WSL-032: Agy planner integration still requires the removed `--print` flag
+
+- Severity: low (test contract; production source-candidate behavior was correct)
+- Status: fixed in source; CI verification pending
+- Found by: complete Windows workspace test gate
+
+The production-process Agy tests and WSL actual-provider QA correctly used the official piped-stdin
+transport, but an older planner integration asserted that the fake invocation arguments contained
+`--print`. The complete workspace suite therefore failed after the implementation removed that
+prompt-valued flag. This was stale test policy, not a production fallback: the fake process already
+received and parsed the canonical planner bridge from stdin.
+
+The integration now asserts that `--print`, `-p`, and `--prompt` are all absent while retaining mode,
+sandbox, graph collection, and fake invocation evidence. The focused four-test planner suite,
+workspace clippy, and complete all-feature workspace tests pass. Exact PR CI remains pending.
+
 ## 2026-08-03 clean-install nightly provider-boundary QA
 
 - WSL 2 clean-install QA of `0.1.1-nightly.20260803.28d0d5f` used an isolated
@@ -727,7 +1019,7 @@ that import readiness is unavailable through IPC, so neither mode currently pres
 ## WSL-022: plan-only rejects an established read-only provider command
 
 - Severity: high
-- Status: fix-in-progress (source checks passed; published-nightly verification pending)
+- Status: fixed in source candidate; nightly verification pending
 - Observed nightly: `0.1.1-nightly.20260803.28d0d5f`
 - Observed provider: Codex
 
@@ -757,10 +1049,25 @@ evidence when the requested sandbox is read-only and the provider has establishe
   suite (7 tests), and fake-provider support targets. The successful regression persists status
   `succeeded`, canonical `answer_complete`, separate redacted evidence, and zero writable task state;
   the file-change regression still fails closed.
-- These checks use fake providers only. Published-nightly WSL verification remains pending, so the
-  issue is not yet `fixed`.
+- Exact merge CI passed on Ubuntu, macOS, and Windows. WSL clean-installed the matching
+  `0.1.1-nightly.20260807.d3ad1af`, completed fake conversations for all four providers and
+  retained zero writable task state. The original unconditional-command rejection is fixed.
+- Follow-up source-candidate QA used actual Codex 0.146.0 and safely observed only
+  `/bin/bash -lc pwd`. Codex emitted a prose progress message and then a separate valid canonical
+  outcome. The conversation orchestrator joined both normalized `WorkerEvent::Message` values,
+  so the unchanged strict collector rejected the combined bytes before parsing the valid final
+  envelope. The command policy and writable safety remained correct, but the end-to-end scenario
+  was not complete and the issue was reopened at the multi-message collection boundary.
+- The follow-up correction selects a terminal suffix only when it parses as exactly one JSON object
+  and every preceding message is plain prose. Structured prefixes, JSON-like text, code fences,
+  multiple objects, unknown fields, and malformed envelopes continue through the unchanged strict
+  collector and fail closed. This preserves multiline Agy envelopes while moving only bounded prose
+  into evidence. The fake Codex fixture now emits command commentary, and focused regressions cover
+  valid terminal suffixes plus ambiguous structured prefixes. Actual Codex 0.146.0 then completed
+  the same `/bin/bash -lc pwd` scenario with canonical `COLAY_READ_ONLY_OK`, an empty workspace, and
+  zero writable rows. Deployed-nightly closure remains pending.
 
-### Completion conditions
+### Completion evidence
 
 - Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
 - Release completion: a newly published nightly passes isolated WSL clean-install QA and the issue status changes to `fixed`.
@@ -768,7 +1075,7 @@ evidence when the requested sandbox is read-only and the provider has establishe
 ## WSL-023: WSL provider discovery can expose a Windows executable
 
 - Severity: high
-- Status: fix-in-progress (source checks passed; published-nightly verification pending)
+- Status: fixed (all four deployed QA providers resolved Linux-native paths)
 - Observed nightly: `0.1.1-nightly.20260803.28d0d5f`
 - Observed provider: Antigravity (`agy`)
 
@@ -780,9 +1087,9 @@ During the same isolated WSL clean-install QA, the non-inference command
 inference. The persisted provider result remained unavailable because no native executable was
 resolved, with zero new tasks, task attempts, worktrees, coordinator leases, and worker leases.
 
-The resolver currently permits PATH discovery to expose a Windows executable to WSL instead of
-requiring a Linux-native binary. Discovery must reject Windows-mounted and Windows PE candidates
-before any probe, uniformly for Codex, Claude, Gemini, and Agy.
+The resolver permitted PATH discovery to expose a Windows executable to WSL instead of requiring
+a Linux-native binary. The correction rejects Windows-mounted and Windows PE candidates before
+any probe, uniformly for Codex, Claude, Gemini, and Agy.
 
 ### Source fix and focused verification
 
@@ -792,18 +1099,22 @@ before any probe, uniformly for Codex, Claude, Gemini, and Agy.
 - Focused source checks passed: all 18 executable resolver tests, all 39 `orchestrator-process` unit
   tests, and all 6 provider process-runtime tests. Local inert mount, PE, symlink, and script fixtures
   were classified without invoking a real provider.
-- Published-nightly WSL validation of native identity and pre-probe rejection remains pending, so
-  the issue is not yet `fixed`.
+- Published-nightly WSL validation resolved Codex, Claude, Gemini, and Agy from Linux-native paths
+  under `/home/kimohy`; none resolved below `/mnt` or to a PE image. The deployment gate is
+  satisfied.
 
-### Completion conditions
+### Completion evidence
 
-- Source completion: fake-provider regression tests pass for all four provider identities and required workspace checks pass.
-- Release completion: a newly published nightly passes isolated WSL clean-install QA and the issue status changes to `fixed`.
+- Source completion: fake-provider coverage must include a read-only command followed by a prose
+  progress message and exactly one final canonical envelope, while rejecting missing, malformed,
+  or ambiguous final envelopes.
+- Release completion: a newly published nightly passes that actual isolated WSL scenario and the
+  issue status changes back to `fixed`.
 
 ## WSL-024: fake-provider-only worker guard is an incomplete basename denylist
 
 - Severity: high
-- Status: fix-in-progress (focused RED/GREEN and local full gates passed; CI, merge, and nightly verification pending)
+- Status: fixed (exact merge CI and deployed fake-only four-provider QA passed)
 - Affected scope: tests and CI with `COLAY_TEST_FAKE_PROVIDERS_ONLY=1`
 
 ### Observation and risk
@@ -834,8 +1145,10 @@ fail-open CI policy inconsistency.
   27 provider unit tests. The fallback fixture retained a nonexistent primary path but
   now uses the exact compiled fake basename; all 20 production-runtime provider E2E
   cases passed with fake-only mode enabled. Workspace-wide formatting, Clippy, and
-  tests then passed with fake-only mode enabled and provider credentials cleared. PR
-  CI and published-nightly WSL validation remain the completion gates.
+  tests then passed with fake-only mode enabled and provider credentials cleared. Exact merge CI
+  passed on all three platforms. The matching deployed nightly completed isolated fake-only
+  migration, daemon lifecycle, all four provider conversations, and 32 concurrent clients without
+  invoking a real provider, satisfying the release gate.
 - This basename allowlist prevents accidental use of default, renamed, or wrapper
   provider commands; it is not a cryptographic identity check against a hostile binary
   deliberately substituted under an allowed test-support filename. E2E tests retain
@@ -843,7 +1156,7 @@ fail-open CI policy inconsistency.
   fake binary SHA-256. A future canonical-path or content-hash contract can strengthen
   the generic runtime boundary without broadening this correction's claim.
 
-### Completion conditions
+### Completion evidence
 
 - Source completion: all four default provider identities are rejected by the
   fake-only production worker guard and fake fixtures remain allowed.
@@ -983,7 +1296,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
   `0.1.1-nightly.20260726.b086448`, `0.1.1-nightly.20260726.20b7654`,
   `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`,
   `0.1.1-nightly.20260801.3f4e2f7`, `0.1.1-nightly.20260802.8f2654a`,
-  `0.1.1-nightly.20260803.95cf4d3`
+  `0.1.1-nightly.20260803.95cf4d3`, `0.1.1-nightly.20260807.d3ad1af`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 자동화 테스트와 CI는 fake provider만 사용한다. 실제 provider inference는 사용자가
   명시적으로 승인한 격리 수동 QA에서만 제한적으로 호출한다.
@@ -993,28 +1306,36 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-022` | low | monitoring (non-code Windows host filesystem anomaly; clean full gate GREEN; final CI pending) | a freshly created `DoctorFixture` repository disappeared before current-schema WAL seeding |
-| `WIN-021` | low | fix-in-progress (identical-tree Windows CI RED/GREEN; scoped bounded fixture timeout and local repeats pass; final CI pending) | cold-start receipt correctness fixture inherits the production registration latency deadline |
-| `WIN-020` | low | fix-in-progress (identical-tree Ubuntu CI RED/GREEN; deterministic gate and local repeats pass; final CI pending) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
-| `WIN-019` | medium | fix-in-progress (exact-`b71f9a9` macOS CI RED; alias RED/GREEN and final local full gates pass; final CI pending) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
-| `WIN-018` | low | fix-in-progress (exact-`b71f9a9` Windows CI RED; bounded-wait and final local full gates pass; final CI pending) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
-| `WIN-017` | medium | fix-in-progress (exact-`b71f9a9` stress failed once; exact-`a05bc02` stress passed once; final CI/nightly pending) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
-| `WIN-016` | medium | fix-in-progress (native mutex RED/GREEN; duplicate state gate removed; final local full gates pass; CI/nightly pending) | read-only ACL verification can race an in-process ACL repair sequence |
-| `WIN-015` | medium | fix-in-progress (reviewed PowerShell 7.2/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
-| `WIN-014` | low | fix-in-progress (reviewed deterministic fixture, exact A/B, and authoritative stress pass; merge/CI pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
-| `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
-| `WIN-012` | medium | fix-in-progress (structural matrix, exact A/B, and authoritative stress pass; merge/CI pending) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
-| `WIN-011` | medium | fix-in-progress (PID matrix, exact A/B, and authoritative stress pass; merge/CI pending) | process-audit PID multiset comparison treats hashtable insertion order as data |
-| `WIN-010` | high | fix-in-progress (fresh exact A/B and authoritative stress passed; CI/nightly pending) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
-| `WSL-024` | high | fix-in-progress (fail-closed allowlist/fallback RED/GREEN and local full gates passed; CI/merge/nightly pending) | fake-provider-only worker guard is an incomplete basename denylist and skips fallbacks |
+| `WSL-032` | low | fixed in source; CI verification pending | an older Agy planner integration still requires the removed prompt-valued `--print` flag |
+| `WSL-031` | medium | fixed in source candidate; nightly verification pending | Agy stdin capability accepts an unrelated semver or negative help sentence as support |
+| `WSL-030` | medium | fixed in source candidate; nightly verification pending | prose-prefixed structured output can bypass terminal-envelope ambiguity checks |
+| `WSL-029` | low | fixed in source candidate; nightly verification pending | successful evidence redundantly appends a second copy of the canonical outcome |
+| `WSL-028` | medium | fixed in source candidate; nightly verification pending | Agy help's `--print-timeout` text misclassifies an immediate usage error as a runtime timeout |
+| `WSL-027` | high | fixed in source candidate; nightly verification pending | Agy's prompt-valued `--print` first consumed `--mode`, then rejected a terminal flag without an argument |
+| `WSL-026` | medium | fixed in source candidate; nightly verification pending | fresh migration performs 17 disposable plus 17 live `synchronous=FULL` commits |
+| `WSL-025` | high | fixed in source candidate; nightly verification pending | the shared provider prompt omits mandatory `outcome` from every required-field list |
+| `WIN-022` | low | monitoring (non-code Windows host filesystem anomaly; exact merge CI GREEN) | a freshly created `DoctorFixture` repository disappeared before current-schema WAL seeding |
+| `WIN-021` | low | fixed (exact merge CI and nightly smoke GREEN) | cold-start receipt correctness fixture inherits the production registration latency deadline |
+| `WIN-020` | low | fixed (exact merge CI and nightly smoke GREEN) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
+| `WIN-019` | medium | fixed (exact merge CI and nightly smoke GREEN) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
+| `WIN-018` | low | fixed (exact merge CI and nightly smoke GREEN) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
+| `WIN-017` | medium | fixed (authoritative stress and exact merge CI GREEN) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
+| `WIN-016` | medium | fixed (native mutex regression and exact merge CI GREEN) | read-only ACL verification can race an in-process ACL repair sequence |
+| `WIN-015` | medium | fixed (PowerShell 7.2/7.6 A/B, stress, and exact merge CI GREEN) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
+| `WIN-014` | low | fixed (deterministic fixture, stress, and exact merge CI GREEN) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
+| `WIN-013` | medium | fixed (PowerShell 7.2/7.6, stress, and exact merge CI GREEN) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
+| `WIN-012` | medium | fixed (structural matrix, stress, and exact merge CI GREEN) | generic JSON equivalence is property-order-sensitive and collapses singleton arrays |
+| `WIN-011` | medium | fixed (PID matrix, stress, and exact merge CI GREEN) | process-audit PID multiset comparison treats hashtable insertion order as data |
+| `WIN-010` | high | fixed (fresh exact A/B, stress, and exact merge CI GREEN) | amended deadline helpers initially broke marker import and allowed explicit null deadline downgrade |
+| `WSL-024` | high | fixed (deployed fake-only four-provider QA GREEN) | fake-provider-only worker guard is an incomplete basename denylist and skips fallbacks |
 | `WSL-014` | high | fixed | non-Git plan-only Codex invocation omits `--skip-git-repo-check` |
 | `WSL-015` | high | fixed | `--provider` preference is recorded but ignored for conversation execution |
 | `WSL-016` | high | fixed | provider failures are persisted as succeeded and reduced to generic needs-attention |
 | `WSL-019` | high | fixed | unsealed legacy invalid graph prevents daemon startup |
 | `WSL-020` | high | fixed | real Codex output is rejected because the exact conversation JSON field contract is not supplied |
 | `WSL-021` | medium | fixed | doctor reports an already completed legacy import as pending |
-| `WSL-022` | high | fix-in-progress | plan-only rejects a provider command even when the read-only sandbox and capability are established |
-| `WSL-023` | high | fix-in-progress | WSL provider discovery can expose a Windows executable instead of requiring a Linux-native binary |
+| `WSL-022` | high | fixed in source candidate; nightly verification pending | multi-message read-only command output is joined ahead of an otherwise valid final envelope |
+| `WSL-023` | high | fixed (all four deployed QA providers resolved Linux-native paths) | WSL provider discovery can expose a Windows executable instead of requiring a Linux-native binary |
 | `WSL-001` | medium | fixed | NVM/Node 버전 및 비대화형 PATH 불일치 |
 | `WSL-002` | high | fixed | daemon startup phase, bounded probe wait, exact child cleanup 적용 |
 | `WSL-003` | high | fixed | WSL/Windows idle daemon의 반복 `BEGIN IMMEDIATE`로 direct writer starvation |
@@ -1024,7 +1345,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-007` | low | fixed | chat TUI reconnect 테스트의 고정 500ms 타이밍 플래이크 |
 | `WSL-008` | high | fixed | provider 오류/실행 중단 후 장기 lease가 남아 `resume` 충돌 |
 | `WSL-009` | high | fixed | config가 없는 기존 DB에서 `migrate apply`가 시작 전에 실패 |
-| `WSL-010` | critical | fix-in-progress | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
+| `WSL-010` | critical | fixed (schema 17 user-global state and non-Git plan-only verified) | repository-local DB 분산과 provider safe mode가 migration·plan 진입을 순환 차단 |
 | `WSL-011` | high | open | migration 대기 DB에서 `doctor`가 미래 schema 컬럼을 먼저 조회해 raw SQL 오류 반환 |
 | `WSL-012` | high | fixed | 최소 버전 이상 Codex가 exact-only 판정으로 safe mode에 고정됨 |
 | `WSL-013` | high | fixed | startup/secondary workspace probe가 daemon restart 종료를 차단 |
@@ -1032,7 +1353,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-002` | medium | closed | Windows nightly PE의 Authenticode 부재를 enterprise 지원 제한으로 명시 |
 | `WIN-003` | low | open | Windows 전체 테스트에서 `icacls.exe` 접근 거부 플래이크가 재발 |
 | `WIN-004` | medium | fixed | Agy가 provider 관리 CLI의 허용 enum에서 누락됨 |
-| `WIN-005` | high | fix-in-progress (unchanged latency limits passed authoritative re-acceptance; merge/CI/nightly pending) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
+| `WIN-005` | high | fixed (unchanged latency limits, exact merge CI, and nightly GREEN) | fresh daemon bootstrap 뒤 중복 legacy 검사가 `workspace.register` 응답 제한을 초과 |
 | `WIN-006` | high | fix-in-progress (source tests passed; LocalSystem native/nightly verification pending) | LocalSystem 실행에서 current-user와 SYSTEM SID가 같아 native state ACL 생성·검증이 자체 충돌 |
 | `WIN-007` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B preflight가 zero candidate-process pipeline output을 strict-mode collection으로 정규화하지 않음 |
 | `WIN-008` | medium | fixed (reviewed exact-HEAD A/B passed) | marker A/B가 active daemon의 global `state.db` family hash를 읽어 Windows sharing violation으로 중단됨 |

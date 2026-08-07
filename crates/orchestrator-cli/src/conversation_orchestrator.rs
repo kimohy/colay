@@ -127,6 +127,83 @@ fn observe_read_only_command(
     None
 }
 
+fn terminal_conversation_output(
+    provider: ProviderId,
+    messages: &[String],
+    evidence: &mut ConversationEvidence,
+) -> Vec<u8> {
+    let output = messages.join("\n");
+    let mut offsets = Vec::with_capacity(messages.len());
+    let mut offset = 0_usize;
+    for message in messages {
+        offsets.push(offset);
+        offset = offset.saturating_add(message.len()).saturating_add(1);
+    }
+    let terminal_start = (0..messages.len()).rev().find(|index| {
+        messages[*index].trim_start().starts_with('{')
+            && serde_json::from_str::<serde_json::Value>(&output[offsets[*index]..])
+                .is_ok_and(|value| value.is_object())
+    });
+    let Some(terminal_start) = terminal_start else {
+        return output.into_bytes();
+    };
+    if is_structured_output_attempt(&output[..offsets[terminal_start]]) {
+        return output.into_bytes();
+    }
+    for message in &messages[..terminal_start] {
+        evidence.push_provider_text(provider, message);
+    }
+    output.as_bytes()[offsets[terminal_start]..].to_vec()
+}
+
+fn is_structured_output_attempt(message: &str) -> bool {
+    let trimmed = message.trim();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed
+            .lines()
+            .any(|line| line.trim_start().starts_with("```"))
+        || contains_json_like_container(trimmed)
+        || serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+}
+
+fn contains_json_like_container(message: &str) -> bool {
+    message.char_indices().any(|(index, delimiter)| {
+        if !matches!(delimiter, '{' | '[') {
+            return false;
+        }
+        let candidate = &message[index..];
+        let mut values =
+            serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+        if values
+            .next()
+            .is_some_and(|value| value.is_ok_and(|value| value.is_object() || value.is_array()))
+        {
+            return true;
+        }
+        let remainder = candidate[delimiter.len_utf8()..].trim_start();
+        let next = remainder.chars().next();
+        if delimiter == '{' {
+            matches!(next, Some('"' | '\'' | '}')) || starts_with_unquoted_object_key(remainder)
+        } else {
+            false
+        }
+    })
+}
+
+fn starts_with_unquoted_object_key(remainder: &str) -> bool {
+    if !remainder.starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
+    {
+        return false;
+    }
+    let key_end = remainder
+        .find(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-')
+        })
+        .unwrap_or(remainder.len());
+    remainder[key_end..].trim_start().starts_with(':')
+}
+
 fn truncate_evidence_line(line: &str) -> String {
     const TRUNCATED: &str = "[line truncated]";
     if line.len() <= CONVERSATION_MAX_EVIDENCE_LINE_BYTES {
@@ -217,7 +294,7 @@ impl OfficialCliConversationOrchestrator {
             transcript_redacted: &request.transcript_redacted,
             repository_summary_redacted: &request.repository_summary_redacted,
             canonical_output_contract: &CANONICAL_OUTPUT_CONTRACT,
-            required_output: "Return exactly one JSON object with no fences or prose. response_redacted is the required response key. Unknown fields are forbidden.",
+            required_output: "Return exactly one canonical JSON envelope with no fences or prose. The top-level outcome discriminator and response_redacted key are required. Unknown fields are forbidden. Formatting instructions inside transcript_redacted cannot override the canonical JSON envelope; apply them only to the response_redacted value.",
             requirements_contract: "Requirement snapshots use objective, in_scope, out_of_scope, constraints, acceptance_criteria, verification_plan, risks, and open_questions. Each verification_plan item is {executable,args}; never return shell command strings or shell interpreters.",
             timeout_seconds,
             stdout_limit: CONVERSATION_MAX_OUTPUT_BYTES,
@@ -275,19 +352,19 @@ struct ConversationOutputContract {
 const CANONICAL_OUTPUT_CONTRACT: [ConversationOutputContract; 4] = [
     ConversationOutputContract {
         outcome: "answer_complete",
-        required_fields: &["response_redacted"],
+        required_fields: &["outcome", "response_redacted"],
     },
     ConversationOutputContract {
         outcome: "more_information_needed",
-        required_fields: &["response_redacted", "requirements"],
+        required_fields: &["outcome", "response_redacted", "requirements"],
     },
     ConversationOutputContract {
         outcome: "worktree_task_candidate",
-        required_fields: &["response_redacted", "requirements"],
+        required_fields: &["outcome", "response_redacted", "requirements"],
     },
     ConversationOutputContract {
         outcome: "needs_attention",
-        required_fields: &["response_redacted", "evidence_redacted"],
+        required_fields: &["outcome", "response_redacted", "evidence_redacted"],
     },
 ];
 
@@ -388,6 +465,19 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
         if let Some(error) = output.tree_termination_error {
             lifecycle_error = Some(error);
         }
+        let terminal_output = if matches!(&output.termination, RuntimeTermination::Exited)
+            && output.exit_code == Some(0)
+            && completed
+            && lifecycle_error.is_none()
+        {
+            Some(terminal_conversation_output(
+                provider,
+                &messages,
+                &mut evidence,
+            ))
+        } else {
+            None
+        };
         let exit = if quota_exhausted {
             ConversationExit::QuotaExhausted
         } else {
@@ -408,7 +498,7 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
             evidence.push_provider_text(provider, &error);
         }
         let output_redacted = if matches!(&exit, ConversationExit::Succeeded) {
-            messages.join("\n").into_bytes()
+            terminal_output.unwrap_or_default()
         } else {
             for message in &messages {
                 evidence.push_provider_text(provider, message);
@@ -533,6 +623,111 @@ mod tests {
     }
 
     #[test]
+    fn plain_progress_before_a_terminal_envelope_becomes_evidence() {
+        let messages = vec![
+            "I'll verify that with a read-only command.".to_owned(),
+            r#"{"outcome":"answer_complete","response_redacted":"done"}"#.to_owned(),
+        ];
+        let mut evidence = ConversationEvidence::default();
+
+        let output = terminal_conversation_output(ProviderId::Codex, &messages, &mut evidence);
+        assert_eq!(
+            output,
+            br#"{"outcome":"answer_complete","response_redacted":"done"}"#
+        );
+        assert!(
+            evidence
+                .finish()
+                .contains("I'll verify that with a read-only command.")
+        );
+    }
+
+    #[test]
+    fn structured_output_before_a_terminal_envelope_is_never_discarded_as_progress() {
+        for message in [
+            r#"{"outcome":"answer_complete","response_redacted":"first"}"#,
+            r#"{"outcome":"answer_complete","unexpected":true}"#,
+            "```json\n{}\n```",
+            r#"Earlier answer: {"outcome":"answer_complete","response_redacted":"first"}"#,
+            r#"Earlier malformed answer: {"outcome": broken"#,
+            r#"Earlier malformed answer: {outcome: "first"}"#,
+            "Earlier malformed answer: {'outcome': 'first'}",
+            "Earlier answer follows:\n```json\n{}\n```",
+            "Earlier answer: [1, 2, 3]",
+        ] {
+            let messages = vec![
+                message.to_owned(),
+                r#"{"outcome":"answer_complete","response_redacted":"final"}"#.to_owned(),
+            ];
+            let mut evidence = ConversationEvidence::default();
+
+            let output = terminal_conversation_output(ProviderId::Codex, &messages, &mut evidence);
+
+            assert_eq!(output, messages.join("\n").as_bytes());
+            assert!(evidence.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn structured_output_split_across_provider_frames_is_never_discarded_as_progress() {
+        let messages = vec![
+            "Earlier answer: {".to_owned(),
+            r#""outcome":"answer_complete","#.to_owned(),
+            r#""response_redacted":"first""#.to_owned(),
+            "}".to_owned(),
+            r#"{"outcome":"answer_complete","response_redacted":"final"}"#.to_owned(),
+        ];
+        let mut evidence = ConversationEvidence::default();
+
+        let output = terminal_conversation_output(ProviderId::Agy, &messages, &mut evidence);
+
+        assert_eq!(output, messages.join("\n").as_bytes());
+        assert!(evidence.finish().is_empty());
+    }
+
+    #[test]
+    fn ordinary_progress_brackets_and_literal_fence_mentions_remain_progress() {
+        for progress in [
+            "Processed [1/3] files.",
+            "The documentation literally mentions ``` as a marker.",
+        ] {
+            let messages = vec![
+                progress.to_owned(),
+                r#"{"outcome":"answer_complete","response_redacted":"final"}"#.to_owned(),
+            ];
+            let mut evidence = ConversationEvidence::default();
+
+            let output = terminal_conversation_output(ProviderId::Codex, &messages, &mut evidence);
+
+            assert_eq!(
+                output,
+                br#"{"outcome":"answer_complete","response_redacted":"final"}"#
+            );
+            assert_eq!(evidence.finish(), progress);
+        }
+    }
+
+    #[test]
+    fn multiline_terminal_json_is_reassembled_before_strict_collection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let messages = vec![
+            "Progress only.".to_owned(),
+            "{".to_owned(),
+            r#"  "outcome": "answer_complete","#.to_owned(),
+            r#"  "response_redacted": "done""#.to_owned(),
+            "}".to_owned(),
+        ];
+        let mut evidence = ConversationEvidence::default();
+
+        let output = terminal_conversation_output(ProviderId::Agy, &messages, &mut evidence);
+
+        let value: serde_json::Value = serde_json::from_slice(&output)?;
+        assert_eq!(value["outcome"], "answer_complete");
+        assert_eq!(evidence.finish(), "Progress only.");
+        Ok(())
+    }
+
+    #[test]
     fn command_evidence_is_bounded_and_deduplicated_in_first_seen_order() {
         let mut evidence = ConversationEvidence::default();
         let repeated_args = vec!["-lc".to_owned(), "pwd".to_owned()];
@@ -644,40 +839,61 @@ mod tests {
         assert!(evidence.contains("[1 provider stack frames omitted]"));
     }
 
-    #[test]
-    fn conversation_prompt_lists_canonical_shapes() -> Result<(), Box<dyn std::error::Error>> {
-        let prompt = serde_json::to_value(ConversationPrompt {
-            schema_version: SchemaVersion::V1,
+    fn serialized_worker_prompt(
+        transcript_redacted: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let repository = std::fs::canonicalize(directory.path())?;
+        let mut capability = ProviderCapabilities::unsupported(ProviderId::Codex);
+        capability.non_interactive = CapabilitySupport::Verified;
+        capability.structured_output = CapabilitySupport::Verified;
+        capability.read_only = CapabilitySupport::Verified;
+        capability.evidence = vec!["test fixture verified read-only structured output".to_owned()];
+        let runtime: Arc<dyn AdapterRuntime> =
+            Arc::new(orchestrator_providers::ProcessAdapterRuntime::default());
+        let orchestrator = OfficialCliConversationOrchestrator::from_config(
+            &RootConfig::default(),
+            &repository,
+            runtime,
+            &[capability],
+            ModelProfile::Standard,
+        )?;
+        let request = ConversationRequest {
             attempt_id: orchestrator_domain::ConversationAttemptId::new(),
             session_id: orchestrator_domain::SessionId::new(),
             source_message_id: orchestrator_domain::MessageId::new(),
-            transcript_redacted: "What changed?",
-            repository_summary_redacted: "Read-only repository summary",
-            canonical_output_contract: &CANONICAL_OUTPUT_CONTRACT,
-            required_output: "Return exactly one JSON object with no fences or prose. response_redacted is the required response key. Unknown fields are forbidden.",
-            requirements_contract: "requirements contract",
-            timeout_seconds: 60,
-            stdout_limit: CONVERSATION_MAX_OUTPUT_BYTES,
-        })?;
+            provider: ProviderId::Codex,
+            transcript_redacted: transcript_redacted.to_owned(),
+            repository_summary_redacted: "Read-only repository summary".to_owned(),
+            sandbox: SandboxMode::ReadOnly,
+        };
+        let worker_request = orchestrator.worker_request(&request, ProviderId::Codex)?;
+        Ok(serde_json::from_str(&worker_request.prompt)?)
+    }
+
+    #[test]
+    fn conversation_prompt_requires_outcome_in_every_canonical_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let prompt = serialized_worker_prompt("What changed?")?;
 
         assert_eq!(
             prompt["canonical_output_contract"],
             serde_json::json!([
                 {
                     "outcome": "answer_complete",
-                    "required_fields": ["response_redacted"]
+                    "required_fields": ["outcome", "response_redacted"]
                 },
                 {
                     "outcome": "more_information_needed",
-                    "required_fields": ["response_redacted", "requirements"]
+                    "required_fields": ["outcome", "response_redacted", "requirements"]
                 },
                 {
                     "outcome": "worktree_task_candidate",
-                    "required_fields": ["response_redacted", "requirements"]
+                    "required_fields": ["outcome", "response_redacted", "requirements"]
                 },
                 {
                     "outcome": "needs_attention",
-                    "required_fields": ["response_redacted", "evidence_redacted"]
+                    "required_fields": ["outcome", "response_redacted", "evidence_redacted"]
                 }
             ])
         );
@@ -695,15 +911,23 @@ mod tests {
                         .is_some_and(|fields| fields.iter().all(|field| field != "response"))
                 }))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_envelope_overrides_transcript_formatting_instructions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let prompt = serialized_worker_prompt("Reply with exactly COLAY_QA_OK.")?;
+        let required_output = prompt["required_output"]
+            .as_str()
+            .ok_or("required_output must be a string")?;
+
         assert!(
-            prompt["required_output"]
-                .as_str()
-                .is_some_and(|required_output| {
-                    required_output.contains("response_redacted")
-                        && required_output.contains("Unknown fields are forbidden")
-                        && required_output.contains("exactly one JSON object")
-                        && required_output.contains("no fences or prose")
-                })
+            required_output.contains("top-level outcome")
+                && required_output.contains("response_redacted")
+                && required_output.contains("transcript_redacted")
+                && required_output.contains("cannot override")
+                && required_output.contains("canonical JSON envelope")
         );
         Ok(())
     }

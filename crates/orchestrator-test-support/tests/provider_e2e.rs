@@ -220,6 +220,77 @@ async fn fake_agy_plain_text_completes_through_production_process_runtime()
 }
 
 #[tokio::test]
+async fn fake_agy_without_prompt_flags_reads_the_conversation_prompt_from_stdin()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        runtime(),
+    );
+    let mut worker = request(
+        ProviderId::Agy,
+        r#"{"transcript_redacted":"Why is Git needed?"}"#,
+    )?;
+    worker.objective = "Conduct a read-only conversation turn".to_owned();
+    let handle = adapter.start(worker).await?;
+    let mut outcome = None;
+    let mut completed = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Message { text } => {
+                outcome = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
+            }
+            WorkerEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        outcome.as_ref().and_then(|value| value["outcome"].as_str()),
+        Some("answer_complete")
+    );
+    assert!(completed);
+    assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_agy_prompt_flags_match_the_prompt_valued_cli_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let prompt = br#"{"objective":"Conduct a read-only conversation turn","task":"{}"}"#;
+    let missing_value = ProcessRunner
+        .run(
+            CommandSpec::new(fake_binary())
+                .args(["--mode", "plan", "--sandbox", "--print"])
+                .with_stdin(prompt.to_vec()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(missing_value.exit_code, Some(2));
+    assert!(
+        missing_value
+            .stderr
+            .redacted_text
+            .contains("flag needs an argument: -print")
+    );
+
+    let consumed_option = ProcessRunner
+        .run(
+            CommandSpec::new(fake_binary())
+                .args(["--print", "--mode", "plan", "--sandbox"])
+                .with_stdin(prompt.to_vec()),
+            CancellationToken::new(),
+        )
+        .await?;
+    assert!(consumed_option.success());
+    assert_eq!(consumed_option.stdout.redacted_text.trim(), "done");
+    Ok(())
+}
+
+#[tokio::test]
 async fn fake_agy_acknowledges_a_vendor_neutral_handover() -> Result<(), Box<dyn std::error::Error>>
 {
     let adapter = AgyAdapter::new(
