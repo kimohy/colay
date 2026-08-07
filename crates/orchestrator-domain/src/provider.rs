@@ -179,6 +179,11 @@ pub enum WorkerEvent {
     Message {
         text: String,
     },
+    /// A continuation of one semantic provider message. Consecutive deltas
+    /// must be concatenated byte-for-byte instead of being newline-joined.
+    MessageDelta {
+        text: String,
+    },
     CommandStarted {
         command_id: String,
         executable: String,

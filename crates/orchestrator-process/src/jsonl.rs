@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::CapturedOutput;
+use crate::{CapturedOutput, redaction::PrivateKeyStreamRedaction};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MalformedJsonLine {
@@ -26,9 +26,19 @@ pub fn parse_json_lines(output: &CapturedOutput) -> JsonLines {
         invalid_utf8: output.invalid_utf8,
         ..JsonLines::default()
     };
-    let mut private_key_active = false;
+    let mut private_key_redaction = PrivateKeyStreamRedaction::default();
     for (index, raw) in lossy.lines().enumerate() {
         if raw.trim().is_empty() {
+            continue;
+        }
+        let private_key_sensitive = private_key_redaction.inspect_frame(raw.as_bytes());
+        private_key_redaction.inspect_frame(b"\n");
+        if private_key_sensitive {
+            result.malformed.push(MalformedJsonLine {
+                line_number: index + 1,
+                error: "private-key material was redacted before JSON parsing".to_owned(),
+                redacted_line: "[REDACTED PRIVATE KEY]".to_owned(),
+            });
             continue;
         }
         match serde_json::from_str(raw) {
@@ -36,33 +46,11 @@ pub fn parse_json_lines(output: &CapturedOutput) -> JsonLines {
             Err(error) => result.malformed.push(MalformedJsonLine {
                 line_number: index + 1,
                 error: error.to_string(),
-                redacted_line: redact_evidence_line(raw, &output.redactor, &mut private_key_active),
+                redacted_line: output.redactor.redact(raw),
             }),
         }
     }
     result
-}
-
-fn redact_evidence_line(
-    raw: &str,
-    redactor: &crate::Redactor,
-    private_key_active: &mut bool,
-) -> String {
-    let begins_private_key = raw.contains("-----BEGIN") && raw.contains("PRIVATE KEY-----");
-    let ends_private_key = raw.contains("-----END") && raw.contains("PRIVATE KEY-----");
-    let redact_entire_line = *private_key_active || begins_private_key;
-    if begins_private_key {
-        *private_key_active = true;
-    }
-    let safe = if redact_entire_line {
-        "[REDACTED PRIVATE KEY]".to_owned()
-    } else {
-        redactor.redact(raw)
-    };
-    if ends_private_key {
-        *private_key_active = false;
-    }
-    safe
 }
 
 #[cfg(test)]
@@ -99,5 +87,44 @@ mod tests {
                 .all(|line| line.redacted_line == "[REDACTED PRIVATE KEY]")
         );
         assert_eq!(parsed.malformed[3].redacted_line, "not-json");
+    }
+
+    #[test]
+    fn invalid_private_key_end_keeps_later_evidence_redacted() {
+        let output = CapturedOutput::for_test(
+            b"-----BEGIN PRIVATE KEY-----\nprivate-body\n-----ENDxPRIVATE KEY-----\nstill-private\n"
+                .to_vec(),
+            Redactor::new(&RedactionConfig::default())
+                .unwrap_or_else(|error| panic!("redactor: {error}")),
+        );
+
+        let parsed = parse_json_lines(&output);
+        assert_eq!(parsed.malformed.len(), 4);
+        assert!(
+            parsed
+                .malformed
+                .iter()
+                .all(|line| line.redacted_line == "[REDACTED PRIVATE KEY]")
+        );
+    }
+
+    #[test]
+    fn valid_json_inside_private_key_material_is_never_returned_as_a_value() {
+        let output = CapturedOutput::for_test(
+            b"-----BEGIN PRIVATE KEY-----\n\"valid-json-secret\"\n-----END PRIVATE KEY-----\n"
+                .to_vec(),
+            Redactor::new(&RedactionConfig::default())
+                .unwrap_or_else(|error| panic!("redactor: {error}")),
+        );
+
+        let parsed = parse_json_lines(&output);
+        assert!(parsed.values.is_empty());
+        assert_eq!(parsed.malformed.len(), 3);
+        assert!(
+            parsed
+                .malformed
+                .iter()
+                .all(|line| line.redacted_line == "[REDACTED PRIVATE KEY]")
+        );
     }
 }

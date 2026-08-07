@@ -31,6 +31,22 @@ pub enum FakeRuntimeScenario {
     ConversationResponseAlias,
     ReadOnlyCommand,
     ReadOnlyCommandWithFileChange,
+    AmbiguousScalarPrefix,
+    GeminiDetailedErrorThenErrorResult,
+    GeminiWarningBetweenDeltas,
+    GeminiCompleteMessage,
+}
+
+fn is_conversation_scenario(scenario: FakeRuntimeScenario) -> bool {
+    matches!(
+        scenario,
+        FakeRuntimeScenario::Success
+            | FakeRuntimeScenario::ConversationResponseAlias
+            | FakeRuntimeScenario::ReadOnlyCommand
+            | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
+            | FakeRuntimeScenario::AmbiguousScalarPrefix
+            | FakeRuntimeScenario::GeminiWarningBetweenDeltas
+    )
 }
 
 /// Returns verified fake-only capability evidence for a read-only conversation provider.
@@ -154,13 +170,8 @@ impl AdapterRuntime for FakeAdapterRuntime {
     ) -> Result<WorkerHandle, ProviderError> {
         self.ensure_fake(&invocation.executable)?;
         let lines = if request.objective == "Conduct a read-only conversation turn"
-            && matches!(
-                self.scenario,
-                FakeRuntimeScenario::Success
-                    | FakeRuntimeScenario::ConversationResponseAlias
-                    | FakeRuntimeScenario::ReadOnlyCommand
-                    | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
-            ) {
+            && is_conversation_scenario(self.scenario)
+        {
             conversation_lines(provider, &request.prompt, self.scenario)
         } else {
             scenario_lines(provider, self.scenario)
@@ -168,11 +179,19 @@ impl AdapterRuntime for FakeAdapterRuntime {
         let mut events = lines
             .into_iter()
             .enumerate()
-            .map(|(index, bytes)| RawEvent {
-                channel: RawEventChannel::Stdout,
-                sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
-                bytes,
-                received_at: Utc::now(),
+            .map(|(index, mut bytes)| {
+                // The production fake CLI writes every Agy text frame with
+                // `println!`; preserve that transport byte in the in-memory
+                // runtime now that Agy stdout is assembled as deltas.
+                if provider == ProviderId::Agy {
+                    bytes.push(b'\n');
+                }
+                RawEvent {
+                    channel: RawEventChannel::Stdout,
+                    sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                    bytes,
+                    received_at: Utc::now(),
+                }
             })
             .collect::<VecDeque<_>>();
         if provider == ProviderId::Agy && self.scenario != FakeRuntimeScenario::Timeout {
@@ -363,6 +382,9 @@ fn fake_probe_output(args: &[String], codex_version: Option<&str>) -> String {
 }
 
 fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Vec<u8>> {
+    if provider == ProviderId::Gemini {
+        return gemini_scenario_lines(scenario);
+    }
     let lines: Vec<&str> = match (provider, scenario) {
         (ProviderId::Codex, FakeRuntimeScenario::Success) => vec![
             r#"{"type":"thread.started","thread_id":"fake-codex-session"}"#,
@@ -396,36 +418,15 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
         (ProviderId::Claude, FakeRuntimeScenario::TerminalError) => {
             vec![r#"{"type":"result","is_error":true,"result":"Credit balance is too low"}"#]
         }
-        (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::MalformedOutput) => {
-            vec!["not-json"]
-        }
-        (ProviderId::Gemini, FakeRuntimeScenario::Success) => vec![
-            r#"{"type":"init","session_id":"fake-gemini-session"}"#,
-            r#"{"type":"message","role":"assistant","content":"done"}"#,
-            r#"{"type":"result","result":"done"}"#,
-        ],
-        (ProviderId::Gemini, FakeRuntimeScenario::QuotaExceeded) => {
-            vec![r#"{"type":"error","message":"Daily quota exceeded"}"#]
-        }
-        (ProviderId::Gemini, FakeRuntimeScenario::TerminalError) => {
-            vec![r#"{"type":"error","message":"Credit balance is too low"}"#]
-        }
-        (ProviderId::Gemini, FakeRuntimeScenario::DiagnosticNoise) => vec![
-            r#"{"type":"stderr","message":"provider diagnostic"}"#,
-            r#"{"type":"stderr","message":"provider diagnostic"}"#,
-            r#"{"type":"stderr","message":"provider diagnostic"}"#,
-        ],
-        (ProviderId::Claude | ProviderId::Gemini, FakeRuntimeScenario::UnknownEvent) => {
+        (ProviderId::Claude, FakeRuntimeScenario::MalformedOutput) => vec!["not-json"],
+        (ProviderId::Claude, FakeRuntimeScenario::UnknownEvent) => {
             vec![r#"{"type":"new_optional_event","payload":1}"#]
         }
         (ProviderId::Claude, FakeRuntimeScenario::SecretOutput) => vec![
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"api_key=supersecretvalue"}]}}"#,
             r#"{"type":"result","is_error":false,"result":"done"}"#,
         ],
-        (ProviderId::Gemini, FakeRuntimeScenario::SecretOutput) => vec![
-            r#"{"type":"message","role":"assistant","content":"api_key=supersecretvalue"}"#,
-            r#"{"type":"result","result":"done"}"#,
-        ],
+        (ProviderId::Gemini, _) => unreachable!("Gemini scenarios are handled above"),
         (ProviderId::Agy, FakeRuntimeScenario::Success) => vec!["done"],
         (ProviderId::Agy, FakeRuntimeScenario::QuotaExceeded) => vec!["Daily quota exceeded"],
         (ProviderId::Agy, FakeRuntimeScenario::TerminalError) => vec!["Credit balance is too low"],
@@ -441,13 +442,81 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
             | FakeRuntimeScenario::Timeout
             | FakeRuntimeScenario::ConversationResponseAlias
             | FakeRuntimeScenario::ReadOnlyCommand
-            | FakeRuntimeScenario::ReadOnlyCommandWithFileChange,
+            | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
+            | FakeRuntimeScenario::AmbiguousScalarPrefix
+            | FakeRuntimeScenario::GeminiDetailedErrorThenErrorResult
+            | FakeRuntimeScenario::GeminiWarningBetweenDeltas
+            | FakeRuntimeScenario::GeminiCompleteMessage,
         ) => Vec::new(),
     };
     lines
         .into_iter()
         .map(|line| line.as_bytes().to_vec())
         .collect()
+}
+
+fn gemini_scenario_lines(scenario: FakeRuntimeScenario) -> Vec<Vec<u8>> {
+    match scenario {
+        FakeRuntimeScenario::Success | FakeRuntimeScenario::SecretOutput => {
+            let assistant = if scenario == FakeRuntimeScenario::Success {
+                "done"
+            } else {
+                "api_key=supersecretvalue"
+            };
+            gemini_stream_lines(
+                "fake-gemini-session",
+                "exercise fake provider",
+                assistant,
+                Some(serde_json::json!({
+                    "total_tokens": 21,
+                    "input_tokens": 13,
+                    "output_tokens": 8,
+                    "cached": 2
+                })),
+            )
+        }
+        FakeRuntimeScenario::QuotaExceeded => vec![
+            br#"{"type":"error","message":"Daily quota exceeded","timestamp":"2026-08-07T00:00:00Z"}"#.to_vec(),
+        ],
+        FakeRuntimeScenario::TerminalError => vec![
+            br#"{"type":"error","message":"Credit balance is too low","timestamp":"2026-08-07T00:00:00Z"}"#.to_vec(),
+        ],
+        FakeRuntimeScenario::MalformedOutput => vec![b"not-json".to_vec()],
+        FakeRuntimeScenario::UnknownEvent => vec![
+            br#"{"type":"new_optional_event","payload":1,"timestamp":"2026-08-07T00:00:00Z"}"#.to_vec(),
+        ],
+        FakeRuntimeScenario::DiagnosticNoise => [0, 1, 2]
+            .map(|second| {
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "stderr",
+                    "message": "provider diagnostic",
+                    "timestamp": format!("2026-08-07T00:00:0{second}Z")
+                }))
+                .unwrap_or_default()
+            })
+            .to_vec(),
+        FakeRuntimeScenario::GeminiDetailedErrorThenErrorResult => vec![
+            br#"{"type":"error","severity":"error","message":"Authentication failed. Run `gemini auth login` and retry the request.","timestamp":"2026-08-07T00:00:00Z"}"#.to_vec(),
+            br#"{"type":"result","status":"error","timestamp":"2026-08-07T00:00:01Z"}"#.to_vec(),
+        ],
+        FakeRuntimeScenario::GeminiWarningBetweenDeltas => gemini_stream_lines_with_warning(
+            "fake-gemini-warning",
+            "exercise fake provider",
+            "done",
+            None,
+        ),
+        FakeRuntimeScenario::GeminiCompleteMessage => gemini_complete_message_lines(
+            "fake-gemini-complete",
+            "exercise fake provider",
+            "done",
+        ),
+        FakeRuntimeScenario::ProcessCrash
+        | FakeRuntimeScenario::Timeout
+        | FakeRuntimeScenario::ConversationResponseAlias
+        | FakeRuntimeScenario::ReadOnlyCommand
+        | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
+        | FakeRuntimeScenario::AmbiguousScalarPrefix => Vec::new(),
+    }
 }
 
 fn codex_conversation_lines(text: &str, scenario: FakeRuntimeScenario) -> Vec<serde_json::Value> {
@@ -488,6 +557,26 @@ fn codex_conversation_lines(text: &str, scenario: FakeRuntimeScenario) -> Vec<se
             }
         }));
     }
+    if scenario == FakeRuntimeScenario::AmbiguousScalarPrefix {
+        lines.extend([
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "ambiguous-progress",
+                    "type": "agent_message",
+                    "text": "Checking the request."
+                }
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "ambiguous-scalar",
+                    "type": "agent_message",
+                    "text": "null"
+                }
+            }),
+        ]);
+    }
     lines.extend([
         serde_json::json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":text}}),
         serde_json::json!({"type":"turn.completed","usage":{}}),
@@ -505,7 +594,175 @@ fn conversation_lines(
         .get("transcript_redacted")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let outcome = if scenario == FakeRuntimeScenario::ConversationResponseAlias {
+    let text =
+        serde_json::to_string(&conversation_outcome(transcript, scenario)).unwrap_or_default();
+    let lines = match provider {
+        ProviderId::Codex => codex_conversation_lines(&text, scenario),
+        ProviderId::Claude => {
+            let mut lines = vec![serde_json::json!({
+                "type":"system","subtype":"init","session_id":"fake-conversation"
+            })];
+            if scenario == FakeRuntimeScenario::AmbiguousScalarPrefix {
+                lines.extend([
+                    serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"Checking the request."}]}}),
+                    serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"null"}]}}),
+                ]);
+            }
+            lines.extend([
+                serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
+                serde_json::json!({"type":"result","is_error":false,"result":text}),
+            ]);
+            lines
+        }
+        ProviderId::Gemini => {
+            let assistant = if scenario == FakeRuntimeScenario::AmbiguousScalarPrefix {
+                format!("Checking the request.\nnull\n{text}")
+            } else {
+                text
+            };
+            if scenario == FakeRuntimeScenario::GeminiWarningBetweenDeltas {
+                return gemini_stream_lines_with_warning(
+                    "fake-conversation",
+                    "echoed user request",
+                    &assistant,
+                    None,
+                );
+            }
+            return gemini_stream_lines(
+                "fake-conversation",
+                "echoed user request",
+                &assistant,
+                None,
+            );
+        }
+        ProviderId::Agy => {
+            if scenario == FakeRuntimeScenario::AmbiguousScalarPrefix {
+                return vec![
+                    b"Checking the request.".to_vec(),
+                    b"null".to_vec(),
+                    text.into_bytes(),
+                ];
+            }
+            return vec![text.into_bytes()];
+        }
+    };
+    lines
+        .into_iter()
+        .map(|line| serde_json::to_vec(&line).unwrap_or_default())
+        .collect()
+}
+
+fn gemini_delta_events(text: &str) -> Vec<serde_json::Value> {
+    let split = text
+        .char_indices()
+        .nth(3)
+        .map_or(text.len(), |(index, _)| index);
+    [&text[..split], &text[split..]]
+        .into_iter()
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": chunk,
+                "delta": true,
+                "timestamp": "2026-08-07T00:00:02Z"
+            })
+        })
+        .collect()
+}
+
+fn gemini_stream_lines(
+    session_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+    stats: Option<serde_json::Value>,
+) -> Vec<Vec<u8>> {
+    let mut values = vec![
+        serde_json::json!({
+            "type":"init",
+            "session_id":session_id,
+            "model":"fake-gemini",
+            "timestamp":"2026-08-07T00:00:00Z"
+        }),
+        serde_json::json!({
+            "type":"message",
+            "role":"user",
+            "content":user_text,
+            "timestamp":"2026-08-07T00:00:01Z"
+        }),
+    ];
+    values.extend(gemini_delta_events(assistant_text));
+    let mut result = serde_json::json!({
+        "type":"result",
+        "status":"success",
+        "timestamp":"2026-08-07T00:00:03Z"
+    });
+    if let Some(stats) = stats {
+        result["stats"] = stats;
+    }
+    values.push(result);
+    values
+        .into_iter()
+        .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+        .collect()
+}
+
+fn gemini_stream_lines_with_warning(
+    session_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+    stats: Option<serde_json::Value>,
+) -> Vec<Vec<u8>> {
+    let mut lines = gemini_stream_lines(session_id, user_text, assistant_text, stats);
+    let warning = serde_json::to_vec(&serde_json::json!({
+        "type": "error",
+        "severity": "warning",
+        "message": "Loop detected, stopping execution",
+        "timestamp": "2026-08-07T00:00:02.500Z"
+    }))
+    .unwrap_or_default();
+    lines.insert(3.min(lines.len()), warning);
+    lines
+}
+
+fn gemini_complete_message_lines(
+    session_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+) -> Vec<Vec<u8>> {
+    [
+        serde_json::json!({
+            "type":"init",
+            "session_id":session_id,
+            "model":"fake-gemini",
+            "timestamp":"2026-08-07T00:00:00Z"
+        }),
+        serde_json::json!({
+            "type":"message",
+            "role":"user",
+            "content":user_text,
+            "timestamp":"2026-08-07T00:00:01Z"
+        }),
+        serde_json::json!({
+            "type":"message",
+            "role":"assistant",
+            "content":assistant_text,
+            "timestamp":"2026-08-07T00:00:02Z"
+        }),
+        serde_json::json!({
+            "type":"result",
+            "status":"success",
+            "timestamp":"2026-08-07T00:00:03Z"
+        }),
+    ]
+    .into_iter()
+    .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+    .collect()
+}
+
+fn conversation_outcome(transcript: &str, scenario: FakeRuntimeScenario) -> serde_json::Value {
+    if scenario == FakeRuntimeScenario::ConversationResponseAlias {
         serde_json::json!({
             "outcome": "answer_complete",
             "response": "Hello! How can I help?"
@@ -554,26 +811,7 @@ fn conversation_lines(
             "outcome": "answer_complete",
             "response_redacted": "Git is needed only after an approved writable task candidate."
         })
-    };
-    let text = serde_json::to_string(&outcome).unwrap_or_default();
-    let lines = match provider {
-        ProviderId::Codex => codex_conversation_lines(&text, scenario),
-        ProviderId::Claude => vec![
-            serde_json::json!({"type":"system","subtype":"init","session_id":"fake-conversation"}),
-            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
-            serde_json::json!({"type":"result","is_error":false,"result":text}),
-        ],
-        ProviderId::Gemini => vec![
-            serde_json::json!({"type":"init","session_id":"fake-conversation"}),
-            serde_json::json!({"type":"message","role":"assistant","content":text}),
-            serde_json::json!({"type":"result","result":text}),
-        ],
-        ProviderId::Agy => return vec![text.into_bytes()],
-    };
-    lines
-        .into_iter()
-        .map(|line| serde_json::to_vec(&line).unwrap_or_default())
-        .collect()
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -639,6 +877,12 @@ where
         emit_handover_acknowledgement(provider, provider_input);
         return;
     }
+    if provider == ProviderId::Agy
+        && provider_input.contains("scenario:agy-overlong-redaction-boundary")
+    {
+        emit_agy_overlong_redaction_boundary();
+        return;
+    }
 
     if provider_input.contains("scenario:codex-quota") {
         if provider == ProviderId::Codex {
@@ -669,6 +913,8 @@ where
             "unknown"
         } else if provider_input.contains("scenario:secret") {
             "secret"
+        } else if provider_input.contains("scenario:gemini-complete-message") {
+            "gemini-complete-message"
         } else {
             "success"
         }
@@ -693,11 +939,24 @@ where
         "malformed" => FakeRuntimeScenario::MalformedOutput,
         "unknown" => FakeRuntimeScenario::UnknownEvent,
         "secret" => FakeRuntimeScenario::SecretOutput,
+        "gemini-complete-message" => FakeRuntimeScenario::GeminiCompleteMessage,
         _ => FakeRuntimeScenario::Success,
     };
     for line in scenario_lines(provider, scenario) {
         println!("{}", String::from_utf8_lossy(&line));
     }
+}
+
+fn emit_agy_overlong_redaction_boundary() {
+    const STREAM_FRAME_BYTES: usize = 1024 * 1024;
+    const TOKEN_PREFIX: &[u8] = b"Bearer abcdefgh";
+    const TOKEN_SUFFIX: &[u8] = b"ijklmnop";
+    let padding = vec![b'x'; STREAM_FRAME_BYTES - TOKEN_PREFIX.len()];
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(&padding);
+    let _ = stdout.write_all(TOKEN_PREFIX);
+    let _ = stdout.write_all(TOKEN_SUFFIX);
+    let _ = stdout.flush();
 }
 
 #[derive(serde::Deserialize)]
@@ -805,7 +1064,11 @@ fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
         eprintln!("fake conversation provider crash");
         std::process::exit(17);
     }
-    let scenario = if prompt.contains("scenario:read-only-command-file-change") {
+    let scenario = if prompt.contains("scenario:ambiguous-scalar-prefix") {
+        FakeRuntimeScenario::AmbiguousScalarPrefix
+    } else if prompt.contains("scenario:gemini-warning-between-deltas") {
+        FakeRuntimeScenario::GeminiWarningBetweenDeltas
+    } else if prompt.contains("scenario:read-only-command-file-change") {
         FakeRuntimeScenario::ReadOnlyCommandWithFileChange
     } else if prompt.contains("scenario:read-only-command") {
         FakeRuntimeScenario::ReadOnlyCommand
@@ -921,32 +1184,51 @@ fn emit_planner_fixture(provider: ProviderId, args: &[String], prompt: &serde_js
         })
         .to_string()
     };
-    for line in planner_lines(provider, &text) {
+    let include_read_only_command = goal.contains("scenario:read-only-command");
+    for line in planner_lines(provider, &text, include_read_only_command) {
         println!("{}", String::from_utf8_lossy(&line));
     }
 }
 
-fn planner_lines(provider: ProviderId, text: &str) -> Vec<Vec<u8>> {
+fn planner_lines(
+    provider: ProviderId,
+    text: &str,
+    include_read_only_command: bool,
+) -> Vec<Vec<u8>> {
     if provider == ProviderId::Agy {
         return vec![text.as_bytes().to_vec()];
     }
     let values = match provider {
-        ProviderId::Codex => vec![
-            serde_json::json!({"type":"thread.started","thread_id":"fake-planner"}),
-            serde_json::json!({"type":"turn.started"}),
-            serde_json::json!({"type":"item.completed","item":{"id":"plan","type":"agent_message","text":text}}),
-            serde_json::json!({"type":"turn.completed","usage":{}}),
-        ],
+        ProviderId::Codex => {
+            let mut values = vec![
+                serde_json::json!({"type":"thread.started","thread_id":"fake-planner"}),
+                serde_json::json!({"type":"turn.started"}),
+            ];
+            if include_read_only_command {
+                values.push(serde_json::json!({
+                    "type": "item.started",
+                    "item": {
+                        "id": "inspect-repository",
+                        "type": "command_execution",
+                        "command": "rg --files",
+                        "status": "in_progress"
+                    }
+                }));
+            }
+            values.extend([
+                serde_json::json!({"type":"item.completed","item":{"id":"plan","type":"agent_message","text":text}}),
+                serde_json::json!({"type":"turn.completed","usage":{}}),
+            ]);
+            values
+        }
         ProviderId::Claude => vec![
             serde_json::json!({"type":"system","subtype":"init","session_id":"fake-planner"}),
             serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
             serde_json::json!({"type":"result","is_error":false,"result":text}),
         ],
-        ProviderId::Gemini => vec![
-            serde_json::json!({"type":"init","session_id":"fake-planner"}),
-            serde_json::json!({"type":"message","role":"assistant","content":text}),
-            serde_json::json!({"type":"result","result":text}),
-        ],
+        ProviderId::Gemini => {
+            return gemini_stream_lines("fake-planner", "planning request", text, None);
+        }
         ProviderId::Agy => unreachable!("Agy plain text is handled above"),
     };
     values
@@ -999,14 +1281,14 @@ fn handover_acknowledgement_lines(provider: ProviderId, stdin: &str) -> Vec<Vec<
             }),
             serde_json::json!({"type": "result", "is_error": false, "result": "acknowledged"}),
         ],
-        ProviderId::Gemini => vec![
-            serde_json::json!({
-                "type": "message",
-                "role": "assistant",
-                "content": acknowledgement
-            }),
-            serde_json::json!({"type": "result", "result": "acknowledged"}),
-        ],
+        ProviderId::Gemini => {
+            return gemini_stream_lines(
+                "fake-handover",
+                "handover acknowledgement request",
+                &acknowledgement,
+                None,
+            );
+        }
         ProviderId::Codex => vec![
             serde_json::json!({
                 "type": "item.completed",
@@ -1059,6 +1341,15 @@ fn run_fake_app_server() {
                 &serde_json::json!({"id": id, "result": {"userAgent": "fake"}}),
             ),
             Some("thread/start" | "thread/resume") => {
+                if message
+                    .pointer("/params/model")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("fake-appserver-pre-turn-protocol-error")
+                {
+                    let _ = writeln!(stdout, "{{not-json}}");
+                    let _ = stdout.flush();
+                    continue;
+                }
                 write_fake_message(
                     &mut stdout,
                     &serde_json::json!({
@@ -1079,6 +1370,11 @@ fn run_fake_app_server() {
                     .pointer("/params/input/0/text")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
+                if prompt.contains("scenario:appserver-awaiting-turn-protocol-error") {
+                    let _ = writeln!(stdout, "{{not-json}}");
+                    let _ = stdout.flush();
+                    continue;
+                }
                 write_fake_message(
                     &mut stdout,
                     &serde_json::json!({
@@ -1098,22 +1394,33 @@ fn run_fake_app_server() {
                         "params": {"turn": {"id": "fake-turn", "items": [], "status": "inProgress"}}
                     }),
                 );
-                let text = if prompt.contains("scenario:secret") {
-                    "api_key=supersecretvalue"
+                let messages = if prompt.contains("scenario:appserver-split-private-key") {
+                    vec![
+                        "-----BEGIN PRIVATE KEY-----\nprivate-part-a",
+                        "private-part-b\n-----END PRIVATE KEY-----",
+                    ]
+                } else if prompt.contains("scenario:secret") {
+                    vec!["api_key=supersecretvalue"]
                 } else {
-                    "done"
+                    vec!["done"]
                 };
-                write_fake_message(
-                    &mut stdout,
-                    &serde_json::json!({
-                        "method": "item/completed",
-                        "params": {
-                            "threadId": "fake-codex-session",
-                            "turnId": "fake-turn",
-                            "item": {"id": "m1", "type": "agentMessage", "text": text}
-                        }
-                    }),
-                );
+                for (index, text) in messages.into_iter().enumerate() {
+                    write_fake_message(
+                        &mut stdout,
+                        &serde_json::json!({
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": "fake-codex-session",
+                                "turnId": "fake-turn",
+                                "item": {
+                                    "id": format!("m{}", index + 1),
+                                    "type": "agentMessage",
+                                    "text": text
+                                }
+                            }
+                        }),
+                    );
+                }
                 write_fake_message(
                     &mut stdout,
                     &serde_json::json!({

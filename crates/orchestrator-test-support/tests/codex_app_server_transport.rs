@@ -36,6 +36,12 @@ fn request(prompt: &str) -> Result<WorkerRequest, std::io::Error> {
     })
 }
 
+fn request_with_pre_turn_protocol_failure(prompt: &str) -> Result<WorkerRequest, std::io::Error> {
+    let mut request = request(prompt)?;
+    request.model = Some("fake-appserver-pre-turn-protocol-error".to_owned());
+    Ok(request)
+}
+
 fn adapter(features: CodexTransportFeatures, preference: CodexTransportPreference) -> CodexAdapter {
     CodexAdapter::new(
         CodexAdapterConfig {
@@ -84,14 +90,14 @@ async fn stable_app_server_completes_through_production_runtime()
 }
 
 #[tokio::test]
-async fn protocol_failure_falls_back_once_to_verified_exec_jsonl()
+async fn pre_turn_protocol_failure_falls_back_once_to_verified_exec_jsonl()
 -> Result<(), Box<dyn std::error::Error>> {
     let adapter = adapter(
         CodexTransportFeatures::default(),
         CodexTransportPreference::AppServerFirst,
     );
     let handle = adapter
-        .start(request("scenario:appserver-protocol-error")?)
+        .start(request_with_pre_turn_protocol_failure("success")?)
         .await?;
     let mut completed = false;
     let mut fallback_count = 0_u8;
@@ -114,6 +120,135 @@ async fn protocol_failure_falls_back_once_to_verified_exec_jsonl()
 }
 
 #[tokio::test]
+async fn post_turn_protocol_failure_never_retries_exec_jsonl()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = adapter(
+        CodexTransportFeatures::default(),
+        CodexTransportPreference::AppServerFirst,
+    );
+    let handle = adapter
+        .start(request("scenario:appserver-protocol-error")?)
+        .await?;
+    let mut completed = false;
+    let mut fallback_count = 0_u8;
+    let mut turn_started = false;
+    let mut protocol_error_retryable = None;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Completed { .. } => completed = true,
+            WorkerEvent::Unknown { event_type, .. } if event_type == "turn.started" => {
+                turn_started = true;
+            }
+            WorkerEvent::Unknown { event_type, .. }
+                if event_type == "orchestrator.transport_fallback" =>
+            {
+                fallback_count = fallback_count.saturating_add(1);
+            }
+            WorkerEvent::Error {
+                code, retryable, ..
+            } if code.as_deref() == Some("app_server_protocol_error") => {
+                protocol_error_retryable = Some(retryable);
+            }
+            _ => {}
+        }
+    }
+    let output = adapter.wait(&handle).await?;
+    assert_eq!(output.termination, RuntimeTermination::Cancelled);
+    assert!(!completed);
+    assert!(turn_started);
+    assert_eq!(fallback_count, 0);
+    assert_eq!(protocol_error_retryable, Some(false));
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_request_protocol_failure_before_ack_never_retries_exec_jsonl()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = adapter(
+        CodexTransportFeatures::default(),
+        CodexTransportPreference::AppServerFirst,
+    );
+    let handle = adapter
+        .start(request("scenario:appserver-awaiting-turn-protocol-error")?)
+        .await?;
+    let mut completed = false;
+    let mut fallback_count = 0_u8;
+    let mut turn_started = false;
+    let mut protocol_error_retryable = None;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Completed { .. } => completed = true,
+            WorkerEvent::Unknown { event_type, .. } if event_type == "turn.started" => {
+                turn_started = true;
+            }
+            WorkerEvent::Unknown { event_type, .. }
+                if event_type == "orchestrator.transport_fallback" =>
+            {
+                fallback_count = fallback_count.saturating_add(1);
+            }
+            WorkerEvent::Error {
+                code, retryable, ..
+            } if code.as_deref() == Some("app_server_protocol_error") => {
+                protocol_error_retryable = Some(retryable);
+            }
+            _ => {}
+        }
+    }
+    let output = adapter.wait(&handle).await?;
+    assert_eq!(output.termination, RuntimeTermination::Cancelled);
+    assert!(!completed);
+    assert!(!turn_started);
+    assert_eq!(fallback_count, 0);
+    assert_eq!(protocol_error_retryable, Some(false));
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_private_key_app_server_frames_fail_closed_without_evidence_leak()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = adapter(
+        CodexTransportFeatures::default(),
+        CodexTransportPreference::AppServerFirst,
+    );
+    let handle = adapter
+        .start(request("scenario:appserver-split-private-key")?)
+        .await?;
+    let mut raw_evidence = Vec::new();
+    let mut completed = false;
+    let mut fallback = false;
+    let mut protocol_error_retryable = None;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        raw_evidence.extend_from_slice(&raw.bytes);
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Completed { .. } => completed = true,
+            WorkerEvent::Unknown { event_type, .. }
+                if event_type == "orchestrator.transport_fallback" =>
+            {
+                fallback = true;
+            }
+            WorkerEvent::Error {
+                code, retryable, ..
+            } if code.as_deref() == Some("app_server_protocol_error") => {
+                protocol_error_retryable = Some(retryable);
+            }
+            _ => {}
+        }
+    }
+    let output = adapter.wait(&handle).await?;
+    let persisted_boundary = [raw_evidence, output.stdout, output.stderr].concat();
+    let persisted_boundary = String::from_utf8_lossy(&persisted_boundary);
+
+    assert_eq!(output.termination, RuntimeTermination::Cancelled);
+    assert!(!completed);
+    assert!(!fallback);
+    assert_eq!(protocol_error_retryable, Some(false));
+    assert!(!persisted_boundary.contains("private-part-a"));
+    assert!(!persisted_boundary.contains("private-part-b"));
+    assert!(!persisted_boundary.contains("-----BEGIN PRIVATE KEY-----"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fallback_chain_never_retries_a_second_transport() -> Result<(), Box<dyn std::error::Error>>
 {
     let adapter = adapter(
@@ -121,8 +256,8 @@ async fn fallback_chain_never_retries_a_second_transport() -> Result<(), Box<dyn
         CodexTransportPreference::AppServerFirst,
     );
     let handle = adapter
-        .start(request(
-            "scenario:appserver-protocol-error scenario:malformed",
+        .start(request_with_pre_turn_protocol_failure(
+            "scenario:malformed",
         )?)
         .await?;
     let mut fallback_count = 0_u8;

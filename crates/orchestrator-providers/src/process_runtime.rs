@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,13 +24,18 @@ use crate::{
     StructuredOutput,
 };
 
+const MAX_FORWARDED_EVENTS: u64 = 4_096;
+
 struct ProcessJob {
     provider: ProviderId,
     process_id: Mutex<Option<u32>>,
     cancellation: CancellationToken,
     events: Mutex<mpsc::Receiver<RawEvent>>,
     dropped_frames: AtomicU64,
+    protocol_loss: AtomicBool,
     event_sequence: AtomicU64,
+    forwarded_events: AtomicU64,
+    event_limit_exceeded: AtomicBool,
     result: Mutex<Option<Result<RuntimeOutput, String>>>,
     completion: Notify,
 }
@@ -139,7 +144,10 @@ impl AdapterRuntime for ProcessAdapterRuntime {
             cancellation: CancellationToken::new(),
             events: Mutex::new(event_receiver),
             dropped_frames: AtomicU64::new(0),
+            protocol_loss: AtomicBool::new(false),
             event_sequence: AtomicU64::new(1),
+            forwarded_events: AtomicU64::new(0),
+            event_limit_exceeded: AtomicBool::new(false),
             result: Mutex::new(None),
             completion: Notify::new(),
         });
@@ -185,20 +193,17 @@ impl AdapterRuntime for ProcessAdapterRuntime {
 
     async fn next_event(&self, handle: &WorkerHandle) -> Result<Option<RawEvent>, ProviderError> {
         let job = self.job(handle).await?;
-        let dropped = job.dropped_frames.swap(0, Ordering::AcqRel);
-        if dropped > 0 {
-            return Ok(Some(RawEvent {
-                channel: RawEventChannel::Protocol,
-                sequence: u64::MAX,
-                bytes: serde_json::to_vec(&serde_json::json!({
-                    "type": "orchestrator.frames_dropped",
-                    "count": dropped,
-                }))
-                .unwrap_or_default(),
-                received_at: Utc::now(),
-            }));
+        let mut events = job.events.lock().await;
+        if let Ok(event) = events.try_recv() {
+            return Ok(Some(event));
         }
-        Ok(job.events.lock().await.recv().await)
+        if let Some(event) = take_queued_before_protocol_loss(&job, &mut events) {
+            return Ok(Some(event));
+        }
+        match events.recv().await {
+            Some(event) => Ok(Some(event)),
+            None => Ok(take_queued_before_protocol_loss(&job, &mut events)),
+        }
     }
 
     async fn wait(&self, handle: &WorkerHandle) -> Result<RuntimeOutput, ProviderError> {
@@ -207,7 +212,12 @@ impl AdapterRuntime for ProcessAdapterRuntime {
             let notified = job.completion.notified();
             if let Some(result) = job.result.lock().await.clone() {
                 self.jobs.lock().await.remove(&handle.attempt_id);
-                return result.map_err(ProviderError::Runtime);
+                return result
+                    .map(|mut output| {
+                        output.truncated |= job.protocol_loss.load(Ordering::Acquire);
+                        output
+                    })
+                    .map_err(ProviderError::Runtime);
             }
             notified.await;
         }
@@ -279,7 +289,11 @@ async fn run_worker_chain(
                 return failure.output.ok_or(failure.message);
             };
             fallback.fallback = None;
-            emit_fallback_event(job, event_sender, redactor, &failure.message);
+            let notice_forwarded =
+                emit_fallback_event(job, event_sender, redactor, &failure.message);
+            if !notice_forwarded || job.cancellation.is_cancelled() {
+                return failure.output.ok_or(failure.message);
+            }
             let session = supervisor
                 .start(command_spec(&fallback, redaction))
                 .await
@@ -309,7 +323,11 @@ async fn drive_static(
                     break;
                 };
                 match event {
-                    ProcessEvent::FramesDropped { count } => add_dropped(job, count),
+                    ProcessEvent::FramesDropped { count } => {
+                        add_dropped(job, count);
+                        cancellation_requested = true;
+                        session.cancel();
+                    }
                     ProcessEvent::Exited { exit_code, .. } => {
                         if output == StructuredOutput::AgyText {
                             let value = serde_json::json!({
@@ -397,6 +415,7 @@ async fn drive_app_server(
                     ProcessEvent::Output {
                         channel: OutputChannel::Stdout,
                         bytes,
+                        redacted_text,
                         invalid_utf8,
                         ..
                     } => {
@@ -406,6 +425,15 @@ async fn drive_app_server(
                                 AppServerError::InvalidUtf8.to_string(),
                                 protocol.can_fallback(),
                             ).await;
+                        }
+                        if bytes.as_slice() != redacted_text.as_bytes() {
+                            return app_server_failure(
+                                process,
+                                "App Server stdout frame contained redacted sensitive material"
+                                    .to_owned(),
+                                protocol.can_fallback(),
+                            )
+                            .await;
                         }
                         let step = match protocol.handle_frame(&bytes) {
                             Ok(step) => step,
@@ -428,7 +456,9 @@ async fn drive_app_server(
                         }
                         for event in step.events {
                             match canonical_raw_event(job, redactor, &event) {
-                                Ok(raw) => try_send(job, event_sender, raw),
+                                Ok(raw) => {
+                                    try_send(job, event_sender, raw);
+                                }
                                 Err(error) => {
                                     return app_server_failure(
                                         process,
@@ -479,10 +509,11 @@ async fn drive_app_server(
                         try_send(job, event_sender, raw);
                     }
                     ProcessEvent::FramesDropped { count } => {
+                        let (message, safe_to_fallback) = app_server_frame_loss(job, count);
                         return app_server_failure(
                             process,
-                            format!("App Server protocol lost {count} frame(s)"),
-                            protocol.can_fallback(),
+                            message,
+                            safe_to_fallback,
                         ).await;
                     }
                     ProcessEvent::Exited { termination, .. } => {
@@ -520,6 +551,11 @@ async fn app_server_failure(
     })
 }
 
+fn app_server_frame_loss(job: &ProcessJob, count: u64) -> (String, bool) {
+    add_dropped(job, count);
+    (format!("App Server protocol lost {count} frame(s)"), false)
+}
+
 fn canonical_raw_event(
     job: &ProcessJob,
     redactor: &Redactor,
@@ -553,16 +589,14 @@ fn emit_fallback_event(
     sender: &mpsc::Sender<RawEvent>,
     redactor: &Redactor,
     reason: &str,
-) {
+) -> bool {
     let event = serde_json::json!({
         "type": "orchestrator.transport_fallback",
         "from": "codex_app_server_stdio",
         "to": "codex_exec_jsonl",
         "reason": redactor.redact(reason),
     });
-    if let Ok(raw) = canonical_raw_event(job, redactor, &event) {
-        try_send(job, sender, raw);
-    }
+    canonical_raw_event(job, redactor, &event).is_ok_and(|raw| try_send(job, sender, raw))
 }
 
 fn emit_protocol_error(
@@ -581,18 +615,67 @@ fn emit_protocol_error(
     }
 }
 
-fn try_send(job: &ProcessJob, sender: &mpsc::Sender<RawEvent>, event: RawEvent) {
-    if let Err(mpsc::error::TrySendError::Full(_)) = sender.try_send(event) {
-        add_dropped(job, 1);
+fn try_send(job: &ProcessJob, sender: &mpsc::Sender<RawEvent>, event: RawEvent) -> bool {
+    if job.protocol_loss.load(Ordering::Acquire) || job.event_limit_exceeded.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    if job.forwarded_events.fetch_add(1, Ordering::AcqRel) >= MAX_FORWARDED_EVENTS {
+        if !job.event_limit_exceeded.swap(true, Ordering::AcqRel) {
+            add_dropped(job, 1);
+            job.cancellation.cancel();
+        }
+        return false;
+    }
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_) | mpsc::error::TrySendError::Closed(_)) => {
+            add_dropped(job, 1);
+            false
+        }
     }
 }
 
 fn add_dropped(job: &ProcessJob, count: u64) {
+    if count == 0 {
+        return;
+    }
     let _ = job
         .dropped_frames
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_add(count))
         });
+    // Publish the count before the sticky loss flag so an Acquire observer can
+    // always construct the marker without blocking on a channel notification.
+    job.protocol_loss.store(true, Ordering::Release);
+    job.cancellation.cancel();
+}
+
+fn take_protocol_loss_event(job: &ProcessJob) -> Option<RawEvent> {
+    let dropped = job.dropped_frames.swap(0, Ordering::AcqRel);
+    (dropped > 0).then(|| RawEvent {
+        channel: RawEventChannel::Protocol,
+        sequence: next_sequence(job),
+        bytes: serde_json::to_vec(&serde_json::json!({
+            "type": "orchestrator.frames_dropped",
+            "count": dropped,
+        }))
+        .unwrap_or_default(),
+        received_at: Utc::now(),
+    })
+}
+
+fn take_queued_before_protocol_loss(
+    job: &ProcessJob,
+    events: &mut mpsc::Receiver<RawEvent>,
+) -> Option<RawEvent> {
+    if !job.protocol_loss.load(Ordering::Acquire) {
+        return None;
+    }
+    events
+        .try_recv()
+        .ok()
+        .or_else(|| take_protocol_loss_event(job))
 }
 
 fn next_sequence(job: &ProcessJob) -> u64 {
@@ -756,6 +839,223 @@ fn validate_fake_provider_executable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_job(receiver: mpsc::Receiver<RawEvent>) -> Arc<ProcessJob> {
+        Arc::new(ProcessJob {
+            provider: ProviderId::Gemini,
+            process_id: Mutex::new(None),
+            cancellation: CancellationToken::new(),
+            events: Mutex::new(receiver),
+            dropped_frames: AtomicU64::new(0),
+            protocol_loss: AtomicBool::new(false),
+            event_sequence: AtomicU64::new(1),
+            forwarded_events: AtomicU64::new(0),
+            event_limit_exceeded: AtomicBool::new(false),
+            result: Mutex::new(None),
+            completion: Notify::new(),
+        })
+    }
+
+    async fn runtime_with_job(job: Arc<ProcessJob>) -> (ProcessAdapterRuntime, WorkerHandle) {
+        let runtime = ProcessAdapterRuntime::default();
+        let attempt_id = AttemptId::new();
+        runtime.jobs.lock().await.insert(attempt_id, job);
+        let handle = WorkerHandle {
+            attempt_id,
+            provider: ProviderId::Gemini,
+            process_id: None,
+            session_id: None,
+        };
+        (runtime, handle)
+    }
+
+    fn raw_event(sequence: u64, bytes: &[u8]) -> RawEvent {
+        RawEvent {
+            channel: RawEventChannel::Stdout,
+            sequence,
+            bytes: bytes.to_vec(),
+            received_at: Utc::now(),
+        }
+    }
+
+    fn require_event(
+        result: Result<Option<RawEvent>, ProviderError>,
+    ) -> Result<RawEvent, ProviderError> {
+        result?.ok_or_else(|| ProviderError::Runtime("event stream closed unexpectedly".to_owned()))
+    }
+
+    #[tokio::test]
+    async fn blocked_next_event_reports_loss_when_sender_closes_after_overflow()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+        job.forwarded_events
+            .store(MAX_FORWARDED_EVENTS, Ordering::Release);
+        let (runtime, handle) = runtime_with_job(Arc::clone(&job)).await;
+
+        let next_event = tokio::spawn(async move { runtime.next_event(&handle).await });
+        for _ in 0..100 {
+            if job.events.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(job.events.try_lock().is_err(), "next_event did not block");
+
+        try_send(&job, &sender, raw_event(next_sequence(&job), b"overflow"));
+        drop(sender);
+
+        let marker =
+            require_event(tokio::time::timeout(Duration::from_secs(1), next_event).await??)?;
+        let payload: serde_json::Value = serde_json::from_slice(&marker.bytes)?;
+        assert_eq!(payload["type"], "orchestrator.frames_dropped");
+        assert_eq!(payload["count"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_event_precedes_monotonic_protocol_loss_marker() -> Result<(), ProviderError> {
+        let (sender, receiver) = mpsc::channel(2);
+        let job = test_job(receiver);
+        let first_sequence = next_sequence(&job);
+        try_send(&job, &sender, raw_event(first_sequence, b"accepted"));
+        job.forwarded_events
+            .store(MAX_FORWARDED_EVENTS, Ordering::Release);
+        try_send(&job, &sender, raw_event(next_sequence(&job), b"overflow"));
+        let (runtime, handle) = runtime_with_job(job).await;
+
+        let accepted = require_event(runtime.next_event(&handle).await)?;
+        let marker = require_event(runtime.next_event(&handle).await)?;
+
+        assert_eq!(accepted.bytes, b"accepted");
+        assert_eq!(accepted.sequence, first_sequence);
+        assert_eq!(marker.channel, RawEventChannel::Protocol);
+        assert!(marker.sequence > accepted.sequence);
+        assert_ne!(marker.sequence, u64::MAX);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loss_observation_rechecks_the_queue_after_an_initial_empty_read()
+    -> Result<(), ProviderError> {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let job = test_job(mpsc::channel(1).1);
+        assert!(receiver.try_recv().is_err());
+
+        let first_sequence = next_sequence(&job);
+        try_send(&job, &sender, raw_event(first_sequence, b"accepted-in-gap"));
+        add_dropped(&job, 1);
+
+        let accepted = take_queued_before_protocol_loss(&job, &mut receiver)
+            .ok_or_else(|| ProviderError::Runtime("queued event was skipped".to_owned()))?;
+        let marker = take_queued_before_protocol_loss(&job, &mut receiver)
+            .ok_or_else(|| ProviderError::Runtime("loss marker was not emitted".to_owned()))?;
+
+        assert_eq!(accepted.bytes, b"accepted-in-gap");
+        assert_eq!(accepted.sequence, first_sequence);
+        assert!(marker.sequence > accepted.sequence);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_event_is_forwarded_after_protocol_loss_becomes_sticky() -> Result<(), ProviderError>
+    {
+        let (sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+        try_send(&job, &sender, raw_event(next_sequence(&job), b"accepted"));
+        try_send(&job, &sender, raw_event(next_sequence(&job), b"dropped"));
+        assert!(job.protocol_loss.load(Ordering::Acquire));
+
+        let accepted = job.events.lock().await.recv().await;
+        assert!(accepted.is_some());
+        try_send(&job, &sender, raw_event(next_sequence(&job), b"post-loss"));
+
+        assert!(job.events.lock().await.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn app_server_frame_loss_is_sticky_and_never_safe_to_fallback() {
+        let (_sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+
+        let (message, safe_to_fallback) = app_server_frame_loss(&job, 3);
+
+        assert_eq!(message, "App Server protocol lost 3 frame(s)");
+        assert!(!safe_to_fallback);
+        assert!(job.protocol_loss.load(Ordering::Acquire));
+        assert!(job.cancellation.is_cancelled());
+        assert_eq!(job.dropped_frames.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn a_lost_fallback_notice_forbids_starting_the_fallback_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+        let redactor = Redactor::new(&RedactionConfig::default())?;
+        try_send(&job, &sender, raw_event(next_sequence(&job), b"queue-full"));
+
+        let notice_forwarded = emit_fallback_event(&job, &sender, &redactor, "startup failed");
+
+        assert!(!notice_forwarded);
+        assert!(job.protocol_loss.load(Ordering::Acquire));
+        assert!(job.cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_marks_successful_output_truncated_after_undrained_protocol_loss()
+    -> Result<(), ProviderError> {
+        let (_sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+        add_dropped(&job, 2);
+        *job.result.lock().await = Some(Ok(RuntimeOutput {
+            resolved_executable: None,
+            exit_code: Some(0),
+            termination: RuntimeTermination::Exited,
+            tree_termination_error: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        }));
+        let (runtime, handle) = runtime_with_job(job).await;
+
+        let output = runtime.wait(&handle).await?;
+
+        assert!(output.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_loss_cancels_the_worker() {
+        let (_sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+
+        add_dropped(&job, 1);
+
+        assert!(job.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn paced_streams_are_cancelled_at_the_forwarded_event_limit() {
+        let (sender, receiver) = mpsc::channel(1);
+        let job = test_job(receiver);
+        let event = raw_event(1, b"x");
+
+        for _ in 0..MAX_FORWARDED_EVENTS {
+            try_send(&job, &sender, event.clone());
+            assert!(job.events.lock().await.recv().await.is_some());
+        }
+        assert!(!job.cancellation.is_cancelled());
+
+        try_send(&job, &sender, event.clone());
+        assert!(job.cancellation.is_cancelled());
+        assert_eq!(job.dropped_frames.load(Ordering::Acquire), 1);
+        try_send(&job, &sender, event);
+        assert_eq!(job.dropped_frames.load(Ordering::Acquire), 1);
+        assert!(job.events.lock().await.try_recv().is_err());
+    }
 
     fn test_invocation(executable: &str) -> PreparedInvocation {
         PreparedInvocation {

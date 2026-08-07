@@ -60,6 +60,12 @@ enum EndpointValidation {
     Legacy(LegacyDaemonIdentity),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointOpenPolicy {
+    Discovery,
+    Selected,
+}
+
 impl DaemonEndpoint {
     fn primary(path: &Path) -> Self {
         Self {
@@ -288,7 +294,9 @@ async fn ping(paths: &GlobalStatePaths, endpoint: &DaemonEndpoint) -> Result<Pin
         action: "daemon.ping".to_owned(),
         payload: json!({}),
     };
-    let mut stream = open_response_stream(paths, endpoint, &request).await?;
+    let mut stream =
+        open_response_stream_with_policy(paths, endpoint, &request, EndpointOpenPolicy::Discovery)
+            .await?;
     let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
         .await
         .context("timed out waiting for the user daemon readiness response")??
@@ -1012,15 +1020,24 @@ fn configure_background_process(command: &mut Command) {
 }
 
 async fn open_response_stream(
-    #[cfg(windows)] paths: &GlobalStatePaths,
-    #[cfg(not(windows))] _paths: &GlobalStatePaths,
+    paths: &GlobalStatePaths,
     endpoint: &DaemonEndpoint,
     request: &IpcRequest,
+) -> Result<IpcResponseStream> {
+    open_response_stream_with_policy(paths, endpoint, request, EndpointOpenPolicy::Selected).await
+}
+
+async fn open_response_stream_with_policy(
+    paths: &GlobalStatePaths,
+    endpoint: &DaemonEndpoint,
+    request: &IpcRequest,
+    policy: EndpointOpenPolicy,
 ) -> Result<IpcResponseStream> {
     let mut encoded = serde_json::to_vec(request)?;
     encoded.push(b'\n');
     #[cfg(unix)]
     {
+        let _ = (paths, policy);
         let stream = tokio::net::UnixStream::connect(&endpoint.path).await?;
         match endpoint.validation {
             EndpointValidation::Primary => response_stream(stream, &encoded).await,
@@ -1033,6 +1050,7 @@ async fn open_response_stream(
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
         let stream = open_windows_pipe_with_retry(
             deadline,
+            policy,
             || ClientOptions::new().open(&endpoint.path),
             tokio::time::sleep,
         )
@@ -1051,7 +1069,7 @@ async fn open_response_stream(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (_paths, endpoint, encoded);
+        let _ = (paths, endpoint, encoded, policy);
         bail!("local IPC is unsupported on this platform")
     }
 }
@@ -1093,6 +1111,7 @@ where
 #[cfg(windows)]
 async fn open_windows_pipe_with_retry<S, Open, Sleep, SleepFuture>(
     deadline: Instant,
+    policy: EndpointOpenPolicy,
     mut open: Open,
     mut sleep: Sleep,
 ) -> std::io::Result<S>
@@ -1104,7 +1123,12 @@ where
     loop {
         match open() {
             Ok(stream) => return Ok(stream),
-            Err(error) if error.raw_os_error() == Some(231) && Instant::now() < deadline => {
+            Err(error)
+                if (error.raw_os_error() == Some(231)
+                    || (policy == EndpointOpenPolicy::Selected
+                        && error.raw_os_error() == Some(2)))
+                    && Instant::now() < deadline =>
+            {
                 sleep(CONNECT_POLL_INTERVAL).await;
             }
             Err(error) => return Err(error),
@@ -1130,8 +1154,6 @@ mod tests {
     use std::time::Instant;
     use std::{cell::Cell, collections::VecDeque, future, io};
 
-    #[cfg(windows)]
-    use super::open_windows_pipe_with_retry;
     use super::{
         CONNECT_TIMEOUT, LegacyDaemonIdentity, PingReadiness, RESPONSE_TIMEOUT,
         ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
@@ -1140,6 +1162,8 @@ mod tests {
         resolve_ready_child, response_stream_with_legacy_identity, spawn_contender_once,
         startup_workspace_receipt, validate_legacy_daemon_identity,
     };
+    #[cfg(windows)]
+    use super::{EndpointOpenPolicy, open_windows_pipe_with_retry};
     #[cfg(feature = "test-fixtures")]
     use super::{parse_test_spawn_barrier_count, parse_test_workspace_register_response_timeout};
     use anyhow::Context as _;
@@ -2074,12 +2098,13 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_pipe_busy_retries_until_success() -> io::Result<()> {
+    async fn windows_discovery_pipe_busy_retries_until_success() -> io::Result<()> {
         let open_count = Cell::new(0_u32);
         let sleep_count = Cell::new(0_u32);
 
         open_windows_pipe_with_retry(
             Instant::now() + RESPONSE_TIMEOUT,
+            EndpointOpenPolicy::Discovery,
             || {
                 let attempt = open_count.get() + 1;
                 open_count.set(attempt);
@@ -2103,12 +2128,43 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_pipe_non_busy_error_fails_without_retry() -> io::Result<()> {
+    async fn windows_selected_pipe_not_found_retries_until_success() -> io::Result<()> {
+        let open_count = Cell::new(0_u32);
+        let sleep_count = Cell::new(0_u32);
+
+        open_windows_pipe_with_retry(
+            Instant::now() + RESPONSE_TIMEOUT,
+            EndpointOpenPolicy::Selected,
+            || {
+                let attempt = open_count.get() + 1;
+                open_count.set(attempt);
+                if attempt < 3 {
+                    Err(io::Error::from_raw_os_error(2))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                sleep_count.set(sleep_count.get() + 1);
+                future::ready(())
+            },
+        )
+        .await?;
+
+        assert_eq!(open_count.get(), 3);
+        assert_eq!(sleep_count.get(), 2);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_discovery_pipe_not_found_fails_without_retry() -> io::Result<()> {
         let open_count = Cell::new(0_u32);
         let sleep_count = Cell::new(0_u32);
 
         let result = open_windows_pipe_with_retry::<(), _, _, _>(
             Instant::now() + RESPONSE_TIMEOUT,
+            EndpointOpenPolicy::Discovery,
             || {
                 open_count.set(open_count.get() + 1);
                 Err(io::Error::from_raw_os_error(2))
@@ -2121,11 +2177,42 @@ mod tests {
         .await;
         let Err(error) = result else {
             return Err(io::Error::other(
-                "non-busy pipe open unexpectedly succeeded",
+                "missing discovery pipe unexpectedly retried to success",
             ));
         };
 
         assert_eq!(error.raw_os_error(), Some(2));
+        assert_eq!(open_count.get(), 1);
+        assert_eq!(sleep_count.get(), 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_non_retryable_error_fails_without_retry() -> io::Result<()> {
+        let open_count = Cell::new(0_u32);
+        let sleep_count = Cell::new(0_u32);
+
+        let result = open_windows_pipe_with_retry::<(), _, _, _>(
+            Instant::now() + RESPONSE_TIMEOUT,
+            EndpointOpenPolicy::Selected,
+            || {
+                open_count.set(open_count.get() + 1);
+                Err(io::Error::from_raw_os_error(5))
+            },
+            |_| {
+                sleep_count.set(sleep_count.get() + 1);
+                future::ready(())
+            },
+        )
+        .await;
+        let Err(error) = result else {
+            return Err(io::Error::other(
+                "non-retryable pipe open unexpectedly succeeded",
+            ));
+        };
+
+        assert_eq!(error.raw_os_error(), Some(5));
         assert_eq!(open_count.get(), 1);
         assert_eq!(sleep_count.get(), 0);
         Ok(())
@@ -2139,6 +2226,7 @@ mod tests {
 
         let result = open_windows_pipe_with_retry::<(), _, _, _>(
             Instant::now(),
+            EndpointOpenPolicy::Discovery,
             || {
                 open_count.set(open_count.get() + 1);
                 Err(io::Error::from_raw_os_error(231))
@@ -2156,6 +2244,37 @@ mod tests {
         };
 
         assert_eq!(error.raw_os_error(), Some(231));
+        assert_eq!(open_count.get(), 1);
+        assert_eq!(sleep_count.get(), 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_pipe_not_found_error_stops_at_the_deadline() -> io::Result<()> {
+        let open_count = Cell::new(0_u32);
+        let sleep_count = Cell::new(0_u32);
+
+        let result = open_windows_pipe_with_retry::<(), _, _, _>(
+            Instant::now(),
+            EndpointOpenPolicy::Selected,
+            || {
+                open_count.set(open_count.get() + 1);
+                Err(io::Error::from_raw_os_error(2))
+            },
+            |_| {
+                sleep_count.set(sleep_count.get() + 1);
+                future::ready(())
+            },
+        )
+        .await;
+        let Err(error) = result else {
+            return Err(io::Error::other(
+                "expired not-found pipe open unexpectedly succeeded",
+            ));
+        };
+
+        assert_eq!(error.raw_os_error(), Some(2));
         assert_eq!(open_count.get(), 1);
         assert_eq!(sleep_count.get(), 0);
         Ok(())
