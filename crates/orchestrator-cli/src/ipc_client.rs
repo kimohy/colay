@@ -29,6 +29,8 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "test-fixtures")]
 const MAX_TEST_SPAWN_BARRIER_PARTICIPANTS: usize = 64;
+#[cfg(feature = "test-fixtures")]
+const MAX_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(1);
 
 type ResponseReader = Pin<Box<dyn AsyncBufRead + Send>>;
 
@@ -485,6 +487,7 @@ async fn register_workspace(
     repository: &Path,
     explicit_config: Option<&Path>,
 ) -> Result<WorkspaceId> {
+    let response_timeout = workspace_register_response_timeout()?;
     let config = crate::daemon::load_daemon_config(repository, explicit_config)?;
     let request = IpcRequest {
         schema_version: IPC_SCHEMA_VERSION,
@@ -498,7 +501,7 @@ async fn register_workspace(
         }),
     };
     let mut stream = open_response_stream(paths, endpoint, &request).await?;
-    let response = tokio::time::timeout(RESPONSE_TIMEOUT, stream.next())
+    let response = tokio::time::timeout(response_timeout, stream.next())
         .await
         .context("timed out registering the workspace with the user daemon")??
         .ok_or_else(|| anyhow!("user daemon closed workspace IPC without replying"))?;
@@ -511,6 +514,43 @@ async fn register_workspace(
     workspace_id
         .parse()
         .context("user daemon returned an invalid workspace identifier")
+}
+
+fn workspace_register_response_timeout() -> Result<Duration> {
+    #[cfg(feature = "test-fixtures")]
+    {
+        parse_test_workspace_register_response_timeout(
+            std::env::var_os("COLAY_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT_MS").as_deref(),
+        )
+    }
+    #[cfg(not(feature = "test-fixtures"))]
+    {
+        Ok(RESPONSE_TIMEOUT)
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+fn parse_test_workspace_register_response_timeout(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(RESPONSE_TIMEOUT);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("workspace register response timeout is not valid UTF-8"))?;
+    let milliseconds = value
+        .parse::<u64>()
+        .context("workspace register response timeout is not a positive integer")?;
+    let timeout = Duration::from_millis(milliseconds);
+    if !(RESPONSE_TIMEOUT..=MAX_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT).contains(&timeout) {
+        bail!(
+            "workspace register response timeout must be between {} and {} milliseconds",
+            RESPONSE_TIMEOUT.as_millis(),
+            MAX_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT.as_millis()
+        );
+    }
+    Ok(timeout)
 }
 
 fn ensure_success(response: &IpcResponse) -> Result<()> {
@@ -1092,8 +1132,6 @@ mod tests {
 
     #[cfg(windows)]
     use super::open_windows_pipe_with_retry;
-    #[cfg(feature = "test-fixtures")]
-    use super::parse_test_spawn_barrier_count;
     use super::{
         CONNECT_TIMEOUT, LegacyDaemonIdentity, PingReadiness, RESPONSE_TIMEOUT,
         ReadyChildDisposition, ReapProgress, StartupChild, classify_ready_child,
@@ -1102,6 +1140,8 @@ mod tests {
         resolve_ready_child, response_stream_with_legacy_identity, spawn_contender_once,
         startup_workspace_receipt, validate_legacy_daemon_identity,
     };
+    #[cfg(feature = "test-fixtures")]
+    use super::{parse_test_spawn_barrier_count, parse_test_workspace_register_response_timeout};
     use anyhow::Context as _;
     use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest, IpcResponse};
     use serde_json::{Value, json};
@@ -1533,6 +1573,28 @@ mod tests {
             assert!(
                 parse_test_spawn_barrier_count(std::ffi::OsStr::new(invalid)).is_err(),
                 "accepted invalid spawn barrier count {invalid:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn workspace_register_test_timeout_is_scoped_and_bounded() -> anyhow::Result<()> {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            parse_test_workspace_register_response_timeout(None)?,
+            RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            parse_test_workspace_register_response_timeout(Some(OsStr::new("30000")))?,
+            std::time::Duration::from_secs(30)
+        );
+        for invalid in ["9999", "60001", "not-a-number"] {
+            assert!(
+                parse_test_workspace_register_response_timeout(Some(OsStr::new(invalid))).is_err(),
+                "accepted invalid workspace register response timeout {invalid:?}"
             );
         }
         Ok(())

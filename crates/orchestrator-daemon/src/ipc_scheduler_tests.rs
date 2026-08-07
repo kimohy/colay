@@ -1725,6 +1725,8 @@ impl Drop for DropProbe {
 struct ErrorThenSuccessBackend {
     calls: AtomicUsize,
     drops: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    success_started: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    success_release: Arc<ReleaseGate>,
     commits: tokio::sync::mpsc::UnboundedSender<&'static str>,
 }
 
@@ -1739,6 +1741,8 @@ impl WriterBackend for ErrorThenSuccessBackend {
                 "injected preparation failure".to_owned(),
             ));
         }
+        let _ = self.success_started.send("success-preparation-started");
+        self.success_release.wait();
         Ok(Box::new(MarkerCommit(self.commits.clone())))
     }
 
@@ -1775,10 +1779,14 @@ async fn preparation_error_drops_guards_advances_lane_and_success_waits_for_comm
     let repository = temporary.path().join("repository");
     fs::create_dir_all(&repository)?;
     let (drops, mut dropped) = tokio::sync::mpsc::unbounded_channel();
+    let (success_starts, mut success_started) = tokio::sync::mpsc::unbounded_channel();
+    let success_release = Arc::new(ReleaseGate::closed());
     let (commits, mut committed) = tokio::sync::mpsc::unbounded_channel();
     let backend = Arc::new(ErrorThenSuccessBackend {
         calls: AtomicUsize::new(0),
         drops,
+        success_started: success_starts,
+        success_release: Arc::clone(&success_release),
         commits,
     });
     let (activations, mut activated) = tokio::sync::mpsc::unbounded_channel();
@@ -1803,7 +1811,7 @@ async fn preparation_error_drops_guards_advances_lane_and_success_waits_for_comm
             response: failed_response,
         })
         .await?;
-    let (success_response, success_reply) = tokio::sync::oneshot::channel();
+    let (success_response, mut success_reply) = tokio::sync::oneshot::channel();
     writer
         .send(WriterRequest {
             request: register_request_with_state(1, &repository, ".other-colay"),
@@ -1811,17 +1819,40 @@ async fn preparation_error_drops_guards_advances_lane_and_success_waits_for_comm
         })
         .await?;
 
-    let failed = failed_reply.await?;
+    let failed = tokio::time::timeout(Duration::from_secs(2), failed_reply).await;
+    let dropped_guard = tokio::time::timeout(Duration::from_secs(2), dropped.recv()).await;
+    let started = tokio::time::timeout(Duration::from_secs(2), success_started.recv()).await;
+    let commit_before_release = committed.try_recv();
+    let activation_before_release = activated.try_recv();
+    let response_before_release = success_reply.try_recv();
+    success_release.release();
+
+    let failed = failed??;
     assert_eq!(failed.outcome["status"], "error");
     assert_eq!(
-        dropped.recv().await,
+        dropped_guard?,
         Some("preparation-guard-dropped"),
         "failed preparation did not drop its owned guard"
     );
-    assert!(committed.try_recv().is_err());
-    assert!(activated.try_recv().is_err());
+    assert_eq!(
+        started?,
+        Some("success-preparation-started"),
+        "failed preparation did not advance its workspace lane"
+    );
+    assert!(matches!(
+        commit_before_release,
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        activation_before_release,
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        response_before_release,
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
 
-    let success = success_reply.await?;
+    let success = tokio::time::timeout(Duration::from_secs(2), success_reply).await??;
     assert_eq!(success.outcome["status"], "ok");
     assert_eq!(success.outcome["data"]["imported_legacy_state"], true);
     assert_eq!(committed.try_recv(), Ok("commit-complete"));

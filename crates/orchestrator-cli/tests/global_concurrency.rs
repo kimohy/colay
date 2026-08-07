@@ -648,6 +648,9 @@ impl CommandContext {
                 "COLAY_TEST_DAEMON_SPAWN_BARRIER_COUNT",
                 expected.to_string(),
             )
+            // This debug fixture owns cold-start receipt/import semantics. Dedicated Windows
+            // stress QA owns the unchanged ten-second production latency acceptance.
+            .env("COLAY_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT_MS", "30000")
             .env("COLAY_TEST_FAKE_PROVIDERS_ONLY", "1")
             .env("PATH", &self.path)
             .env("PATHEXT", ".EXE;.CMD")

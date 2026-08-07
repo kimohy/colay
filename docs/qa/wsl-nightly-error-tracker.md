@@ -993,6 +993,9 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
+| `WIN-022` | low | monitoring (non-code Windows host filesystem anomaly; clean full gate GREEN; final CI pending) | a freshly created `DoctorFixture` repository disappeared before current-schema WAL seeding |
+| `WIN-021` | low | fix-in-progress (identical-tree Windows CI RED/GREEN; scoped bounded fixture timeout and local repeats pass; final CI pending) | cold-start receipt correctness fixture inherits the production registration latency deadline |
+| `WIN-020` | low | fix-in-progress (identical-tree Ubuntu CI RED/GREEN; deterministic gate and local repeats pass; final CI pending) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
 | `WIN-019` | medium | fix-in-progress (exact-`b71f9a9` macOS CI RED; alias RED/GREEN and final local full gates pass; final CI pending) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
 | `WIN-018` | low | fix-in-progress (exact-`b71f9a9` Windows CI RED; bounded-wait and final local full gates pass; final CI pending) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
 | `WIN-017` | medium | fix-in-progress (exact-`b71f9a9` stress failed once; exact-`a05bc02` stress passed once; final CI/nightly pending) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
@@ -2980,6 +2983,118 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   and diff checks also passed. The final combined full workspace gates passed, including
   the `651.7s` test run with zero failures. Production path validation was not changed.
   Fresh macOS CI remains required.
+
+## WIN-020: scheduler fixture assumes the successor has not committed yet
+
+### Observation and root cause
+
+- Exact source `a05bc0277353475021503f6e1e26f922dc357078` failed the Ubuntu job in
+  pull-request CI run `31133515062`. Test
+  `preparation_error_drops_guards_advances_lane_and_success_waits_for_commit_activation`
+  received the expected predecessor failure and guard-drop evidence, then failed at
+  `committed.try_recv().is_err()`. The exact same tree SHA
+  `010f82b3cb9193260c040d3181eaa1e59f339f19` passed push CI run `31133509680`,
+  and both later exact-`6970f5b` push/PR runs passed Ubuntu. Those GREEN runs confirm
+  the failure is scheduling-sensitive but do not erase the preserved RED.
+- Production finalizes the failed generation, advances its workspace lane, and sends
+  the failed response. The successor's preparation and commit may therefore complete
+  before the async test task is scheduled after receiving that response. The old
+  negative `try_recv` assertion was not a scheduler contract and raced a valid fast
+  successor.
+
+### Deterministic correction and validation
+
+- The test backend now emits an explicit successor-preparation-started signal and
+  blocks that preparation on the existing `ReleaseGate`. The test collects the failed
+  response, guard drop, and successor start with bounded two-second waits, snapshots
+  commit, activation, and success response as `Empty` while the gate is closed, then
+  releases the gate and retains the original commit-before-activation-before-response
+  assertions. No production scheduler code changed.
+- The uncorrected exact test reproduced RED `0/1`. After correction, the exact test
+  passed, ten consecutive exact repetitions passed `10/10`, the scheduler group passed
+  `16/16`, and the daemon library passed `60/60`. Targeted Clippy with warnings denied,
+  formatting, and diff checks passed. Fresh final-head three-platform CI remains the
+  closure gate.
+
+## WIN-021: cold-start correctness fixture inherits the production latency deadline
+
+### Observation and root cause
+
+- The Windows job in the same pull-request CI run `31133515062` timed out one of four
+  simultaneous synthetic legacy-workspace clients after the unchanged ten-second
+  `workspace.register` response deadline. Daemon diagnostics still showed one online
+  owner and only the three exact expected contender-ownership messages; earlier tests
+  in that job passed.
+- The identical source tree passed push CI run `31133509680`. Clean local exact runs on
+  the pre-correction head also passed in `20.19s` and `16.62s`, and exact-`6970f5b`
+  push/PR runs `31134120605` and `31134123881` subsequently passed all three operating
+  systems. This proves host-I/O sensitivity, not a merge-tree difference. The test's
+  purpose is receipt ownership, four-way contender resolution, import-once durability,
+  source immutability, and zero writable residue; the dedicated Windows stress gate
+  separately owns the unchanged product latency thresholds.
+
+### Scoped correction and validation
+
+- Builds with `test-fixtures` may now set
+  `COLAY_TEST_WORKSPACE_REGISTER_RESPONSE_TIMEOUT_MS` only for the
+  `workspace.register` response wait. The parser fails closed outside the bounded
+  inclusive `10,000..=60,000ms` range and defaults to the production `10,000ms` when
+  absent. The four-contender cold-start fixture alone sets `30,000ms`; contender count,
+  spawn barrier, owner-bound receipt handling, real SQLite imports, and all durability
+  assertions remain unchanged. Default/release builds retain the exact ten-second
+  constant and cannot read the fixture override.
+- The parser test first failed to compile before the implementation, then passed `1/1`.
+  The exact four-contender integration passed three consecutive runs in
+  `22.37s`, `17.26s`, and `17.22s`; the complete global-concurrency target passed
+  `8/8`, and the default-feature production-timeout contract passed `1/1`. Targeted
+  Clippy with warnings denied, formatting, and diff checks passed. Fresh final-head
+  three-platform CI remains the closure gate.
+
+## WIN-022: current-schema WAL doctor fixture temporarily loses its repository
+
+### Preserved full-gate failure
+
+- The first final combined `cargo test --workspace --all-features` run after the
+  `WIN-020`/`WIN-021` corrections exited `1` after `595.9s`. Test
+  `doctor_preserves_current_schema_wal_database_and_sidecars` returned
+  `StateError::Io` for the freshly created path
+  `C:\Users\kimoh\AppData\Local\Temp\.tmpJbNVaf\repository`, with Windows
+  `os error 2` (`The system cannot find the file specified`). The error shape maps to
+  `WorkspacePathIdentity::resolve` canonicalizing the repository during
+  `seed_current_schema_in_wal_mode`, before the doctor child command is launched.
+- The failure occurred while independent review commands were also using the shared
+  Cargo target and the run reported an artifact-directory lock wait. That concurrency
+  is recorded as context, not accepted as the cause: Cargo artifact locking does not
+  itself explain disappearance of an unrelated owned temporary repository.
+- A subsequent isolated exact diagnostic passed `1/1` in `7.52s`, and the complete
+  `global_doctor` target passed `33/33` with its normal parallel test threads in
+  `43.25s`. These GREEN diagnostics established intermittency but did not replace the
+  preserved full-gate RED.
+
+### Independent classification and clean closure gate
+
+- `DoctorFixture` owns its `TempDir` for the full test lifetime, its custom `Drop` runs
+  before owned fields are dropped, and neither `global_doctor` nor the relevant product
+  path can remove the fixture root or repository. The fixture and failing WAL test had
+  been unchanged since July 26, and the branch changes do not reach this setup path.
+- The failing test binary passed eight concurrent exact invocations, the current binary
+  passed another 24 concurrent exact invocations, and an independent bounded exact loop
+  passed `10/10`. Together with the isolated and full-target diagnostics, no source-level
+  deletion or timing condition reproduced.
+- The system temporary directory was a normal NTFS directory rather than a reparse
+  point, the volume reported `Healthy/OK`, and the estimated failure interval contained
+  no Storage Sense, SilentCleanup, temporary-file cleanup, or Defender detection event.
+  The bounded USN journal had already rotated the original `.tmpJbNVaf` record, so the
+  external deletion actor cannot be attributed after the fact.
+- No canonicalization retry, repository recreation, or alternate temporary root was
+  added: each would mask a real namespace loss without evidence of a product defect.
+  After all diagnostic children were stopped and no other Cargo job was active, the
+  required `cargo test --workspace --all-features` gate passed with zero failures in
+  `632.6s`, including `global_doctor` `33/33` and global concurrency `8/8`.
+- `WIN-022` is therefore classified as a non-code Windows host filesystem anomaly and
+  retained for monitoring. Recurrence requires stage-boundary metadata capture and a
+  ProcMon/USN trace before any code change. Fresh final-head three-platform CI remains
+  the release closure gate.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 
