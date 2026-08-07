@@ -993,7 +993,10 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 
 | ID | 심각도 | 상태 | 요약 |
 | --- | --- | --- | --- |
-| `WIN-016` | medium | fix-in-progress (native/state mutex RED/GREEN and local full gates pass; CI/nightly pending) | read-only ACL verification can race an in-process ACL repair sequence |
+| `WIN-019` | medium | fix-in-progress (exact-`b71f9a9` macOS CI RED; alias RED/GREEN and final local full gates pass; final CI pending) | scheduler tests pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
+| `WIN-018` | low | fix-in-progress (exact-`b71f9a9` Windows CI RED; bounded-wait and final local full gates pass; final CI pending) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
+| `WIN-017` | medium | fix-in-progress (exact-`b71f9a9` stress failed once; redundant state serialization removed; final local full gates pass; new exact-head stress pending) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
+| `WIN-016` | medium | fix-in-progress (native mutex RED/GREEN; duplicate state gate removed; final local full gates pass; CI/nightly pending) | read-only ACL verification can race an in-process ACL repair sequence |
 | `WIN-015` | medium | fix-in-progress (reviewed PowerShell 7.2/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
 | `WIN-014` | low | fix-in-progress (reviewed deterministic fixture, exact A/B, and authoritative stress pass; merge/CI pending) | 35ms readiness deadline fixture can expire before recording its required mock status poll |
 | `WIN-013` | medium | fix-in-progress (official PowerShell 7.2.24/7.6, exact A/B, and authoritative stress pass; merge/CI pending) | JSON equivalence used .NET 8-only APIs despite the PowerShell 7.2 runtime floor |
@@ -2680,32 +2683,32 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 
 - The Windows native artifact API serialized `ensure_private_state_artifact` with
   `STATE_ARTIFACT_REPAIR`, but `verify_private_state_artifact` bypassed that mutex.
-  The state permission layer had the same asymmetry: mutation held
-  `WINDOWS_ACL_LOCK`, while read-only verification did not. A concurrent doctor or
-  verifier could therefore observe the old non-exact DACL during the bounded repair
-  sequence and report a transient permissions failure even though repair completed
-  successfully.
-- Native verification now acquires the same repair mutex as native ensure. State
-  verification also acquires the same state ACL mutex as its mutation path before
-  canonicalizing and entering the native layer. Both state paths use the identical
-  `state -> native` lock order; direct callers of the native API are protected by the
-  native mutex.
-- Initial scheduler-based Windows regressions reproduced both gate bypasses before the
-  correction. Their final form avoids scheduler timing: thread-local acquisition
-  counters assert that ensure and verify each enter the same mutex helper.
-  `ensure_and_verify_acquire_the_shared_in_process_acl_gate` covers the native gate,
-  and `windows_ensure_and_verify_acquire_the_shared_state_acl_gate` covers the state
-  gate. The complete Windows IPC suite passed `47/47`, the focused Windows state
-  permission suite passed `9/9`, and both changed packages passed Clippy with warnings
-  denied. After the deterministic refinement, workspace-wide formatting, Clippy, and
-  tests passed again with fake-only mode enabled and provider credentials cleared.
-  Three-platform CI, merge, and published-nightly verification remain pending.
+  A concurrent doctor or verifier could therefore enter the native descriptor read
+  while a same-process repair sequence was in progress and report a transient
+  permissions failure.
+- Native verification now acquires the same repair mutex as native ensure. This native
+  boundary is authoritative for both the state facade and direct native callers: it
+  serializes non-reparse target pinning, descriptor read, optional complete-DACL write,
+  and post-write verification. The state facade performs fail-closed component,
+  canonical-path, and link checks without a second global mutex. A verifier that wins
+  the native mutex before repair may still report the pre-repair ACL; it cannot observe
+  a partial in-process repair.
+- The final regression avoids scheduler timing: a thread-local acquisition counter in
+  `ensure_and_verify_acquire_the_shared_in_process_acl_gate` asserts that native ensure
+  and verify each enter the same mutex helper. The earlier state-gate counter was
+  removed with the redundant state gate. In the final single-gate form, the complete
+  Windows IPC suite passed `47/47`, the focused Windows state permission suite passed
+  `8/8`, and the distinct-workspace concurrent import regression passed `1/1`. Related
+  package Clippy passed with warnings denied. Workspace-wide formatting, Clippy, and
+  tests then passed with fake-only mode enabled and provider credentials cleared,
+  followed by three-platform CI, merge, and published-nightly QA still pending.
 
 ### Completion conditions
 
-- Source completion: read-only verification cannot enter either ACL sequence while a
-  same-process ensure/repair operation holds its corresponding gate, with consistent
-  lock ordering and focused regression coverage.
+- Source completion: read-only verification and ensure/repair serialize their complete
+  native descriptor sequences through the same fail-closed gate, with retained-handle
+  identity checks and focused regression coverage. State path validation remains
+  independent for disjoint artifacts.
 - Release completion: the exact source revision passes the three-platform CI matrix
   and the published nightly passes isolated WSL and Windows-facing doctor QA.
 
@@ -2801,6 +2804,135 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
 - This closes the local authoritative Windows source re-acceptance for `WIN-005` and
   `WIN-010` through `WIN-015`. Their index entries remain `fix-in-progress` until the
   reviewed commits are merged and published CI/nightly verification completes.
+
+## WIN-017: redundant state ACL serialization reduces registration latency headroom
+
+### 2026-08-07 exact-`b71f9a9` authoritative stress — failed once
+
+- Clean source commit `b71f9a972942e3e0d072f2bcaeedde41c7589c2e` was built and
+  invoked exactly once through the verified portable PowerShell 7.6.4 binary. The
+  worktree and candidate-process preflight were clean, and the evidence recorded a
+  minimum `14.099GiB` free, above its `5GiB` floor. The invocation exited `1` after
+  `200.4s`; it was not retried. The stored run
+  interval is `198.9200996s`, from `2026-08-06T22:49:24.696597Z` through
+  `2026-08-06T22:52:43.6166966Z`.
+- Evidence
+  `artifacts/qa/windows-state-acl/windows-state-acl-stress-20260806T224924688Z.json`
+  is `492,354` bytes with SHA-256
+  `550fd38b0410759ca806fb394e7fc15702546d5a20ce69f1483ff0e54a61347d`.
+  It pins the unchanged harness SHA-256
+  `3c8cfb7fac68efcfba41d34e1dd3608171577f93b2c678e8f294d8a9f731d27a`,
+  `colay.exe` SHA-256
+  `430285ea52698394da28ec29c060c0d693cf1875f19bc83c8625d813e0d27439`,
+  fake-provider SHA-256
+  `674455deea7cee91aacde7df7687fb854c87fa94828324ae3a2f2a75059f84c2`,
+  and portable PowerShell SHA-256
+  `db6dd81183fe57d22e03b911ec9a30a2fd7c40542e97743615355a6fb44f458f`.
+- The unchanged latency contract failed in three places. Serial measurements were
+  `[4924, 4516, 5590, 1244, 3609]ms`, making nearest-rank p95 and maximum `5590ms`
+  against `5000ms`. Concurrent measurements were
+  `[6830, 7958, 8037, 8674]ms`; `concurrent-register-8` exceeded `8000ms` by `37ms`
+  and `concurrent-register-9` exceeded it by `674ms`. This acceptance failure is not
+  replaced by the earlier passing revision and will not be hidden by a retry.
+- Functional evidence remained clean: all 18 latency inspections and the attributed
+  correctness `2/1/2` aggregate/group/event contract passed; durable workspace,
+  workspace-path, import, and session counts were `10/10/9/9`; publication and lock
+  counts matched `10/9/9`; SQLite integrity was `ok` with zero foreign-key violations;
+  and all writable task, attempt, worktree, worker-lease, and coordinator-lease counts
+  were zero. Process audit, daemon/endpoint shutdown, observer teardown, and residue
+  checks passed with no forbidden utility launch, ownership refusal, cleanup error,
+  active process, or final host candidate process. Provider credentials were cleared
+  and `fake_provider_only=true`.
+- Fixture-only seed writes, excluded from product thresholds, were
+  `[2941, 6649, 4374, 748, 732, 753, 4151, 750, 760]ms` with total `21,858ms`, versus
+  `16,005ms` in the preceding passing run. This is evidence of host I/O variability,
+  but it does not invalidate the product-threshold failure or establish a sole cause.
+  The preserved runtime root is
+  `C:\Users\kimoh\AppData\Local\Temp\colay-acl-20260806T224924688Z`.
+
+### Correction in progress
+
+- Static path tracing confirmed that registration repeatedly invokes the state ensure
+  path throughout inspection, preparation, and commit for a non-empty legacy import.
+  The state-layer
+  `WINDOWS_ACL_LOCK` serialized two component walks, canonicalization, metadata, and
+  the complete native ACL call for every artifact, including disjoint workspaces. It
+  duplicated the native `STATE_ARTIFACT_REPAIR` gate and did not coordinate direct
+  native callers or external processes.
+- The redundant state gate is removed from both ensure and verify. Fail-closed path,
+  symlink/junction, and canonical-target validation remains intact and can overlap for
+  disjoint artifacts; the native gate still serializes target pinning and the complete
+  descriptor read/repair/post-write verification sequence. Independent code and test
+  reviews found no production safety blocker. No quantitative improvement is claimed
+  until one new clean exact-head authoritative stress run passes.
+- Final-form focused source checks passed: Windows IPC `47/47`, Windows state permission
+  tests `8/8`, the exact distinct-workspace concurrent import regression `1/1`, and
+  Clippy for both affected packages with warnings denied. Independent code and test
+  reviews returned READY for production safety. `cargo fmt --all -- --check`, full
+  workspace Clippy with warnings denied, and the complete workspace test suite then
+  passed on the final combined source; the latest full test command exited `0` after
+  `651.7s`. Exact-head latency acceptance remains pending.
+- If the new exact-head run still exceeds either unchanged limit, it will be preserved
+  as another failure rather than retried. The next design investigation will focus on
+  native descriptor-gate granularity; thresholds, durability, ACL strictness, and
+  cleanup requirements remain unchanged.
+
+## WIN-018: Windows pipe-security test races the daemon's semantic online phase
+
+### Observation and correction
+
+- Exact source `b71f9a972942e3e0d072f2bcaeedde41c7589c2e` reached GitHub Actions
+  CI run `31129898165`. Ubuntu passed, while the Windows job failed in
+  `windows_primary_and_legacy_pipes_serve_v1_with_current_user_only_dacls` at
+  `global_daemon.rs:397`: the raw v1 `daemon.status` response was `probing`, not the
+  test's expected `online`. The preceding Windows suites, including global concurrency
+  `8/8`, passed.
+- The initial top-level `colay status` proves that IPC is ready but does not promise
+  that the daemon's consecutive persisted `probing -> online` transitions have both
+  completed. The security test immediately queried both the primary and legacy
+  endpoints and therefore encoded a scheduler-speed assumption unrelated to its pipe
+  DACL contract.
+- The correction must wait on the persisted daemon phase with a bounded deadline
+  before issuing raw requests to both endpoints. It must retain the exact one-current-
+  user-ACE, no-broad-principal, v1 response, and final `online` assertions; accepting
+  `probing`, adding an unbounded sleep, or weakening pipe security is not acceptable.
+- The fixture now reads the active daemon row every `25ms` for at most `5s` and includes
+  the last observed phase in its timeout diagnostic. Its dedicated read connection
+  disables SQLite's default busy wait; transient `BUSY`/`LOCKED` results re-enter the
+  deadline loop instead of extending it. It does not launch a status subprocess whose
+  pipe-open and response deadlines could exceed the outer bound. Only after the
+  persisted phase is `online` does the test query both raw endpoints. The exact test
+  passed `1/1`, the complete `global_daemon` integration target passed `7/7`, and
+  targeted Clippy, formatting, and diff checks passed. The final combined workspace
+  Clippy and test suite also passed, with the latter exiting `0` after `651.7s`. Fresh
+  three-platform CI remains required.
+
+## WIN-019: macOS scheduler fixtures use a symlink-aliased temp root
+
+### Observation and correction
+
+- In the same exact-source CI run `31129898165`, the macOS job failed 15 daemon
+  scheduler tests with the common root error `SymlinkEscape("/var")`; 40 tests in that
+  crate passed before the suite stopped. GitHub Actions was also reporting a major
+  outage, but these source-level failures are retained and handled rather than
+  dismissed as infrastructure noise.
+- On macOS, `tempfile::tempdir()` commonly returns a path below `/var/folders`, while
+  `/var` aliases `/private/var`. Production state validation correctly rejects a link
+  component before opening or hardening persisted state. The scheduler fixtures passed
+  the raw temporary path into `GlobalStatePaths`, unlike other tests that canonicalize
+  their owned temporary root first.
+- The correction is test-only: retain ownership of each `TempDir`, canonicalize its
+  root once, and build all state and repository paths below that canonical root. The
+  production symlink/junction/reparse rejection policy must remain unchanged. Local
+  focused/full tests and a fresh macOS CI job are required before closure.
+- The 15 affected fixtures now use a local owned `CanonicalTempDir` wrapper and never
+  pass the raw alias into state resolution. A Windows junction-backed `TEMP`/`TMP`
+  reproduced the same failure before the correction (`SymlinkEscape`), then passed the
+  representative test `1/1` and the complete scheduler group `16/16` with the fix.
+  The daemon library passed `60/60`; targeted Clippy with warnings denied, formatting,
+  and diff checks also passed. The final combined full workspace gates passed, including
+  the `651.7s` test run with zero failures. Production path validation was not changed.
+  Fresh macOS CI remains required.
 
 ## WIN-006: LocalSystem에서 native state ACL 역할 SID 중복
 

@@ -63,6 +63,18 @@ path. Only the successfully acquired current process identity is cached. The pro
 mutex remains for the first implementation so repair and verification sequences in one process are
 serialized while correctness and load evidence are collected.
 
+> **2026-08-07 amendment — one authoritative native serialization boundary.**
+> The required process-local ACL mutex is `STATE_ARTIFACT_REPAIR` in the Windows FFI boundary.
+> Both native ensure and native verify acquire it before non-reparse target pinning and retain it
+> through descriptor read, optional complete-DACL write, and post-write verification. The safe
+> `orchestrator-state` facade performs component, canonical-path, metadata, and link validation
+> without a second global mutex, so preflight for disjoint artifacts may overlap. The removed outer
+> mutex neither protected direct native callers nor coordinated external processes and duplicated
+> the native gate while serializing unrelated filesystem work. A verifier that reaches the native
+> gate before an ensure may fail closed on the pre-repair descriptor; it cannot observe a partial
+> same-process repair. No path or ACL result is cached, and retained-handle, no-delete-sharing,
+> exact-DACL, owner-preservation, and reparse rejection requirements are unchanged.
+
 ## Crate and safety boundary
 
 `orchestrator-state` remains free of `unsafe`. On Windows it gains a target-specific dependency on

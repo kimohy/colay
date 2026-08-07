@@ -15,6 +15,8 @@ use orchestrator_daemon::{IPC_SCHEMA_VERSION, IpcRequest};
 #[cfg(windows)]
 use orchestrator_state::{GlobalStatePaths, StateEnvironment, current_windows_user_sid};
 use orchestrator_state::{STATE_SCHEMA_VERSION, WorkspaceId};
+#[cfg(windows)]
+use rusqlite::OptionalExtension as _;
 use rusqlite::{Connection, params};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -210,6 +212,48 @@ impl GlobalDaemonFixture {
         })
     }
 
+    #[cfg(windows)]
+    fn wait_for_daemon_state(&self, expected: &str, timeout: Duration) -> Result<()> {
+        let connection = Connection::open(self.global_database())?;
+        connection.busy_timeout(Duration::ZERO)?;
+        let deadline = Instant::now() + timeout;
+        let mut last_state = None;
+        loop {
+            if Instant::now() >= deadline {
+                anyhow::bail!("daemon did not reach {expected}: last state={last_state:?}");
+            }
+            match connection
+                .query_row(
+                    "SELECT phase FROM daemon_instances \
+                     WHERE released_at IS NULL ORDER BY started_at DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            {
+                Ok(state) => {
+                    last_state = state;
+                }
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let observed_at = Instant::now();
+            if last_state.as_deref() == Some(expected) && observed_at <= deadline {
+                return Ok(());
+            }
+            if observed_at >= deadline {
+                anyhow::bail!("daemon did not reach {expected}: last state={last_state:?}");
+            }
+            std::thread::sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(observed_at)),
+            );
+        }
+    }
+
     fn database_files(&self) -> Result<Vec<PathBuf>> {
         fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             if !directory.exists() {
@@ -346,6 +390,7 @@ fn windows_primary_and_legacy_pipes_serve_v1_with_current_user_only_dacls() -> R
         String::from_utf8_lossy(&started.stdout),
         String::from_utf8_lossy(&started.stderr)
     );
+    fixture.wait_for_daemon_state("online", Duration::from_secs(5))?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         fixture.colay_home.clone(),
     )?)?;

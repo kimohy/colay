@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,6 +19,26 @@ use super::{
     WriterScheduler, build_writer_runtime, process_writer_request, resolve_registration_admission,
     spawn_writer_thread_with_backend, workspace_activation, writer_loop_with_backend,
 };
+
+struct CanonicalTempDir {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl CanonicalTempDir {
+    fn new() -> std::io::Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let path = fs::canonicalize(directory.path())?;
+        Ok(Self {
+            _directory: directory,
+            path,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 struct ReleaseGate {
     released: Mutex<bool>,
@@ -92,7 +113,7 @@ impl RegistrationCommit for NoopCommit {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn four_distinct_workspace_lanes_overlap_blocking_preparation_before_release()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -148,7 +169,7 @@ async fn four_distinct_workspace_lanes_overlap_blocking_preparation_before_relea
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn five_ready_lanes_create_only_four_active_jobs_then_start_the_fifth()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -243,7 +264,7 @@ impl WriterBackend for IndividuallyGatedBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn global_ready_queue_starts_eligible_lanes_fifo_without_stale_entries()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -322,7 +343,7 @@ async fn full_internal_admission_capacity_backpressures_the_bounded_ingress_chan
 -> Result<(), Box<dyn std::error::Error>> {
     const EXPECTED_INTERNAL_ADMISSION_CAPACITY: usize = 64;
 
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -410,7 +431,7 @@ async fn full_internal_admission_capacity_backpressures_the_bounded_ingress_chan
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn internal_capacity_counts_coalesced_and_ordinary_admissions()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -521,7 +542,7 @@ impl RegistrationCommit for BlockingCommit {
 #[tokio::test(flavor = "current_thread")]
 async fn synchronous_commit_does_not_stall_the_calling_runtime()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -758,7 +779,7 @@ fn spawn_synchronous_stage_observer(
 #[tokio::test(flavor = "current_thread")]
 async fn all_synchronous_writer_stages_leave_the_calling_runtime_responsive_and_publish_in_order()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -900,7 +921,7 @@ fn writer_runtime_limits_blocking_workers_to_four() -> Result<(), Box<dyn std::e
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_closes_admission_then_drains_an_already_admitted_preparation()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1103,7 +1124,7 @@ fn stop_request(request_id: &str) -> IpcRequest {
 #[tokio::test(flavor = "current_thread")]
 async fn priority_stop_at_capacity_promptly_rejects_unadmitted_work_and_drains_the_prefix()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1231,7 +1252,7 @@ impl WriterBackend for EvidenceBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evidence_lookup_waits_for_the_same_workspace_lane_without_blocking_runtime()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1373,7 +1394,7 @@ impl RegistrationCommit for OrderedCommit {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn out_of_order_preparations_commit_around_an_ordinary_action_in_admission_order()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1458,7 +1479,7 @@ async fn out_of_order_preparations_commit_around_an_ordinary_action_in_admission
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn path_aliases_share_one_workspace_lane_and_one_preparation_generation()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1523,7 +1544,7 @@ async fn path_aliases_share_one_workspace_lane_and_one_preparation_generation()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn different_semantics_for_one_workspace_never_overlap()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1632,7 +1653,7 @@ impl RegistrationCommit for ReplayCommit {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_response_receiver_does_not_cancel_commit_and_retry_is_replay_safe()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
@@ -1745,7 +1766,7 @@ impl RegistrationCommit for MarkerCommit {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preparation_error_drops_guards_advances_lane_and_success_waits_for_commit_activation()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
+    let temporary = CanonicalTempDir::new()?;
     let paths = GlobalStatePaths::resolve(&StateEnvironment::with_colay_home(
         temporary.path().join("global"),
     )?)?;
