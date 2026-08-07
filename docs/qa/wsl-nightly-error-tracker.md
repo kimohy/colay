@@ -169,6 +169,12 @@
   derives every path from it; production symlink rejection is unchanged. Focused fake Agy tests
   passed 2/2 on Windows with targeted Clippy, format, and diff checks GREEN. A follow-up macOS CI run
   is required before merge.
+- The follow-up PR #22 Ubuntu job exposed a `WIN-018` recurrence in
+  `slow_fake_provider_probe_does_not_make_start_fail`: `daemon start` succeeded at IPC readiness,
+  then an immediate status read observed the legitimate intermediate `booting` phase rather than
+  `online`. The test now uses its existing 25ms bounded phase poll for at most five seconds;
+  production startup semantics are unchanged. The focused test passed 3/3, the daemon lifecycle
+  target passed 5/5, and targeted Clippy/format/diff checks passed. Fresh exact-head CI is required.
 
 ## 2026-08-07 PR #20 merge and deployed-nightly QA
 
@@ -1772,7 +1778,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WIN-021` | low | fixed (exact merge CI and nightly smoke GREEN) | cold-start receipt correctness fixture inherits the production registration latency deadline |
 | `WIN-020` | low | fixed (exact merge CI and nightly smoke GREEN) | scheduler test assumes a successor cannot commit before the test observes its predecessor's failure response |
 | `WIN-019` | medium | regression recurrence fixed in PR #22 source; fresh macOS CI pending | test fixtures pass a `/var`-aliased noncanonical temp root into fail-closed state path validation |
-| `WIN-018` | low | fixed (exact merge CI and nightly smoke GREEN) | named-pipe security test assumes IPC readiness means the persisted daemon phase has already reached `online` |
+| `WIN-018` | low | regression recurrence fixed in PR #22 source; fresh CI pending | daemon tests assume IPC readiness means the persisted daemon phase has already reached `online` |
 | `WIN-017` | medium | fixed (authoritative stress and exact merge CI GREEN) | state-layer ACL gate serializes path validation for disjoint workspace artifacts and erodes Windows registration latency headroom |
 | `WIN-016` | medium | fixed (native mutex regression and exact merge CI GREEN) | read-only ACL verification can race an in-process ACL repair sequence |
 | `WIN-015` | medium | fixed (PowerShell 7.2/7.6 A/B, stress, and exact merge CI GREEN) | PowerShell 7.2 can enumerate an exited process with empty identity fields and break residue probes |
@@ -3731,6 +3737,14 @@ error: lease conflict for task 019f86e9-e70b-7340-a119-20d230d0f8ff: another coo
   targeted Clippy, formatting, and diff checks passed. The final combined workspace
   Clippy and test suite also passed, with the latter exiting `0` after `651.7s`. Fresh
   three-platform CI remains required.
+- Regression recurrence on 2026-08-07: PR #22 Ubuntu CI failed
+  `slow_fake_provider_probe_does_not_make_start_fail` because the test read status exactly once
+  after successful `daemon start` and observed `booting`. IPC readiness intentionally precedes the
+  stored `probing -> online` transitions, so the one-shot assertion again encoded scheduler speed.
+  It now calls the existing `wait_for_state("online", 5s)` helper, which polls every 25ms and retains
+  the last status in its bounded timeout diagnostic. Production startup behavior is unchanged. The
+  focused test passed three consecutive runs, the full daemon lifecycle target passed 5/5, and
+  targeted Clippy, format, and diff checks passed. Fresh exact-head CI is required.
 
 ## WIN-019: macOS scheduler fixtures use a symlink-aliased temp root
 

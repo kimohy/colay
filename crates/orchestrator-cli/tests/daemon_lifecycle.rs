@@ -338,8 +338,7 @@ fn slow_fake_provider_probe_does_not_make_start_fail() -> Result<()> {
     let started = fixture.invoke_without_capture(&["daemon", "start"])?;
 
     assert!(started.success());
-    let status = fixture.json(&["daemon", "status"])?;
-    assert_eq!(status["data"]["status"]["state"], "online");
+    fixture.wait_for_state("online", Duration::from_secs(5))?;
     Ok(())
 }
 
