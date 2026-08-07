@@ -53,6 +53,8 @@ use orchestrator_state::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
+
+use crate::worker_messages::{WorkerMessageCollector, redact_decoded_provider_text};
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 use uuid::Uuid;
@@ -2940,10 +2942,12 @@ async fn run_worker(
     if !attempt_already_persisted {
         persist_attempt_started(database, &request, started_at)?;
     }
+    let redactor = Redactor::new(redaction_config)?;
     let handle = match adapter.start(request.clone()).await {
         Ok(handle) => handle,
         Err(error) => {
-            persist_attempt_start_failure(database, request.attempt_id, &error.to_string())?;
+            let error = redact_decoded_provider_text(&redactor, &error.to_string());
+            persist_attempt_start_failure(database, request.attempt_id, &error)?;
             let finished_at = Utc::now();
             return Ok(WorkerRunRecord {
                 result: WorkerResult {
@@ -2982,11 +2986,11 @@ async fn run_worker(
         worker_started_payload(&request),
     )?;
 
-    let redactor = Redactor::new(redaction_config)?;
     let mut quota_exceeded = false;
     let mut completed = false;
     let mut lifecycle_error = None;
-    let mut messages = Vec::new();
+    let mut messages =
+        WorkerMessageCollector::with_redactor(redactor.clone(), request.max_output_bytes);
     let mut session_id = None;
     let mut active_commands = HashMap::<String, (String, Vec<String>, DateTime<Utc>)>::new();
     let mut commands = Vec::new();
@@ -3021,6 +3025,7 @@ async fn run_worker(
                     && let Some(control) = claim_next_control(database, request.task_id)?
                 {
                     if let Err(error) = adapter.cancel(&handle).await {
+                        let error = messages.redact_provider_text(&error.to_string());
                         lifecycle_error = Some(format!("provider_cancel_error:{error}"));
                     }
                     requested_control = Some(control);
@@ -3037,8 +3042,11 @@ async fn run_worker(
             Ok(Some(raw)) => raw,
             Ok(None) => break,
             Err(error) => {
+                messages.discard_streamed_output();
+                let error = messages.redact_provider_text(&error.to_string());
                 lifecycle_error = Some(format!("provider_event_error:{error}"));
                 if let Err(cancel_error) = adapter.cancel(&handle).await {
+                    let cancel_error = messages.redact_provider_text(&cancel_error.to_string());
                     lifecycle_error = Some(format!(
                         "provider_event_error:{error};provider_cancel_error:{cancel_error}"
                     ));
@@ -3049,9 +3057,21 @@ async fn run_worker(
         match adapter.parse_event(raw).await {
             Ok(event) => {
                 let terminal_error = matches!(&event, WorkerEvent::Error { .. });
+                if let Err(error) = messages.observe(&event) {
+                    lifecycle_error.get_or_insert_with(|| error.to_string());
+                    if let Err(cancel_error) = adapter.cancel(&handle).await {
+                        let cancel_error = messages.redact_provider_text(&cancel_error.to_string());
+                        lifecycle_error
+                            .get_or_insert_with(|| format!("provider_cancel_error:{cancel_error}"));
+                    }
+                    break;
+                }
                 match &event {
-                    WorkerEvent::Started { session_id: value } => session_id.clone_from(value),
-                    WorkerEvent::Message { text } => messages.push(text.clone()),
+                    WorkerEvent::Started { session_id: value } => {
+                        session_id = value
+                            .as_deref()
+                            .map(|value| messages.redact_provider_text(value));
+                    }
                     WorkerEvent::CommandStarted {
                         command_id,
                         executable,
@@ -3061,13 +3081,16 @@ async fn run_worker(
                             .insert(
                                 command_id.clone(),
                                 (
-                                    redactor.redact(executable),
-                                    args.iter().map(|arg| redactor.redact(arg)).collect(),
+                                    messages.redact_provider_text(executable),
+                                    args.iter()
+                                        .map(|arg| messages.redact_provider_text(arg))
+                                        .collect(),
                                     Utc::now(),
                                 ),
                             )
                             .is_some()
                         {
+                            let command_id = messages.redact_provider_text(command_id);
                             lifecycle_error =
                                 Some(format!("duplicate_command_started:{command_id}"));
                         }
@@ -3112,6 +3135,7 @@ async fn run_worker(
                                 stderr_sha256: None,
                             });
                         } else {
+                            let command_id = messages.redact_provider_text(command_id);
                             lifecycle_error =
                                 Some(format!("unknown_command_completed:{command_id}"));
                         }
@@ -3156,17 +3180,22 @@ async fn run_worker(
                         }
                     }
                     WorkerEvent::Error { code, .. } => {
-                        lifecycle_error =
-                            Some(code.clone().unwrap_or_else(|| "worker_error".to_owned()));
+                        lifecycle_error = Some(code.as_deref().map_or_else(
+                            || "worker_error".to_owned(),
+                            |code| messages.redact_provider_text(code),
+                        ));
                     }
                     WorkerEvent::Unknown {
                         event_type,
                         affects_lifecycle: true,
                         ..
                     } => {
+                        let event_type = messages.redact_provider_text(event_type);
                         lifecycle_error = Some(format!("unknown_lifecycle_event:{event_type}"));
                     }
-                    WorkerEvent::FileChanged { .. }
+                    WorkerEvent::Message { .. }
+                    | WorkerEvent::MessageDelta { .. }
+                    | WorkerEvent::FileChanged { .. }
                     | WorkerEvent::CheckpointClaim { .. }
                     | WorkerEvent::Unknown { .. } => {}
                 }
@@ -3182,6 +3211,7 @@ async fn run_worker(
                 )?;
                 if terminal_error {
                     if let Err(error) = adapter.cancel(&handle).await {
+                        let error = messages.redact_provider_text(&error.to_string());
                         lifecycle_error = Some(format!(
                             "{};provider_cancel_error:{error}",
                             lifecycle_error.as_deref().unwrap_or("worker_error")
@@ -3191,8 +3221,11 @@ async fn run_worker(
                 }
             }
             Err(error) => {
+                messages.discard_streamed_output();
+                let error = messages.redact_provider_text(&error.to_string());
                 lifecycle_error = Some(format!("compatibility_error:{error}"));
                 if let Err(cancel_error) = adapter.cancel(&handle).await {
+                    let cancel_error = messages.redact_provider_text(&cancel_error.to_string());
                     lifecycle_error = Some(format!(
                         "compatibility_error:{error};provider_cancel_error:{cancel_error}"
                     ));
@@ -3206,6 +3239,7 @@ async fn run_worker(
             && let Some(control) = claim_next_control(database, request.task_id)?
         {
             if let Err(error) = adapter.cancel(&handle).await {
+                let error = messages.redact_provider_text(&error.to_string());
                 lifecycle_error = Some(format!("provider_cancel_error:{error}"));
             }
             requested_control = Some(control);
@@ -3213,6 +3247,7 @@ async fn run_worker(
         }
         if active_commands.is_empty() && proactive_handover {
             if let Err(error) = adapter.cancel(&handle).await {
+                let error = messages.redact_provider_text(&error.to_string());
                 lifecycle_error = Some(format!("provider_cancel_error:{error}"));
             }
             break;
@@ -3273,6 +3308,10 @@ async fn run_worker(
     if !active_commands.is_empty() && lifecycle_error.is_none() {
         lifecycle_error = Some("incomplete_command_lifecycle".to_owned());
     }
+    if output.truncated {
+        messages.discard_streamed_output();
+        lifecycle_error.get_or_insert_with(|| "provider_output_limit_exceeded".to_owned());
+    }
     for (_, (executable, args, command_started_at)) in active_commands {
         let evidence_id = CommandEvidenceId::new();
         if looks_like_test_command(&executable, &args) {
@@ -3315,6 +3354,7 @@ async fn run_worker(
             RuntimeTermination::Exited => WorkerOutcome::Failed,
         }
     };
+    let messages = messages.into_messages();
     let summary = messages
         .last()
         .map(|message| bounded_text(&redactor.redact(message), 8_192));
@@ -3383,7 +3423,11 @@ fn audit_worker_event(event: &WorkerEvent, redactor: &Redactor) -> Value {
         }
         WorkerEvent::Message { text } => json!({
             "type": "message",
-            "text": bounded_text(&redactor.redact(text), 4_096),
+            "text": bounded_text(&redact_decoded_provider_text(redactor, text), 4_096),
+        }),
+        WorkerEvent::MessageDelta { text } => json!({
+            "type": "message_delta",
+            "bytes": text.len(),
         }),
         WorkerEvent::CommandStarted {
             command_id,
@@ -3391,15 +3435,22 @@ fn audit_worker_event(event: &WorkerEvent, redactor: &Redactor) -> Value {
             args,
         } => json!({
             "type": "command_started",
-            "command_id": command_id,
-            "executable": bounded_text(&redactor.redact(executable), 512),
-            "args": args.iter().map(|arg| bounded_text(&redactor.redact(arg), 512)).collect::<Vec<_>>(),
+            "command_id": bounded_text(&redact_decoded_provider_text(redactor, command_id), 512),
+            "executable": bounded_text(&redact_decoded_provider_text(redactor, executable), 512),
+            "args": args.iter().map(|arg| bounded_text(&redact_decoded_provider_text(redactor, arg), 512)).collect::<Vec<_>>(),
         }),
         WorkerEvent::CommandCompleted {
             command_id,
             exit_code,
-        } => json!({"type": "command_completed", "command_id": command_id, "exit_code": exit_code}),
-        WorkerEvent::FileChanged { path } => json!({"type": "file_changed", "path": path}),
+        } => json!({
+            "type": "command_completed",
+            "command_id": bounded_text(&redact_decoded_provider_text(redactor, command_id), 512),
+            "exit_code": exit_code,
+        }),
+        WorkerEvent::FileChanged { path } => json!({
+            "type": "file_changed",
+            "path": bounded_text(&redact_decoded_provider_text(redactor, &path.to_string()), 2_048),
+        }),
         WorkerEvent::Usage { observation } => json!({
             "type": "usage",
             "provider": observation.provider,
@@ -3408,16 +3459,16 @@ fn audit_worker_event(event: &WorkerEvent, redactor: &Redactor) -> Value {
         }),
         WorkerEvent::QuotaExceeded { detail } => json!({
             "type": "quota_exceeded",
-            "detail": detail.as_deref().map(|value| bounded_text(&redactor.redact(value), 1_024)),
+            "detail": detail.as_deref().map(|value| bounded_text(&redact_decoded_provider_text(redactor, value), 1_024)),
         }),
         WorkerEvent::CheckpointClaim { summary } => json!({
             "type": "checkpoint_claim",
-            "summary": bounded_text(&redactor.redact(summary), 2_048),
+            "summary": bounded_text(&redact_decoded_provider_text(redactor, summary), 2_048),
             "trusted": false,
         }),
         WorkerEvent::Completed { summary, usage } => json!({
             "type": "completed",
-            "summary": summary.as_deref().map(|value| bounded_text(&redactor.redact(value), 2_048)),
+            "summary": summary.as_deref().map(|value| bounded_text(&redact_decoded_provider_text(redactor, value), 2_048)),
             "usage": usage.as_ref().map(|observation| json!({
                 "provider": observation.provider,
                 "amount": observation.amount,
@@ -3432,8 +3483,8 @@ fn audit_worker_event(event: &WorkerEvent, redactor: &Redactor) -> Value {
             retryable,
         } => json!({
             "type": "error",
-            "code": code,
-            "message": bounded_text(&redactor.redact(message), 2_048),
+            "code": code.as_deref().map(|value| bounded_text(&redact_decoded_provider_text(redactor, value), 512)),
+            "message": bounded_text(&redact_decoded_provider_text(redactor, message), 2_048),
             "retryable": retryable,
         }),
         WorkerEvent::Unknown {
@@ -3442,7 +3493,7 @@ fn audit_worker_event(event: &WorkerEvent, redactor: &Redactor) -> Value {
             ..
         } => json!({
             "type": "unknown",
-            "event_type": event_type,
+            "event_type": bounded_text(&redact_decoded_provider_text(redactor, event_type), 512),
             "affects_lifecycle": affects_lifecycle,
             "payload_persisted": false,
         }),
@@ -3616,7 +3667,7 @@ fn block_for_unconfirmed_termination(
     detail: &str,
     redactor: &Redactor,
 ) -> Result<()> {
-    let detail = bounded_text(&redactor.redact(detail), 2_048);
+    let detail = bounded_text(&redact_decoded_provider_text(redactor, detail), 2_048);
     persist_attempt_unconfirmed_termination(database, request.attempt_id, &detail)?;
     let from_state = transition_task(
         database,
@@ -7413,9 +7464,9 @@ mod tests {
     use anyhow::{Context as _, Result};
     use chrono::Utc;
     use orchestrator_domain::{
-        AttemptId, ModelProfile, ProviderId, ReasoningEffort, SandboxMode, SchemaVersion,
+        AttemptId, ModelProfile, ProviderId, ReasoningEffort, RepoPath, SandboxMode, SchemaVersion,
         TaskEnvelope, TaskEvent, TaskId, TaskState, TestEvidence, TestStatus, VerificationStatus,
-        WorkerOutcome, WorkerRequest, WorkerResult,
+        WorkerEvent, WorkerOutcome, WorkerRequest, WorkerResult,
     };
     use orchestrator_process::{
         EnvironmentPolicy, ExecutableHostContext, ExecutablePlatform, ExecutablePolicy,
@@ -7432,12 +7483,94 @@ mod tests {
     use super::{
         CheckStatus, LegacyImportProjection, ReviewOutcome, RollbackManifestStep, StatePaths,
         acceptance_evidence, acquire_maintenance_with_legacy_inspection, acquire_task_coordinator,
-        acquire_worker_lease, append_live_doctor_checks, block_for_unconfirmed_termination,
-        initialize, live_legacy_import_check, load_config_runtime, mixed_git_checkout_warning,
-        next_run_command_poll_interval, provider_adapter, provider_command_spec,
-        reset_model_profile, rollback_resolution_context, run_with_coordinator_renewal, run_worker,
-        set_model_profile, set_provider_enabled, trusted_rollback_steps, worker_started_payload,
+        acquire_worker_lease, append_live_doctor_checks, audit_worker_event,
+        block_for_unconfirmed_termination, initialize, live_legacy_import_check,
+        load_config_runtime, mixed_git_checkout_warning, next_run_command_poll_interval,
+        provider_adapter, provider_command_spec, reset_model_profile, rollback_resolution_context,
+        run_with_coordinator_renewal, run_worker, set_model_profile, set_provider_enabled,
+        trusted_rollback_steps, worker_started_payload,
     };
+
+    #[test]
+    fn streamed_and_unknown_provider_payloads_are_not_persisted_in_audit_events() -> Result<()> {
+        let redactor = Redactor::new(&RedactionConfig {
+            literals: Vec::new(),
+            patterns: vec!["CUSTOM-[A-Z]+".to_owned()],
+        })?;
+        let secret = "CUSTOM-SECRETVALUE";
+
+        let delta = audit_worker_event(
+            &WorkerEvent::MessageDelta {
+                text: secret.to_owned(),
+            },
+            &redactor,
+        );
+        assert_eq!(
+            delta,
+            serde_json::json!({"type": "message_delta", "bytes": secret.len()})
+        );
+        assert!(!delta.to_string().contains(secret));
+
+        let unknown = audit_worker_event(
+            &WorkerEvent::Unknown {
+                event_type: "provider.fixture".to_owned(),
+                payload: serde_json::json!({"secret": secret}),
+                affects_lifecycle: false,
+            },
+            &redactor,
+        );
+        assert_eq!(unknown["payload_persisted"], false);
+        assert!(!unknown.to_string().contains(secret));
+
+        let prior_frame_redaction = audit_worker_event(
+            &WorkerEvent::Error {
+                code: None,
+                message: "[REDACTED]unmatched-secret-suffix".to_owned(),
+                retryable: false,
+            },
+            &redactor,
+        );
+        assert_eq!(prior_frame_redaction["message"], "[REDACTED]");
+        Ok(())
+    }
+
+    #[test]
+    fn audit_worker_event_redacts_decoded_provider_metadata() -> Result<()> {
+        let redactor = Redactor::new(&RedactionConfig::default())?;
+        let secret = "topsecretvalue";
+        let events = [
+            WorkerEvent::CommandStarted {
+                command_id: "command-api_key=topsecretvalue".to_owned(),
+                executable: "cargo".to_owned(),
+                args: Vec::new(),
+            },
+            WorkerEvent::CommandCompleted {
+                command_id: "[REDACTED]suffix".to_owned(),
+                exit_code: Some(0),
+            },
+            WorkerEvent::FileChanged {
+                path: RepoPath::try_from("artifacts/api_key=topsecretvalue.json")?,
+            },
+            WorkerEvent::Error {
+                code: Some("provider_api_key=topsecretvalue".to_owned()),
+                message: "provider failed".to_owned(),
+                retryable: false,
+            },
+            WorkerEvent::Unknown {
+                event_type: "provider.api_key=topsecretvalue".to_owned(),
+                payload: serde_json::Value::Null,
+                affects_lifecycle: false,
+            },
+        ];
+
+        for event in events {
+            let audit = audit_worker_event(&event, &redactor);
+            let audit = audit.to_string();
+            assert!(!audit.contains(secret));
+            assert!(!audit.contains("suffix"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn cli_provider_command_spec_requires_a_native_provider() {
@@ -8956,7 +9089,7 @@ mod tests {
             &database,
             &request,
             orchestrator_domain::CorrelationId::new(),
-            "taskkill failed after sk-abcdefghijklmnopqrstuvwxyz1234",
+            "taskkill failed after sk-abcdefghijklmnopqrstuvwxyz1234 [REDACTED]unmatched-secret-suffix",
             &redactor,
         )?;
 
@@ -8969,6 +9102,7 @@ mod tests {
         assert_eq!(attempt.outcome.as_deref(), Some("termination_unconfirmed"));
         let event_text = std::fs::read_to_string(&state.events)?;
         assert!(!event_text.contains("abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(!event_text.contains("unmatched-secret-suffix"));
         let events = event_text
             .lines()
             .map(serde_json::from_str::<TaskEvent>)

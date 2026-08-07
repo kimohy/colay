@@ -177,7 +177,10 @@ impl WorkerAdapter for AgyAdapter {
 
     async fn parse_event(&self, event: RawEvent) -> Result<WorkerEvent, ProviderError> {
         match event.channel {
-            RawEventChannel::Stdout => Ok(WorkerEvent::Message {
+            // Agy's plain stdout is one semantic response split into transport
+            // frames. Preserve it as deltas so consumers reassemble and redact
+            // across frame boundaries without inventing newlines.
+            RawEventChannel::Stdout => Ok(WorkerEvent::MessageDelta {
                 text: String::from_utf8_lossy(&event.bytes).into_owned(),
             }),
             RawEventChannel::Stderr => Ok(WorkerEvent::Unknown {
@@ -193,11 +196,20 @@ impl WorkerAdapter for AgyAdapter {
 fn parse_exit_event(bytes: &[u8]) -> Result<WorkerEvent, ProviderError> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| ProviderError::MalformedOutput(error.to_string()))?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("orchestrator.process_exited")
-    {
-        return Err(ProviderError::MalformedOutput(
-            "unexpected Agy runtime protocol event".to_owned(),
-        ));
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("orchestrator.frames_dropped") => {
+            return Ok(WorkerEvent::Error {
+                code: Some("runtime_protocol_loss".to_owned()),
+                message: "Agy runtime dropped provider output frames".to_owned(),
+                retryable: false,
+            });
+        }
+        Some("orchestrator.process_exited") => {}
+        _ => {
+            return Err(ProviderError::MalformedOutput(
+                "unexpected Agy runtime protocol event".to_owned(),
+            ));
+        }
     }
     let exit_code = value
         .get("exit_code")
@@ -689,7 +701,7 @@ mod tests {
             .await?;
         assert_eq!(
             message,
-            WorkerEvent::Message {
+            WorkerEvent::MessageDelta {
                 text: "done".to_owned()
             }
         );
@@ -724,10 +736,27 @@ mod tests {
             } if code == "agy_process_exit"
         ));
 
-        let malformed = adapter
+        let protocol_loss = adapter
             .parse_event(RawEvent {
                 channel: RawEventChannel::Protocol,
                 sequence: 4,
+                bytes: br#"{"type":"orchestrator.frames_dropped","count":1}"#.to_vec(),
+                received_at: chrono::Utc::now(),
+            })
+            .await?;
+        assert!(matches!(
+            protocol_loss,
+            WorkerEvent::Error {
+                code: Some(ref code),
+                retryable: false,
+                ..
+            } if code == "runtime_protocol_loss"
+        ));
+
+        let malformed = adapter
+            .parse_event(RawEvent {
+                channel: RawEventChannel::Protocol,
+                sequence: 5,
                 bytes: br#"{"type":"unexpected","exit_code":0}"#.to_vec(),
                 received_at: chrono::Utc::now(),
             })

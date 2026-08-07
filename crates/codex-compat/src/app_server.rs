@@ -440,7 +440,13 @@ impl StableAppServerSession {
 
     #[must_use]
     pub const fn can_fallback(&self) -> bool {
-        !self.side_effect_observed && !matches!(self.phase, SessionPhase::Completed)
+        !self.side_effect_observed
+            && matches!(
+                self.phase,
+                SessionPhase::Created
+                    | SessionPhase::AwaitingInitialize { .. }
+                    | SessionPhase::AwaitingThread { .. }
+            )
     }
 
     #[must_use]
@@ -899,6 +905,23 @@ mod tests {
             .handle_frame(b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr-1\",\"turn\":{\"id\":\"turn-1\",\"items\":[],\"status\":\"completed\"}}}\n")?;
         assert!(step.completed);
         assert_eq!(step.events[0]["usage"]["input_tokens"], 8);
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_is_forbidden_as_soon_as_the_turn_request_is_created() -> Result<(), AppServerError>
+    {
+        let mut session = StableAppServerSession::new(AppServerSessionPlan::new(request()))?;
+        let _ = session.start()?;
+        assert!(session.can_fallback());
+
+        let _ = session.handle_frame(b"{\"id\":0,\"result\":{}}\n")?;
+        assert!(session.can_fallback());
+
+        let step =
+            session.handle_frame(b"{\"id\":1,\"result\":{\"thread\":{\"id\":\"thr-1\"}}}\n")?;
+        assert!(String::from_utf8_lossy(&step.outbound[0]).contains("turn/start"));
+        assert!(!session.can_fallback());
         Ok(())
     }
 

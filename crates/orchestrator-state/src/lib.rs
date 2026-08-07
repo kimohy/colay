@@ -85,9 +85,10 @@ pub use permissions::{
     ensure_private_directory, ensure_private_file, reject_symlink_components, verify_private_file,
 };
 pub use records::{
-    ClaimedControlRecoveryPolicy, ControlAction, ControlRecoveryDisposition, ControlRequest,
-    NewTaskAttemptRecord, NewTaskRecord, NewWorktreeRecord, RecoveredControl, RoutingAuditRecord,
-    StoredHandover, StoredTask, StoredTaskAttempt, StoredWorktree, TaskListFilter,
+    ClaimedControlRecoveryPolicy, CompletedTaskAttemptRecord, ControlAction,
+    ControlRecoveryDisposition, ControlRequest, NewTaskAttemptRecord, NewTaskRecord,
+    NewWorktreeRecord, RecoveredControl, RoutingAuditRecord, StoredHandover, StoredTask,
+    StoredTaskAttempt, StoredWorktree, TaskListFilter,
 };
 pub use scheduling::{ClaimReadyTaskRequest, ClaimedTask};
 pub use sessions::{NewSessionRecord, SessionListFilter, StoredSession};

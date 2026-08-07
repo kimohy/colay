@@ -17,6 +17,7 @@ use orchestrator_domain::{
 use orchestrator_state::Database;
 
 const README: &str = include_str!("../../../README.md");
+const OPERATIONS: &str = include_str!("../../../docs/operations.md");
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -244,4 +245,39 @@ fn chat_tui_readme_documents_navigation_reconnect_and_phase_boundary() {
     ] {
         assert!(README.contains(expected), "README is missing `{expected}`");
     }
+}
+
+#[test]
+fn plan_only_docs_match_provider_conversation_promotion_fence() {
+    for (name, document) in [("README", README), ("operations", OPERATIONS)] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("read-only provider conversation"),
+            "{name} does not describe the plan-only provider conversation"
+        );
+        assert!(
+            normalized.contains("does not create a task or worktree"),
+            "{name} does not describe the plan-only promotion fence"
+        );
+        for obsolete in [
+            "static compatibility command",
+            "static persisted assessment",
+            "without creating a worktree or invoking a provider",
+            "repository-local lease",
+            "If a normal run reports that the directory is not a Git repository",
+        ] {
+            assert!(
+                !normalized.contains(obsolete),
+                "{name} still contains obsolete plan-only wording: {obsolete}"
+            );
+        }
+    }
+    assert!(
+        README
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("one user-global SQLite database"),
+        "README does not describe the user-global state model"
+    );
 }

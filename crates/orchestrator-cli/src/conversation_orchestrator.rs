@@ -19,11 +19,15 @@ use orchestrator_providers::{
 use orchestrator_state::RootConfig;
 use serde::Serialize;
 
-use crate::task_planner::{OfficialCliTaskPlanner, build_provider_adapter, profile_settings};
+use crate::{
+    task_planner::{OfficialCliTaskPlanner, build_provider_adapter, profile_settings},
+    worker_messages::WorkerMessageCollector,
+};
 
 const CONVERSATION_MAX_EVIDENCE_LINES: usize = 64;
 const CONVERSATION_MAX_EVIDENCE_LINE_BYTES: usize = 2 * 1024;
 const CONVERSATION_MAX_UNKNOWN_EVENT_TYPES: usize = 16;
+const CONVERSATION_MAX_JSON_ATTEMPT_CANDIDATES: usize = 16;
 
 #[derive(Default)]
 struct ConversationEvidence {
@@ -159,18 +163,199 @@ fn terminal_conversation_output(
 fn is_structured_output_attempt(message: &str) -> bool {
     let trimmed = message.trim();
     trimmed.starts_with('{')
-        || trimmed.starts_with('[')
         || trimmed
             .lines()
             .any(|line| line.trim_start().starts_with("```"))
+        || contains_json_scalar_attempt(trimmed)
         || contains_json_like_container(trimmed)
         || serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
-fn contains_json_like_container(message: &str) -> bool {
-    message.char_indices().any(|(index, delimiter)| {
-        if !matches!(delimiter, '{' | '[') {
+fn contains_json_scalar_attempt(message: &str) -> bool {
+    message.split(['\n', '\r']).any(|line| {
+        let line = trim_json_candidate(line);
+        starts_with_json_scalar_attempt(line) || contains_labeled_json_scalar(line)
+    })
+}
+
+fn trim_json_candidate(candidate: &str) -> &str {
+    let candidate = candidate.trim();
+    candidate
+        .strip_prefix('\u{feff}')
+        .unwrap_or(candidate)
+        .trim_start()
+}
+
+fn contains_labeled_json_scalar(line: &str) -> bool {
+    let mut candidates = 0_usize;
+    for (index, separator) in line.char_indices() {
+        if !matches!(separator, ':' | '=') || !ends_with_structured_label(&line[..index]) {
+            continue;
+        }
+        candidates = candidates.saturating_add(1);
+        if candidates > CONVERSATION_MAX_JSON_ATTEMPT_CANDIDATES {
+            return true;
+        }
+        let separator_len = if separator == '=' && line[index..].starts_with("=>") {
+            2
+        } else {
+            separator.len_utf8()
+        };
+        if starts_with_json_scalar_value_or_intent(trim_json_candidate(
+            &line[index + separator_len..],
+        )) {
+            return true;
+        }
+    }
+    for (index, _) in line.char_indices() {
+        let candidate = &line[index..];
+        let Some(value) = strip_prefix_ignore_ascii_case(candidate, " is ") else {
+            continue;
+        };
+        if !ends_with_structured_label(&line[..index]) {
+            continue;
+        }
+        candidates = candidates.saturating_add(1);
+        if candidates > CONVERSATION_MAX_JSON_ATTEMPT_CANDIDATES {
+            return true;
+        }
+        if starts_with_json_scalar_value_or_intent(trim_json_candidate(value)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn ends_with_structured_label(prefix: &str) -> bool {
+    let prefix = prefix.trim_end();
+    let label_start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-')
+        })
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let label = &prefix[label_start..];
+    [
+        "answer",
+        "output",
+        "result",
+        "response",
+        "json",
+        "payload",
+        "value",
+        "envelope",
+        "response_redacted",
+        "outcome_json",
+    ]
+    .iter()
+    .any(|candidate| label.eq_ignore_ascii_case(candidate))
+}
+
+fn starts_with_json_scalar_value(candidate: &str) -> bool {
+    serde_json::Deserializer::from_str(candidate)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .is_some_and(|value| value.is_ok_and(|value| !value.is_object() && !value.is_array()))
+}
+
+fn starts_with_json_scalar_value_or_intent(candidate: &str) -> bool {
+    if starts_with_json_scalar_value(candidate)
+        || starts_with_incomplete_json_scalar(candidate)
+        || candidate.starts_with('-')
+        || candidate.starts_with(|character: char| character.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
+fn starts_with_incomplete_json_scalar(candidate: &str) -> bool {
+    if candidate.starts_with('"') {
+        return true;
+    }
+    let token_end = candidate
+        .find(|character: char| !character.is_ascii_alphabetic())
+        .unwrap_or(candidate.len());
+    let token = &candidate[..token_end];
+    token.len() >= 2
+        && ["null", "true", "false"]
+            .iter()
+            .any(|keyword| keyword.starts_with(token))
+}
+
+fn starts_with_json_scalar_attempt(candidate: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+    let Some(Ok(value)) = values.next() else {
+        return starts_with_incomplete_json_scalar(candidate)
+            || is_malformed_json_number_intent(candidate);
+    };
+    if value.is_object() || value.is_array() {
+        return false;
+    }
+    let remainder = candidate[values.byte_offset()..].trim_start();
+    remainder.is_empty()
+        || is_json_value_sequence(remainder)
+        || (!value.is_number() && !remainder.is_empty())
+        || is_malformed_json_number_intent(candidate)
+}
+
+fn is_malformed_json_number_intent(candidate: &str) -> bool {
+    let candidate = candidate.strip_prefix('-').unwrap_or(candidate);
+    candidate.starts_with(|character: char| character.is_ascii_digit())
+        && candidate.chars().all(|character| {
+            character.is_ascii_digit() || matches!(character, '.' | 'e' | 'E' | '+' | '-')
+        })
+        && serde_json::from_str::<serde_json::Value>(candidate).is_err()
+}
+
+fn is_json_value_sequence(candidate: &str) -> bool {
+    let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+    let mut found = false;
+    for value in &mut values {
+        if value.is_err() {
             return false;
+        }
+        found = true;
+    }
+    found
+}
+
+fn contains_json_like_container(message: &str) -> bool {
+    let mut candidates = 0_usize;
+    let mut line_content_start = None;
+    for (index, delimiter) in message.char_indices() {
+        if matches!(delimiter, '\n' | '\r') {
+            line_content_start = None;
+            continue;
+        }
+        let at_line_start = line_content_start.is_none();
+        if at_line_start && !delimiter.is_whitespace() && delimiter != '\u{feff}' {
+            line_content_start = Some(index);
+        }
+        if !matches!(delimiter, '{' | '[') {
+            continue;
+        }
+        if delimiter == '[' && !at_line_start {
+            let line_prefix = &message[line_content_start.unwrap_or(index)..index];
+            if is_labeled_json_array_boundary(line_prefix) {
+                return true;
+            }
+            continue;
+        }
+        candidates = candidates.saturating_add(1);
+        if candidates > CONVERSATION_MAX_JSON_ATTEMPT_CANDIDATES {
+            return true;
         }
         let candidate = &message[index..];
         let mut values =
@@ -181,14 +366,57 @@ fn contains_json_like_container(message: &str) -> bool {
         {
             return true;
         }
+        if candidate
+            .split(['\n', '\r'])
+            .next()
+            .is_some_and(|line| line[delimiter.len_utf8()..].trim().is_empty())
+        {
+            return true;
+        }
         let remainder = candidate[delimiter.len_utf8()..].trim_start();
         let next = remainder.chars().next();
-        if delimiter == '{' {
+        let looks_structured = if delimiter == '{' {
             matches!(next, Some('"' | '\'' | '}')) || starts_with_unquoted_object_key(remainder)
         } else {
-            false
+            looks_like_malformed_json_array(remainder)
+        };
+        if looks_structured {
+            return true;
         }
-    })
+    }
+    false
+}
+
+fn is_labeled_json_array_boundary(line_prefix: &str) -> bool {
+    let line_prefix = line_prefix.trim_end();
+    ["=>", ":", "="].iter().any(|separator| {
+        line_prefix
+            .strip_suffix(separator)
+            .is_some_and(ends_with_structured_label)
+    }) || ends_with_natural_label_connector(line_prefix)
+}
+
+fn ends_with_natural_label_connector(prefix: &str) -> bool {
+    const CONNECTOR: &str = " is";
+    prefix
+        .get(..prefix.len().saturating_sub(CONNECTOR.len()))
+        .zip(prefix.get(prefix.len().saturating_sub(CONNECTOR.len())..))
+        .is_some_and(|(label, connector)| {
+            connector.eq_ignore_ascii_case(CONNECTOR) && ends_with_structured_label(label)
+        })
+}
+
+fn looks_like_malformed_json_array(remainder: &str) -> bool {
+    let remainder = remainder.trim_start();
+    if matches!(remainder.chars().next(), Some('"' | '\'' | '{' | '[' | ']')) {
+        return true;
+    }
+    let mut values = serde_json::Deserializer::from_str(remainder).into_iter::<serde_json::Value>();
+    let Some(Ok(_)) = values.next() else {
+        return false;
+    };
+    let trailing = remainder[values.byte_offset()..].trim_start();
+    trailing.is_empty() || !trailing.starts_with('/')
 }
 
 fn starts_with_unquoted_object_key(remainder: &str) -> bool {
@@ -382,6 +610,7 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
             )));
         }
         let worker_request = self.worker_request(&request, provider)?;
+        let message_byte_limit = worker_request.max_output_bytes;
         let adapter: Arc<dyn WorkerAdapter> = Arc::from(
             build_provider_adapter(
                 provider,
@@ -396,7 +625,11 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
             .await
             .map_err(invocation_failure)?;
         let mut guard = ActiveConversationGuard::new(Arc::clone(&adapter), handle.clone());
-        let mut messages = Vec::new();
+        let mut messages = WorkerMessageCollector::new(
+            &self.planner.config.orchestrator.redaction.patterns,
+            message_byte_limit,
+        )
+        .map_err(invocation_failure)?;
         let mut evidence = ConversationEvidence::default();
         let read_only_support = self.planner.capabilities[&provider].read_only;
         for capability_evidence in &self.planner.capabilities[&provider].evidence {
@@ -405,66 +638,106 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
         let mut quota_exhausted = false;
         let mut completed = false;
         let mut lifecycle_error = None;
-        while let Some(raw) = adapter
-            .next_event(&handle)
-            .await
-            .map_err(invocation_failure)?
-        {
+        while let Some(raw) = adapter.next_event(&handle).await.map_err(|error| {
+            let error = messages.redact_provider_text(&error.to_string());
+            invocation_failure(error)
+        })? {
             match adapter.parse_event(raw).await {
-                Ok(WorkerEvent::Message { text }) => messages.push(text),
-                Ok(WorkerEvent::Completed { .. }) => completed = true,
-                Ok(WorkerEvent::QuotaExceeded { detail }) => {
-                    quota_exhausted = true;
-                    if let Some(detail) = detail {
-                        evidence.push_provider_text(provider, &detail);
+                Ok(event) => {
+                    if let Err(error) = messages.observe(&event) {
+                        lifecycle_error.get_or_insert_with(|| error.to_string());
+                        if let Err(error) = adapter.cancel(&handle).await {
+                            let error = messages.redact_provider_text(&error.to_string());
+                            evidence.push_provider_text(provider, &error);
+                        }
+                        break;
+                    }
+                    match event {
+                        WorkerEvent::Completed { .. } => completed = true,
+                        WorkerEvent::QuotaExceeded { detail } => {
+                            quota_exhausted = true;
+                            if let Some(detail) = detail {
+                                let detail = messages.redact_provider_text(&detail);
+                                evidence.push_provider_text(provider, &detail);
+                            }
+                        }
+                        WorkerEvent::Error { message, .. } => {
+                            let message = messages.redact_provider_text(&message);
+                            lifecycle_error.get_or_insert(message);
+                        }
+                        WorkerEvent::Unknown {
+                            event_type,
+                            affects_lifecycle,
+                            ..
+                        } => {
+                            let event_type = messages.redact_provider_text(&event_type);
+                            evidence.record_unknown_event(&event_type);
+                            if affects_lifecycle {
+                                lifecycle_error.get_or_insert_with(|| {
+                                    format!("unknown lifecycle-affecting event: {event_type}")
+                                });
+                            }
+                        }
+                        WorkerEvent::FileChanged { path } => {
+                            let path = messages.redact_provider_text(&path.to_string());
+                            lifecycle_error.get_or_insert_with(|| {
+                                format!("read-only conversation reported a file change: {path}")
+                            });
+                        }
+                        WorkerEvent::CommandStarted {
+                            executable, args, ..
+                        } => {
+                            let executable = messages.redact_provider_text(&executable);
+                            let args = args
+                                .iter()
+                                .map(|arg| messages.redact_provider_text(arg))
+                                .collect::<Vec<_>>();
+                            if let Some(error) = observe_read_only_command(
+                                provider,
+                                request.sandbox,
+                                read_only_support,
+                                &executable,
+                                &args,
+                                &mut evidence,
+                            ) {
+                                lifecycle_error.get_or_insert(error);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Ok(WorkerEvent::Error { message, .. }) => lifecycle_error = Some(message),
-                Ok(WorkerEvent::Unknown {
-                    event_type,
-                    affects_lifecycle,
-                    ..
-                }) => {
-                    evidence.record_unknown_event(&event_type);
-                    if affects_lifecycle {
-                        lifecycle_error =
-                            Some(format!("unknown lifecycle-affecting event: {event_type}"));
+                Err(error) => {
+                    messages.discard_streamed_output();
+                    let error = messages.redact_provider_text(&error.to_string());
+                    lifecycle_error.get_or_insert(error);
+                    if let Err(error) = adapter.cancel(&handle).await {
+                        let error = messages.redact_provider_text(&error.to_string());
+                        evidence.push_provider_text(provider, &error);
                     }
+                    break;
                 }
-                Ok(WorkerEvent::FileChanged { path }) => {
-                    lifecycle_error = Some(format!(
-                        "read-only conversation reported a file change: {path}"
-                    ));
-                }
-                Ok(WorkerEvent::CommandStarted {
-                    executable, args, ..
-                }) => {
-                    if let Some(error) = observe_read_only_command(
-                        provider,
-                        request.sandbox,
-                        read_only_support,
-                        &executable,
-                        &args,
-                        &mut evidence,
-                    ) {
-                        lifecycle_error = Some(error);
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => lifecycle_error = Some(error.to_string()),
             }
         }
-        let output = adapter.wait(&handle).await.map_err(invocation_failure)?;
+        let output = adapter.wait(&handle).await.map_err(|error| {
+            let error = messages.redact_provider_text(&error.to_string());
+            invocation_failure(error)
+        })?;
         guard.disarm();
-        if !output.stderr.is_empty() {
-            evidence.push_provider_text(provider, &String::from_utf8_lossy(&output.stderr));
+        if !output.truncated && !output.stderr.is_empty() {
+            let stderr = messages.redact_provider_text(&String::from_utf8_lossy(&output.stderr));
+            evidence.push_provider_text(provider, &stderr);
         }
         if output.truncated {
+            messages.discard_streamed_output();
             evidence.push_text("provider runtime truncated output");
+            lifecycle_error
+                .get_or_insert_with(|| "provider output exceeded the configured limit".to_owned());
         }
         if let Some(error) = output.tree_termination_error {
-            lifecycle_error = Some(error);
+            let error = messages.redact_provider_text(&error);
+            lifecycle_error.get_or_insert(error);
         }
+        let messages = messages.into_messages();
         let terminal_output = if matches!(&output.termination, RuntimeTermination::Exited)
             && output.exit_code == Some(0)
             && completed
@@ -652,6 +925,16 @@ mod tests {
             r#"Earlier malformed answer: {"outcome": broken"#,
             r#"Earlier malformed answer: {outcome: "first"}"#,
             "Earlier malformed answer: {'outcome': 'first'}",
+            "Earlier malformed answer: [1, broken",
+            "Earlier malformed answer: [1 2]",
+            "Earlier malformed answer: [1 broken]",
+            "Earlier malformed answer: [old, new]",
+            "{",
+            "{   ",
+            "[",
+            "[   ",
+            "\u{feff}[1, 2]",
+            "[] queue empty",
             "Earlier answer follows:\n```json\n{}\n```",
             "Earlier answer: [1, 2, 3]",
         ] {
@@ -686,9 +969,112 @@ mod tests {
     }
 
     #[test]
+    fn standalone_json_scalar_after_progress_is_never_discarded_as_progress() {
+        for prefix in [
+            vec!["Checking the request.".to_owned(), "null".to_owned()],
+            vec!["Checking the request.\ntrue".to_owned()],
+            vec!["Checking the request.".to_owned(), "42".to_owned()],
+            vec![
+                "Checking the request.".to_owned(),
+                r#""earlier answer""#.to_owned(),
+            ],
+            vec!["Earlier answer: null".to_owned()],
+            vec!["Earlier answer: true".to_owned()],
+            vec!["Earlier answer: 42".to_owned()],
+            vec![r#"Earlier answer: "earlier answer""#.to_owned()],
+            vec!["Earlier answer = null".to_owned()],
+            vec!["Earlier answer => 42".to_owned()],
+            vec!["response_redacted: null".to_owned()],
+            vec!["Earlier answer: null trailing text".to_owned()],
+            vec!["Earlier answer: 42 trailing text".to_owned()],
+            vec![r#"response = "draft" extra"#.to_owned()],
+            vec!["Earlier answer: nul".to_owned()],
+            vec!["Earlier answer: tru".to_owned()],
+            vec!["Earlier answer: fals".to_owned()],
+            vec![r#"response = "unterminated"#.to_owned()],
+            vec!["Earlier answer: 1e+".to_owned()],
+            vec!["Earlier answer is null".to_owned()],
+            vec!["Earlier answer IS 42 trailing text".to_owned()],
+            vec!["Earlier answer is 1e+".to_owned()],
+            vec!["Earlier answer is [1, 2]".to_owned()],
+            vec!["Earlier answer is [1, broken".to_owned()],
+            vec!["1e+".to_owned()],
+            vec!["1.".to_owned()],
+            vec!["01".to_owned()],
+            vec!["nul".to_owned()],
+            vec!["tru".to_owned()],
+            vec!["fals".to_owned()],
+            vec![r#""unterminated"#.to_owned()],
+            vec!["null true".to_owned()],
+            vec!["42 false".to_owned()],
+            vec!["null trailing text".to_owned()],
+            vec!["\u{feff}null".to_owned()],
+            vec!["Checking the request.\rnull".to_owned()],
+        ] {
+            let mut messages = prefix;
+            messages
+                .push(r#"{"outcome":"answer_complete","response_redacted":"final"}"#.to_owned());
+            let mut evidence = ConversationEvidence::default();
+
+            let output = terminal_conversation_output(ProviderId::Codex, &messages, &mut evidence);
+
+            assert_eq!(output, messages.join("\n").as_bytes());
+            assert!(evidence.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn natural_structured_labels_detect_explicit_json_intent_without_matching_prose() {
+        for output in [
+            "Earlier answer is null",
+            "Earlier answer IS 1e+",
+            "Earlier answer is [1, 2]",
+            "Earlier answer is [1, broken",
+            // The structured `answer` label makes numeric intent explicit.
+            "Answer is 42 files",
+        ] {
+            assert!(is_structured_output_attempt(output), "{output}");
+        }
+
+        for progress in [
+            "42 trailing text",
+            "Processed 42 files",
+            "Checked at 12:30",
+            "Processed 1/3",
+            "[INFO] completed.",
+            "Answer is pending",
+        ] {
+            assert!(!is_structured_output_attempt(progress), "{progress}");
+        }
+    }
+
+    #[test]
+    fn unicode_progress_before_a_scalar_label_never_slices_between_utf8_bytes() {
+        assert!(!is_structured_output_attempt("응답: pending"));
+        assert!(!is_structured_output_attempt("응답: null"));
+        assert!(is_structured_output_attempt("응답 answer: null"));
+    }
+
+    #[test]
     fn ordinary_progress_brackets_and_literal_fence_mentions_remain_progress() {
         for progress in [
             "Processed [1/3] files.",
+            "Progress: [1/3] files processed.",
+            "[true/false] checked.",
+            "Processed 42 files.",
+            "42 trailing text",
+            "Feature flag true was checked.",
+            "Count: 42 files processed.",
+            "Response time: 42",
+            "Result count: 42",
+            "Answer: pending",
+            "Answer: failure pending",
+            "Answer is pending",
+            "Checked at 12:30",
+            "Indexed values[0] successfully.",
+            "Compared [old, new] states.",
+            "[INFO] completed.",
+            "Checked null handling.",
             "The documentation literally mentions ``` as a marker.",
         ] {
             let messages = vec![
@@ -725,6 +1111,21 @@ mod tests {
         assert_eq!(value["outcome"], "answer_complete");
         assert_eq!(evidence.finish(), "Progress only.");
         Ok(())
+    }
+
+    #[test]
+    fn bracket_heavy_progress_is_scanned_once_without_becoming_structured_output() {
+        let progress = "Indexed values[0] successfully. ".repeat(30_000);
+        let indented = format!(
+            "progress\n{}{}",
+            " ".repeat(400_000),
+            "x[0]".repeat(100_000)
+        );
+
+        assert!(progress.len() < CONVERSATION_MAX_OUTPUT_BYTES);
+        assert!(!is_structured_output_attempt(&progress));
+        assert!(indented.len() < CONVERSATION_MAX_OUTPUT_BYTES);
+        assert!(!is_structured_output_attempt(&indented));
     }
 
     #[test]

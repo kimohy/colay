@@ -1,3 +1,5 @@
-{"type":"init","session_id":"fixture-gemini"}
-{"type":"message","role":"assistant","content":"done"}
-{"type":"result","result":"done","status":"success","stats":{"total_tokens":21,"input_tokens":13,"output_tokens":8,"cached":2}}
+{"type":"init","session_id":"fixture-gemini","model":"fake-gemini","timestamp":"2026-08-07T00:00:00Z"}
+{"type":"message","role":"user","content":"fixture request","timestamp":"2026-08-07T00:00:01Z"}
+{"type":"message","role":"assistant","content":"do","delta":true,"timestamp":"2026-08-07T00:00:02Z"}
+{"type":"message","role":"assistant","content":"ne","delta":true,"timestamp":"2026-08-07T00:00:03Z"}
+{"type":"result","status":"success","stats":{"total_tokens":21,"input_tokens":13,"output_tokens":8,"cached":2},"timestamp":"2026-08-07T00:00:04Z"}

@@ -290,6 +290,47 @@ fn file_change_after_read_only_command_fails_without_writable_state() -> Result<
 }
 
 #[test]
+fn ambiguous_scalar_prefix_fails_closed_without_writable_state() -> Result<()> {
+    let fixture = PlanFixture::non_git()?;
+    let output = fixture.colay(["run", "--plan-only", "scenario:ambiguous-scalar-prefix"])?;
+    assert!(
+        !output.status.success(),
+        "ambiguous provider output unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let database = fixture.database()?;
+    let (status, outcome_json, error_redacted): (String, String, String) = database.query_row(
+        "SELECT status, outcome_json, error_redacted FROM conversation_attempts LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(status, "failed");
+    let outcome: serde_json::Value = serde_json::from_str(&outcome_json)?;
+    assert_eq!(outcome["outcome"], "needs_attention");
+    let evidence = outcome["evidence_redacted"]
+        .as_str()
+        .context("failed outcome has no evidence")?;
+    assert!(evidence.contains("Checking the request."));
+    assert!(evidence.contains("\nnull\n"));
+    assert!(evidence.contains(r#""outcome":"answer_complete""#));
+    assert!(
+        error_redacted.contains("incompatible with the required read-only conversation protocol"),
+        "{error_redacted}"
+    );
+    for table in [
+        "tasks",
+        "task_attempts",
+        "worktrees",
+        "coordinator_leases",
+        "worker_leases",
+    ] {
+        assert_eq!(fixture.count(table)?, 0, "unexpected row in {table}");
+    }
+    assert_eq!(fixture.fake_conversation_starts()?, 1);
+    Ok(())
+}
+
+#[test]
 fn provider_failure_exits_nonzero_with_actionable_redacted_outcome() -> Result<()> {
     let fixture = PlanFixture::non_git()?;
     let output = fixture.colay(["run", "--plan-only", "scenario:crash"])?;

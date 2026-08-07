@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ExecutableHostContext, ExecutablePlatform, ExecutablePolicy, ExecutableResolutionError,
     ExecutableSearch, RedactionConfig, RedactionError, Redactor, ResolvedExecutable,
-    resolve_executable,
+    redaction::PrivateKeyStreamRedaction, resolve_executable,
 };
 
 const DEFAULT_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
@@ -311,7 +311,8 @@ impl CapturedOutput {
     pub fn for_test(bytes: Vec<u8>, redactor: Redactor) -> Self {
         let bytes_seen = bytes.len() as u64;
         let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
-        let redacted_text = redactor.redact(&String::from_utf8_lossy(&bytes));
+        let lossy = String::from_utf8_lossy(&bytes);
+        let redacted_text = redact_complete_capture(&redactor, &lossy, false);
         Self {
             bytes,
             redacted_text,
@@ -700,7 +701,8 @@ where
     let mut bytes_seen = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     let mut pending_frame = Vec::new();
-    let mut private_key_active = false;
+    let mut private_key_redaction = PrivateKeyStreamRedaction::default();
+    let mut stream_limit_reported = false;
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
@@ -708,8 +710,9 @@ where
         }
         bytes_seen = bytes_seen.saturating_add(read as u64);
         let remaining = limit.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-        pending_frame.extend_from_slice(&buffer[..read]);
+        let retained = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        pending_frame.extend_from_slice(&buffer[..retained]);
         emit_complete_frames(
             &mut pending_frame,
             false,
@@ -717,8 +720,12 @@ where
             &redactor,
             &event_sender,
             &sequence,
-            &mut private_key_active,
+            &mut private_key_redaction,
         );
+        if retained < read && !stream_limit_reported {
+            stream_limit_reported = true;
+            let _ = event_sender.send(ProcessEvent::FramesDropped { count: 1 });
+        }
     }
     emit_complete_frames(
         &mut pending_frame,
@@ -727,10 +734,12 @@ where
         &redactor,
         &event_sender,
         &sequence,
-        &mut private_key_active,
+        &mut private_key_redaction,
     );
     let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
-    let redacted_text = redactor.redact(&String::from_utf8_lossy(&bytes));
+    let lossy = String::from_utf8_lossy(&bytes);
+    let redacted_text =
+        redact_complete_capture(&redactor, &lossy, private_key_redaction.is_active());
     Ok(CapturedOutput {
         truncated: bytes_seen > bytes.len() as u64,
         bytes,
@@ -741,6 +750,20 @@ where
     })
 }
 
+fn redact_complete_capture(redactor: &Redactor, text: &str, private_key_active: bool) -> String {
+    if private_key_active || contains_unterminated_private_key(text) {
+        "[REDACTED STREAM FRAME]".to_owned()
+    } else {
+        redactor.redact(text)
+    }
+}
+
+fn contains_unterminated_private_key(text: &str) -> bool {
+    let mut private_key_redaction = PrivateKeyStreamRedaction::default();
+    private_key_redaction.inspect_frame(text.as_bytes());
+    private_key_redaction.is_active()
+}
+
 fn emit_complete_frames(
     pending: &mut Vec<u8>,
     end_of_stream: bool,
@@ -748,7 +771,7 @@ fn emit_complete_frames(
     redactor: &Redactor,
     sender: &broadcast::Sender<ProcessEvent>,
     sequence: &AtomicU64,
-    private_key_active: &mut bool,
+    private_key_redaction: &mut PrivateKeyStreamRedaction,
 ) {
     const MAX_FRAME_BYTES: usize = 1024 * 1024;
     loop {
@@ -767,7 +790,7 @@ fn emit_complete_frames(
             redactor,
             sender,
             sequence,
-            private_key_active,
+            private_key_redaction,
         );
     }
     if end_of_stream && !pending.is_empty() {
@@ -779,7 +802,7 @@ fn emit_complete_frames(
             redactor,
             sender,
             sequence,
-            private_key_active,
+            private_key_redaction,
         );
     }
 }
@@ -791,24 +814,17 @@ fn send_frame(
     redactor: &Redactor,
     sender: &broadcast::Sender<ProcessEvent>,
     sequence: &AtomicU64,
-    private_key_active: &mut bool,
+    private_key_redaction: &mut PrivateKeyStreamRedaction,
 ) {
     let invalid_utf8 = std::str::from_utf8(&bytes).is_err();
     let lossy = String::from_utf8_lossy(&bytes);
-    let begins_private_key = lossy.contains("-----BEGIN") && lossy.contains("PRIVATE KEY-----");
-    let ends_private_key = lossy.contains("-----END") && lossy.contains("PRIVATE KEY-----");
-    let redact_entire_frame = overlong || *private_key_active || begins_private_key;
-    if begins_private_key {
-        *private_key_active = true;
-    }
+    let private_key_sensitive = private_key_redaction.inspect_frame(&bytes);
+    let redact_entire_frame = overlong || private_key_sensitive;
     let redacted_text = if redact_entire_frame {
         "[REDACTED STREAM FRAME]".to_owned()
     } else {
         redactor.redact(&lossy)
     };
-    if ends_private_key {
-        *private_key_active = false;
-    }
     let _ = sender.send(ProcessEvent::Output {
         sequence: sequence.fetch_add(1, Ordering::Relaxed),
         channel,
@@ -1036,6 +1052,8 @@ mod tests {
         io::{BufRead as _, Write as _},
         path::Path,
         process::Stdio,
+        sync::mpsc,
+        thread,
         time::Duration,
     };
 
@@ -1043,12 +1061,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CommandSpec, EnvironmentPolicy, ProcessEvent, ProcessRunner, ProcessSupervisor,
-        TerminationReason, terminate_child_tree,
+        CapturedOutput, CommandSpec, EnvironmentPolicy, ProcessEvent, ProcessRunner,
+        ProcessSupervisor, TerminationReason, contains_unterminated_private_key,
+        terminate_child_tree,
     };
     #[cfg(windows)]
     use super::{terminate_platform_tree, trusted_taskkill_path};
-    use crate::ExecutableKind;
+    use crate::redaction::PrivateKeyStreamRedaction;
+    use crate::{ExecutableKind, RedactionConfig, Redactor};
 
     fn fixture(mode: &str) -> CommandSpec {
         let executable = std::env::current_exe()
@@ -1076,6 +1096,18 @@ mod tests {
             }
             "large" => {
                 let _ = std::io::stdout().write_all(&vec![b'x'; 10_000]);
+            }
+            "truncated-private-key" => {
+                let _ = std::io::stderr()
+                    .write_all(b"-----BEGIN PRIVATE KEY-----\nprivate-body-line\n");
+                let _ = std::io::stderr().write_all(&vec![b'x'; 10_000]);
+            }
+            "split-private-key-marker" => {
+                const FRAME_BYTES: usize = 1024 * 1024;
+                const BEGIN_PREFIX: &[u8] = b"-----BEGIN ";
+                let _ = std::io::stderr().write_all(&vec![b'x'; FRAME_BYTES - BEGIN_PREFIX.len()]);
+                let _ = std::io::stderr().write_all(BEGIN_PREFIX);
+                let _ = std::io::stderr().write_all(b"PRIVATE KEY-----\nsplit-private-body\n");
             }
             "sleep" => std::thread::sleep(Duration::from_secs(10)),
             "interactive" => {
@@ -1194,6 +1226,226 @@ mod tests {
         assert_eq!(result.stdout.bytes.len(), 128);
         assert!(result.stdout.truncated);
         assert!(result.stdout.bytes_seen >= 10_000);
+    }
+
+    #[tokio::test]
+    async fn streamed_frames_stop_at_the_capture_limit_and_report_protocol_loss() {
+        let mut spec = fixture("large");
+        spec.stdout_limit = 128;
+        let mut session = ProcessSupervisor
+            .start(spec)
+            .await
+            .unwrap_or_else(|error| panic!("start: {error}"));
+        let mut streamed_bytes = 0_usize;
+        let mut reported_loss = false;
+        while let Some(event) = session.next_event().await {
+            match event {
+                ProcessEvent::Output { bytes, .. } => {
+                    streamed_bytes = streamed_bytes.saturating_add(bytes.len());
+                }
+                ProcessEvent::FramesDropped { .. } => reported_loss = true,
+                ProcessEvent::Exited { .. } => break,
+                ProcessEvent::Started { .. } => {}
+            }
+        }
+        let result = session
+            .wait()
+            .await
+            .unwrap_or_else(|error| panic!("wait: {error}"));
+
+        assert!(reported_loss);
+        assert!(streamed_bytes <= 128);
+        assert!(result.stdout.truncated);
+        assert!(result.stdout.bytes_seen >= 10_000);
+    }
+
+    #[tokio::test]
+    async fn truncated_private_key_capture_never_exposes_the_unterminated_body() {
+        let mut spec = fixture("truncated-private-key");
+        spec.stderr_limit = 64;
+        let result = ProcessRunner
+            .run(spec, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("process: {error}"));
+
+        assert!(result.stderr.truncated);
+        assert!(!result.stderr.redacted_text.contains("private-body-line"));
+        assert_eq!(result.stderr.redacted_text, "[REDACTED STREAM FRAME]");
+    }
+
+    #[test]
+    fn complete_capture_scan_rejects_a_later_unterminated_private_key() {
+        let output = CapturedOutput::for_test(
+            b"-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----\n\
+              -----BEGIN RSA PRIVATE KEY-----\nsecond-private-body\n"
+                .to_vec(),
+            Redactor::new(&RedactionConfig::default())
+                .unwrap_or_else(|error| panic!("redactor: {error}")),
+        );
+
+        assert_eq!(output.redacted_text, "[REDACTED STREAM FRAME]");
+        assert!(!output.redacted_text.contains("second-private-body"));
+    }
+
+    #[test]
+    fn invalid_private_key_end_never_releases_stream_or_capture() {
+        for invalid_end in [
+            "-----ENDxPRIVATE KEY-----",
+            "-----END rsa PRIVATE KEY-----",
+            "-----END RSA private KEY-----",
+        ] {
+            let capture = format!(
+                "-----BEGIN PRIVATE KEY-----\nprivate-body\n{invalid_end}\nstill-private\n"
+            );
+            let mut stream = PrivateKeyStreamRedaction::default();
+            let streamed_frames = capture
+                .as_bytes()
+                .chunks(7)
+                .map(|frame| stream.inspect_frame(frame))
+                .collect::<Vec<_>>();
+
+            assert!(
+                stream.is_active(),
+                "invalid END marker `{invalid_end}` must not close the key"
+            );
+            assert!(
+                streamed_frames.iter().skip(1).all(|sensitive| *sensitive),
+                "all frames after the private-key BEGIN must stay redacted"
+            );
+            assert!(contains_unterminated_private_key(&capture));
+
+            let output = CapturedOutput::for_test(
+                capture.into_bytes(),
+                Redactor::new(&RedactionConfig::default())
+                    .unwrap_or_else(|error| panic!("redactor: {error}")),
+            );
+            assert_eq!(output.redacted_text, "[REDACTED STREAM FRAME]");
+            assert!(!output.redacted_text.contains("private-body"));
+            assert!(!output.redacted_text.contains("still-private"));
+        }
+    }
+
+    #[test]
+    fn stray_end_cannot_consume_a_later_begin_on_the_same_line() {
+        let capture =
+            "-----END PRIVATE KEY-----noise-----BEGIN EC PRIVATE KEY-----\nprivate-body\n";
+        let mut stream = PrivateKeyStreamRedaction::default();
+
+        assert!(stream.inspect_frame(capture.as_bytes()));
+        assert!(stream.is_active());
+        assert!(contains_unterminated_private_key(capture));
+    }
+
+    #[test]
+    fn private_key_boundaries_survive_every_frame_split() {
+        const BEGIN: &[u8] = b"prefix-----BEGIN RSA PRIVATE KEY-----";
+        const END: &[u8] = b"-----END RSA PRIVATE KEY-----suffix";
+        const END_BOUNDARY_LEN: usize = b"-----END RSA PRIVATE KEY-----".len();
+
+        for split in 0..=BEGIN.len() {
+            let mut stream = PrivateKeyStreamRedaction::default();
+            let first_sensitive = stream.inspect_frame(&BEGIN[..split]);
+            let second_sensitive = stream.inspect_frame(&BEGIN[split..]);
+            assert!(
+                stream.is_active(),
+                "BEGIN split at {split} was not recognized"
+            );
+            assert!(
+                first_sensitive || second_sensitive,
+                "BEGIN split at {split} was not marked sensitive"
+            );
+        }
+
+        for split in 0..=END.len() {
+            let mut stream = PrivateKeyStreamRedaction::default();
+            assert!(stream.inspect_frame(b"-----BEGIN PRIVATE KEY-----\nbody\n"));
+            let first_sensitive = stream.inspect_frame(&END[..split]);
+            let second_sensitive = stream.inspect_frame(&END[split..]);
+            assert!(
+                !stream.is_active(),
+                "END split at {split} was not recognized"
+            );
+            assert!(
+                first_sensitive,
+                "END split at {split} exposed its first frame"
+            );
+            assert!(
+                split >= END_BOUNDARY_LEN || second_sensitive,
+                "END split at {split} exposed its second frame"
+            );
+        }
+    }
+
+    #[test]
+    fn private_key_boundary_candidates_do_not_cross_line_endings() {
+        for separator in [b"\n".as_slice(), b"\r".as_slice(), b"\r\n".as_slice()] {
+            let mut invalid_begin = PrivateKeyStreamRedaction::default();
+            assert!(invalid_begin.inspect_frame(b"-----BEG"));
+            assert!(invalid_begin.inspect_frame(separator));
+            invalid_begin.inspect_frame(b"IN PRIVATE KEY-----");
+            assert!(!invalid_begin.is_active());
+
+            let mut invalid_end = PrivateKeyStreamRedaction::default();
+            assert!(invalid_end.inspect_frame(b"-----BEGIN PRIVATE KEY-----\nbody\n"));
+            assert!(invalid_end.inspect_frame(b"-----EN"));
+            assert!(invalid_end.inspect_frame(separator));
+            assert!(invalid_end.inspect_frame(b"D PRIVATE KEY-----\nafter"));
+            assert!(invalid_end.is_active());
+        }
+    }
+
+    #[test]
+    fn private_key_scan_is_bounded_for_dense_near_limit_capture() {
+        const CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+        let mut dense = "-----BEGIN".repeat(CAPTURE_BYTES / "-----BEGIN".len());
+        dense.push_str(" PRIVATE KEY-----");
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let _ = sender.send(contains_unterminated_private_key(&dense));
+        });
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "private-key scanning must remain linear in the retained capture size"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_key_marker_split_at_the_stream_frame_boundary_taints_the_capture() {
+        let mut spec = fixture("split-private-key-marker");
+        spec.stderr_limit = 2 * 1024 * 1024;
+        let mut session = ProcessSupervisor
+            .start(spec)
+            .await
+            .unwrap_or_else(|error| panic!("start process: {error}"));
+        let mut streamed_stderr = Vec::new();
+        while let Some(event) = session.next_event().await {
+            match event {
+                ProcessEvent::Output {
+                    channel: super::OutputChannel::Stderr,
+                    redacted_text,
+                    ..
+                } => streamed_stderr.push(redacted_text),
+                ProcessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        let result = session
+            .wait()
+            .await
+            .unwrap_or_else(|error| panic!("wait for process: {error}"));
+
+        assert!(!result.stderr.truncated);
+        assert_eq!(result.stderr.redacted_text, "[REDACTED STREAM FRAME]");
+        assert!(!result.stderr.redacted_text.contains("split-private-body"));
+        assert!(
+            streamed_stderr
+                .iter()
+                .all(|frame| !frame.contains("split-private-body")),
+            "streamed stderr exposed a private-key body: {streamed_stderr:?}"
+        );
     }
 
     #[tokio::test]

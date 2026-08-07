@@ -62,14 +62,17 @@ colay rollback apply --to <version> --plan-hash <sha256> --approved-by <identity
 colay tui [task-id]
 ```
 
-`colay run` is the direct writable-task compatibility path. Before creating `.colay` state or a
-task, it requires a Git repository with a valid base commit and no unresolved merge, rebase,
-cherry-pick, revert, or bisect operation. A non-Git directory and an unborn `HEAD` return distinct
-actionable errors without leaving a `planned` task. `run --plan-only` remains a static persisted
-assessment; it does not invoke a provider and is not the conversation-first interview mode.
+`colay run` is a conversation-first compatibility entry point. It can answer or interview in a
+non-Git directory and does not create a writable task merely because the command was submitted. A
+complete candidate can be promoted only by a later explicit approval of its exact sealed revision;
+that promotion requires a Git repository with a valid base commit and no unresolved merge, rebase,
+cherry-pick, revert, or bisect operation. `run --plan-only` starts the same bounded read-only
+provider conversation and persists its interview, requirement, and planning evidence in the
+user-global workspace partition. Its additional promotion fence means the invocation does not
+create a task or worktree, request writable execution, or require a Git base commit.
 
 `colay tui` is the primary durable chat workspace. It starts or reconnects to
-the repository daemon, restores the latest session and selected task, and shows
+the user daemon, registers the current workspace, restores the latest session and selected task, and shows
 a text-only task list, conversation timeline, inspector, attention queue, and
 explicit composer target. The daemon continues after the TUI closes.
 
@@ -90,7 +93,8 @@ retargets the composer. `/admin` opens the preserved five-panel administration
 dashboard and returns to chat without losing the explicit target. `?` shows
 keyboard help; `q` exits when the composer is not focused.
 
-`colay daemon start` is idempotent while its repository-local lease is healthy.
+`colay daemon start` is idempotent while its user-global owner lease is healthy; one process serves
+all registered workspaces in that native OS user environment.
 The TUI performs daemon reconnect on startup. A stopped or stale daemon leaves
 the timeline readable but disables messages and task controls until
 `colay daemon restart`; it never opens a network listener. Messages are
@@ -167,6 +171,13 @@ compiled defaults
 
 `COLAY_HOME` defaults to `~/.colay` on Unix and `%USERPROFILE%\.colay` on Windows. Configuration files are partial overrides: tables merge by key, while arrays replace the lower-precedence array rather than concatenate. Every loaded file must declare the supported `config_version`. Absent automatic layers are ignored, but normal runtime commands fail when an explicitly selected `$COLAY_CONFIG` or `--config` file is missing. `init` is the creation-path exception: it treats a missing explicit selector as the destination for its new minimal override.
 
-Repository state remains local to the repository (by default, `.colay`); personal defaults and environment-selected configuration are global inputs, not a global state directory. A legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic discovery finds both legacy and current repository configuration, Colay fails closed until `--config` explicitly selects one. `init` writes a minimal configuration override and initializes state safely. Other read-only commands do not create repository state. `run --plan-only` initializes its persisted static assessment state; a normal `run` does so only after Git readiness succeeds. Start from [`config.example.toml`](config.example.toml).
+Durable orchestration state uses one user-global SQLite database per native OS user environment,
+with every encountered directory isolated by `workspace_id`. Windows and WSL therefore use
+separate native state roots. A repository `.colay/config.toml` is only an optional policy override;
+a legacy `.codex/orchestrator/config.toml` is discovered without moving its state. If automatic
+discovery finds both policy files, Colay fails closed until `--config` explicitly selects one.
+`init` writes a minimal configuration override safely. `run --plan-only` initializes persisted
+conversation and planning state in the global workspace partition, while its promotion fence keeps
+writable task/worktree tables empty. Start from [`config.example.toml`](config.example.toml).
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/security.md`](docs/security.md), [`docs/operations.md`](docs/operations.md), [`docs/compatibility.md`](docs/compatibility.md), [`docs/testing.md`](docs/testing.md), and [`docs/release.md`](docs/release.md) for the implemented boundary and current limitations.

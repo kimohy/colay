@@ -141,6 +141,29 @@ pub struct NewTaskAttemptRecord {
     pub started_at: DateTime<Utc>,
 }
 
+/// One fully completed worker attempt and its optional sealed evidence.
+///
+/// [`WorkspaceDatabase::record_completed_task_attempt`] persists this entire record in one
+/// transaction so a late evidence conflict cannot leave an unfinished attempt behind.
+#[derive(Clone, Debug)]
+pub struct CompletedTaskAttemptRecord {
+    pub attempt: NewTaskAttemptRecord,
+    pub checkpoint: Option<Checkpoint>,
+    pub verification: Option<VerificationResult>,
+    pub outcome: String,
+    pub worker_result: serde_json::Value,
+    pub ended_at: DateTime<Utc>,
+}
+
+struct PreparedCompletedTaskAttempt {
+    checkpoint_json: Option<String>,
+    diff_artifact: Option<StoredArtifact>,
+    verification_fields: Option<(String, String)>,
+    worker_result_json: String,
+    started_at: String,
+    ended_at: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewWorktreeRecord {
     pub task_id: TaskId,
@@ -1840,6 +1863,105 @@ impl_workspace_database!(WorkspaceDatabase<'_>);
 impl_workspace_database!(crate::Database);
 
 impl WorkspaceDatabase<'_> {
+    /// Atomically records a completed attempt together with all sealed evidence produced by it.
+    ///
+    /// File-backed checkpoint evidence and serializable verification fields are inspected before
+    /// opening the `SQLite` transaction. Any later uniqueness or optimistic conflict rolls back the
+    /// attempt start, checkpoint/artifact registration, verification, and attempt finish together.
+    pub fn record_completed_task_attempt(
+        &self,
+        completion: &CompletedTaskAttemptRecord,
+    ) -> StateResult<u32> {
+        let prepared = self.prepare_completed_task_attempt(completion)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ordinal = insert_completed_attempt_start(
+            &transaction,
+            &completion.attempt,
+            &prepared.started_at,
+        )?;
+        insert_completed_attempt_checkpoint(&transaction, completion, &prepared)?;
+        insert_completed_attempt_verification(&transaction, completion, &prepared)?;
+        finish_completed_attempt(&transaction, completion, &prepared)?;
+        transaction.commit()?;
+        Ok(ordinal)
+    }
+
+    fn prepare_completed_task_attempt(
+        &self,
+        completion: &CompletedTaskAttemptRecord,
+    ) -> StateResult<PreparedCompletedTaskAttempt> {
+        if completion.attempt.worker_mode.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "task attempt worker mode must not be blank".to_owned(),
+            ));
+        }
+        if completion.outcome.trim().is_empty() {
+            return Err(StateError::InvalidRecord(
+                "task attempt outcome must not be blank".to_owned(),
+            ));
+        }
+        if completion.ended_at < completion.attempt.started_at {
+            return Err(StateError::InvalidRecord(
+                "task attempt cannot end before it starts".to_owned(),
+            ));
+        }
+        let (checkpoint_json, diff_artifact) = self.prepare_completed_checkpoint(completion)?;
+        Ok(PreparedCompletedTaskAttempt {
+            checkpoint_json,
+            diff_artifact,
+            verification_fields: prepare_completed_verification(completion)?,
+            worker_result_json: serde_json::to_string(&completion.worker_result)?,
+            started_at: completion.attempt.started_at.to_rfc3339(),
+            ended_at: completion.ended_at.to_rfc3339(),
+        })
+    }
+
+    fn prepare_completed_checkpoint(
+        &self,
+        completion: &CompletedTaskAttemptRecord,
+    ) -> StateResult<(Option<String>, Option<StoredArtifact>)> {
+        let Some(checkpoint) = completion.checkpoint.as_ref() else {
+            return Ok((None, None));
+        };
+        if checkpoint.task_id != completion.attempt.task_id
+            || checkpoint.attempt_id != completion.attempt.attempt_id
+            || checkpoint.current_worker != completion.attempt.provider
+        {
+            return Err(StateError::InvalidRecord(
+                "checkpoint identity does not match task attempt".to_owned(),
+            ));
+        }
+        if !checkpoint.has_supported_schema() {
+            return Err(StateError::InvalidRecord(format!(
+                "unsupported checkpoint schema version {}",
+                checkpoint.schema_version
+            )));
+        }
+        if !checkpoint
+            .verify_integrity()
+            .map_err(|error| StateError::InvalidRecord(error.to_string()))?
+        {
+            return Err(StateError::InvalidRecord(
+                "checkpoint integrity hash is invalid".to_owned(),
+            ));
+        }
+        let artifact = checkpoint
+            .diff_path
+            .as_ref()
+            .map(|path| self.inspect_checkpoint_diff(checkpoint, path))
+            .transpose()?;
+        if artifact
+            .as_ref()
+            .is_some_and(|value| i64::try_from(value.byte_length).is_err())
+        {
+            return Err(StateError::InvalidRecord(
+                "checkpoint diff exceeds SQLite length range".to_owned(),
+            ));
+        }
+        Ok((Some(serde_json::to_string(checkpoint)?), artifact))
+    }
+
     /// Lists immutable artifact evidence for this workspace so maintenance diagnostics can
     /// verify referenced bytes without exposing the underlying `SQLite` connection.
     pub fn list_artifacts(&self) -> StateResult<Vec<StoredArtifact>> {
@@ -1874,6 +1996,146 @@ impl WorkspaceDatabase<'_> {
             })
             .collect()
     }
+}
+
+fn prepare_completed_verification(
+    completion: &CompletedTaskAttemptRecord,
+) -> StateResult<Option<(String, String)>> {
+    let Some(verification) = completion.verification.as_ref() else {
+        return Ok(None);
+    };
+    if verification.task_id != completion.attempt.task_id
+        || verification.implementation_provider != completion.attempt.provider
+    {
+        return Err(StateError::InvalidRecord(
+            "verification identity does not match task attempt".to_owned(),
+        ));
+    }
+    if verification.schema_version.as_str() != SchemaVersion::V1 {
+        return Err(StateError::InvalidRecord(format!(
+            "unsupported verification schema version {}",
+            verification.schema_version
+        )));
+    }
+    Ok(Some((
+        serde_string(&verification.status)?,
+        serde_json::to_string(verification)?,
+    )))
+}
+
+fn insert_completed_attempt_start(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt: &NewTaskAttemptRecord,
+    started_at: &str,
+) -> StateResult<u32> {
+    let ordinal_value: i64 = transaction.query_row(
+        "SELECT coalesce(max(ordinal), 0) + 1 FROM task_attempts WHERE task_id = ?1",
+        [attempt.task_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let ordinal = u32::try_from(ordinal_value)
+        .map_err(|_| StateError::InvalidRecord("task attempt ordinal overflow".to_owned()))?;
+    transaction.execute(
+        "INSERT INTO main.task_attempts(attempt_id, task_id, ordinal, provider_id, worker_mode,
+            started_at, ended_at, outcome, worker_result_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL)",
+        params![
+            attempt.attempt_id.to_string(),
+            attempt.task_id.to_string(),
+            ordinal_value,
+            attempt.provider.as_str(),
+            attempt.worker_mode.trim(),
+            started_at,
+        ],
+    )?;
+    Ok(ordinal)
+}
+
+fn insert_completed_attempt_checkpoint(
+    transaction: &rusqlite::Transaction<'_>,
+    completion: &CompletedTaskAttemptRecord,
+    prepared: &PreparedCompletedTaskAttempt,
+) -> StateResult<()> {
+    let Some(checkpoint) = completion.checkpoint.as_ref() else {
+        return Ok(());
+    };
+    let checkpoint_json = prepared.checkpoint_json.as_deref().ok_or_else(|| {
+        StateError::InvalidRecord("prepared checkpoint JSON is missing".to_owned())
+    })?;
+    let diff_artifact_id = prepared
+        .diff_artifact
+        .as_ref()
+        .map(|artifact| register_checkpoint_artifact(transaction, checkpoint, artifact))
+        .transpose()?;
+    transaction.execute(
+        "INSERT INTO main.checkpoints(checkpoint_id, task_id, attempt_id, schema_version, \
+         checkpoint_json, integrity_hash, diff_artifact_id, git_head, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            checkpoint.checkpoint_id.to_string(),
+            checkpoint.task_id.to_string(),
+            checkpoint.attempt_id.to_string(),
+            checkpoint.schema_version.as_str(),
+            checkpoint_json,
+            checkpoint.integrity_hash,
+            diff_artifact_id,
+            checkpoint.git_base,
+            checkpoint.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_completed_attempt_verification(
+    transaction: &rusqlite::Transaction<'_>,
+    completion: &CompletedTaskAttemptRecord,
+    prepared: &PreparedCompletedTaskAttempt,
+) -> StateResult<()> {
+    let (Some(verification), Some((status, result_json))) = (
+        completion.verification.as_ref(),
+        prepared.verification_fields.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    transaction.execute(
+        "INSERT INTO main.verification_results(verification_id, task_id, attempt_id, \
+         reviewer_provider, outcome, schema_version, result_json, started_at, completed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![
+            verification.verification_id.to_string(),
+            verification.task_id.to_string(),
+            completion.attempt.attempt_id.to_string(),
+            verification.reviewer_provider.map(ProviderId::as_str),
+            status,
+            verification.schema_version.as_str(),
+            result_json,
+            verification.verified_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn finish_completed_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    completion: &CompletedTaskAttemptRecord,
+    prepared: &PreparedCompletedTaskAttempt,
+) -> StateResult<()> {
+    let changed = transaction.execute(
+        "UPDATE main.task_attempts SET ended_at = ?1, outcome = ?2, worker_result_json = ?3
+         WHERE workspace_id = current_workspace() AND attempt_id = ?4 AND ended_at IS NULL",
+        params![
+            prepared.ended_at,
+            completion.outcome.trim(),
+            prepared.worker_result_json,
+            completion.attempt.attempt_id.to_string(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StateError::OptimisticConflict {
+            entity: format!("unfinished task attempt {}", completion.attempt.attempt_id),
+        });
+    }
+    Ok(())
 }
 
 impl Database {
@@ -2437,7 +2699,8 @@ mod tests {
         AttemptId, Checkpoint, CheckpointId, CorrelationId, EventActor, EventId, EventType,
         HandoverAcknowledgement, HandoverBundle, HandoverId, ProviderId, QuotaPeriod, QuotaScope,
         RepoPath, SchemaVersion, TaskEnvelope, TaskEvent, TaskId, TaskState, TransitionGuards,
-        UsageSnapshot, UsageUnit, WorkerOutcome, WorkerResult,
+        UsageSnapshot, UsageUnit, VerificationId, VerificationResult, VerificationStatus,
+        WorkerOutcome, WorkerResult,
     };
     use rusqlite::params;
     use serde_json::json;
@@ -2445,9 +2708,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        ArtifactStore, ClaimedControlRecoveryPolicy, ControlAction, ControlRecoveryDisposition,
-        CoordinatorLeaseRequest, Database, NewTaskRecord, RoutingAuditRecord, StoredTaskAttempt,
-        TaskListFilter, WorkspaceId,
+        ArtifactStore, ClaimedControlRecoveryPolicy, CompletedTaskAttemptRecord, ControlAction,
+        ControlRecoveryDisposition, CoordinatorLeaseRequest, Database, NewTaskAttemptRecord,
+        NewTaskRecord, RoutingAuditRecord, StoredTaskAttempt, TaskListFilter, WorkspaceId,
     };
 
     #[test]
@@ -3191,6 +3454,116 @@ mod tests {
 
         std::fs::remove_file(diff_path.join_to(directory.path()))?;
         assert!(database.latest_sealed_checkpoint(task_id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn completed_attempt_rolls_back_artifact_and_checkpoint_on_verification_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = crate::CanonicalTempDir::new("atomic-completed-attempt")?;
+        let database = Database::open(directory.path().join("orchestrator.db"))?;
+        database.migrate_with_backup(&directory.path().join("backups"))?;
+        let workspace_id = database
+            .resolve_repository_workspace(directory.path())?
+            .workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let now = Utc::now();
+        let task_id = TaskId::new();
+        workspace.create_task(&NewTaskRecord {
+            task_id,
+            schema_version: SchemaVersion::V1.to_owned(),
+            state: TaskState::Running,
+            objective: "persist one completed attempt".to_owned(),
+            original_request_redacted: "atomic evidence".to_owned(),
+            envelope: json!({"schema_version": SchemaVersion::V1}),
+            created_at: now,
+        })?;
+
+        let attempt_id = AttemptId::new();
+        let checkpoint_id = CheckpointId::new();
+        let diff = b"diff --git a/src/lib.rs b/src/lib.rs\n+atomic\n";
+        let digest = hex::encode(Sha256::digest(diff));
+        let diff_path = RepoPath::try_from(format!(
+            "checkpoints/{checkpoint_id}/worktree.{digest}.diff"
+        ))?;
+        ArtifactStore::open(directory.path())?.put(diff_path.clone(), diff)?;
+        let changed_files = vec![RepoPath::try_from("src/lib.rs")?];
+        let checkpoint = Checkpoint {
+            schema_version: SchemaVersion::v1(),
+            checkpoint_id,
+            task_id,
+            attempt_id,
+            objective: "persist one completed attempt".to_owned(),
+            current_plan: Vec::new(),
+            completed_steps: Vec::new(),
+            pending_steps: Vec::new(),
+            files_read: Vec::new(),
+            files_changed: changed_files.clone(),
+            git_base: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            diff_path: Some(diff_path),
+            commands_run: Vec::new(),
+            tests: Vec::new(),
+            decisions: Vec::new(),
+            unresolved_questions: Vec::new(),
+            known_failures: Vec::new(),
+            worker_claim: None,
+            current_worker: ProviderId::Codex,
+            concise_context_summary: "sealed atomic evidence".to_owned(),
+            created_at: now,
+            integrity_hash: String::new(),
+        }
+        .seal()?;
+
+        let verification_id = VerificationId::new();
+        let existing_verification = VerificationResult {
+            schema_version: SchemaVersion::v1(),
+            verification_id,
+            task_id,
+            implementation_provider: ProviderId::Codex,
+            reviewer_provider: None,
+            status: VerificationStatus::Inconclusive,
+            checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            changed_files: changed_files.clone(),
+            out_of_scope_files: Vec::new(),
+            unresolved_todos: vec!["pre-existing verification".to_owned()],
+            requires_approval: false,
+            verified_at: now,
+        };
+        workspace.record_verification(&existing_verification)?;
+        let conflicting_verification = VerificationResult {
+            status: VerificationStatus::Fail,
+            unresolved_todos: Vec::new(),
+            ..existing_verification.clone()
+        };
+        let completion = CompletedTaskAttemptRecord {
+            attempt: NewTaskAttemptRecord {
+                attempt_id,
+                task_id,
+                provider: ProviderId::Codex,
+                worker_mode: "workspace_write".to_owned(),
+                started_at: now,
+            },
+            checkpoint: Some(checkpoint),
+            verification: Some(conflicting_verification),
+            outcome: "failed".to_owned(),
+            worker_result: json!({"summary": "late verification conflict"}),
+            ended_at: now + TimeDelta::seconds(1),
+        };
+
+        assert!(
+            workspace
+                .record_completed_task_attempt(&completion)
+                .is_err()
+        );
+        assert!(workspace.list_task_attempts(task_id)?.is_empty());
+        assert!(workspace.latest_sealed_checkpoint(task_id)?.is_none());
+        assert!(workspace.list_artifacts()?.is_empty());
+        assert_eq!(
+            workspace.latest_verification(task_id)?,
+            Some(existing_verification)
+        );
         Ok(())
     }
 

@@ -6,9 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use orchestrator_domain::{
-    AttemptId, GraphRevisionId, ModelProfile, ProviderCapabilities, ProviderId, QuotaPeriod,
-    QuotaScope, ReasoningEffort, SandboxMode, SchemaVersion, TaskId, UsageUnit, WorkerEvent,
-    WorkerRequest,
+    AttemptId, CapabilitySupport, GraphRevisionId, ModelProfile, ProviderCapabilities, ProviderId,
+    QuotaPeriod, QuotaScope, ReasoningEffort, SandboxMode, SchemaVersion, TaskId, UsageUnit,
+    WorkerEvent, WorkerRequest,
 };
 use orchestrator_engine::{
     PLANNER_MAX_OUTPUT_BYTES, PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse,
@@ -22,12 +22,39 @@ use orchestrator_providers::{
 use orchestrator_state::{OrchestratorConfig, ProviderConfig, RootConfig};
 use serde::Serialize;
 
+use crate::worker_messages::WorkerMessageCollector;
+
 pub struct OfficialCliTaskPlanner {
     pub(crate) config: RootConfig,
     pub(crate) repository: PathBuf,
     pub(crate) runtime: Arc<dyn AdapterRuntime>,
     pub(crate) capabilities: BTreeMap<ProviderId, ProviderCapabilities>,
     pub(crate) profile: ModelProfile,
+}
+
+fn observe_read_only_command(
+    provider: ProviderId,
+    sandbox: SandboxMode,
+    support: CapabilitySupport,
+    executable: &str,
+    args: &[String],
+    evidence: &mut Vec<String>,
+) -> Option<String> {
+    if sandbox != SandboxMode::ReadOnly
+        || !matches!(
+            support,
+            CapabilitySupport::Advertised | CapabilitySupport::Verified
+        )
+    {
+        return Some(format!(
+            "provider command execution lacks an established read-only capability: {executable}"
+        ));
+    }
+    let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_owned());
+    evidence.push(format!(
+        "read-only provider command started: provider={provider}; executable={executable}; args={args}"
+    ));
+    None
 }
 
 impl OfficialCliTaskPlanner {
@@ -246,6 +273,7 @@ impl TaskPlanner for OfficialCliTaskPlanner {
     async fn propose(&self, request: PlannerRequest) -> Result<PlannerResponse, PlannerFailure> {
         let provider = self.select_provider(&request)?;
         let worker_request = self.worker_request(&request, provider)?;
+        let message_byte_limit = worker_request.max_output_bytes;
         let adapter: Arc<dyn WorkerAdapter> = Arc::from(
             build_provider_adapter(
                 provider,
@@ -260,63 +288,110 @@ impl TaskPlanner for OfficialCliTaskPlanner {
             .await
             .map_err(|error| invocation_failure(&error.to_string()))?;
         let mut guard = ActivePlannerGuard::new(Arc::clone(&adapter), handle.clone());
-        let mut messages = Vec::new();
+        let mut messages = WorkerMessageCollector::new(
+            &self.config.orchestrator.redaction.patterns,
+            message_byte_limit,
+        )
+        .map_err(|error| invocation_failure(&error.to_string()))?;
         let mut evidence = self.capabilities[&provider].evidence.clone();
+        let read_only_support = self.capabilities[&provider].read_only;
         let mut quota_exhausted = false;
         let mut completed = false;
         let mut lifecycle_error = None;
-        while let Some(raw) = adapter
-            .next_event(&handle)
-            .await
-            .map_err(|error| invocation_failure(&error.to_string()))?
-        {
+        while let Some(raw) = adapter.next_event(&handle).await.map_err(|error| {
+            let error = messages.redact_provider_text(&error.to_string());
+            invocation_failure(&error)
+        })? {
             match adapter.parse_event(raw).await {
-                Ok(WorkerEvent::Message { text }) => messages.push(text),
-                Ok(WorkerEvent::Completed { .. }) => completed = true,
-                Ok(WorkerEvent::QuotaExceeded { detail }) => {
-                    quota_exhausted = true;
-                    if let Some(detail) = detail {
-                        evidence.push(detail);
+                Ok(event) => {
+                    if let Err(error) = messages.observe(&event) {
+                        lifecycle_error.get_or_insert_with(|| error.to_string());
+                        if let Err(error) = adapter.cancel(&handle).await {
+                            evidence.push(messages.redact_provider_text(&error.to_string()));
+                        }
+                        break;
+                    }
+                    match event {
+                        WorkerEvent::Completed { .. } => completed = true,
+                        WorkerEvent::QuotaExceeded { detail } => {
+                            quota_exhausted = true;
+                            if let Some(detail) = detail {
+                                evidence.push(messages.redact_provider_text(&detail));
+                            }
+                        }
+                        WorkerEvent::Error { message, .. } => {
+                            let message = messages.redact_provider_text(&message);
+                            lifecycle_error.get_or_insert(message);
+                        }
+                        WorkerEvent::Unknown {
+                            event_type,
+                            affects_lifecycle,
+                            ..
+                        } => {
+                            let event_type = messages.redact_provider_text(&event_type);
+                            evidence.push(format!("unknown event: {event_type}"));
+                            if affects_lifecycle {
+                                lifecycle_error.get_or_insert_with(|| {
+                                    format!("unknown lifecycle-affecting event: {event_type}")
+                                });
+                            }
+                        }
+                        WorkerEvent::FileChanged { path } => {
+                            let path = messages.redact_provider_text(&path.to_string());
+                            lifecycle_error.get_or_insert_with(|| {
+                                format!("read-only planner reported a file change: {path}")
+                            });
+                        }
+                        WorkerEvent::CommandStarted {
+                            executable, args, ..
+                        } => {
+                            let executable = messages.redact_provider_text(&executable);
+                            let args = args
+                                .iter()
+                                .map(|arg| messages.redact_provider_text(arg))
+                                .collect::<Vec<_>>();
+                            if let Some(error) = observe_read_only_command(
+                                provider,
+                                request.sandbox,
+                                read_only_support,
+                                &executable,
+                                &args,
+                                &mut evidence,
+                            ) {
+                                lifecycle_error.get_or_insert(error);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Ok(WorkerEvent::Error { message, .. }) => lifecycle_error = Some(message),
-                Ok(WorkerEvent::Unknown {
-                    event_type,
-                    affects_lifecycle,
-                    ..
-                }) => {
-                    evidence.push(format!("unknown event: {event_type}"));
-                    if affects_lifecycle {
-                        lifecycle_error =
-                            Some(format!("unknown lifecycle-affecting event: {event_type}"));
+                Err(error) => {
+                    messages.discard_streamed_output();
+                    let error = messages.redact_provider_text(&error.to_string());
+                    lifecycle_error.get_or_insert(error);
+                    if let Err(error) = adapter.cancel(&handle).await {
+                        evidence.push(messages.redact_provider_text(&error.to_string()));
                     }
+                    break;
                 }
-                Ok(WorkerEvent::FileChanged { path }) => {
-                    lifecycle_error =
-                        Some(format!("read-only planner reported a file change: {path}"));
-                }
-                Ok(WorkerEvent::CommandStarted { executable, .. }) => {
-                    lifecycle_error = Some(format!(
-                        "read-only planner reported command execution: {executable}"
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) => lifecycle_error = Some(error.to_string()),
             }
         }
-        let output = adapter
-            .wait(&handle)
-            .await
-            .map_err(|error| invocation_failure(&error.to_string()))?;
+        let output = adapter.wait(&handle).await.map_err(|error| {
+            let error = messages.redact_provider_text(&error.to_string());
+            invocation_failure(&error)
+        })?;
         guard.disarm();
-        if !output.stderr.is_empty() {
-            evidence.push(String::from_utf8_lossy(&output.stderr).into_owned());
+        if !output.truncated && !output.stderr.is_empty() {
+            evidence.push(messages.redact_provider_text(&String::from_utf8_lossy(&output.stderr)));
         }
         if output.truncated {
+            messages.discard_streamed_output();
             evidence.push("provider runtime truncated output".to_owned());
+            lifecycle_error
+                .get_or_insert_with(|| "provider output exceeded the configured limit".to_owned());
         }
         if let Some(error) = output.tree_termination_error {
-            lifecycle_error = Some(error);
+            let error = messages.redact_provider_text(&error);
+            lifecycle_error.get_or_insert(error);
         }
         let exit = if quota_exhausted {
             PlannerExit::QuotaExhausted
@@ -337,6 +412,7 @@ impl TaskPlanner for OfficialCliTaskPlanner {
         if let Some(error) = lifecycle_error {
             evidence.push(error);
         }
+        let messages = messages.into_messages();
         Ok(PlannerResponse {
             schema_version: SchemaVersion::v1(),
             session_id: request.session_id,
@@ -510,5 +586,79 @@ fn parse_quota_period(value: &str) -> Result<QuotaPeriod, PlannerFailure> {
         _ => Err(invocation_failure(
             "planner provider quota period is invalid",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_providers_accept_commands_only_with_established_read_only_capability() {
+        for provider in [
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Gemini,
+            ProviderId::Agy,
+        ] {
+            for support in [CapabilitySupport::Advertised, CapabilitySupport::Verified] {
+                let mut evidence = Vec::new();
+                let violation = observe_read_only_command(
+                    provider,
+                    SandboxMode::ReadOnly,
+                    support,
+                    "rg",
+                    &["--files".to_owned()],
+                    &mut evidence,
+                );
+                assert!(violation.is_none(), "{provider} {support:?}");
+                assert_eq!(evidence.len(), 1);
+                assert!(evidence[0].contains("read-only provider command started"));
+                assert!(evidence[0].contains(&format!("provider={provider}")));
+                assert!(evidence[0].contains("--files"));
+            }
+        }
+    }
+
+    #[test]
+    fn command_policy_rejects_degraded_unsupported_and_writable_contexts() {
+        for provider in [
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Gemini,
+            ProviderId::Agy,
+        ] {
+            for support in [CapabilitySupport::Unsupported, CapabilitySupport::Degraded] {
+                let mut evidence = Vec::new();
+                assert!(
+                    observe_read_only_command(
+                        provider,
+                        SandboxMode::ReadOnly,
+                        support,
+                        "rg",
+                        &["--files".to_owned()],
+                        &mut evidence,
+                    )
+                    .is_some(),
+                    "{provider} {support:?}"
+                );
+                assert!(evidence.is_empty());
+            }
+
+            let mut evidence = Vec::new();
+            assert!(
+                observe_read_only_command(
+                    provider,
+                    SandboxMode::WorkspaceWrite,
+                    CapabilitySupport::Verified,
+                    "rg",
+                    &["--files".to_owned()],
+                    &mut evidence,
+                )
+                .is_some(),
+                "{provider} writable"
+            );
+            assert!(evidence.is_empty());
+        }
     }
 }

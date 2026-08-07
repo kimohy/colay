@@ -51,12 +51,22 @@ When `.colay/config.toml` is absent, Colay can continue using a legacy `.codex/o
 
 ## Running and inspecting tasks
 
-Use `run --plan-only` to persist an assessment and routing decision without creating a worktree or invoking a provider. It is a static compatibility command, not the conversation-first provider interview. A normal writable run first resolves the repository root, verifies `HEAD^{commit}`, and rejects unresolved Git operations before it creates `.colay` state or a task. It then creates a task branch/worktree, runs a bounded worker, checkpoints Git evidence, and independently verifies the result before completion.
+Use `run --plan-only` to start one bounded read-only provider conversation and persist its
+interview, requirement, and planning evidence in the current global workspace partition. The
+promotion fence means that invocation does not create a task or worktree, request writable
+execution, or require a Git base commit. Provider selection, output validation, redaction, and
+read-only command policy are the same conversation-first boundaries used before approval. A normal
+`run` uses the same conversation path without the invocation-level promotion fence; it can produce
+a complete candidate but cannot itself authorize a task. A later exact approval verifies the
+repository root and `HEAD^{commit}`, rejects unresolved Git operations, and only then promotes the
+sealed graph. Execution creates a task branch/worktree, runs a bounded worker, checkpoints Git
+evidence, and independently verifies the result before completion.
 
-If a normal run reports that the directory is not a Git repository, move to the intended project
-repository. If it reports that the repository has no base commit, review the intended initial file
-set and create an initial commit. Do not use a broad `git add .` in an arbitrary parent workspace:
-it can capture credentials, dependency directories, or nested repositories.
+If planning or exact approval reports that the directory is not a Git repository, move to the
+intended project repository before promotion. If it reports that the repository has no base commit,
+review the intended initial file set and create an initial commit. Do not use a broad `git add .` in
+an arbitrary parent workspace: it can capture credentials, dependency directories, or nested
+repositories.
 
 On WSL, prefer a Linux-native clone under the distribution filesystem (for example
 `~/workspace/project`) for Linux Colay. `doctor` warns when the active checkout is under

@@ -9,8 +9,8 @@ use orchestrator_engine::{
     GitWorktree, TaskExecutionReport, TaskExecutionRequest, TaskExecutor, canonicalize_directory,
 };
 use orchestrator_state::{
-    ClaimReadyTaskRequest, ClaimedTask, Database, NewTaskAttemptRecord, NewWorktreeRecord,
-    WorkspaceDatabase, WorkspaceId,
+    ClaimReadyTaskRequest, ClaimedTask, CompletedTaskAttemptRecord, Database, NewTaskAttemptRecord,
+    NewWorktreeRecord, WorkspaceDatabase, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -277,13 +277,35 @@ async fn run_claimed_task_inner(
                 break;
             }
         };
-        persist_report(
+        if !report_matches_execution_target(&report, claim, &services.state_root) {
+            finish_instructions(database, &instructions, false)?;
+            transition(
+                database,
+                claim,
+                TaskState::Running,
+                TaskState::Failed,
+                false,
+            )?;
+            break;
+        }
+        if let Err(error) = persist_report(
             database,
             claim,
             &report,
             &services.repository_root,
             redactor,
-        )?;
+        ) {
+            finish_instructions(database, &instructions, false)?;
+            transition(
+                database,
+                claim,
+                TaskState::Running,
+                TaskState::Failed,
+                false,
+            )?;
+            let _redacted_failure = redactor.redact(&error.to_string());
+            break;
+        }
         let passed = report.passed_completion_gate();
         finish_instructions(database, &instructions, passed)?;
         if report.outcome != WorkerOutcome::Succeeded || !passed {
@@ -332,6 +354,25 @@ async fn run_claimed_task_inner(
     Ok(())
 }
 
+fn report_matches_execution_target(
+    report: &TaskExecutionReport,
+    claim: &ClaimedTask,
+    state_root: &std::path::Path,
+) -> bool {
+    if !report.validates_claim(claim)
+        || report.branch != format!("orchestrator/task-{}", report.task_id)
+    {
+        return false;
+    }
+    let Ok(managed_worktrees) = canonicalize_directory(&state_root.join("worktrees")) else {
+        return false;
+    };
+    let Ok(reported_worktree) = canonicalize_directory(&report.worktree_path) else {
+        return false;
+    };
+    reported_worktree == managed_worktrees.join(report.task_id.to_string())
+}
+
 fn persist_report(
     database: &WorkspaceDatabase<'_>,
     claim: &ClaimedTask,
@@ -364,19 +405,6 @@ fn persist_report(
             created_at: Utc::now(),
         })?;
     }
-    database.record_task_attempt_started(&NewTaskAttemptRecord {
-        attempt_id: report.attempt_id,
-        task_id: report.task_id,
-        provider: report.provider,
-        worker_mode: "workspace_write".to_owned(),
-        started_at: claim.acquired_at,
-    })?;
-    if let Some(checkpoint) = report.checkpoint.as_ref() {
-        database.record_checkpoint(checkpoint)?;
-    }
-    if let Some(verification) = report.verification.as_ref() {
-        database.record_verification(verification)?;
-    }
     let result = serde_json::json!({
         "task_id": report.task_id,
         "attempt_id": report.attempt_id,
@@ -386,13 +414,27 @@ fn persist_report(
         "changed_files": report.changed_files,
         "checkpoint_id": report.checkpoint.as_ref().map(|value| value.checkpoint_id),
         "verification_id": report.verification.as_ref().map(|value| value.verification_id),
+        "lifecycle_failure": report.lifecycle_failure.as_ref().map(|failure| serde_json::json!({
+            "code": failure.code.as_ref().map(|code| redactor.redact(code)),
+            "summary": redactor.redact(&failure.summary),
+            "retryable": failure.retryable,
+            "occurred_at": failure.occurred_at,
+        })),
     });
-    database.finish_task_attempt(
-        report.attempt_id,
-        worker_outcome_text(report.outcome),
-        &result,
-        Utc::now(),
-    )?;
+    database.record_completed_task_attempt(&CompletedTaskAttemptRecord {
+        attempt: NewTaskAttemptRecord {
+            attempt_id: report.attempt_id,
+            task_id: report.task_id,
+            provider: report.provider,
+            worker_mode: "workspace_write".to_owned(),
+            started_at: claim.acquired_at,
+        },
+        checkpoint: report.checkpoint.clone(),
+        verification: report.verification.clone(),
+        outcome: worker_outcome_text(report.outcome).to_owned(),
+        worker_result: result,
+        ended_at: Utc::now(),
+    })?;
     Ok(())
 }
 
@@ -413,7 +455,7 @@ fn finish_instructions(
             Some(if applied {
                 "instruction included in verified task execution"
             } else {
-                "task execution did not pass; instruction will be retried"
+                "task execution did not pass; instruction was not applied"
             }),
         )?;
     }
@@ -503,9 +545,11 @@ const fn worker_outcome_text(outcome: WorkerOutcome) -> &'static str {
 mod tests {
     use std::{
         collections::BTreeMap,
+        fs,
+        path::PathBuf,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -513,17 +557,25 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeDelta, Utc};
     use orchestrator_domain::{
-        DaemonInstanceId, GraphRevisionId, MessageId, ProviderId, RepoPath, SchemaVersion,
-        SessionId, TaskEnvelope, TaskId, TaskState, WorkerOutcome,
+        Checkpoint, CheckpointId, DaemonInstanceId, FailureRecord, GraphRevisionId, MessageId,
+        ModelProfile, ProviderId, RepoPath, ResourceScope, ScheduleClaimId, SchemaVersion,
+        SessionId, TaskEnvelope, TaskId, TaskState, VerificationId, VerificationResult,
+        VerificationStatus, WorkerOutcome,
     };
     use orchestrator_engine::{
-        EngineResult, TaskExecutionReport, TaskExecutionRequest, TaskExecutor,
+        EngineError, EngineResult, TaskExecutionReport, TaskExecutionRequest, TaskExecutor,
     };
-    use orchestrator_state::{DaemonLeaseRequest, Database, WorkspaceDatabase};
+    use orchestrator_state::{
+        ClaimedTask, DaemonLeaseRequest, Database, NewWorktreeRecord, WorkspaceDatabase,
+        WorkspaceId,
+    };
     use rusqlite::params;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ExecutionServices, reap_finished_tasks, spawn_ready_tasks, stop_execution_jobs};
+    use super::{
+        ExecutionServices, reap_finished_tasks, report_matches_execution_target, spawn_ready_tasks,
+        stop_execution_jobs,
+    };
     use crate::MessageRedactor;
     use crate::test_support::{with_workspace, with_workspace_transaction};
 
@@ -573,8 +625,220 @@ mod tests {
                 changed_files: Vec::new(),
                 checkpoint: None,
                 verification: None,
+                lifecycle_failure: None,
             })
         }
+    }
+
+    struct NonRetryableExecutor {
+        calls: AtomicUsize,
+        wrong_task: AtomicBool,
+        wrong_base: AtomicBool,
+        wrong_verification: AtomicBool,
+        verification_id: Option<VerificationId>,
+    }
+
+    #[async_trait]
+    impl TaskExecutor for NonRetryableExecutor {
+        async fn execute(
+            &self,
+            request: TaskExecutionRequest,
+            _cancellation: CancellationToken,
+        ) -> EngineResult<TaskExecutionReport> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let attempt_id = orchestrator_domain::AttemptId::new();
+            let report_task_id = if self.wrong_task.load(Ordering::SeqCst) {
+                TaskId::new()
+            } else {
+                request.claim.task_id
+            };
+            let report_base = if self.wrong_base.load(Ordering::SeqCst) {
+                "1".repeat(40)
+            } else {
+                request.claim.approved_base_commit.clone()
+            };
+            let failure = FailureRecord {
+                code: Some("app_server_protocol_error".to_owned()),
+                summary: "provider result is unknown after writable dispatch".to_owned(),
+                retryable: false,
+                occurred_at: Utc::now(),
+            };
+            let checkpoint = Checkpoint {
+                schema_version: SchemaVersion::v1(),
+                checkpoint_id: CheckpointId::new(),
+                task_id: report_task_id,
+                attempt_id,
+                objective: request.claim.envelope.objective.clone(),
+                current_plan: Vec::new(),
+                completed_steps: Vec::new(),
+                pending_steps: Vec::new(),
+                files_read: Vec::new(),
+                files_changed: Vec::new(),
+                git_base: Some(report_base.clone()),
+                diff_path: None,
+                commands_run: Vec::new(),
+                tests: Vec::new(),
+                decisions: Vec::new(),
+                unresolved_questions: Vec::new(),
+                known_failures: vec![failure.clone()],
+                worker_claim: None,
+                current_worker: request.claim.provider,
+                concise_context_summary: failure.summary.clone(),
+                created_at: Utc::now(),
+                integrity_hash: String::new(),
+            }
+            .seal()?;
+            let verification = if let Some(verification_id) = self.verification_id {
+                Some(VerificationResult {
+                    schema_version: SchemaVersion::v1(),
+                    verification_id,
+                    task_id: report_task_id,
+                    implementation_provider: request.claim.provider,
+                    reviewer_provider: None,
+                    status: VerificationStatus::Fail,
+                    checks: Vec::new(),
+                    acceptance_criteria: Vec::new(),
+                    changed_files: Vec::new(),
+                    out_of_scope_files: Vec::new(),
+                    unresolved_todos: Vec::new(),
+                    requires_approval: false,
+                    verified_at: Utc::now(),
+                })
+            } else if self.wrong_verification.load(Ordering::SeqCst) {
+                let foreign_change = RepoPath::try_from("foreign/change.rs")
+                    .map_err(|error| EngineError::InvalidRepoPath(error.to_string()))?;
+                Some(VerificationResult {
+                    schema_version: SchemaVersion::v1(),
+                    verification_id: VerificationId::new(),
+                    task_id: TaskId::new(),
+                    implementation_provider: ProviderId::Agy,
+                    reviewer_provider: None,
+                    status: VerificationStatus::Fail,
+                    checks: Vec::new(),
+                    acceptance_criteria: Vec::new(),
+                    changed_files: vec![foreign_change],
+                    out_of_scope_files: Vec::new(),
+                    unresolved_todos: Vec::new(),
+                    requires_approval: false,
+                    verified_at: Utc::now(),
+                })
+            } else {
+                None
+            };
+            Ok(TaskExecutionReport {
+                task_id: report_task_id,
+                attempt_id,
+                provider: request.claim.provider,
+                outcome: WorkerOutcome::Failed,
+                summary_redacted: failure.summary.clone(),
+                worktree_path: request
+                    .state_root
+                    .join("worktrees")
+                    .join(report_task_id.to_string()),
+                branch: format!("orchestrator/task-{report_task_id}"),
+                base_revision: report_base,
+                changed_files: Vec::new(),
+                checkpoint: Some(checkpoint),
+                verification,
+                lifecycle_failure: Some(failure),
+            })
+        }
+    }
+
+    fn target_claim() -> Result<ClaimedTask, Box<dyn std::error::Error>> {
+        let now = Utc::now();
+        let envelope = TaskEnvelope::new("target path", "target path", now);
+        Ok(ClaimedTask {
+            workspace_id: "00000000-0000-0000-0000-000000000002".parse::<WorkspaceId>()?,
+            schedule_claim_id: ScheduleClaimId::new(),
+            daemon_instance_id: DaemonInstanceId::new(),
+            session_id: SessionId::new(),
+            revision_id: GraphRevisionId::new(),
+            task_id: envelope.task_id,
+            node_key: "target-path".to_owned(),
+            display_order: 1,
+            provider: ProviderId::Codex,
+            profile: ModelProfile::Standard,
+            envelope,
+            scope: ResourceScope {
+                paths: Vec::new(),
+                repository_wide: true,
+            },
+            approved_base_commit: "0".repeat(40),
+            acquired_at: now,
+            expires_at: now + TimeDelta::minutes(5),
+        })
+    }
+
+    fn target_report(claim: &ClaimedTask, worktree_path: PathBuf) -> TaskExecutionReport {
+        TaskExecutionReport {
+            task_id: claim.task_id,
+            attempt_id: orchestrator_domain::AttemptId::new(),
+            provider: claim.provider,
+            outcome: WorkerOutcome::Failed,
+            summary_redacted: "target path report".to_owned(),
+            worktree_path,
+            branch: format!("orchestrator/task-{}", claim.task_id),
+            base_revision: claim.approved_base_commit.clone(),
+            changed_files: Vec::new(),
+            checkpoint: None,
+            verification: None,
+            lifecycle_failure: None,
+        }
+    }
+
+    #[test]
+    fn execution_target_accepts_canonical_equivalent_path_and_rejects_other_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let state_root = directory.path().join("state");
+        let alias_component = state_root.join("alias-component");
+        let claim = target_claim()?;
+        let expected_worktree = state_root.join("worktrees").join(claim.task_id.to_string());
+        fs::create_dir_all(&expected_worktree)?;
+        fs::create_dir_all(&alias_component)?;
+
+        let lexical_state_root = alias_component.join("..");
+        let mut report = target_report(&claim, fs::canonicalize(&expected_worktree)?);
+        assert!(report_matches_execution_target(
+            &report,
+            &claim,
+            &lexical_state_root
+        ));
+
+        let other_worktree = directory
+            .path()
+            .join("other")
+            .join(claim.task_id.to_string());
+        fs::create_dir_all(&other_worktree)?;
+        report.worktree_path = fs::canonicalize(other_worktree)?;
+        assert!(!report_matches_execution_target(
+            &report,
+            &claim,
+            &lexical_state_root
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_target_accepts_symlinked_state_root_for_same_managed_worktree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let state_root = directory.path().join("state");
+        let claim = target_claim()?;
+        let expected_worktree = state_root.join("worktrees").join(claim.task_id.to_string());
+        fs::create_dir_all(&expected_worktree)?;
+        let state_alias = directory.path().join("state-alias");
+        std::os::unix::fs::symlink(&state_root, &state_alias)?;
+        let report = target_report(&claim, fs::canonicalize(expected_worktree)?);
+
+        assert!(report_matches_execution_target(
+            &report,
+            &claim,
+            &state_alias
+        ));
+        Ok(())
     }
 
     fn seed_graph(
@@ -683,6 +947,39 @@ mod tests {
         Ok(task_id)
     }
 
+    async fn execute_one_ready_task(
+        database: &Arc<Database>,
+        workspace_id: orchestrator_state::WorkspaceId,
+        daemon: DaemonInstanceId,
+        services: &ExecutionServices,
+        redactor: &Arc<dyn MessageRedactor>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut jobs = Vec::new();
+        spawn_ready_tasks(
+            database,
+            workspace_id,
+            daemon,
+            services,
+            redactor,
+            cancellation,
+            &mut jobs,
+        )?;
+        if jobs.len() != 1 {
+            return Err(format!("expected one scheduled task, found {}", jobs.len()).into());
+        }
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            reap_finished_tasks(&mut jobs).await?;
+            if jobs.is_empty() {
+                return Ok(());
+            }
+        }
+        cancellation.cancel();
+        stop_execution_jobs(cancellation, jobs).await?;
+        Err("scheduled task did not finish in time".into())
+    }
+
     #[tokio::test]
     async fn scheduler_runs_disjoint_tasks_in_parallel_and_releases_all_claims()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -752,6 +1049,396 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(active, 0);
+            Ok(())
+        })?;
+        stop_execution_jobs(&cancellation, jobs).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn non_retryable_report_is_terminal_after_one_attempt_and_preserves_failure_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        let database_path = root.join("state.db");
+        let database = Arc::new(Database::open(&database_path)?);
+        database.migrate_with_backup(&root.join("backups"))?;
+        let workspace_id = database.resolve_repository_workspace(&root)?.workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let daemon = DaemonInstanceId::new();
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id: daemon,
+            pid: 43,
+            started_at: Utc::now(),
+            ttl: TimeDelta::minutes(2),
+        })?;
+        let (session, revision) = seed_graph(&database_path, &workspace)?;
+        let task_id = seed_task(&database_path, &workspace, session, revision, 1)?;
+        fs::create_dir_all(root.join("worktrees").join(task_id.to_string()))?;
+        let executor = Arc::new(NonRetryableExecutor {
+            calls: AtomicUsize::new(0),
+            wrong_task: AtomicBool::new(false),
+            wrong_base: AtomicBool::new(false),
+            wrong_verification: AtomicBool::new(false),
+            verification_id: None,
+        });
+        let services = ExecutionServices {
+            executor: executor.clone(),
+            repository_root: root.clone(),
+            state_root: root,
+            global_limit: 1,
+            provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+            claim_ttl: TimeDelta::seconds(30),
+        };
+        let redactor: Arc<dyn MessageRedactor> = Arc::new(IdentityRedactor);
+        let cancellation = CancellationToken::new();
+        let mut jobs = Vec::new();
+
+        spawn_ready_tasks(
+            &database,
+            workspace.workspace_id(),
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+            &mut jobs,
+        )?;
+        assert_eq!(jobs.len(), 1);
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            reap_finished_tasks(&mut jobs).await?;
+            if jobs.is_empty() {
+                break;
+            }
+        }
+
+        assert!(jobs.is_empty());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let task = workspace.load_task(task_id)?.ok_or("task missing")?;
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.resume_state, None);
+        let attempts = workspace.list_task_attempts(task_id)?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome.as_deref(), Some("failed"));
+        assert!(attempts[0].ended_at.is_some());
+        let persisted_failure = attempts[0]
+            .worker_result
+            .as_ref()
+            .and_then(|result| result.get("lifecycle_failure"))
+            .ok_or("attempt omitted lifecycle failure")?;
+        assert_eq!(persisted_failure["code"], "app_server_protocol_error");
+        assert_eq!(persisted_failure["retryable"].as_bool(), Some(false));
+        let checkpoint = workspace
+            .latest_sealed_checkpoint(task_id)?
+            .ok_or("checkpoint missing")?;
+        assert!(checkpoint.verify_integrity()?);
+        assert_eq!(checkpoint.known_failures.len(), 1);
+        assert!(!checkpoint.known_failures[0].retryable);
+        assert_eq!(
+            checkpoint.known_failures[0].code.as_deref(),
+            Some("app_server_protocol_error")
+        );
+        assert_eq!(workspace.count_handovers(task_id)?, 0);
+        with_workspace(&database_path, &workspace, |connection| {
+            let active: i64 = connection.query_row(
+                "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(active, 0);
+            Ok(())
+        })?;
+
+        spawn_ready_tasks(
+            &database,
+            workspace.workspace_id(),
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+            &mut jobs,
+        )?;
+        assert!(jobs.is_empty());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        stop_execution_jobs(&cancellation, jobs).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn verification_conflict_rolls_back_report_evidence_and_releases_claim()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        let database_path = root.join("state.db");
+        let database = Arc::new(Database::open(&database_path)?);
+        database.migrate_with_backup(&root.join("backups"))?;
+        let workspace_id = database.resolve_repository_workspace(&root)?.workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let daemon = DaemonInstanceId::new();
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id: daemon,
+            pid: 45,
+            started_at: Utc::now(),
+            ttl: TimeDelta::minutes(2),
+        })?;
+        let (session, revision) = seed_graph(&database_path, &workspace)?;
+        let task_id = seed_task(&database_path, &workspace, session, revision, 1)?;
+        fs::create_dir_all(root.join("worktrees").join(task_id.to_string()))?;
+
+        let verification_id = VerificationId::new();
+        let existing_verification = VerificationResult {
+            schema_version: SchemaVersion::v1(),
+            verification_id,
+            task_id,
+            implementation_provider: ProviderId::Codex,
+            reviewer_provider: None,
+            status: VerificationStatus::Inconclusive,
+            checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            changed_files: Vec::new(),
+            out_of_scope_files: Vec::new(),
+            unresolved_todos: vec!["pre-existing verification evidence".to_owned()],
+            requires_approval: false,
+            verified_at: Utc::now(),
+        };
+        workspace.record_verification(&existing_verification)?;
+
+        let executor = Arc::new(NonRetryableExecutor {
+            calls: AtomicUsize::new(0),
+            wrong_task: AtomicBool::new(false),
+            wrong_base: AtomicBool::new(false),
+            wrong_verification: AtomicBool::new(false),
+            verification_id: Some(verification_id),
+        });
+        let services = ExecutionServices {
+            executor: executor.clone(),
+            repository_root: root.clone(),
+            state_root: root,
+            global_limit: 1,
+            provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+            claim_ttl: TimeDelta::seconds(30),
+        };
+        let redactor: Arc<dyn MessageRedactor> = Arc::new(IdentityRedactor);
+        let cancellation = CancellationToken::new();
+
+        execute_one_ready_task(
+            &database,
+            workspace_id,
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+        )
+        .await?;
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            workspace.load_task(task_id)?.map(|task| task.state),
+            Some(TaskState::Failed)
+        );
+        assert!(workspace.list_task_attempts(task_id)?.is_empty());
+        assert!(workspace.latest_sealed_checkpoint(task_id)?.is_none());
+        assert_eq!(
+            workspace.latest_verification(task_id)?,
+            Some(existing_verification)
+        );
+        assert!(workspace.active_worktree(task_id)?.is_some());
+        with_workspace(&database_path, &workspace, |connection| {
+            let open_attempts: i64 = connection.query_row(
+                "SELECT count(*) FROM task_attempts WHERE ended_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(open_attempts, 0);
+            let checkpoints: i64 =
+                connection.query_row("SELECT count(*) FROM checkpoints", [], |row| row.get(0))?;
+            assert_eq!(checkpoints, 0);
+            let verifications: i64 =
+                connection.query_row("SELECT count(*) FROM verification_results", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(verifications, 1);
+            let active_claims: i64 = connection.query_row(
+                "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(active_claims, 0);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn misbound_reports_fail_terminal_without_persistence_or_reclaim()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        let database_path = root.join("state.db");
+        let database = Arc::new(Database::open(&database_path)?);
+        database.migrate_with_backup(&root.join("backups"))?;
+        let workspace_id = database.resolve_repository_workspace(&root)?.workspace_id;
+        let workspace = database.workspace(workspace_id);
+        let daemon = DaemonInstanceId::new();
+        database.acquire_daemon_lease(&DaemonLeaseRequest {
+            instance_id: daemon,
+            pid: 44,
+            started_at: Utc::now(),
+            ttl: TimeDelta::minutes(2),
+        })?;
+        let (session, revision) = seed_graph(&database_path, &workspace)?;
+        let wrong_task = seed_task(&database_path, &workspace, session, revision, 1)?;
+        let wrong_base = seed_task(&database_path, &workspace, session, revision, 2)?;
+        let mismatched_worktree = seed_task(&database_path, &workspace, session, revision, 3)?;
+        let misbound_verification = seed_task(&database_path, &workspace, session, revision, 4)?;
+        let executor = Arc::new(NonRetryableExecutor {
+            calls: AtomicUsize::new(0),
+            wrong_task: AtomicBool::new(true),
+            wrong_base: AtomicBool::new(false),
+            wrong_verification: AtomicBool::new(false),
+            verification_id: None,
+        });
+        let services = ExecutionServices {
+            executor: executor.clone(),
+            repository_root: root.clone(),
+            state_root: root.clone(),
+            global_limit: 1,
+            provider_limits: BTreeMap::from([(ProviderId::Codex, 1)]),
+            claim_ttl: TimeDelta::seconds(30),
+        };
+        let redactor: Arc<dyn MessageRedactor> = Arc::new(IdentityRedactor);
+        let cancellation = CancellationToken::new();
+
+        execute_one_ready_task(
+            &database,
+            workspace_id,
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+        )
+        .await?;
+        assert_eq!(
+            workspace.load_task(wrong_task)?.map(|task| task.state),
+            Some(TaskState::Failed)
+        );
+        assert!(workspace.list_task_attempts(wrong_task)?.is_empty());
+        assert!(workspace.active_worktree(wrong_task)?.is_none());
+
+        executor.wrong_task.store(false, Ordering::SeqCst);
+        executor.wrong_base.store(true, Ordering::SeqCst);
+        execute_one_ready_task(
+            &database,
+            workspace_id,
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+        )
+        .await?;
+        assert_eq!(
+            workspace.load_task(wrong_base)?.map(|task| task.state),
+            Some(TaskState::Failed)
+        );
+        assert!(workspace.list_task_attempts(wrong_base)?.is_empty());
+        assert!(workspace.active_worktree(wrong_base)?.is_none());
+
+        executor.wrong_base.store(false, Ordering::SeqCst);
+        fs::create_dir_all(root.join("worktrees").join(mismatched_worktree.to_string()))?;
+        workspace.record_active_worktree(&NewWorktreeRecord {
+            task_id: mismatched_worktree,
+            repo_root: root.clone(),
+            worktree_path: root.join("worktrees/mismatched"),
+            branch_name: "orchestrator/task-mismatched".to_owned(),
+            base_revision: "0".repeat(40),
+            created_at: Utc::now(),
+        })?;
+        execute_one_ready_task(
+            &database,
+            workspace_id,
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+        )
+        .await?;
+        assert_eq!(
+            workspace
+                .load_task(mismatched_worktree)?
+                .map(|task| task.state),
+            Some(TaskState::Failed)
+        );
+        assert!(
+            workspace
+                .list_task_attempts(mismatched_worktree)?
+                .is_empty()
+        );
+        assert!(workspace.active_worktree(mismatched_worktree)?.is_some());
+
+        executor.wrong_verification.store(true, Ordering::SeqCst);
+        fs::create_dir_all(
+            root.join("worktrees")
+                .join(misbound_verification.to_string()),
+        )?;
+        execute_one_ready_task(
+            &database,
+            workspace_id,
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+        )
+        .await?;
+        assert_eq!(
+            workspace
+                .load_task(misbound_verification)?
+                .map(|task| task.state),
+            Some(TaskState::Failed)
+        );
+        assert!(
+            workspace
+                .list_task_attempts(misbound_verification)?
+                .is_empty()
+        );
+        assert!(workspace.active_worktree(misbound_verification)?.is_none());
+        assert!(
+            workspace
+                .latest_sealed_checkpoint(misbound_verification)?
+                .is_none()
+        );
+        assert!(
+            workspace
+                .latest_verification(misbound_verification)?
+                .is_none()
+        );
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
+
+        let mut jobs = Vec::new();
+        spawn_ready_tasks(
+            &database,
+            workspace_id,
+            daemon,
+            &services,
+            &redactor,
+            &cancellation,
+            &mut jobs,
+        )?;
+        assert!(jobs.is_empty());
+        with_workspace(&database_path, &workspace, |connection| {
+            let active: i64 = connection.query_row(
+                "SELECT count(*) FROM task_schedule_claims WHERE released_at IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(active, 0);
+            let verification_results: i64 =
+                connection.query_row("SELECT count(*) FROM verification_results", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(verification_results, 0);
             Ok(())
         })?;
         stop_execution_jobs(&cancellation, jobs).await?;

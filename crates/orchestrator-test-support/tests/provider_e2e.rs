@@ -192,6 +192,86 @@ async fn fake_codex_stream_runs_through_production_process_runtime()
 }
 
 #[tokio::test]
+async fn fake_gemini_stream_matches_the_official_echo_delta_and_result_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = GeminiAdapter::new(
+        GeminiAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Gemini),
+        },
+        runtime(),
+    );
+    let handle = adapter
+        .start(request(ProviderId::Gemini, "success")?)
+        .await?;
+    let mut saw_user_echo = false;
+    let mut assistant = String::new();
+    let mut completed = false;
+    let mut saw_complete_message = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Unknown { event_type, .. } if event_type == "gemini.message.user" => {
+                saw_user_echo = true;
+            }
+            WorkerEvent::MessageDelta { text } => assistant.push_str(&text),
+            WorkerEvent::Message { .. } => saw_complete_message = true,
+            WorkerEvent::Completed { summary, .. } => {
+                completed = true;
+                assert!(summary.is_none());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_user_echo);
+    assert_eq!(assistant, "done");
+    assert!(completed);
+    assert!(!saw_complete_message);
+    assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_gemini_complete_message_without_delta_runs_through_production_runtime()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = GeminiAdapter::new(
+        GeminiAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Gemini),
+        },
+        runtime(),
+    );
+    let handle = adapter
+        .start(request(
+            ProviderId::Gemini,
+            "scenario:gemini-complete-message",
+        )?)
+        .await?;
+    let mut assistant = None;
+    let mut saw_delta = false;
+    let mut completed = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::Message { text } => assistant = Some(text),
+            WorkerEvent::MessageDelta { .. } => saw_delta = true,
+            WorkerEvent::Completed { summary, .. } => {
+                completed = true;
+                assert!(summary.is_none());
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(assistant.as_deref(), Some("done"));
+    assert!(!saw_delta);
+    assert!(completed);
+    assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fake_agy_plain_text_completes_through_production_process_runtime()
 -> Result<(), Box<dyn std::error::Error>> {
     let adapter = AgyAdapter::new(
@@ -203,18 +283,18 @@ async fn fake_agy_plain_text_completes_through_production_process_runtime()
         runtime(),
     );
     let handle = adapter.start(request(ProviderId::Agy, "success")?).await?;
-    let mut message = false;
+    let mut message = String::new();
     let mut completed = false;
     while let Some(raw) = adapter.next_event(&handle).await? {
         match adapter.parse_event(raw).await? {
-            WorkerEvent::Message { text } if text.contains("done") => message = true,
+            WorkerEvent::MessageDelta { text } => message.push_str(&text),
             WorkerEvent::Completed { .. } => completed = true,
             _ => {}
         }
     }
     let result = adapter.wait(&handle).await?;
     assert_eq!(result.exit_code, Some(0));
-    assert!(message);
+    assert!(message.contains("done"));
     assert!(completed);
     Ok(())
 }
@@ -236,22 +316,18 @@ async fn fake_agy_without_prompt_flags_reads_the_conversation_prompt_from_stdin(
     )?;
     worker.objective = "Conduct a read-only conversation turn".to_owned();
     let handle = adapter.start(worker).await?;
-    let mut outcome = None;
+    let mut message = String::new();
     let mut completed = false;
     while let Some(raw) = adapter.next_event(&handle).await? {
         match adapter.parse_event(raw).await? {
-            WorkerEvent::Message { text } => {
-                outcome = serde_json::from_str::<serde_json::Value>(text.trim()).ok();
-            }
+            WorkerEvent::MessageDelta { text } => message.push_str(&text),
             WorkerEvent::Completed { .. } => completed = true,
             _ => {}
         }
     }
 
-    assert_eq!(
-        outcome.as_ref().and_then(|value| value["outcome"].as_str()),
-        Some("answer_complete")
-    );
+    let outcome = serde_json::from_str::<serde_json::Value>(message.trim())?;
+    assert_eq!(outcome["outcome"].as_str(), Some("answer_complete"));
     assert!(completed);
     assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
     Ok(())
@@ -311,20 +387,17 @@ async fn fake_agy_acknowledges_a_vendor_neutral_handover() -> Result<(), Box<dyn
         "unresolved_questions": []
     }));
     let handle = adapter.start(worker).await?;
-    let mut acknowledged = false;
+    let mut message = String::new();
     let mut completed = false;
     while let Some(raw) = adapter.next_event(&handle).await? {
         match adapter.parse_event(raw).await? {
-            WorkerEvent::Message { text } => {
-                let value: serde_json::Value = serde_json::from_str(text.trim())?;
-                acknowledged =
-                    value["type"] == "handover_ack" && value["bundle_hash"] == "sealed-hash";
-            }
+            WorkerEvent::MessageDelta { text } => message.push_str(&text),
             WorkerEvent::Completed { .. } => completed = true,
             _ => {}
         }
     }
-    assert!(acknowledged);
+    let value: serde_json::Value = serde_json::from_str(message.trim())?;
+    assert!(value["type"] == "handover_ack" && value["bundle_hash"] == "sealed-hash");
     assert!(completed);
     assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
     Ok(())
@@ -428,6 +501,11 @@ async fn prepared_argv_omits_empty_models_and_uses_safe_permissions()
     let claude_invocation = claude.prepare(&request(ProviderId::Claude, "secret task")?)?;
     let claude_args = claude_invocation.args_lossy();
     assert!(!claude_args.iter().any(|arg| arg == "--model"));
+    assert!(
+        !claude_args
+            .iter()
+            .any(|arg| arg == "--include-partial-messages")
+    );
     assert!(
         claude_args
             .windows(2)
@@ -567,13 +645,49 @@ async fn agy_plain_text_is_redacted_before_domain_normalization()
         assert!(!String::from_utf8_lossy(&raw.bytes).contains("supersecretvalue"));
         if matches!(
             adapter.parse_event(raw).await?,
-            WorkerEvent::Message { ref text } if text.contains("[REDACTED]")
+            WorkerEvent::MessageDelta { ref text } if text.contains("[REDACTED]")
         ) {
             saw_redaction = true;
         }
     }
     assert!(saw_redaction);
     assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn agy_overlong_line_preserves_redaction_taint_as_one_delta_sequence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let adapter = AgyAdapter::new(
+        AgyAdapterConfig {
+            executable: fake_binary(),
+            usage_probe: UsageProbeConfig::ManualOrLedger,
+            usage_scope: scope(ProviderId::Agy),
+        },
+        runtime(),
+    );
+    let mut worker = request(ProviderId::Agy, "scenario:agy-overlong-redaction-boundary")?;
+    worker.max_output_bytes = 2 * 1024 * 1024;
+    let handle = adapter.start(worker).await?;
+    let mut deltas = Vec::new();
+    let mut completed = false;
+    while let Some(raw) = adapter.next_event(&handle).await? {
+        assert!(!String::from_utf8_lossy(&raw.bytes).contains("Bearer abcdefghijklmnop"));
+        match adapter.parse_event(raw).await? {
+            WorkerEvent::MessageDelta { text } => deltas.push(text),
+            WorkerEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+    let output = adapter.wait(&handle).await?;
+
+    assert!(completed);
+    assert!(!output.truncated);
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(
+        deltas,
+        vec!["[REDACTED STREAM FRAME]".to_owned(), "ijklmnop".to_owned()]
+    );
     Ok(())
 }
 

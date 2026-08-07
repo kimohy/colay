@@ -110,6 +110,7 @@ pub(crate) fn normalize_codex_event(event: CompatEvent) -> Result<WorkerEvent, P
                     detail: Some(message),
                 })
             } else {
+                let retryable = code.as_deref() != Some("app_server_protocol_error");
                 Ok(WorkerEvent::Error {
                     code: if quota == Some(QuotaErrorKind::RateLimit) {
                         Some("rate_limited".to_owned())
@@ -117,7 +118,7 @@ pub(crate) fn normalize_codex_event(event: CompatEvent) -> Result<WorkerEvent, P
                         code
                     },
                     message,
-                    retryable: true,
+                    retryable,
                 })
             }
         }
@@ -247,12 +248,13 @@ pub fn parse_claude_event(value: Value) -> Result<WorkerEvent, ProviderError> {
         "assistant" => Ok(WorkerEvent::Message {
             text: extract_claude_text(&value).unwrap_or_default(),
         }),
-        "stream_event" => Ok(WorkerEvent::Message {
-            text: value
-                .pointer("/event/delta/text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+        // Colay does not request Claude's partial-message mode. A stream delta is
+        // therefore diagnostic protocol data, not a complete semantic message;
+        // treating arbitrary chunks as messages would invent newline boundaries.
+        "stream_event" => Ok(WorkerEvent::Unknown {
+            event_type: "claude.stream_event".to_owned(),
+            payload: value,
+            affects_lifecycle: false,
         }),
         "result" => {
             let usage = claude_usage_observation(&value);
@@ -299,71 +301,184 @@ pub fn parse_gemini_event(value: Value) -> Result<WorkerEvent, ProviderError> {
         .and_then(Value::as_str)
         .ok_or_else(|| ProviderError::MalformedOutput("Gemini event has no type".to_owned()))?;
     match event_type {
-        "init" | "session.started" => Ok(WorkerEvent::Started {
-            session_id: value
-                .get("session_id")
-                .or_else(|| value.get("sessionId"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        }),
-        "message" => Ok(WorkerEvent::Message {
-            text: value
-                .get("content")
-                .or_else(|| value.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        }),
-        "tool_use" | "tool.started" => Ok(WorkerEvent::CommandStarted {
-            command_id: event_id(&value, "gemini-tool"),
-            executable: value
-                .get("name")
-                .or_else(|| value.get("tool_name"))
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_owned(),
-            args: value
-                .get("parameters")
-                .map(ToString::to_string)
-                .into_iter()
-                .collect(),
-        }),
-        "tool_result" | "tool.completed" => Ok(WorkerEvent::CommandCompleted {
-            command_id: event_id(&value, "gemini-tool"),
-            exit_code: value
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                .and_then(|code| i32::try_from(code).ok()),
-        }),
-        "file_change" => {
-            let path = value.get("path").and_then(Value::as_str).ok_or_else(|| {
-                ProviderError::MalformedOutput("file change has no path".to_owned())
-            })?;
-            Ok(WorkerEvent::FileChanged {
-                path: RepoPath::try_from(path.to_owned())?,
-            })
-        }
-        "result" | "completed" => {
-            let usage = gemini_usage_observation(&value);
-            Ok(WorkerEvent::Completed {
-                summary: value
-                    .get("result")
-                    .or_else(|| value.get("text"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                usage,
-            })
-        }
-        "error" => {
-            let message = extract_error_message(&value)
-                .unwrap_or_else(|| "Gemini emitted an error".to_owned());
-            Ok(quota_or_error(message, value.get("error"), "gemini_error"))
-        }
+        "init" | "session.started" => Ok(gemini_started(&value)),
+        "message" => parse_gemini_message(value),
+        "tool_use" | "tool.started" => Ok(gemini_command_started(&value)),
+        "tool_result" | "tool.completed" => Ok(gemini_command_completed(&value)),
+        "file_change" => parse_gemini_file_change(&value),
+        "result" | "completed" => parse_gemini_result(&value),
+        "error" => parse_gemini_error(value),
         unknown => Ok(WorkerEvent::Unknown {
             event_type: format!("gemini.{unknown}"),
             payload: value,
             affects_lifecycle: false,
         }),
+    }
+}
+
+fn gemini_started(value: &Value) -> WorkerEvent {
+    WorkerEvent::Started {
+        session_id: value
+            .get("session_id")
+            .or_else(|| value.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn parse_gemini_message(value: Value) -> Result<WorkerEvent, ProviderError> {
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::MalformedOutput("Gemini message has no role".to_owned()))?;
+    let delta = gemini_optional_delta(&value)?;
+    let text = gemini_message_text(&value)?;
+    if role == "user" {
+        return Ok(WorkerEvent::Unknown {
+            event_type: "gemini.message.user".to_owned(),
+            payload: value,
+            affects_lifecycle: false,
+        });
+    }
+    if role != "assistant" {
+        return Err(ProviderError::MalformedOutput(format!(
+            "Gemini message has unsupported role: {role}"
+        )));
+    }
+    Ok(if delta {
+        WorkerEvent::MessageDelta { text }
+    } else {
+        WorkerEvent::Message { text }
+    })
+}
+
+fn gemini_optional_delta(value: &Value) -> Result<bool, ProviderError> {
+    match value.get("delta") {
+        None => Ok(false),
+        Some(Value::Bool(delta)) => Ok(*delta),
+        Some(_) => Err(ProviderError::MalformedOutput(
+            "Gemini message delta flag is not boolean".to_owned(),
+        )),
+    }
+}
+
+fn gemini_message_text(value: &Value) -> Result<String, ProviderError> {
+    value
+        .get("content")
+        .or_else(|| value.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| ProviderError::MalformedOutput("Gemini message has no text".to_owned()))
+}
+
+fn gemini_command_started(value: &Value) -> WorkerEvent {
+    WorkerEvent::CommandStarted {
+        command_id: event_id(value, "gemini-tool"),
+        executable: value
+            .get("name")
+            .or_else(|| value.get("tool_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_owned(),
+        args: value
+            .get("parameters")
+            .map(ToString::to_string)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn gemini_command_completed(value: &Value) -> WorkerEvent {
+    WorkerEvent::CommandCompleted {
+        command_id: event_id(value, "gemini-tool"),
+        exit_code: value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
+    }
+}
+
+fn parse_gemini_file_change(value: &Value) -> Result<WorkerEvent, ProviderError> {
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProviderError::MalformedOutput("file change has no path".to_owned()))?;
+    Ok(WorkerEvent::FileChanged {
+        path: RepoPath::try_from(path.to_owned())?,
+    })
+}
+
+fn parse_gemini_result(value: &Value) -> Result<WorkerEvent, ProviderError> {
+    match gemini_result_status(value)? {
+        Some("error") => {
+            let message = extract_error_message(value)
+                .unwrap_or_else(|| "Gemini emitted an error result".to_owned());
+            Ok(quota_or_error(message, value.get("error"), "gemini_error"))
+        }
+        Some("success") if gemini_has_error_payload(value) => Err(ProviderError::MalformedOutput(
+            "Gemini success result contains an error payload".to_owned(),
+        )),
+        None if gemini_has_error_payload(value) => Err(ProviderError::MalformedOutput(
+            "Gemini result without status contains an error payload".to_owned(),
+        )),
+        Some("success") | None => Ok(WorkerEvent::Completed {
+            summary: value
+                .get("result")
+                .or_else(|| value.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            usage: gemini_usage_observation(value),
+        }),
+        Some(status) => Err(ProviderError::MalformedOutput(format!(
+            "Gemini result has unsupported status: {status}"
+        ))),
+    }
+}
+
+fn gemini_result_status(value: &Value) -> Result<Option<&str>, ProviderError> {
+    value
+        .get("status")
+        .map(|status| {
+            status.as_str().ok_or_else(|| {
+                ProviderError::MalformedOutput("Gemini result status is not a string".to_owned())
+            })
+        })
+        .transpose()
+}
+
+fn gemini_has_error_payload(value: &Value) -> bool {
+    match value.get("error") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(error)) => !error.is_empty(),
+        Some(Value::Array(errors)) => !errors.is_empty(),
+        Some(Value::Object(error)) => !error.is_empty(),
+        Some(Value::Bool(_) | Value::Number(_)) => true,
+    }
+}
+
+fn parse_gemini_error(value: Value) -> Result<WorkerEvent, ProviderError> {
+    let severity = value
+        .get("severity")
+        .map(|severity| {
+            severity.as_str().ok_or_else(|| {
+                ProviderError::MalformedOutput("Gemini error severity is not a string".to_owned())
+            })
+        })
+        .transpose()?;
+    match severity {
+        Some("warning") => Ok(WorkerEvent::Unknown {
+            event_type: "gemini.warning".to_owned(),
+            payload: value,
+            affects_lifecycle: false,
+        }),
+        Some("error") | None => {
+            let message = extract_error_message(&value)
+                .unwrap_or_else(|| "Gemini emitted an error".to_owned());
+            Ok(quota_or_error(message, value.get("error"), "gemini_error"))
+        }
+        Some(severity) => Err(ProviderError::MalformedOutput(format!(
+            "Gemini error has unsupported severity: {severity}"
+        ))),
     }
 }
 
@@ -578,6 +693,246 @@ mod tests {
             "result": "Monthly usage limit reached"
         }));
         assert!(matches!(event, Ok(WorkerEvent::QuotaExceeded { .. })));
+    }
+
+    #[test]
+    fn codex_app_server_protocol_error_is_never_retryable() {
+        let event = normalize_codex_event(CompatEvent::Error {
+            code: Some("app_server_protocol_error".to_owned()),
+            message: "turn dispatch outcome is unknown".to_owned(),
+            quota: None,
+        });
+
+        assert!(matches!(
+            event,
+            Ok(WorkerEvent::Error {
+                code: Some(ref code),
+                retryable: false,
+                ..
+            }) if code == "app_server_protocol_error"
+        ));
+    }
+
+    #[test]
+    fn claude_partial_stream_delta_is_not_a_semantic_message() {
+        let payload = serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "42"}
+            }
+        });
+        let event = parse_claude_event(payload.clone());
+
+        assert!(matches!(
+            &event,
+            Ok(WorkerEvent::Unknown {
+                event_type,
+                affects_lifecycle: false,
+                ..
+            }) if event_type == "claude.stream_event"
+        ));
+        if let Ok(WorkerEvent::Unknown {
+            payload: normalized_payload,
+            ..
+        }) = event
+        {
+            assert_eq!(normalized_payload, payload);
+        }
+    }
+
+    #[test]
+    fn gemini_assistant_delta_preserves_the_continuation_contract() {
+        let event = parse_gemini_event(serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "partial",
+            "delta": true,
+            "timestamp": "2026-08-07T00:00:00Z"
+        }));
+
+        assert!(matches!(
+            event,
+            Ok(WorkerEvent::MessageDelta { ref text }) if text == "partial"
+        ));
+    }
+
+    #[test]
+    fn gemini_assistant_message_without_delta_is_complete() {
+        let event = parse_gemini_event(serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "complete",
+            "timestamp": "2026-08-07T00:00:00Z"
+        }));
+
+        assert!(matches!(
+            event,
+            Ok(WorkerEvent::Message { ref text }) if text == "complete"
+        ));
+    }
+
+    #[test]
+    fn gemini_assistant_message_with_false_delta_is_complete() {
+        let event = parse_gemini_event(serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "complete",
+            "delta": false,
+            "timestamp": "2026-08-07T00:00:00Z"
+        }));
+
+        assert!(matches!(
+            event,
+            Ok(WorkerEvent::Message { ref text }) if text == "complete"
+        ));
+    }
+
+    #[test]
+    fn gemini_user_echo_is_not_a_semantic_provider_message() {
+        let payload = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": "original prompt"
+        });
+        let event = parse_gemini_event(payload.clone());
+
+        assert!(matches!(
+            &event,
+            Ok(WorkerEvent::Unknown {
+                event_type,
+                affects_lifecycle: false,
+                ..
+            }) if event_type == "gemini.message.user"
+        ));
+        if let Ok(WorkerEvent::Unknown {
+            payload: normalized_payload,
+            ..
+        }) = event
+        {
+            assert_eq!(normalized_payload, payload);
+        }
+    }
+
+    #[test]
+    fn gemini_user_echo_still_requires_content_and_a_boolean_delta() {
+        for payload in [
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "timestamp": "2026-08-07T00:00:00Z"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": 42,
+                "timestamp": "2026-08-07T00:00:00Z"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": "prompt",
+                "delta": "false",
+                "timestamp": "2026-08-07T00:00:00Z"
+            }),
+        ] {
+            assert!(matches!(
+                parse_gemini_event(payload),
+                Err(ProviderError::MalformedOutput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn gemini_error_result_is_not_treated_as_completion() {
+        let event = parse_gemini_event(serde_json::json!({
+            "type": "result",
+            "status": "error",
+            "error": {
+                "type": "AUTHENTICATION_ERROR",
+                "message": "authentication required"
+            }
+        }));
+
+        assert!(matches!(
+            event,
+            Ok(WorkerEvent::Error {
+                code: Some(ref code),
+                ref message,
+                retryable: true
+            }) if code == "gemini_error" && message == "authentication required"
+        ));
+    }
+
+    #[test]
+    fn gemini_success_result_with_error_payload_is_rejected() {
+        let event = parse_gemini_event(serde_json::json!({
+            "type": "result",
+            "status": "success",
+            "result": "done",
+            "error": { "message": "contradictory failure" }
+        }));
+
+        assert!(matches!(event, Err(ProviderError::MalformedOutput(_))));
+    }
+
+    #[test]
+    fn gemini_result_without_status_cannot_hide_an_error_payload() {
+        let event = parse_gemini_event(serde_json::json!({
+            "type": "result",
+            "error": { "message": "authentication failed" }
+        }));
+
+        assert!(matches!(event, Err(ProviderError::MalformedOutput(_))));
+    }
+
+    #[test]
+    fn gemini_warning_event_is_non_lifecycle_protocol_evidence() {
+        let payload = serde_json::json!({
+            "type": "error",
+            "severity": "warning",
+            "message": "Loop detected, stopping execution"
+        });
+        let event = parse_gemini_event(payload.clone());
+
+        assert!(matches!(
+            &event,
+            Ok(WorkerEvent::Unknown {
+                event_type,
+                affects_lifecycle: false,
+                ..
+            }) if event_type == "gemini.warning"
+        ));
+        if let Ok(WorkerEvent::Unknown {
+            payload: normalized_payload,
+            ..
+        }) = event
+        {
+            assert_eq!(normalized_payload, payload);
+        }
+    }
+
+    #[test]
+    fn gemini_rejects_invalid_delta_and_result_status_shapes() {
+        let invalid_delta = parse_gemini_event(serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "partial",
+            "delta": "true"
+        }));
+        let invalid_status = parse_gemini_event(serde_json::json!({
+            "type": "result",
+            "status": "maybe"
+        }));
+
+        assert!(matches!(
+            invalid_delta,
+            Err(ProviderError::MalformedOutput(_))
+        ));
+        assert!(matches!(
+            invalid_status,
+            Err(ProviderError::MalformedOutput(_))
+        ));
     }
 
     #[test]

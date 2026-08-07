@@ -4,6 +4,7 @@ mod chat_tui;
 mod daemon;
 mod ipc_client;
 mod profile_config;
+mod worker_messages;
 
 use std::path::PathBuf;
 

@@ -135,6 +135,88 @@ async fn plans_through_a_bounded_read_only_shell_free_fake_cli()
     Ok(())
 }
 
+#[tokio::test]
+async fn verified_read_only_planner_command_is_evidence_and_does_not_fail_the_plan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    fs::create_dir_all(repository.join(".colay"))?;
+    let mut config = RootConfig::default();
+    config.features.codex_app_server_adapter = false;
+    config.orchestrator.providers.gemini = None;
+    config.orchestrator.providers.claude = None;
+    config.orchestrator.providers.agy = None;
+    config
+        .orchestrator
+        .providers
+        .codex
+        .as_mut()
+        .ok_or("codex config")?
+        .executable = fake_provider_binary().to_string_lossy().into_owned();
+    let runtime: Arc<dyn AdapterRuntime> =
+        Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
+    let planner = OfficialCliTaskPlanner::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability()],
+        ModelProfile::Standard,
+    )?;
+
+    let request = request("scenario:read-only-command");
+    let response = planner.propose(request.clone()).await?;
+
+    assert_eq!(response.sandbox, SandboxMode::ReadOnly);
+    assert!(
+        response
+            .evidence_redacted
+            .contains("read-only provider command started")
+    );
+    let graph = collect_planner_response(&request, response)?;
+    assert_eq!(graph.proposal.nodes.len(), 2);
+    assert!(!repository.join(".colay/worktrees").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn gemini_planner_excludes_the_user_echo_and_reassembles_delta_chunks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    fs::create_dir_all(repository.join(".colay"))?;
+    let mut config = RootConfig::default();
+    config.orchestrator.default_timeout_minutes = 1;
+    config.orchestrator.providers.codex = None;
+    config.orchestrator.providers.claude = None;
+    config.orchestrator.providers.agy = None;
+    config
+        .orchestrator
+        .providers
+        .gemini
+        .as_mut()
+        .ok_or("gemini config")?
+        .executable = fake_provider_binary().to_string_lossy().into_owned();
+    let runtime: Arc<dyn AdapterRuntime> =
+        Arc::new(ProcessAdapterRuntime::new(RedactionConfig::default()));
+    let planner = OfficialCliTaskPlanner::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[capability_for(ProviderId::Gemini)],
+        ModelProfile::Standard,
+    )?;
+    let mut planner_request = request("plan through Gemini deltas");
+    planner_request.validation_policy.eligible_providers = BTreeSet::from([ProviderId::Gemini]);
+    planner_request.validation_policy.per_provider_limits =
+        BTreeMap::from([(ProviderId::Gemini, 1)]);
+
+    let response = planner.propose(planner_request.clone()).await?;
+    assert_eq!(response.provider, ProviderId::Gemini);
+    let graph = collect_planner_response(&planner_request, response)?;
+    assert_eq!(graph.proposal.nodes.len(), 2);
+    Ok(())
+}
+
 #[test]
 fn planner_priority_keeps_agy_ahead_of_gemini() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

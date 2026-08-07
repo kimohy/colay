@@ -11,7 +11,7 @@ use orchestrator_engine::{
     ConversationOrchestrator, ConversationRequest, collect_conversation_response,
     collect_conversation_response_with_evidence,
 };
-use orchestrator_providers::AdapterRuntime;
+use orchestrator_providers::{AdapterRuntime, ProcessAdapterRuntime};
 use orchestrator_state::RootConfig;
 use orchestrator_test_support::{
     FakeAdapterRuntime, FakeRuntimeScenario, fake_conversation_capability,
@@ -213,6 +213,101 @@ async fn all_fake_providers_preserve_the_canonical_read_only_conversation_contra
                 "response_redacted": "Git is needed only after an approved writable task candidate."
             })
         );
+    }
+    assert!(!repository.join(".colay/worktrees").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn process_backed_gemini_warning_between_deltas_preserves_canonical_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(ProcessAdapterRuntime::default());
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.codex = None;
+    config.orchestrator.providers.claude = None;
+    config.orchestrator.providers.agy = None;
+    config
+        .orchestrator
+        .providers
+        .gemini
+        .as_mut()
+        .ok_or("gemini config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[fake_conversation_capability(ProviderId::Gemini)],
+        ModelProfile::Standard,
+    )?;
+    let mut request = request("scenario:gemini-warning-between-deltas");
+    request.provider = ProviderId::Gemini;
+
+    let response = orchestrator.converse(request.clone()).await?;
+    assert!(response.evidence_redacted.contains("gemini.warning"));
+    assert_eq!(
+        serde_json::to_value(collect_conversation_response(&request, response)?)?,
+        serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": "Git is needed only after an approved writable task candidate."
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_fake_providers_fail_closed_on_an_earlier_json_scalar()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::AmbiguousScalarPrefix,
+    )?);
+    let mut config = RootConfig::default();
+    for provider in [
+        config.orchestrator.providers.codex.as_mut(),
+        config.orchestrator.providers.claude.as_mut(),
+        config.orchestrator.providers.gemini.as_mut(),
+        config.orchestrator.providers.agy.as_mut(),
+    ] {
+        provider.ok_or("provider config")?.executable = executable.to_string_lossy().into_owned();
+    }
+    let providers = [
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::Agy,
+    ];
+    let capabilities = providers.map(fake_conversation_capability);
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &capabilities,
+        ModelProfile::Standard,
+    )?;
+
+    for provider in providers {
+        let mut request = request("scenario:ambiguous-scalar-prefix");
+        request.provider = provider;
+        let response = orchestrator.converse(request.clone()).await?;
+
+        assert_eq!(response.provider, provider);
+        assert!(
+            response
+                .output_redacted
+                .windows(b"\nnull\n".len())
+                .any(|window| window == b"\nnull\n")
+        );
+        assert!(matches!(
+            collect_conversation_response(&request, response),
+            Err(ConversationFailure::MalformedOutput { .. })
+        ));
     }
     assert!(!repository.join(".colay/worktrees").exists());
     Ok(())
@@ -501,5 +596,55 @@ async fn noisy_provider_failure_is_deduplicated_bounded_and_safe()
             ..
         })
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn gemini_detailed_error_evidence_is_not_replaced_by_a_bodyless_error_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let repository = fs::canonicalize(directory.path())?;
+    let executable = allowed_fake_binary(&repository)?;
+    let runtime: Arc<dyn AdapterRuntime> = Arc::new(FakeAdapterRuntime::new(
+        &executable,
+        FakeRuntimeScenario::GeminiDetailedErrorThenErrorResult,
+    )?);
+    let mut config = RootConfig::default();
+    config.orchestrator.providers.codex = None;
+    config.orchestrator.providers.claude = None;
+    config.orchestrator.providers.agy = None;
+    config
+        .orchestrator
+        .providers
+        .gemini
+        .as_mut()
+        .ok_or("gemini config")?
+        .executable = executable.to_string_lossy().into_owned();
+    let orchestrator = OfficialCliConversationOrchestrator::from_config(
+        &config,
+        &repository,
+        runtime,
+        &[fake_conversation_capability(ProviderId::Gemini)],
+        ModelProfile::Standard,
+    )?;
+    let mut request = request("Gemini error sequence");
+    request.provider = ProviderId::Gemini;
+
+    let response = orchestrator.converse(request).await?;
+
+    assert_eq!(
+        response.exit,
+        ConversationExit::Crashed { exit_code: Some(0) }
+    );
+    assert!(
+        response
+            .evidence_redacted
+            .contains("Authentication failed. Run `gemini auth login` and retry the request.")
+    );
+    assert!(
+        !response
+            .evidence_redacted
+            .contains("Gemini emitted an error result")
+    );
     Ok(())
 }
