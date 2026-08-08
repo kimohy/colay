@@ -56,7 +56,15 @@ struct FakeConversation {
 
 struct SecretCommandEvidenceConversation;
 
-struct EscapedSecretOutcomeConversation;
+struct EscapedSecretOutcomeConversation {
+    output_redacted: Vec<u8>,
+}
+
+struct PostDecodeRedactionCase {
+    name: &'static str,
+    output_redacted: Vec<u8>,
+    expected_outcome: ConversationOutcome,
+}
 
 struct InvalidatingSecretRedactor;
 
@@ -265,20 +273,95 @@ impl ConversationOrchestrator for FakeConversation {
     }
 }
 
+fn post_decode_redaction_cases() -> Vec<PostDecodeRedactionCase> {
+    let escaped_canary =
+        r"\u0073\u0065\u0063\u0072\u0065\u0074\u002d\u0074\u006f\u006b\u0065\u006e";
+    vec![
+        PostDecodeRedactionCase {
+            name: "answer_complete",
+            output_redacted: format!(
+                r#"{{"outcome":"answer_complete","response_redacted":"answer-{escaped_canary}"}}"#
+            )
+            .into_bytes(),
+            expected_outcome: ConversationOutcome::AnswerComplete {
+                response_redacted: "answer-[REDACTED]".to_owned(),
+            },
+        },
+        PostDecodeRedactionCase {
+            name: "more_information_needed",
+            output_redacted: format!(
+                r#"{{"outcome":"more_information_needed","response_redacted":"more-response-{escaped_canary}","requirements":{{"objective":"more-objective-{escaped_canary}","in_scope":["more-in-scope-{escaped_canary}"],"out_of_scope":["more-out-of-scope-{escaped_canary}"],"constraints":["more-constraint-{escaped_canary}"],"acceptance_criteria":["more-acceptance-{escaped_canary}"],"verification_plan":[{{"executable":"more-cargo-{escaped_canary}","args":["more-test-{escaped_canary}","--more-workspace-{escaped_canary}"]}}],"risks":["more-risk-{escaped_canary}"],"open_questions":["more-question-{escaped_canary}"]}}}}"#
+            )
+            .into_bytes(),
+            expected_outcome: ConversationOutcome::MoreInformationNeeded {
+                response_redacted: "more-response-[REDACTED]".to_owned(),
+                requirements: RequirementSnapshot {
+                    objective: "more-objective-[REDACTED]".to_owned(),
+                    in_scope: vec!["more-in-scope-[REDACTED]".to_owned()],
+                    out_of_scope: vec!["more-out-of-scope-[REDACTED]".to_owned()],
+                    constraints: vec!["more-constraint-[REDACTED]".to_owned()],
+                    acceptance_criteria: vec!["more-acceptance-[REDACTED]".to_owned()],
+                    verification_plan: vec![VerificationCommand {
+                        executable: "more-cargo-[REDACTED]".to_owned(),
+                        args: vec![
+                            "more-test-[REDACTED]".to_owned(),
+                            "--more-workspace-[REDACTED]".to_owned(),
+                        ],
+                    }],
+                    risks: vec!["more-risk-[REDACTED]".to_owned()],
+                    open_questions: vec!["more-question-[REDACTED]".to_owned()],
+                },
+            },
+        },
+        PostDecodeRedactionCase {
+            name: "worktree_task_candidate",
+            output_redacted: format!(
+                r#"{{"outcome":"worktree_task_candidate","response_redacted":"candidate-response-{escaped_canary}","requirements":{{"objective":"candidate-objective-{escaped_canary}","in_scope":["candidate-in-scope-{escaped_canary}"],"out_of_scope":["candidate-out-of-scope-{escaped_canary}"],"constraints":["candidate-constraint-{escaped_canary}"],"acceptance_criteria":["candidate-acceptance-{escaped_canary}"],"verification_plan":[{{"executable":"candidate-cargo-{escaped_canary}","args":["candidate-test-{escaped_canary}","--candidate-workspace-{escaped_canary}"]}}],"risks":["candidate-risk-{escaped_canary}"],"open_questions":[]}}}}"#
+            )
+            .into_bytes(),
+            expected_outcome: ConversationOutcome::WorktreeTaskCandidate {
+                response_redacted: "candidate-response-[REDACTED]".to_owned(),
+                requirements: RequirementSnapshot {
+                    objective: "candidate-objective-[REDACTED]".to_owned(),
+                    in_scope: vec!["candidate-in-scope-[REDACTED]".to_owned()],
+                    out_of_scope: vec!["candidate-out-of-scope-[REDACTED]".to_owned()],
+                    constraints: vec!["candidate-constraint-[REDACTED]".to_owned()],
+                    acceptance_criteria: vec!["candidate-acceptance-[REDACTED]".to_owned()],
+                    verification_plan: vec![VerificationCommand {
+                        executable: "candidate-cargo-[REDACTED]".to_owned(),
+                        args: vec![
+                            "candidate-test-[REDACTED]".to_owned(),
+                            "--candidate-workspace-[REDACTED]".to_owned(),
+                        ],
+                    }],
+                    risks: vec!["candidate-risk-[REDACTED]".to_owned()],
+                    open_questions: Vec::new(),
+                },
+            },
+        },
+        PostDecodeRedactionCase {
+            name: "needs_attention",
+            output_redacted: format!(
+                r#"{{"outcome":"needs_attention","response_redacted":"attention-response-{escaped_canary}","evidence_redacted":"attention-evidence-{escaped_canary}"}}"#
+            )
+            .into_bytes(),
+            expected_outcome: ConversationOutcome::NeedsAttention {
+                response_redacted: "attention-response-[REDACTED]".to_owned(),
+                evidence_redacted: "attention-evidence-[REDACTED]".to_owned(),
+            },
+        },
+    ]
+}
+
 #[async_trait]
 impl ConversationOrchestrator for EscapedSecretOutcomeConversation {
     async fn converse(
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse, ConversationFailure> {
-        let escaped_canary =
-            r"\u0073\u0065\u0063\u0072\u0065\u0074\u002d\u0074\u006f\u006b\u0065\u006e";
-        let output_redacted = format!(
-            r#"{{"outcome":"more_information_needed","response_redacted":"response-{escaped_canary}","requirements":{{"objective":"objective-{escaped_canary}","in_scope":["in-scope-{escaped_canary}"],"out_of_scope":["out-of-scope-{escaped_canary}"],"constraints":["constraint-{escaped_canary}"],"acceptance_criteria":["acceptance-{escaped_canary}"],"verification_plan":[{{"executable":"cargo-{escaped_canary}","args":["test-{escaped_canary}","--workspace-{escaped_canary}"]}}],"risks":["risk-{escaped_canary}"],"open_questions":["question-{escaped_canary}"]}}}}"#
-        )
-        .into_bytes();
         assert!(
-            !output_redacted
+            !self
+                .output_redacted
                 .windows(b"secret-token".len())
                 .any(|window| window == b"secret-token")
         );
@@ -290,7 +373,7 @@ impl ConversationOrchestrator for EscapedSecretOutcomeConversation {
             provider: request.provider,
             sandbox: SandboxMode::ReadOnly,
             exit: ConversationExit::Succeeded,
-            output_redacted,
+            output_redacted: self.output_redacted.clone(),
             evidence_redacted: "fixture evidence secret-token".to_owned(),
         })
     }
@@ -514,6 +597,30 @@ fn assert_zero_writable_rows(
         }
         Ok(())
     })?;
+    Ok(())
+}
+
+fn assert_sqlite_family_excludes(
+    database_path: &std::path::Path,
+    canary: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let path = if suffix.is_empty() {
+            database_path.to_path_buf()
+        } else {
+            let mut path = database_path.as_os_str().to_os_string();
+            path.push(suffix);
+            std::path::PathBuf::from(path)
+        };
+        if path.try_exists()? {
+            let bytes = std::fs::read(&path)?;
+            assert!(
+                !bytes.windows(canary.len()).any(|window| window == canary),
+                "decoded canary reached {}",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -984,65 +1091,170 @@ async fn successful_command_evidence_is_redacted_and_bounded_before_persistence(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn decoded_outcome_strings_are_redacted_before_persistence()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, workspace_id, database_path) = database()?;
-    let workspace = database.workspace(workspace_id);
-    let session_id = seed_session(&database_path, &workspace)?;
-    let append = append_command(session_id, "inspect safely");
-    let source_message_id =
-        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
-    workspace.submit_client_command(&append)?;
-    process_next_client_command(&workspace, &SecretRedactor, Utc::now())?;
-    let services = services_with_conversation(
-        tempfile::tempdir()?.path().to_path_buf(),
-        Arc::new(EscapedSecretOutcomeConversation),
-    );
+    for case in post_decode_redaction_cases() {
+        let (database, workspace_id, database_path) = database()?;
+        let workspace = database.workspace(workspace_id);
+        let session_id = seed_session(&database_path, &workspace)?;
+        let append = append_command(session_id, "inspect safely");
+        let source_message_id =
+            serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?
+                .message_id;
+        workspace.submit_client_command(&append)?;
+        process_next_client_command(&workspace, &SecretRedactor, Utc::now())?;
+        let services = services_with_conversation(
+            tempfile::tempdir()?.path().to_path_buf(),
+            Arc::new(EscapedSecretOutcomeConversation {
+                output_redacted: case.output_redacted,
+            }),
+        );
 
-    process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now()).await?;
+        process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now())
+            .await?;
 
-    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
-    let attempt = workspace
-        .load_conversation_attempt(attempt_id)?
-        .ok_or("conversation attempt is missing")?;
-    let attempt_json = serde_json::to_string(
-        attempt
-            .outcome
-            .as_ref()
-            .ok_or("conversation outcome is missing")?,
-    )?;
-    assert!(!attempt_json.contains("secret-token"));
-    assert!(attempt_json.contains("[REDACTED]"));
+        let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+        let attempt = workspace
+            .load_conversation_attempt(attempt_id)?
+            .ok_or("conversation attempt is missing")?;
+        assert_eq!(
+            attempt.status,
+            ConversationAttemptStatus::Succeeded,
+            "fixture: {}",
+            case.name
+        );
+        assert_eq!(
+            attempt.outcome.as_ref(),
+            Some(&case.expected_outcome),
+            "fixture: {}",
+            case.name
+        );
+        assert_eq!(
+            attempt.evidence_redacted.as_deref(),
+            Some("fixture evidence [REDACTED]"),
+            "fixture: {}",
+            case.name
+        );
+        let attempt_json = serde_json::to_string(
+            attempt
+                .outcome
+                .as_ref()
+                .ok_or("conversation outcome is missing")?,
+        )?;
+        assert!(
+            !attempt_json.contains("secret-token"),
+            "fixture: {}",
+            case.name
+        );
+        assert!(
+            attempt_json.contains("[REDACTED]"),
+            "fixture: {}",
+            case.name
+        );
 
-    let messages = workspace.messages_after(session_id, 0, 10)?;
-    let assistant = messages
-        .into_iter()
-        .map(|(_, message)| message)
-        .find(|message| message.role == orchestrator_domain::MessageRole::Orchestrator)
-        .ok_or("assistant message is missing")?;
-    assert!(!assistant.content_redacted.contains("secret-token"));
-    assert!(assistant.content_redacted.contains("[REDACTED]"));
+        let expected_response = match &case.expected_outcome {
+            ConversationOutcome::AnswerComplete { response_redacted }
+            | ConversationOutcome::MoreInformationNeeded {
+                response_redacted, ..
+            }
+            | ConversationOutcome::WorktreeTaskCandidate {
+                response_redacted, ..
+            }
+            | ConversationOutcome::NeedsAttention {
+                response_redacted, ..
+            } => response_redacted,
+        };
+        let messages = workspace.messages_after(session_id, 0, 10)?;
+        assert_eq!(messages.len(), 2, "fixture: {}", case.name);
+        assert!(
+            messages
+                .iter()
+                .all(|(_, message)| !message.content_redacted.contains("secret-token")),
+            "fixture: {}",
+            case.name
+        );
+        let assistant = messages
+            .iter()
+            .map(|(_, message)| message)
+            .find(|message| message.role == orchestrator_domain::MessageRole::Orchestrator)
+            .ok_or("assistant message is missing")?;
+        assert_eq!(
+            &assistant.content_redacted, expected_response,
+            "fixture: {}",
+            case.name
+        );
 
-    let revision = workspace
-        .current_requirement_revision(session_id)?
-        .ok_or("requirement revision is missing")?;
-    let revision_json = serde_json::to_string(&revision)?;
-    assert!(!revision_json.contains("secret-token"));
-    assert!(revision_json.contains("[REDACTED]"));
+        let expected_requirements = match &case.expected_outcome {
+            ConversationOutcome::MoreInformationNeeded { requirements, .. }
+            | ConversationOutcome::WorktreeTaskCandidate { requirements, .. } => Some(requirements),
+            ConversationOutcome::AnswerComplete { .. }
+            | ConversationOutcome::NeedsAttention { .. } => None,
+        };
+        let revision = workspace.current_requirement_revision(session_id)?;
+        match (revision.as_ref(), expected_requirements) {
+            (Some(revision), Some(expected)) => {
+                assert_eq!(&revision.snapshot, expected, "fixture: {}", case.name);
+                let revision_json = serde_json::to_string(revision)?;
+                assert!(
+                    !revision_json.contains("secret-token"),
+                    "fixture: {}",
+                    case.name
+                );
+                assert_eq!(
+                    revision.snapshot.verification_plan[0].args.len(),
+                    2,
+                    "fixture: {}",
+                    case.name
+                );
+            }
+            (None, None) => {}
+            _ => {
+                return Err(
+                    format!("fixture {} stored the wrong requirements path", case.name).into(),
+                );
+            }
+        }
 
-    let conversation_command = workspace
-        .load_client_command(ClientCommandId::from_uuid(source_message_id.into_uuid()))?
-        .ok_or("conversation command is missing")?;
-    let command_json = serde_json::to_string(&conversation_command)?;
-    assert!(!command_json.contains("secret-token"));
-
-    let database_bytes = std::fs::read(&database_path)?;
-    assert!(
-        !database_bytes
-            .windows(b"secret-token".len())
-            .any(|window| window == b"secret-token")
-    );
-    assert_zero_writable_rows(&database_path, &workspace)?;
+        with_workspace(&database_path, &workspace, |connection| {
+            let mut statement = connection.prepare(
+                "SELECT payload_json, outcome FROM client_commands ORDER BY requested_at, command_id",
+            )?;
+            let commands = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let expected_command_count = if matches!(
+                case.expected_outcome,
+                ConversationOutcome::WorktreeTaskCandidate { .. }
+            ) {
+                3
+            } else {
+                2
+            };
+            assert_eq!(
+                commands.len(),
+                expected_command_count,
+                "fixture: {}",
+                case.name
+            );
+            assert!(
+                commands.iter().all(|(payload, outcome)| {
+                    !payload.contains("secret-token")
+                        && outcome
+                            .as_deref()
+                            .is_none_or(|value| !value.contains("secret-token"))
+                }),
+                "fixture: {}",
+                case.name
+            );
+            Ok(())
+        })?;
+        assert_zero_writable_rows(&database_path, &workspace)?;
+        drop(database);
+        assert_sqlite_family_excludes(&database_path, b"secret-token")?;
+    }
     Ok(())
 }
 
@@ -1057,9 +1269,14 @@ async fn post_decode_redaction_fails_closed_when_it_makes_a_verification_executa
         serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
     workspace.submit_client_command(&append)?;
     process_next_client_command(&workspace, &InvalidatingSecretRedactor, Utc::now())?;
+    let output_redacted = post_decode_redaction_cases()
+        .into_iter()
+        .find(|case| case.name == "more_information_needed")
+        .ok_or("more-information redaction fixture is missing")?
+        .output_redacted;
     let services = services_with_conversation(
         tempfile::tempdir()?.path().to_path_buf(),
-        Arc::new(EscapedSecretOutcomeConversation),
+        Arc::new(EscapedSecretOutcomeConversation { output_redacted }),
     );
 
     let result = process_next_orchestration_command(

@@ -256,17 +256,7 @@ impl PlanFixture {
             ByteSurface::new("stdout", output.stdout.clone()),
             ByteSurface::new("stderr", output.stderr.clone()),
         ];
-        let database = self.colay_home.join("state/state.db");
-        for suffix in ["", "-wal", "-shm"] {
-            let path = if suffix.is_empty() {
-                database.clone()
-            } else {
-                let mut path = database.as_os_str().to_os_string();
-                path.push(suffix);
-                PathBuf::from(path)
-            };
-            push_surface(&path, &mut surfaces)?;
-        }
+        collect_file_surfaces(&self.colay_home.join("state"), &mut surfaces)?;
         collect_jsonl_surfaces(&self.root, &mut surfaces)?;
         collect_file_surfaces(&self.colay_home.join("data/workspaces"), &mut surfaces)?;
         Ok(surfaces)
@@ -284,6 +274,17 @@ impl ByteSurface {
             label: label.into(),
             bytes,
         }
+    }
+
+    fn contains(&self, needle: &[u8]) -> bool {
+        self.label
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window == needle)
+            || self
+                .bytes
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 }
 
@@ -335,21 +336,11 @@ fn collect_file_surfaces(path: &Path, surfaces: &mut Vec<ByteSurface>) -> Result
 }
 
 fn surface_contains(surfaces: &[ByteSurface], needle: &[u8]) -> bool {
-    surfaces.iter().any(|surface| {
-        surface
-            .bytes
-            .windows(needle.len())
-            .any(|window| window == needle)
-    })
+    surfaces.iter().any(|surface| surface.contains(needle))
 }
 
 fn assert_surfaces_exclude(surfaces: &[ByteSurface], needle: &[u8]) -> Result<()> {
-    if let Some(surface) = surfaces.iter().find(|surface| {
-        surface
-            .bytes
-            .windows(needle.len())
-            .any(|window| window == needle)
-    }) {
+    if let Some(surface) = surfaces.iter().find(|surface| surface.contains(needle)) {
         bail!("sensitive or over-bound bytes found on {}", surface.label);
     }
     Ok(())
@@ -605,6 +596,32 @@ fn decoded_secret_is_redacted_across_every_provider_and_durable_surface() -> Res
         fixture.assert_no_writable_state()?;
     }
     fixture.assert_matrix_workspace_isolation()?;
+    Ok(())
+}
+
+#[test]
+fn durable_surface_scan_includes_rollback_journal_and_artifact_path_names() -> Result<()> {
+    let canary = b"api_key=secret-token";
+    let journal_detected = {
+        let fixture = PlanFixture::non_git()?;
+        let output = fixture.colay(["--help"])?;
+        let journal = fixture.colay_home.join("state/state.db-journal");
+        fs::create_dir_all(journal.parent().context("journal has no parent")?)?;
+        fs::write(&journal, canary)?;
+        assert_surfaces_exclude(&fixture.scanned_surfaces(&output)?, canary).is_err()
+    };
+    let artifact_path_detected = {
+        let fixture = PlanFixture::non_git()?;
+        let output = fixture.colay(["--help"])?;
+        let artifact = fixture
+            .colay_home
+            .join("data/workspaces/nested/api_key=secret-token.txt");
+        fs::create_dir_all(artifact.parent().context("artifact has no parent")?)?;
+        fs::write(artifact, b"safe artifact contents")?;
+        assert_surfaces_exclude(&fixture.scanned_surfaces(&output)?, canary).is_err()
+    };
+
+    assert_eq!((journal_detected, artifact_path_detected), (true, true));
     Ok(())
 }
 
