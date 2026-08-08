@@ -1,4 +1,6 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use orchestrator_domain::{
@@ -56,6 +58,156 @@ fn scope(provider: ProviderId) -> QuotaScope {
 
 fn runtime() -> Arc<ProcessAdapterRuntime> {
     Arc::new(ProcessAdapterRuntime::default())
+}
+
+fn provider_adapter(provider: ProviderId) -> Box<dyn WorkerAdapter> {
+    match provider {
+        ProviderId::Codex => Box::new(CodexAdapter::new(
+            CodexAdapterConfig {
+                executable: fake_binary(),
+                usage_probe: UsageProbeConfig::ManualOrLedger,
+                usage_scope: scope(provider),
+                allow_untested_read_only: false,
+            },
+            runtime(),
+        )),
+        ProviderId::Claude => Box::new(ClaudeAdapter::new(
+            ClaudeAdapterConfig {
+                executable: fake_binary(),
+                usage_probe: UsageProbeConfig::ManualOrLedger,
+                usage_scope: scope(provider),
+                effort_flag_enabled: true,
+            },
+            runtime(),
+        )),
+        ProviderId::Gemini => Box::new(GeminiAdapter::new(
+            GeminiAdapterConfig {
+                executable: fake_binary(),
+                usage_probe: UsageProbeConfig::ManualOrLedger,
+                usage_scope: scope(provider),
+            },
+            runtime(),
+        )),
+        ProviderId::Agy => Box::new(AgyAdapter::new(
+            AgyAdapterConfig {
+                executable: fake_binary(),
+                usage_probe: UsageProbeConfig::ManualOrLedger,
+                usage_scope: scope(provider),
+            },
+            runtime(),
+        )),
+    }
+}
+
+struct FakeConversationOutput {
+    stdout: Vec<u8>,
+    marker: serde_json::Value,
+}
+
+fn run_fake_conversation(
+    provider: ProviderId,
+    scenario: &str,
+) -> Result<FakeConversationOutput, Box<dyn std::error::Error>> {
+    let fixture = tempfile::tempdir()?;
+    let marker_path = fixture.path().join("conversation-marker.json");
+    let task = serde_json::json!({ "transcript_redacted": scenario }).to_string();
+    let bridge = serde_json::to_vec(&serde_json::json!({
+        "objective": "Conduct a read-only conversation turn",
+        "task": task,
+    }))?;
+    let mut command = Command::new(fake_binary());
+    match provider {
+        ProviderId::Codex => {
+            command.args(["exec", "--json"]);
+        }
+        ProviderId::Claude => {
+            command.args([
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--permission-mode",
+                "plan",
+            ]);
+        }
+        ProviderId::Gemini => {
+            command.args(["--output-format", "stream-json", "--approval-mode", "plan"]);
+        }
+        ProviderId::Agy => {
+            command.args([
+                "--mode",
+                "plan",
+                "--sandbox",
+                "--print",
+                std::str::from_utf8(&bridge)?,
+            ]);
+        }
+    }
+    let mut child = command
+        .env("COLAY_TEST_FAKE_CONVERSATION_MARKER", &marker_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("fake provider stdin was unavailable")?
+        .write_all(&bridge)?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{provider} fake provider failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let marker = serde_json::from_slice(&std::fs::read(marker_path)?)?;
+    Ok(FakeConversationOutput {
+        stdout: output.stdout,
+        marker,
+    })
+}
+
+async fn normalized_fake_conversation_events(
+    provider: ProviderId,
+    stdout: &[u8],
+) -> Result<Vec<WorkerEvent>, ProviderError> {
+    let adapter = provider_adapter(provider);
+    let mut events = Vec::new();
+    for (index, line) in stdout
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        events.push(
+            adapter
+                .parse_event(orchestrator_domain::RawEvent {
+                    channel: orchestrator_domain::RawEventChannel::Stdout,
+                    sequence: u64::try_from(index).unwrap_or(u64::MAX),
+                    bytes: line.to_vec(),
+                    received_at: chrono::Utc::now(),
+                })
+                .await?,
+        );
+    }
+    Ok(events)
+}
+
+fn assistant_text(events: &[WorkerEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkerEvent::Message { text } | WorkerEvent::MessageDelta { text } => Some(text),
+            _ => None,
+        })
+        .fold(String::new(), |mut collected, text| {
+            collected.push_str(text);
+            collected
+        })
+}
+
+fn assert_scenario_marker(marker: &serde_json::Value, provider: ProviderId, scenario: &str) {
+    assert_eq!(marker["invocation_count"].as_u64(), Some(1));
+    assert_eq!(marker["provider"].as_str(), Some(provider.as_str()));
+    assert_eq!(marker["scenario"].as_str(), Some(scenario));
 }
 
 #[cfg(not(windows))]
@@ -330,6 +482,109 @@ async fn fake_agy_without_prompt_flags_reads_the_conversation_prompt_from_stdin(
     assert_eq!(outcome["outcome"].as_str(), Some("answer_complete"));
     assert!(completed);
     assert_eq!(adapter.wait(&handle).await?.exit_code, Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn decoded_secret_scenario_preserves_unicode_escapes_through_provider_wire()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ESCAPED_CANARY: &str =
+        r"api\u005fkey=\u0073\u0065\u0063\u0072\u0065\u0074\u002d\u0074\u006f\u006b\u0065\u006e";
+    for provider in [
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::Agy,
+    ] {
+        let output = run_fake_conversation(provider, "scenario:decoded-secret")?;
+        let events = normalized_fake_conversation_events(provider, &output.stdout).await?;
+        let assistant = assistant_text(&events);
+        assert!(
+            assistant.contains(ESCAPED_CANARY),
+            "{provider} selected ordinary conversation success: {assistant}"
+        );
+        assert!(!assistant.contains("api_key=secret-token"));
+        let outcome: serde_json::Value = serde_json::from_str(assistant.trim())?;
+        assert_eq!(
+            outcome["response_redacted"].as_str(),
+            Some("api_key=secret-token")
+        );
+        assert_scenario_marker(&output.marker, provider, "decoded-secret");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn byte_overflow_scenario_crosses_process_frame_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    const PROCESS_FRAME_BYTES: usize = 1024 * 1024;
+    for provider in [
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::Agy,
+    ] {
+        let output = run_fake_conversation(provider, "scenario:byte-overflow")?;
+        let longest_frame = output
+            .stdout
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(|line| line.strip_suffix(b"\n").unwrap_or(line).len())
+            .max()
+            .unwrap_or_default();
+        assert!(
+            longest_frame > PROCESS_FRAME_BYTES,
+            "{provider} selected ordinary conversation success with a {longest_frame}-byte frame"
+        );
+        let events = normalized_fake_conversation_events(provider, &output.stdout).await?;
+        let outcome: serde_json::Value = serde_json::from_str(assistant_text(&events).trim())?;
+        assert!(
+            outcome["response_redacted"]
+                .as_str()
+                .is_some_and(|response| response.ends_with("byte-overflow-sentinel"))
+        );
+        assert_scenario_marker(&output.marker, provider, "byte-overflow");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn event_overflow_scenario_emits_more_than_4096_normalized_events_below_byte_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    const PROCESS_BYTE_LIMIT: usize = 1024 * 1024;
+    const EVENT_LIMIT: usize = 4_096;
+    for provider in [
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Gemini,
+        ProviderId::Agy,
+    ] {
+        let output = run_fake_conversation(provider, "scenario:event-overflow")?;
+        assert!(
+            output.stdout.len() < PROCESS_BYTE_LIMIT,
+            "{provider} emitted {} bytes",
+            output.stdout.len()
+        );
+        let events = normalized_fake_conversation_events(provider, &output.stdout).await?;
+        let assistant_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    WorkerEvent::Message { .. } | WorkerEvent::MessageDelta { .. }
+                )
+            })
+            .count();
+        assert!(
+            assistant_events > EVENT_LIMIT,
+            "{provider} selected ordinary conversation success with {assistant_events} assistant events"
+        );
+        let outcome: serde_json::Value = serde_json::from_str(assistant_text(&events).trim())?;
+        assert_eq!(
+            outcome["response_redacted"].as_str(),
+            Some("event overflow complete")
+        );
+        assert_scenario_marker(&output.marker, provider, "event-overflow");
+    }
     Ok(())
 }
 
