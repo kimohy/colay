@@ -56,6 +56,16 @@ struct FakeConversation {
 
 struct SecretCommandEvidenceConversation;
 
+struct EscapedSecretOutcomeConversation;
+
+struct InvalidatingSecretRedactor;
+
+impl MessageRedactor for InvalidatingSecretRedactor {
+    fn redact(&self, value: &str) -> String {
+        value.replace("secret-token", " ")
+    }
+}
+
 #[derive(Clone)]
 enum FailureFixture {
     Error(ConversationFailure),
@@ -251,6 +261,37 @@ impl ConversationOrchestrator for FakeConversation {
             exit: ConversationExit::Succeeded,
             output_redacted: serde_json::to_vec(&self.outcome).unwrap_or_default(),
             evidence_redacted: "fake conversation".to_owned(),
+        })
+    }
+}
+
+#[async_trait]
+impl ConversationOrchestrator for EscapedSecretOutcomeConversation {
+    async fn converse(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<ConversationResponse, ConversationFailure> {
+        let escaped_canary =
+            r"\u0073\u0065\u0063\u0072\u0065\u0074\u002d\u0074\u006f\u006b\u0065\u006e";
+        let output_redacted = format!(
+            r#"{{"outcome":"more_information_needed","response_redacted":"response-{escaped_canary}","requirements":{{"objective":"objective-{escaped_canary}","in_scope":["in-scope-{escaped_canary}"],"out_of_scope":["out-of-scope-{escaped_canary}"],"constraints":["constraint-{escaped_canary}"],"acceptance_criteria":["acceptance-{escaped_canary}"],"verification_plan":[{{"executable":"cargo-{escaped_canary}","args":["test-{escaped_canary}","--workspace-{escaped_canary}"]}}],"risks":["risk-{escaped_canary}"],"open_questions":["question-{escaped_canary}"]}}}}"#
+        )
+        .into_bytes();
+        assert!(
+            !output_redacted
+                .windows(b"secret-token".len())
+                .any(|window| window == b"secret-token")
+        );
+        Ok(ConversationResponse {
+            schema_version: orchestrator_domain::SchemaVersion::v1(),
+            attempt_id: request.attempt_id,
+            session_id: request.session_id,
+            source_message_id: request.source_message_id,
+            provider: request.provider,
+            sandbox: SandboxMode::ReadOnly,
+            exit: ConversationExit::Succeeded,
+            output_redacted,
+            evidence_redacted: "fixture evidence secret-token".to_owned(),
         })
     }
 }
@@ -937,6 +978,118 @@ async fn successful_command_evidence_is_redacted_and_bounded_before_persistence(
         Some(ConversationOutcome::AnswerComplete {
             response_redacted: "safe answer".to_owned(),
         })
+    );
+    assert_zero_writable_rows(&database_path, &workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn decoded_outcome_strings_are_redacted_before_persistence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    let append = append_command(session_id, "inspect safely");
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    workspace.submit_client_command(&append)?;
+    process_next_client_command(&workspace, &SecretRedactor, Utc::now())?;
+    let services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(EscapedSecretOutcomeConversation),
+    );
+
+    process_next_orchestration_command(&workspace, &services, &SecretRedactor, Utc::now()).await?;
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    let attempt = workspace
+        .load_conversation_attempt(attempt_id)?
+        .ok_or("conversation attempt is missing")?;
+    let attempt_json = serde_json::to_string(
+        attempt
+            .outcome
+            .as_ref()
+            .ok_or("conversation outcome is missing")?,
+    )?;
+    assert!(!attempt_json.contains("secret-token"));
+    assert!(attempt_json.contains("[REDACTED]"));
+
+    let messages = workspace.messages_after(session_id, 0, 10)?;
+    let assistant = messages
+        .into_iter()
+        .map(|(_, message)| message)
+        .find(|message| message.role == orchestrator_domain::MessageRole::Orchestrator)
+        .ok_or("assistant message is missing")?;
+    assert!(!assistant.content_redacted.contains("secret-token"));
+    assert!(assistant.content_redacted.contains("[REDACTED]"));
+
+    let revision = workspace
+        .current_requirement_revision(session_id)?
+        .ok_or("requirement revision is missing")?;
+    let revision_json = serde_json::to_string(&revision)?;
+    assert!(!revision_json.contains("secret-token"));
+    assert!(revision_json.contains("[REDACTED]"));
+
+    let conversation_command = workspace
+        .load_client_command(ClientCommandId::from_uuid(source_message_id.into_uuid()))?
+        .ok_or("conversation command is missing")?;
+    let command_json = serde_json::to_string(&conversation_command)?;
+    assert!(!command_json.contains("secret-token"));
+
+    let database_bytes = std::fs::read(&database_path)?;
+    assert!(
+        !database_bytes
+            .windows(b"secret-token".len())
+            .any(|window| window == b"secret-token")
+    );
+    assert_zero_writable_rows(&database_path, &workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_decode_redaction_fails_closed_when_it_makes_a_verification_executable_unsafe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, workspace_id, database_path) = database()?;
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    let append = append_command(session_id, "inspect safely");
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    workspace.submit_client_command(&append)?;
+    process_next_client_command(&workspace, &InvalidatingSecretRedactor, Utc::now())?;
+    let services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(EscapedSecretOutcomeConversation),
+    );
+
+    let result = process_next_orchestration_command(
+        &workspace,
+        &services,
+        &InvalidatingSecretRedactor,
+        Utc::now(),
+    )
+    .await?;
+    assert!(matches!(
+        result,
+        Some(orchestrator_daemon::CommandProcessingResult::Failed(_))
+    ));
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    let attempt = workspace
+        .load_conversation_attempt(attempt_id)?
+        .ok_or("conversation attempt is missing")?;
+    assert_eq!(attempt.status, ConversationAttemptStatus::Failed);
+    let attempt_json = serde_json::to_string(
+        attempt
+            .outcome
+            .as_ref()
+            .ok_or("conversation outcome is missing")?,
+    )?;
+    assert!(!attempt_json.contains("secret-token"));
+    assert!(
+        workspace
+            .current_requirement_revision(session_id)?
+            .is_none()
     );
     assert_zero_writable_rows(&database_path, &workspace)?;
     Ok(())
