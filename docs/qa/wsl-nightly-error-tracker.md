@@ -1,5 +1,66 @@
 # Colay WSL/Windows Nightly Error Tracker
 
+## 2026-08-08 PR #24 merge and deployed-nightly QA
+
+- PR #24 merged reviewed head `5316650055ec3253b7572a4c38d2976052d8d4de` as
+  `106261ca929de08c697c15406fce33775e3533c5`. Exact-head push and pull-request
+  [CI runs 31241341548](https://github.com/kimohy/colay/actions/runs/31241341548) and
+  [31241343918](https://github.com/kimohy/colay/actions/runs/31241343918) passed all six Ubuntu,
+  macOS, and Windows jobs. The exact-merge [CI run 31241927903](https://github.com/kimohy/colay/actions/runs/31241927903)
+  also passed all three platforms.
+- [Release run 31241927889](https://github.com/kimohy/colay/actions/runs/31241927889) passed
+  classification, all three native builds, immutable validation, Linux/macOS/Windows smoke tests,
+  SLSA attestation, and npm publication. The expected nightly policy skipped `publish-github`.
+  Retained artifact `9017419788` is `release-0.1.1-nightly.20260808.106261c`; its manifest fixes
+  source commit `106261ca929de08c697c15406fce33775e3533c5`, state schema 17, and config schema 4.
+  Linux archive SHA-256 is `17f0f8ef01f98d76ff7f6e51565f310649d1a4c97936aea4d62d48e01857449f`.
+- npm `@kimohy/colay@nightly` converged to exact version
+  `0.1.1-nightly.20260808.106261c`. Root integrity is
+  `sha512-Pg4Afrz3dCinZHjvw/W8qfuqeaJbmtTS7hamea08WIecGbe/Qwd3LFo2EpiRO05OgVxDcoPTX7hQbaZSa0J0+Q==`;
+  Linux integrity is
+  `sha512-cKvjn3QPlbYbOft86anR+swOHxOpMPJkvnnhn4ngIhCY+377L/JwMnZVyuPDreF3NK7gKklEvi+v5hcY+3+Trg==`.
+  All four package versions, integrity values, and the nine attested release subjects matched the
+  immutable release bundle.
+- WSL 2 Ubuntu 24.04 clean-installed the exact npm nightly under Node `22.23.1` and npm `10.9.8`
+  into the retained root
+  `/home/kimohy/.cache/colay-pr24-106261c-20260808T075818Z-a60cc7`. The wrapper and selected native
+  binary both reported the exact nightly; the Linux x86-64 native SHA-256 is
+  `c0c476b7939cd6ebe2a704437c2c7be8573fabc540bdabdc602ef6c16cc2ab10`. The exact-merge fake
+  provider SHA-256 is `47c874c059d6a24a6d00f03fef24cbc1c8660a3501b139aa9e055639628ad5c4`.
+  The user's existing global `0.1.1-nightly.20260803.28d0d5f` installation remained identical at
+  all four checkpoints: wrapper SHA-256 `c9d7731a1decfb4661a40a54b5ae4c4d2d32ee61a6f39f90c3c29c93f52cfed2`
+  and package-tree SHA-256 `be9c5841288e44e383d75fc64c99fc1d040d641d1362bbb4babe82e5e2202854`.
+- The deployed fake matrix passed all 12 exact, no-retry rows: four providers crossed
+  `decoded-secret`, `byte-overflow`, and `event-overflow` once each in 12 distinct empty non-Git
+  workspaces and one user-global database. Every marker contained only provider, scenario, and
+  `invocation_count=1`. Schema and migrations were 17, integrity was `ok`, foreign-key violations
+  were zero, all seven writable task/worktree/lease tables were empty, and no live lease, daemon,
+  process, or socket remained after graceful stop.
+- All four decoded-secret rows succeeded with exact durable and structured CLI
+  `answer_complete` output containing `api_key=[REDACTED]`. The positive control occurred 16 times
+  across the deliberately exhaustive path/content scan. The raw canary occurred zero times in CLI
+  stdout/stderr, every regular file under home/workspaces/evidence/temp/control, exact SQLite
+  state and sidecars, command evidence, JSONL, and paths.
+- All eight overflow rows exited nonzero without timeout, persisted `failed` and terminal
+  `needs_attention` rather than `cancelled`, and retained the exact crashed-lifecycle, truncation,
+  and provider-specific protocol-loss evidence. Maximum retained evidence was 774 bytes, below the
+  16 KiB bound. Both overflow sentinels occurred zero times in the same exhaustive scan.
+- Real compatibility and doctor made zero inference requests and selected distinct native ext4
+  executables under `/home`: Codex `0.146.0`, Claude `2.1.220`, Gemini `0.53.1`, and
+  Agy/Antigravity `1.1.11`. One bounded plan-only turn was sent to each provider with no retry.
+  Codex returned the exact success token in 30.350 seconds and Agy returned it in 25.849 seconds.
+  Claude produced the exact durable quota/billing remediation in 11.563 seconds; Gemini produced
+  the exact durable authentication remediation in 16.632 seconds. Those two external constraints
+  were kept separate from product failures.
+- Final harness status was `BLOCKED_EXTERNAL` with logical exit 2, `failures=[]`, and summary
+  `/home/kimohy/.cache/colay-pr24-106261c-20260808T075818Z-a60cc7/summary.json`. Both fake and real
+  databases ended at schema 17 with integrity `ok`, zero foreign-key violations, writable rows,
+  live leases, processes, and sockets. No workspace mutation or global-installation change occurred.
+  Two earlier retained roots exposed QA-runner-only fail-closed assertion defects before any real
+  provider turn; both were corrected with adversarial regression tests rather than reusing a root.
+- These deployed gates close `WSL-035` and `WSL-036`. `WSL-040` remains an external WSL
+  systemd/Docker cold-start issue and is not reclassified as a Colay defect.
+
 ## 2026-08-07 PR #22 merge and deployed-nightly QA
 
 - PR #22 merged reviewed head `e002cc285ce092acac198041056253362a58c5ad` as
@@ -80,7 +141,8 @@
 
 - Severity: medium (host environment latency; not a Colay release blocker)
 - Status: open external host remediation
-- Observed during: `0.1.1-nightly.20260807.a090a92` preflight and clean-install QA
+- Observed during: `0.1.1-nightly.20260807.a090a92` and
+  `0.1.1-nightly.20260808.106261c` preflight and clean-install QA
 
 The latency reproduced before Node, Colay, SQLite, or a provider started. A cold `/bin/true` took
 21.147 seconds, the first read-only Bash entry exceeded 24 seconds, isolated root creation took
@@ -97,6 +159,9 @@ causal product change is considered.
 The 2026-08-08 provider-boundary source matrix does not change this classification. It exercised
 isolated native test processes and durable state, not the degraded WSL systemd/Docker cold-start
 path. No Colay correction or closure is claimed for `WSL-040`; it remains external host evidence.
+The final deployed-nightly run reproduced the same systemd user-session warning before the product
+process, while independent WSL startup receipts remained roughly 20-33 seconds. Product turns,
+daemon lifecycle, SQLite integrity, and cleanup then completed normally, so this remains external.
 
 ## 2026-08-07 PR #21 merge and deployed-nightly QA
 
@@ -689,9 +754,9 @@ deployable production-shape fake regression.
 ## WSL-035: paced provider streams can exceed semantic and audit bounds
 
 - Severity: high (availability and durable-state growth)
-- Status: source-local CLI boundary matrix GREEN; targeted deployed verification pending
+- Status: fixed (PR #24 exact merge CI and deployed four-provider byte/event matrices GREEN)
 - Found by: independent stream/redaction security review
-- Deployed smoke nightly: `0.1.1-nightly.20260807.a090a92` (targeted gate pending)
+- Verified nightly: `0.1.1-nightly.20260808.106261c`
 
 The process runner bounded retained stdout and stderr, but continued emitting every complete frame
 while draining the child pipes. A provider emitting small paced frames could avoid channel lag and
@@ -740,15 +805,23 @@ most 16 KiB of evidence, persisted no success or over-bound sentinel, and left t
 worktrees, coordinator leases, and worker leases empty. Each four-row matrix used one user-global
 database with four distinct attempt workspace IDs; `integrity_check` was `ok` and foreign-key checks
 were empty. `cargo test -p colay --test global_plan_first --all-features` passed 9/9 locally, with
-the focused conversation, process-runtime, and provider-shape targets also GREEN. This is source
-evidence only; the deployed fake-provider boundary-stress gate above remains pending.
+the focused conversation, process-runtime, and provider-shape targets also GREEN.
+
+The exact PR #24 nightly then closed the deployed gate. In one clean-installed user-global state,
+Codex, Claude, Gemini, and Agy each crossed both byte and event boundaries exactly once. All eight
+rows failed without timeout, persisted `failed` plus terminal `needs_attention`, retained exact
+crashed-lifecycle, truncation, and provider-specific protocol-loss diagnostics, and never became
+`cancelled`. Maximum evidence was 774 bytes, both sentinels were absent from every scanned path and
+regular file, and all task/worktree/lease counts, active daemons, residual processes, and sockets
+were zero. Schema 17, migration sequence 1-17, integrity `ok`, and zero foreign-key violations
+completed the deployed closure evidence.
 
 ## WSL-036: split or decoded provider credentials can leave a suffix in evidence
 
 - Severity: high (credential redaction)
-- Status: source-local post-decode CLI matrix GREEN; deployed redaction-canary verification pending
+- Status: fixed (PR #24 exact merge CI and deployed four-provider decoded canary GREEN)
 - Found by: independent stream/redaction security review
-- Deployed smoke nightly: `0.1.1-nightly.20260807.a090a92` (targeted gate pending)
+- Verified nightly: `0.1.1-nightly.20260808.106261c`
 
 Frame-level redaction could replace a credential prefix in one frame while leaving an unrecognized
 suffix in the next delta. Reassembling `[REDACTED]` plus that suffix no longer contained the original
@@ -798,8 +871,15 @@ control `api_key=[REDACTED]`. An independently literal byte scan found no
 `api_key=secret-token` in captured stdout or stderr, the `state.db`/WAL/SHM family, recursive JSONL,
 or workspace artifact data. Every row retained `integrity_check = ok`, no foreign-key violations,
 and zero task, task-attempt, worktree, or lease rows; the database contained four distinct attempt
-workspace IDs. The full local CLI target passed 9/9. This does not satisfy the deployed-nightly
-canary gate, which remains pending.
+workspace IDs. The full local CLI target passed 9/9.
+
+The exact PR #24 nightly closed the deployed canary gate. Four clean-installed rows each invoked
+one selected provider, succeeded with exact durable and structured CLI `answer_complete` output,
+and retained `api_key=[REDACTED]`. The raw canary was absent from CLI stdout/stderr, the complete
+SQLite family, every regular home/workspace/evidence/temp/control and command-evidence file,
+JSONL, and all scanned paths. The positive control occurred 16 times, proving that the negative
+scan did not merely omit product output. Schema 17, integrity `ok`, zero foreign-key violations,
+empty writable tables and leases, and clean daemon shutdown completed the deployed closure.
 
 ## WSL-039: shipped plan-only and state-location guidance contradicts the implementation
 
@@ -1876,7 +1956,7 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 ## Tracking metadata
 
 - 최초 작성: 2026-07-22 (Asia/Seoul)
-- 마지막 갱신: 2026-08-07
+- 마지막 갱신: 2026-08-08
 - 대상 환경: WSL 2 Ubuntu 24.04 x86-64, Windows 11 Home 10.0.26100 x86-64
 - 확인한 nightly: `0.1.1-nightly.20260722.f693062`, `0.1.1-nightly.20260723.7a977cf`,
   `0.1.1-nightly.20260726.7a45d97`, `0.1.1-nightly.20260726.209e6d2`,
@@ -1884,7 +1964,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
   `0.1.1-nightly.20260726.b2daed0`, `0.1.1-nightly.20260726.46acc8d`,
   `0.1.1-nightly.20260801.3f4e2f7`, `0.1.1-nightly.20260802.8f2654a`,
   `0.1.1-nightly.20260803.95cf4d3`, `0.1.1-nightly.20260807.d3ad1af`,
-  `0.1.1-nightly.20260807.10acacc`
+  `0.1.1-nightly.20260807.10acacc`, `0.1.1-nightly.20260807.a090a92`,
+  `0.1.1-nightly.20260808.106261c`
 - Windows PATH 설치본: Cargo 설치 `colay 0.1.0` (nightly와 불일치)
 - 기본 원칙: 자동화 테스트와 CI는 fake provider만 사용한다. 실제 provider inference는 사용자가
   명시적으로 승인한 격리 수동 QA에서만 제한적으로 호출한다.
@@ -1898,8 +1979,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-039` | medium | fixed (PR #22 exact merge CI and deployed help/behavior GREEN) | shipped docs describe plan-only as static and state as repository-local |
 | `WSL-038` | high | fixed (CI rollback regression + deployed schema/integrity smoke GREEN) | late evidence conflict can leave an unfinished attempt on a terminal failed task |
 | `WSL-037` | high | fixed (PR #22 exact merge CI and deployed read-only command GREEN) | planner rejects verified read-only provider commands before approval |
-| `WSL-036` | high | source-local post-decode CLI matrix GREEN; deployed redaction canary pending | split or decoded provider credentials can leave a suffix in evidence |
-| `WSL-035` | high | source-local CLI boundary matrix GREEN; targeted deployed verification pending | paced provider streams can exceed semantic-memory and append-only audit bounds |
+| `WSL-036` | high | fixed (PR #24 exact merge CI + deployed four-provider decoded canary GREEN) | split or decoded provider credentials can leave a suffix in evidence |
+| `WSL-035` | high | fixed (PR #24 exact merge CI + deployed byte/event boundary matrices GREEN) | paced provider streams can exceed semantic-memory and append-only audit bounds |
 | `WSL-034` | high | fixed (PR #22 exact merge CI and deployed fake QA GREEN) | Gemini user echo and assistant delta chunks are newline-joined as complete messages |
 | `WSL-033` | medium | fixed (PR #22 exact merge CI and deployed provider QA GREEN) | Claude partial stream deltas are treated as complete semantic messages |
 | `WSL-032` | low | fixed (exact merge CI and deployed fake Agy GREEN) | an older Agy planner integration still requires the removed prompt-valued `--print` flag |
@@ -4258,6 +4339,20 @@ error: I/O operation failed for <repository>/.colay/config.toml: No such file or
     `0.1.1-nightly.20260803.95cf4d3`).
 
 ## Update log
+
+### 2026-08-08
+
+- PR #24 exact-head and merge CI passed on Ubuntu, macOS, and Windows. Release run
+  `31241927889`, artifact `9017419788`, npm publication, integrity, and SLSA provenance all matched
+  merge `106261ca929de08c697c15406fce33775e3533c5` and nightly
+  `0.1.1-nightly.20260808.106261c`.
+- A fresh WSL install ran the exact 12-row fake boundary/redaction matrix and exactly one plan-only
+  turn for Codex, Claude, Gemini, and Agy. Fake QA passed completely; Codex and Agy succeeded,
+  Claude was strictly blocked by quota/billing, and Gemini was strictly blocked by authentication.
+  Final status was `BLOCKED_EXTERNAL`/logical exit 2 with zero product failures, retries, timeouts,
+  leaks, writable task rows, workspace mutations, or global-install changes.
+- Deployed canary and boundary evidence closes `WSL-035` and `WSL-036`. The recurring WSL
+  systemd/Docker cold-start warning remains `WSL-040` and remains external to Colay.
 
 ### 2026-08-07
 
