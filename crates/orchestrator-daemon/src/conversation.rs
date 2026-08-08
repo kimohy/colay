@@ -7,8 +7,8 @@ use orchestrator_domain::{
     SandboxMode, SchemaVersion, SessionId, TaskEvent, VerificationCommand,
 };
 use orchestrator_engine::{
-    CONVERSATION_MAX_EVIDENCE_BYTES, CollectedConversationResponse, ConversationFailure,
-    ConversationFailureKind, ConversationOrchestrator, ConversationRequest,
+    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, CollectedConversationResponse,
+    ConversationFailure, ConversationFailureKind, ConversationOrchestrator, ConversationRequest,
     collect_conversation_response_with_evidence, diagnose_conversation_failure,
 };
 use orchestrator_state::{
@@ -173,6 +173,26 @@ fn redact_collected_outcome(
     })
 }
 
+fn validate_canonical_outcome_bound(
+    redactor: &dyn MessageRedactor,
+    outcome: &ConversationOutcome,
+    evidence_redacted: &str,
+) -> Result<(), ConversationFailure> {
+    let canonical_output =
+        serde_json::to_vec(outcome).map_err(|error| ConversationFailure::MalformedOutput {
+            reason: format!("post-redaction outcome serialization failed: {error}"),
+            evidence_redacted: bounded_redacted(redactor, evidence_redacted),
+        })?;
+    if canonical_output.len() > CONVERSATION_MAX_OUTPUT_BYTES {
+        return Err(ConversationFailure::OutputTooLarge {
+            limit: CONVERSATION_MAX_OUTPUT_BYTES,
+            observed: canonical_output.len(),
+            evidence_redacted: bounded_redacted(redactor, evidence_redacted),
+        });
+    }
+    Ok(())
+}
+
 fn redact_conversation_outcome(
     redactor: &dyn MessageRedactor,
     outcome: ConversationOutcome,
@@ -253,15 +273,22 @@ fn finalize_conversation_turn(
     collected: Result<CollectedConversationResponse, ConversationFailure>,
     now: DateTime<Utc>,
 ) -> Result<String, ConversationCommandError> {
+    let collected = collected.and_then(|collected| {
+        let outcome = apply_provider_fallback_notice(collected.outcome, provider_selection);
+        validate_canonical_outcome_bound(redactor, &outcome, &collected.evidence_redacted)?;
+        Ok(CollectedConversationResponse {
+            outcome,
+            evidence_redacted: collected.evidence_redacted,
+        })
+    });
     match collected {
         Ok(collected) => {
-            let outcome = apply_provider_fallback_notice(collected.outcome, provider_selection);
             let evidence_redacted = bounded_redacted(redactor, &collected.evidence_redacted);
             let evidence_redacted =
                 (!evidence_redacted.trim().is_empty()).then_some(evidence_redacted.as_str());
             database.finish_conversation_attempt_with_evidence(
                 request.attempt_id,
-                &outcome,
+                &collected.outcome,
                 evidence_redacted,
                 now,
             )?;
@@ -270,7 +297,7 @@ fn finalize_conversation_turn(
                 command,
                 request.session_id,
                 request.source_message_id,
-                &outcome,
+                &collected.outcome,
             )?;
             Ok(format!("conversation:{}", request.attempt_id))
         }

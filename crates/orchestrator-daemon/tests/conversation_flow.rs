@@ -20,9 +20,9 @@ use orchestrator_domain::{
     RequirementSnapshot, SandboxMode, SessionId, SessionState, VerificationCommand,
 };
 use orchestrator_engine::{
-    CONVERSATION_MAX_EVIDENCE_BYTES, ConversationExit, ConversationFailure,
-    ConversationOrchestrator, ConversationRequest, ConversationResponse, PlannerExit,
-    PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
+    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, ConversationExit,
+    ConversationFailure, ConversationOrchestrator, ConversationRequest, ConversationResponse,
+    PlannerExit, PlannerFailure, PlannerRequest, PlannerResponse, TaskPlanner,
 };
 use orchestrator_state::{
     ConversationAttemptStatus, Database, GraphRevisionStatus, NewConversationAttempt,
@@ -71,6 +71,14 @@ struct InvalidatingSecretRedactor;
 impl MessageRedactor for InvalidatingSecretRedactor {
     fn redact(&self, value: &str) -> String {
         value.replace("secret-token", " ")
+    }
+}
+
+struct ExpandingRedactor;
+
+impl MessageRedactor for ExpandingRedactor {
+    fn redact(&self, value: &str) -> String {
+        value.replace('z', "[REDACTED]")
     }
 }
 
@@ -1308,6 +1316,124 @@ async fn post_decode_redaction_fails_closed_when_it_makes_a_verification_executa
             .current_requirement_revision(session_id)?
             .is_none()
     );
+    assert_zero_writable_rows(&database_path, &workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_decode_redaction_fails_closed_when_canonical_outcome_exceeds_output_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ESCAPED_CHARACTER_COUNT: usize = 110_000;
+
+    let output_redacted = format!(
+        r#"{{"outcome":"answer_complete","response_redacted":"{}"}}"#,
+        r"\u007a".repeat(ESCAPED_CHARACTER_COUNT)
+    )
+    .into_bytes();
+    assert!(output_redacted.len() <= CONVERSATION_MAX_OUTPUT_BYTES);
+    let expanded_outcome = ConversationOutcome::AnswerComplete {
+        response_redacted: "[REDACTED]".repeat(ESCAPED_CHARACTER_COUNT),
+    };
+    assert!(serde_json::to_vec(&expanded_outcome)?.len() > CONVERSATION_MAX_OUTPUT_BYTES);
+
+    let (database, workspace_id, database_path) = database()?;
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    let append = append_command(session_id, "inspect safely");
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    workspace.submit_client_command(&append)?;
+    process_next_client_command(&workspace, &ExpandingRedactor, Utc::now())?;
+    let services = services_with_conversation(
+        tempfile::tempdir()?.path().to_path_buf(),
+        Arc::new(EscapedSecretOutcomeConversation { output_redacted }),
+    );
+
+    let result =
+        process_next_orchestration_command(&workspace, &services, &ExpandingRedactor, Utc::now())
+            .await?;
+    assert!(matches!(
+        result,
+        Some(orchestrator_daemon::CommandProcessingResult::Failed(_))
+    ));
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    let attempt = workspace
+        .load_conversation_attempt(attempt_id)?
+        .ok_or("conversation attempt is missing")?;
+    assert_eq!(attempt.status, ConversationAttemptStatus::Failed);
+    let outcome = attempt
+        .outcome
+        .as_ref()
+        .ok_or("conversation failure outcome is missing")?;
+    assert!(serde_json::to_vec(outcome)?.len() <= CONVERSATION_MAX_OUTPUT_BYTES);
+    assert!(matches!(
+        outcome,
+        ConversationOutcome::NeedsAttention { .. }
+    ));
+    assert!(
+        workspace
+            .current_requirement_revision(session_id)?
+            .is_none()
+    );
+    assert_zero_writable_rows(&database_path, &workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_fallback_notice_cannot_expand_persisted_outcome_past_output_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let empty_outcome = ConversationOutcome::AnswerComplete {
+        response_redacted: String::new(),
+    };
+    let empty_output_len = serde_json::to_vec(&empty_outcome)?.len();
+    let outcome = ConversationOutcome::AnswerComplete {
+        response_redacted: "a".repeat(CONVERSATION_MAX_OUTPUT_BYTES - empty_output_len),
+    };
+    assert_eq!(
+        serde_json::to_vec(&outcome)?.len(),
+        CONVERSATION_MAX_OUTPUT_BYTES
+    );
+
+    let (database, workspace_id, database_path) = database()?;
+    let workspace = database.workspace(workspace_id);
+    let session_id = seed_session(&database_path, &workspace)?;
+    let append = append_command_with_provider(session_id, "inspect safely", Some(ProviderId::Agy));
+    let source_message_id =
+        serde_json::from_value::<AppendMessageCommandPayload>(append.payload.clone())?.message_id;
+    workspace.submit_client_command(&append)?;
+    process_next_client_command(&workspace, &IdentityRedactor, Utc::now())?;
+    let services = services(tempfile::tempdir()?.path().to_path_buf(), outcome);
+
+    let result =
+        process_next_orchestration_command(&workspace, &services, &IdentityRedactor, Utc::now())
+            .await?;
+    assert!(matches!(
+        result,
+        Some(orchestrator_daemon::CommandProcessingResult::Failed(_))
+    ));
+
+    let attempt_id = ConversationAttemptId::from_uuid(source_message_id.into_uuid());
+    let attempt = workspace
+        .load_conversation_attempt(attempt_id)?
+        .ok_or("conversation attempt is missing")?;
+    assert_eq!(attempt.status, ConversationAttemptStatus::Failed);
+    let persisted_outcome = attempt
+        .outcome
+        .as_ref()
+        .ok_or("conversation failure outcome is missing")?;
+    assert!(serde_json::to_vec(persisted_outcome)?.len() <= CONVERSATION_MAX_OUTPUT_BYTES);
+    let ConversationOutcome::NeedsAttention {
+        response_redacted,
+        evidence_redacted,
+    } = persisted_outcome
+    else {
+        return Err("oversized final outcome did not fail closed".into());
+    };
+    assert!(response_redacted.starts_with(
+        "Requested provider agy is unavailable; using codex for this read-only turn.\n"
+    ));
+    assert!(evidence_redacted.len() <= CONVERSATION_MAX_EVIDENCE_BYTES);
     assert_zero_writable_rows(&database_path, &workspace)?;
     Ok(())
 }
