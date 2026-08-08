@@ -35,6 +35,35 @@ pub enum FakeRuntimeScenario {
     GeminiDetailedErrorThenErrorResult,
     GeminiWarningBetweenDeltas,
     GeminiCompleteMessage,
+    DecodedSecret,
+    ByteOverflow,
+    EventOverflow,
+}
+
+impl FakeRuntimeScenario {
+    const fn marker_name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::QuotaExceeded => "quota",
+            Self::TerminalError => "terminal-error",
+            Self::MalformedOutput => "malformed",
+            Self::UnknownEvent => "unknown",
+            Self::ProcessCrash => "crash",
+            Self::DiagnosticNoise => "diagnostic-noise",
+            Self::Timeout => "timeout",
+            Self::SecretOutput => "secret",
+            Self::ConversationResponseAlias => "conversation-response-alias",
+            Self::ReadOnlyCommand => "read-only-command",
+            Self::ReadOnlyCommandWithFileChange => "read-only-command-file-change",
+            Self::AmbiguousScalarPrefix => "ambiguous-scalar-prefix",
+            Self::GeminiDetailedErrorThenErrorResult => "gemini-detailed-error-then-error-result",
+            Self::GeminiWarningBetweenDeltas => "gemini-warning-between-deltas",
+            Self::GeminiCompleteMessage => "gemini-complete-message",
+            Self::DecodedSecret => "decoded-secret",
+            Self::ByteOverflow => "byte-overflow",
+            Self::EventOverflow => "event-overflow",
+        }
+    }
 }
 
 fn is_conversation_scenario(scenario: FakeRuntimeScenario) -> bool {
@@ -46,6 +75,9 @@ fn is_conversation_scenario(scenario: FakeRuntimeScenario) -> bool {
             | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
             | FakeRuntimeScenario::AmbiguousScalarPrefix
             | FakeRuntimeScenario::GeminiWarningBetweenDeltas
+            | FakeRuntimeScenario::DecodedSecret
+            | FakeRuntimeScenario::ByteOverflow
+            | FakeRuntimeScenario::EventOverflow
     )
 }
 
@@ -446,7 +478,10 @@ fn scenario_lines(provider: ProviderId, scenario: FakeRuntimeScenario) -> Vec<Ve
             | FakeRuntimeScenario::AmbiguousScalarPrefix
             | FakeRuntimeScenario::GeminiDetailedErrorThenErrorResult
             | FakeRuntimeScenario::GeminiWarningBetweenDeltas
-            | FakeRuntimeScenario::GeminiCompleteMessage,
+            | FakeRuntimeScenario::GeminiCompleteMessage
+            | FakeRuntimeScenario::DecodedSecret
+            | FakeRuntimeScenario::ByteOverflow
+            | FakeRuntimeScenario::EventOverflow,
         ) => Vec::new(),
     };
     lines
@@ -515,9 +550,15 @@ fn gemini_scenario_lines(scenario: FakeRuntimeScenario) -> Vec<Vec<u8>> {
         | FakeRuntimeScenario::ConversationResponseAlias
         | FakeRuntimeScenario::ReadOnlyCommand
         | FakeRuntimeScenario::ReadOnlyCommandWithFileChange
-        | FakeRuntimeScenario::AmbiguousScalarPrefix => Vec::new(),
+        | FakeRuntimeScenario::AmbiguousScalarPrefix
+        | FakeRuntimeScenario::DecodedSecret
+        | FakeRuntimeScenario::ByteOverflow
+        | FakeRuntimeScenario::EventOverflow => Vec::new(),
     }
 }
+
+const PROCESS_FRAME_BYTES: usize = 1024 * 1024;
+const EVENT_OVERFLOW_ASSISTANT_EVENTS: usize = 4_097;
 
 fn codex_conversation_lines(text: &str, scenario: FakeRuntimeScenario) -> Vec<serde_json::Value> {
     let mut lines = vec![
@@ -577,6 +618,18 @@ fn codex_conversation_lines(text: &str, scenario: FakeRuntimeScenario) -> Vec<se
             }),
         ]);
     }
+    if scenario == FakeRuntimeScenario::EventOverflow {
+        lines.extend((0..EVENT_OVERFLOW_ASSISTANT_EVENTS - 1).map(|index| {
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": format!("event-overflow-{index}"),
+                    "type": "agent_message",
+                    "text": " "
+                }
+            })
+        }));
+    }
     lines.extend([
         serde_json::json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":text}}),
         serde_json::json!({"type":"turn.completed","usage":{}}),
@@ -594,8 +647,7 @@ fn conversation_lines(
         .get("transcript_redacted")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let text =
-        serde_json::to_string(&conversation_outcome(transcript, scenario)).unwrap_or_default();
+    let text = conversation_outcome_text(transcript, scenario);
     let lines = match provider {
         ProviderId::Codex => codex_conversation_lines(&text, scenario),
         ProviderId::Claude => {
@@ -608,9 +660,25 @@ fn conversation_lines(
                     serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"null"}]}}),
                 ]);
             }
+            if scenario == FakeRuntimeScenario::EventOverflow {
+                lines.extend((0..EVENT_OVERFLOW_ASSISTANT_EVENTS - 1).map(|_| {
+                    serde_json::json!({
+                        "type":"assistant",
+                        "message":{"content":[{"type":"text","text":" "}]}
+                    })
+                }));
+            }
+            let result = if matches!(
+                scenario,
+                FakeRuntimeScenario::ByteOverflow | FakeRuntimeScenario::EventOverflow
+            ) {
+                "done"
+            } else {
+                &text
+            };
             lines.extend([
                 serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":text}]}}),
-                serde_json::json!({"type":"result","is_error":false,"result":text}),
+                serde_json::json!({"type":"result","is_error":false,"result":result}),
             ]);
             lines
         }
@@ -628,6 +696,16 @@ fn conversation_lines(
                     None,
                 );
             }
+            if scenario == FakeRuntimeScenario::ByteOverflow {
+                return gemini_complete_message_lines(
+                    "fake-conversation",
+                    "echoed user request",
+                    &assistant,
+                );
+            }
+            if scenario == FakeRuntimeScenario::EventOverflow {
+                return gemini_event_overflow_lines(&assistant);
+            }
             return gemini_stream_lines(
                 "fake-conversation",
                 "echoed user request",
@@ -643,6 +721,11 @@ fn conversation_lines(
                     text.into_bytes(),
                 ];
             }
+            if scenario == FakeRuntimeScenario::EventOverflow {
+                let mut lines = vec![b" ".to_vec(); EVENT_OVERFLOW_ASSISTANT_EVENTS - 1];
+                lines.push(text.into_bytes());
+                return lines;
+            }
             return vec![text.into_bytes()];
         }
     };
@@ -650,6 +733,28 @@ fn conversation_lines(
         .into_iter()
         .map(|line| serde_json::to_vec(&line).unwrap_or_default())
         .collect()
+}
+
+fn conversation_outcome_text(transcript: &str, scenario: FakeRuntimeScenario) -> String {
+    match scenario {
+        FakeRuntimeScenario::DecodedSecret => String::from(
+            r#"{"outcome":"answer_complete","response_redacted":"api\u005fkey=\u0073\u0065\u0063\u0072\u0065\u0074\u002d\u0074\u006f\u006b\u0065\u006e"}"#,
+        ),
+        FakeRuntimeScenario::ByteOverflow => serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": format!(
+                "{}byte-overflow-sentinel",
+                "x".repeat(PROCESS_FRAME_BYTES)
+            )
+        })
+        .to_string(),
+        FakeRuntimeScenario::EventOverflow => serde_json::json!({
+            "outcome": "answer_complete",
+            "response_redacted": "event overflow complete"
+        })
+        .to_string(),
+        _ => serde_json::to_string(&conversation_outcome(transcript, scenario)).unwrap_or_default(),
+    }
 }
 
 fn gemini_delta_events(text: &str) -> Vec<serde_json::Value> {
@@ -702,6 +807,50 @@ fn gemini_stream_lines(
         result["stats"] = stats;
     }
     values.push(result);
+    values
+        .into_iter()
+        .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+        .collect()
+}
+
+fn gemini_event_overflow_lines(assistant_text: &str) -> Vec<Vec<u8>> {
+    let mut values = vec![
+        serde_json::json!({
+            "type":"init",
+            "session_id":"fake-conversation",
+            "model":"fake-gemini",
+            "timestamp":"2026-08-07T00:00:00Z"
+        }),
+        serde_json::json!({
+            "type":"message",
+            "role":"user",
+            "content":"echoed user request",
+            "timestamp":"2026-08-07T00:00:01Z"
+        }),
+    ];
+    values.extend((0..EVENT_OVERFLOW_ASSISTANT_EVENTS - 1).map(|_| {
+        serde_json::json!({
+            "type":"message",
+            "role":"assistant",
+            "content":" ",
+            "delta":true,
+            "timestamp":"2026-08-07T00:00:02Z"
+        })
+    }));
+    values.extend([
+        serde_json::json!({
+            "type":"message",
+            "role":"assistant",
+            "content":assistant_text,
+            "delta":true,
+            "timestamp":"2026-08-07T00:00:02Z"
+        }),
+        serde_json::json!({
+            "type":"result",
+            "status":"success",
+            "timestamp":"2026-08-07T00:00:03Z"
+        }),
+    ]);
     values
         .into_iter()
         .map(|value| serde_json::to_vec(&value).unwrap_or_default())
@@ -1055,16 +1204,37 @@ fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
     let Some(prompt) = conversation_prompt(stdin) else {
         return false;
     };
-    mark_fake_conversation_started();
+    let scenario = conversation_scenario(&prompt);
+    mark_fake_conversation_started(provider, scenario);
+    match scenario {
+        FakeRuntimeScenario::Timeout => {
+            std::thread::sleep(Duration::from_mins(5));
+            return true;
+        }
+        FakeRuntimeScenario::ProcessCrash => {
+            eprintln!("fake conversation provider crash");
+            std::process::exit(17);
+        }
+        _ => {}
+    }
+    for line in conversation_lines(provider, &prompt, scenario) {
+        println!("{}", String::from_utf8_lossy(&line));
+    }
+    true
+}
+
+fn conversation_scenario(prompt: &str) -> FakeRuntimeScenario {
     if prompt.contains("scenario:timeout") {
-        std::thread::sleep(Duration::from_mins(5));
-        return true;
-    }
-    if prompt.contains("scenario:crash") {
-        eprintln!("fake conversation provider crash");
-        std::process::exit(17);
-    }
-    let scenario = if prompt.contains("scenario:ambiguous-scalar-prefix") {
+        FakeRuntimeScenario::Timeout
+    } else if prompt.contains("scenario:crash") {
+        FakeRuntimeScenario::ProcessCrash
+    } else if prompt.contains("scenario:decoded-secret") {
+        FakeRuntimeScenario::DecodedSecret
+    } else if prompt.contains("scenario:byte-overflow") {
+        FakeRuntimeScenario::ByteOverflow
+    } else if prompt.contains("scenario:event-overflow") {
+        FakeRuntimeScenario::EventOverflow
+    } else if prompt.contains("scenario:ambiguous-scalar-prefix") {
         FakeRuntimeScenario::AmbiguousScalarPrefix
     } else if prompt.contains("scenario:gemini-warning-between-deltas") {
         FakeRuntimeScenario::GeminiWarningBetweenDeltas
@@ -1074,14 +1244,10 @@ fn emit_conversation_fixture(provider: ProviderId, stdin: &str) -> bool {
         FakeRuntimeScenario::ReadOnlyCommand
     } else {
         FakeRuntimeScenario::Success
-    };
-    for line in conversation_lines(provider, &prompt, scenario) {
-        println!("{}", String::from_utf8_lossy(&line));
     }
-    true
 }
 
-fn mark_fake_conversation_started() {
+fn mark_fake_conversation_started(provider: ProviderId, scenario: FakeRuntimeScenario) {
     let marker_path = std::env::var_os("COLAY_TEST_FAKE_CONVERSATION_MARKER")
         .map(PathBuf::from)
         .or_else(|| {
@@ -1099,7 +1265,11 @@ fn mark_fake_conversation_started() {
         .and_then(|value| value.get("invocation_count")?.as_u64())
         .unwrap_or_default()
         .saturating_add(1);
-    let marker = serde_json::json!({ "invocation_count": invocation_count });
+    let marker = serde_json::json!({
+        "invocation_count": invocation_count,
+        "provider": provider.as_str(),
+        "scenario": scenario.marker_name(),
+    });
     if let Some(parent) = marker_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

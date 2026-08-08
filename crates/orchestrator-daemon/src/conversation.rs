@@ -3,12 +3,12 @@ use orchestrator_domain::{
     ClientCommand, ClientCommandAction, ClientCommandId, ClientCommandState, ConversationAttemptId,
     ConversationMessage, ConversationOutcome, CorrelationId, EventActor, EventId, EventType,
     MessageId, MessageKind, MessageRole, MessageState, RequestConversationTurnCommandPayload,
-    RequestPlanCommandPayload, RequirementRevision, RequirementRevisionId, SandboxMode,
-    SchemaVersion, SessionId, TaskEvent,
+    RequestPlanCommandPayload, RequirementRevision, RequirementRevisionId, RequirementSnapshot,
+    SandboxMode, SchemaVersion, SessionId, TaskEvent, VerificationCommand,
 };
 use orchestrator_engine::{
-    CONVERSATION_MAX_EVIDENCE_BYTES, CollectedConversationResponse, ConversationFailure,
-    ConversationFailureKind, ConversationOrchestrator, ConversationRequest,
+    CONVERSATION_MAX_EVIDENCE_BYTES, CONVERSATION_MAX_OUTPUT_BYTES, CollectedConversationResponse,
+    ConversationFailure, ConversationFailureKind, ConversationOrchestrator, ConversationRequest,
     collect_conversation_response_with_evidence, diagnose_conversation_failure,
 };
 use orchestrator_state::{
@@ -141,7 +141,8 @@ pub(crate) async fn request_conversation_turn(
         sandbox: SandboxMode::ReadOnly,
     };
     let collected = match orchestrator.converse(request.clone()).await {
-        Ok(response) => collect_conversation_response_with_evidence(&request, response),
+        Ok(response) => collect_conversation_response_with_evidence(&request, response)
+            .and_then(|collected| redact_collected_outcome(redactor, collected)),
         Err(error) => Err(error),
     };
     finalize_conversation_turn(
@@ -155,6 +156,114 @@ pub(crate) async fn request_conversation_turn(
     )
 }
 
+fn redact_collected_outcome(
+    redactor: &dyn MessageRedactor,
+    collected: CollectedConversationResponse,
+) -> Result<CollectedConversationResponse, ConversationFailure> {
+    let outcome = redact_conversation_outcome(redactor, collected.outcome);
+    outcome
+        .validate()
+        .map_err(|source| ConversationFailure::Validation {
+            source,
+            evidence_redacted: bounded_redacted(redactor, &collected.evidence_redacted),
+        })?;
+    Ok(CollectedConversationResponse {
+        outcome,
+        evidence_redacted: collected.evidence_redacted,
+    })
+}
+
+fn validate_canonical_outcome_bound(
+    redactor: &dyn MessageRedactor,
+    outcome: &ConversationOutcome,
+    evidence_redacted: &str,
+) -> Result<(), ConversationFailure> {
+    let canonical_output =
+        serde_json::to_vec(outcome).map_err(|error| ConversationFailure::MalformedOutput {
+            reason: format!("post-redaction outcome serialization failed: {error}"),
+            evidence_redacted: bounded_redacted(redactor, evidence_redacted),
+        })?;
+    if canonical_output.len() > CONVERSATION_MAX_OUTPUT_BYTES {
+        return Err(ConversationFailure::OutputTooLarge {
+            limit: CONVERSATION_MAX_OUTPUT_BYTES,
+            observed: canonical_output.len(),
+            evidence_redacted: bounded_redacted(redactor, evidence_redacted),
+        });
+    }
+    Ok(())
+}
+
+fn redact_conversation_outcome(
+    redactor: &dyn MessageRedactor,
+    outcome: ConversationOutcome,
+) -> ConversationOutcome {
+    match outcome {
+        ConversationOutcome::AnswerComplete { response_redacted } => {
+            ConversationOutcome::AnswerComplete {
+                response_redacted: redactor.redact(&response_redacted),
+            }
+        }
+        ConversationOutcome::MoreInformationNeeded {
+            response_redacted,
+            requirements,
+        } => ConversationOutcome::MoreInformationNeeded {
+            response_redacted: redactor.redact(&response_redacted),
+            requirements: redact_requirement_snapshot(redactor, requirements),
+        },
+        ConversationOutcome::WorktreeTaskCandidate {
+            response_redacted,
+            requirements,
+        } => ConversationOutcome::WorktreeTaskCandidate {
+            response_redacted: redactor.redact(&response_redacted),
+            requirements: redact_requirement_snapshot(redactor, requirements),
+        },
+        ConversationOutcome::NeedsAttention {
+            response_redacted,
+            evidence_redacted,
+        } => ConversationOutcome::NeedsAttention {
+            response_redacted: redactor.redact(&response_redacted),
+            evidence_redacted: redactor.redact(&evidence_redacted),
+        },
+    }
+}
+
+fn redact_requirement_snapshot(
+    redactor: &dyn MessageRedactor,
+    requirements: RequirementSnapshot,
+) -> RequirementSnapshot {
+    RequirementSnapshot {
+        objective: redactor.redact(&requirements.objective),
+        in_scope: redact_strings(redactor, requirements.in_scope),
+        out_of_scope: redact_strings(redactor, requirements.out_of_scope),
+        constraints: redact_strings(redactor, requirements.constraints),
+        acceptance_criteria: redact_strings(redactor, requirements.acceptance_criteria),
+        verification_plan: requirements
+            .verification_plan
+            .into_iter()
+            .map(|command| redact_verification_command(redactor, command))
+            .collect(),
+        risks: redact_strings(redactor, requirements.risks),
+        open_questions: redact_strings(redactor, requirements.open_questions),
+    }
+}
+
+fn redact_verification_command(
+    redactor: &dyn MessageRedactor,
+    command: VerificationCommand,
+) -> VerificationCommand {
+    VerificationCommand {
+        executable: redactor.redact(&command.executable),
+        args: redact_strings(redactor, command.args),
+    }
+}
+
+fn redact_strings(redactor: &dyn MessageRedactor, values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| redactor.redact(&value))
+        .collect()
+}
+
 fn finalize_conversation_turn(
     database: &WorkspaceDatabase<'_>,
     redactor: &dyn MessageRedactor,
@@ -164,15 +273,22 @@ fn finalize_conversation_turn(
     collected: Result<CollectedConversationResponse, ConversationFailure>,
     now: DateTime<Utc>,
 ) -> Result<String, ConversationCommandError> {
+    let collected = collected.and_then(|collected| {
+        let outcome = apply_provider_fallback_notice(collected.outcome, provider_selection);
+        validate_canonical_outcome_bound(redactor, &outcome, &collected.evidence_redacted)?;
+        Ok(CollectedConversationResponse {
+            outcome,
+            evidence_redacted: collected.evidence_redacted,
+        })
+    });
     match collected {
         Ok(collected) => {
-            let outcome = apply_provider_fallback_notice(collected.outcome, provider_selection);
             let evidence_redacted = bounded_redacted(redactor, &collected.evidence_redacted);
             let evidence_redacted =
                 (!evidence_redacted.trim().is_empty()).then_some(evidence_redacted.as_str());
             database.finish_conversation_attempt_with_evidence(
                 request.attempt_id,
-                &outcome,
+                &collected.outcome,
                 evidence_redacted,
                 now,
             )?;
@@ -181,7 +297,7 @@ fn finalize_conversation_turn(
                 command,
                 request.session_id,
                 request.source_message_id,
-                &outcome,
+                &collected.outcome,
             )?;
             Ok(format!("conversation:{}", request.attempt_id))
         }

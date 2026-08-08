@@ -456,6 +456,30 @@ fn truncate_evidence_text(evidence: &str) -> String {
     format!("{}{TRUNCATED}", &evidence[..end])
 }
 
+fn conversation_exit(
+    quota_exhausted: bool,
+    lifecycle_error: bool,
+    termination: &RuntimeTermination,
+    exit_code: Option<i32>,
+    completed: bool,
+) -> ConversationExit {
+    if quota_exhausted {
+        ConversationExit::QuotaExhausted
+    } else {
+        match termination {
+            RuntimeTermination::TimedOut => ConversationExit::TimedOut,
+            RuntimeTermination::Cancelled if lifecycle_error => {
+                ConversationExit::Crashed { exit_code }
+            }
+            RuntimeTermination::Cancelled => ConversationExit::Cancelled,
+            RuntimeTermination::Exited if exit_code == Some(0) && completed && !lifecycle_error => {
+                ConversationExit::Succeeded
+            }
+            RuntimeTermination::Exited => ConversationExit::Crashed { exit_code },
+        }
+    }
+}
+
 pub struct OfficialCliConversationOrchestrator {
     planner: OfficialCliTaskPlanner,
 }
@@ -751,22 +775,13 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
         } else {
             None
         };
-        let exit = if quota_exhausted {
-            ConversationExit::QuotaExhausted
-        } else {
-            match output.termination {
-                RuntimeTermination::TimedOut => ConversationExit::TimedOut,
-                RuntimeTermination::Cancelled => ConversationExit::Cancelled,
-                RuntimeTermination::Exited
-                    if output.exit_code == Some(0) && completed && lifecycle_error.is_none() =>
-                {
-                    ConversationExit::Succeeded
-                }
-                RuntimeTermination::Exited => ConversationExit::Crashed {
-                    exit_code: output.exit_code,
-                },
-            }
-        };
+        let exit = conversation_exit(
+            quota_exhausted,
+            lifecycle_error.is_some(),
+            &output.termination,
+            output.exit_code,
+            completed,
+        );
         if let Some(error) = lifecycle_error {
             evidence.push_provider_text(provider, &error);
         }
@@ -838,6 +853,14 @@ fn map_planner_failure(error: orchestrator_engine::PlannerFailure) -> Conversati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_error_does_not_override_runtime_timeout() {
+        assert_eq!(
+            conversation_exit(false, true, &RuntimeTermination::TimedOut, None, false),
+            ConversationExit::TimedOut
+        );
+    }
 
     #[test]
     fn all_providers_accept_commands_only_with_established_read_only_capability() {
