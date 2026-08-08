@@ -753,6 +753,10 @@ impl ConversationOrchestrator for OfficialCliConversationOrchestrator {
         };
         let exit = if quota_exhausted {
             ConversationExit::QuotaExhausted
+        } else if lifecycle_error.is_some() {
+            ConversationExit::Crashed {
+                exit_code: output.exit_code,
+            }
         } else {
             match output.termination {
                 RuntimeTermination::TimedOut => ConversationExit::TimedOut,

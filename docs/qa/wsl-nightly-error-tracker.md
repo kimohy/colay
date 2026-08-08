@@ -94,6 +94,10 @@ separately from `WIN-024` provider-probe time and must not classify it as daemon
 locking. Host remediation should diagnose or repair the failing WSL Docker/systemd units before a
 causal product change is considered.
 
+The 2026-08-08 provider-boundary source matrix does not change this classification. It exercised
+isolated native test processes and durable state, not the degraded WSL systemd/Docker cold-start
+path. No Colay correction or closure is claimed for `WSL-040`; it remains external host evidence.
+
 ## 2026-08-07 PR #21 merge and deployed-nightly QA
 
 - PR #21 merged reviewed head `19453142b7a3996815773861e58a501e5b0ca008` as
@@ -685,7 +689,7 @@ deployable production-shape fake regression.
 ## WSL-035: paced provider streams can exceed semantic and audit bounds
 
 - Severity: high (availability and durable-state growth)
-- Status: fixed in exact merge CI; targeted deployed boundary-stress verification pending
+- Status: source-local CLI boundary matrix GREEN; targeted deployed verification pending
 - Found by: independent stream/redaction security review
 - Deployed smoke nightly: `0.1.1-nightly.20260807.a090a92` (targeted gate pending)
 
@@ -723,10 +727,26 @@ ordinary and ambiguity smoke turns only; it did not cross a configured output or
 Release closure still requires one deployed fake-provider boundary-stress turn that fails boundedly,
 starts the provider once, and persists no over-bound content.
 
+The 2026-08-08 source-local CLI acceptance matrix now crosses both fixed boundaries through Codex,
+Claude, Gemini, and Agy with the exact `orchestrator-test-support` fake provider. The first Codex
+event-overflow row was RED: the sticky runtime-loss path cancelled its own child, and the
+conversation lifecycle then persisted `cancelled` with the user-facing cancellation diagnostic even
+though it had already recorded protocol loss and truncated output. The source fault was lifecycle
+precedence, not CLI wording. A recorded lifecycle error now takes precedence over the mechanical
+`RuntimeTermination::Cancelled`; a cancellation with no lifecycle error remains cancellation.
+All four byte-overflow rows and all four event-overflow rows then exited nonzero, recorded exactly
+one selected provider/scenario start, persisted `failed` plus terminal `needs_attention`, retained at
+most 16 KiB of evidence, persisted no success or over-bound sentinel, and left tasks, task attempts,
+worktrees, coordinator leases, and worker leases empty. Each four-row matrix used one user-global
+database with four distinct attempt workspace IDs; `integrity_check` was `ok` and foreign-key checks
+were empty. `cargo test -p colay --test global_plan_first --all-features` passed 9/9 locally, with
+the focused conversation, process-runtime, and provider-shape targets also GREEN. This is source
+evidence only; the deployed fake-provider boundary-stress gate above remains pending.
+
 ## WSL-036: split or decoded provider credentials can leave a suffix in evidence
 
 - Severity: high (credential redaction)
-- Status: fixed in exact merge CI; deployed redaction-canary verification pending
+- Status: source-local post-decode CLI matrix GREEN; deployed redaction-canary verification pending
 - Found by: independent stream/redaction security review
 - Deployed smoke nightly: `0.1.1-nightly.20260807.a090a92` (targeted gate pending)
 
@@ -770,6 +790,16 @@ and the merge artifact provenance passed. Deployed QA used empty provider creden
 performed only ordinary and ambiguity turns, so it was a release smoke rather than a secret-canary
 test. Release closure still requires a deployed fake canary with negative inspection of CLI output,
 SQLite, JSONL, and artifacts.
+
+The 2026-08-08 source-local decoded-secret CLI matrix explicitly selected Codex, Claude, Gemini,
+and Agy in four distinct non-Git workspaces backed by one user-global database. Every row exited
+zero, recorded exactly one selected `decoded-secret` fake start, and persisted the literal positive
+control `api_key=[REDACTED]`. An independently literal byte scan found no
+`api_key=secret-token` in captured stdout or stderr, the `state.db`/WAL/SHM family, recursive JSONL,
+or workspace artifact data. Every row retained `integrity_check = ok`, no foreign-key violations,
+and zero task, task-attempt, worktree, or lease rows; the database contained four distinct attempt
+workspace IDs. The full local CLI target passed 9/9. This does not satisfy the deployed-nightly
+canary gate, which remains pending.
 
 ## WSL-039: shipped plan-only and state-location guidance contradicts the implementation
 
@@ -1868,8 +1898,8 @@ PR #11을 merge commit `b2daed02a27a128b43984bab0eedeca6d60324e4`로 병합하�
 | `WSL-039` | medium | fixed (PR #22 exact merge CI and deployed help/behavior GREEN) | shipped docs describe plan-only as static and state as repository-local |
 | `WSL-038` | high | fixed (CI rollback regression + deployed schema/integrity smoke GREEN) | late evidence conflict can leave an unfinished attempt on a terminal failed task |
 | `WSL-037` | high | fixed (PR #22 exact merge CI and deployed read-only command GREEN) | planner rejects verified read-only provider commands before approval |
-| `WSL-036` | high | fixed in exact merge CI; deployed redaction canary pending | split or decoded provider credentials can leave a suffix in evidence |
-| `WSL-035` | high | fixed in exact merge CI; targeted deployed boundary stress pending | paced provider streams can exceed semantic-memory and append-only audit bounds |
+| `WSL-036` | high | source-local post-decode CLI matrix GREEN; deployed redaction canary pending | split or decoded provider credentials can leave a suffix in evidence |
+| `WSL-035` | high | source-local CLI boundary matrix GREEN; targeted deployed verification pending | paced provider streams can exceed semantic-memory and append-only audit bounds |
 | `WSL-034` | high | fixed (PR #22 exact merge CI and deployed fake QA GREEN) | Gemini user echo and assistant delta chunks are newline-joined as complete messages |
 | `WSL-033` | medium | fixed (PR #22 exact merge CI and deployed provider QA GREEN) | Claude partial stream deltas are treated as complete semantic messages |
 | `WSL-032` | low | fixed (exact merge CI and deployed fake Agy GREEN) | an older Agy planner integration still requires the removed prompt-valued `--print` flag |
